@@ -1,0 +1,158 @@
+name: Bug report
+description: Something doesn't work as expected in a VR game with the layer installed.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report. The more of this form you
+        fill in, the faster the root cause can be found — most of these
+        fields narrow things down to a specific runtime, game, or crop
+        configuration in a few seconds.
+
+        If you're not sure about a field, leave a short note ("I don't
+        know") rather than leaving it blank.
+
+  - type: input
+    id: layer-version
+    attributes:
+      label: Layer version
+      description: |
+        Shown in the filename of the installer or ZIP you downloaded
+        (e.g. `XR_APILAYER_NOVENDOR_template-0.0.6-x64-Setup.exe`), or
+        in Windows Explorer → right-click the DLL → Properties → Details
+        → Product version.
+      placeholder: "0.0.6"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Installer (Setup.exe)
+        - Manual ZIP + Install-Layer.ps1
+        - Built from source
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: hmd
+    attributes:
+      label: Headset (HMD)
+      description: Model and any relevant accessories (e.g. "Quest 3 via Link cable", "Valve Index", "Reverb G2", "Pimax Crystal").
+      placeholder: "Quest 3 via Link cable"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Active OpenXR runtime
+      description: |
+        Visible in [OpenXR Explorer](https://github.com/maluoi/openxr-explorer)
+        (open the app, look for "Runtime name"). Or in the layer's own log
+        file at `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        (sanitized game name, e.g. `le_mans_ultimate.log`) — search for
+        "Using OpenXR runtime:".
+      options:
+        - SteamVR
+        - Meta / Oculus (Link or native)
+        - Windows Mixed Reality (WMR)
+        - Virtual Desktop
+        - Varjo Base
+        - Pimax
+        - Other
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: Game (or OpenXR application)
+      description: Name and, if you know it, version or Steam build ID.
+      placeholder: "Le Mans Ultimate (Steam build 0.11.0.5)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: |
+        After setting `"enabled": true` and relaunching the game, I
+        expected the FOV to be narrowed and the black bars to appear on
+        the edges of my view.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+      placeholder: |
+        The game launched but the FOV looks unchanged. No black bars.
+        It's as if the layer wasn't loaded at all.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered list. Include anything unusual about your setup.
+      placeholder: |
+        1. Install the layer with `...-Setup.exe`.
+        2. Edit `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\settings.json`
+           and set `"enabled": true`.
+        3. Launch Le Mans Ultimate via Steam.
+        4. Enter a car, start a session.
+        5. Expected: cropped view. Actual: full FOV.
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Active settings file (content)
+      description: |
+        Paste the content of the per-app file that was in effect —
+        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>_settings.json`
+        (or the global `settings.json` if the per-app file doesn't exist
+        yet). Redact anything sensitive, which shouldn't be anything in
+        practice.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: |
+        The relevant part of
+        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        (the file named after the sanitized game name, e.g.
+        `le_mans_ultimate.log`).
+        Usually the first 30-50 lines show the instance creation and the
+        loaded config; if the issue is mid-session, also include the
+        lines around when the problem occurred. Don't paste the whole
+        thing unless it's under ~200 lines.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: |
+        Screenshots, video clips, other OpenXR layers you have installed
+        (visible in OpenXR Explorer), specific GPU / CPU if relevant,
+        whether the problem is intermittent, etc.
+      placeholder: "Running alongside OpenXR-Toolkit; the issue only appears when FSR is enabled in the game."
+    validations:
+      required: false

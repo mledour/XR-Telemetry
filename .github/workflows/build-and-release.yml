@@ -1,0 +1,435 @@
+name: Build and Release
+
+# Build on every push to main (verification) + every tag v*.*.* (release).
+# workflow_dispatch lets you trigger a build manually from the Actions tab.
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# The release job needs `contents: write` to create GitHub releases
+# and attach assets to them.
+permissions:
+  contents: write
+
+env:
+  SOLUTION: XR_APILAYER_NOVENDOR_template.sln
+  LAYER_NAME: XR_APILAYER_NOVENDOR_template
+  # Hoisted to workflow level so the cache key (Restore step) and the
+  # download step (Install step) reference the same version. Bumping
+  # this triggers a fresh download because the cache key changes —
+  # exactly the behavior we want for Certum MSI updates.
+  SIMPLYSIGN_VERSION: '9.4.3.90'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build: Debug + Release in parallel via matrix. Always runs.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.configuration }} x64
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # fetch-depth: 0 lets softprops/action-gh-release auto-generate
+          # release notes from the full commit history.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Decide once, up front, whether this run will code-sign anything.
+      # We sign ONLY when ALL of these are true:
+      #   1. We're on a tag push (refs/tags/v*) — i.e. an actual release.
+      #      Push-to-main, PR, and workflow_dispatch builds are unsigned
+      #      because they're not user-facing artifacts and signing them
+      #      would burn a Certum HSM session per push for no benefit.
+      #   2. The matrix entry is Release (Debug is never signed).
+      #   3. The CERTUM_USERNAME secret is set. PR/fork builds don't have
+      #      access to secrets by GitHub design, so this also keeps them
+      #      green automatically.
+      # Computing it here (and nowhere else) keeps the per-step `if:`
+      # conditions tidy and avoids referencing `secrets.*` directly in a
+      # step-level `if:`, which is not allowed.
+      - name: Determine signing eligibility
+        id: signing
+        shell: pwsh
+        env:
+          CERTUM_USERNAME: ${{ secrets.CERTUM_USERNAME }}
+        run: |
+          $isTagBuild     = $env:GITHUB_REF -like 'refs/tags/v*'
+          $isReleaseEntry = ('${{ matrix.configuration }}' -eq 'Release')
+          $hasSecret      = -not [string]::IsNullOrEmpty($env:CERTUM_USERNAME)
+          $eligible       = $isTagBuild -and $isReleaseEntry -and $hasSecret
+          Write-Host "isTagBuild     = $isTagBuild  (ref=$env:GITHUB_REF)"
+          Write-Host "isReleaseEntry = $isReleaseEntry"
+          Write-Host "hasSecret      = $hasSecret"
+          Write-Host "should_sign    = $eligible"
+          "should_sign=$($eligible.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore "${{ env.SOLUTION }}"
+
+      # Expose the release version to MSBuild's pre-build script
+      # (scripts\Generate-VersionRc.ps1) so the VERSIONINFO resource baked
+      # into the DLL — and the installer filename, and the runtime log
+      # banner — match the git tag that triggered this build.
+      #
+      # Resolution order:
+      #   1. refs/tags/v<semver>         -> clean "<semver>" (e.g. 0.0.8)
+      #   2. any build after an existing tag  -> git-describe progression
+      #      (e.g. 0.0.8-5-gabc1234) so PR + main-push artifacts show
+      #      how far ahead of the last release they are, not a misleading
+      #      "0.0.0-dev-..." that predates every release.
+      #   3. no tags yet (fresh fork)   -> fall back to "0.0.0-dev-<sha>".
+      #
+      # Requires fetch-depth: 0 on actions/checkout — already set above.
+      - name: Compute layer version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -match '^refs/tags/v(\d+\.\d+\.\d+.*)$') {
+            $version = $matches[1]
+          } else {
+            $desc = git describe --tags --always 2>$null
+            if ($LASTEXITCODE -eq 0 -and $desc -match '^v\d+\.\d+\.\d+') {
+              # e.g. "v0.0.8-5-gabc1234" -> "0.0.8-5-gabc1234"
+              $version = $desc -replace '^v', ''
+            } else {
+              $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+              $version = "0.0.0-dev-$shortSha"
+            }
+          }
+          Write-Host "LAYER_VERSION=$version"
+          "LAYER_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build ${{ matrix.configuration }} | x64
+        run: >-
+          msbuild "${{ env.SOLUTION }}"
+          /p:Configuration=${{ matrix.configuration }}
+          /p:Platform=x64
+          /m
+          /verbosity:minimal
+          /nologo
+
+      # ---- Code signing (tag pushes only, Release matrix only) -------
+      #
+      # Gated by `should_sign` (set in "Determine signing eligibility"
+      # above). PR builds, push-to-main, workflow_dispatch, fork builds
+      # and Debug entries all skip these steps automatically.
+      #
+      # Order matters: the DLL is signed BEFORE staging and BEFORE the
+      # installer build, so the signature ends up in the manual ZIP AND
+      # is embedded as-is inside the Setup.exe (Inno Setup just bundles
+      # the file). The Setup.exe itself is signed in a later step,
+      # after ISCC has produced it.
+      #
+      # SimplySign Desktop is the Certum-side prerequisite: it owns the
+      # cloud HSM session and bridges the cert into the Windows
+      # certificate store so signtool /sha1 <thumbprint> can pick it up.
+      # There is NO Chocolatey package; the only public install path is
+      # the MSI from files.certum.eu. We pin SIMPLYSIGN_VERSION so a
+      # Certum-side "latest" can't silently break the undocumented
+      # /autologin flag Sign-Artifact.ps1 relies on (see
+      # docs/DEVELOPMENT.md "Brittleness notes"). Bumping is a
+      # deliberate act — retest /autologin against the new version
+      # locally before merging.
+      #
+      # MSI cache: the file is ~50-100 MB and Certum's CDN sometimes
+      # throttles. Caching it on the cache key SIMPLYSIGN_VERSION saves
+      # the download (~30 s typical) on subsequent runs. We do NOT
+      # cache the installed Program Files tree because the MSI
+      # registers components the cert-store bridge depends on, and a
+      # plain directory copy would skip that registration.
+      - name: Restore cached SimplySign Desktop MSI
+        if: steps.signing.outputs.should_sign == 'true'
+        id: cache-simplysign-msi
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/SimplySignDesktop.msi
+          key: simplysign-msi-${{ env.SIMPLYSIGN_VERSION }}
+
+      - name: Install SimplySign Desktop
+        if: steps.signing.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP\SimplySignDesktop.msi"
+          if ((Test-Path $msi) -and (Get-Item $msi).Length -ge 1MB) {
+            Write-Host ("Using cached MSI: {0} ({1:N0} bytes)" -f $msi, (Get-Item $msi).Length)
+          } else {
+            $url = "https://files.certum.eu/software/SimplySignDesktop/Windows/$env:SIMPLYSIGN_VERSION/SimplySignDesktop-$env:SIMPLYSIGN_VERSION-64-bit-en.msi"
+            Write-Host "Downloading $url"
+            Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+            if (-not (Test-Path $msi) -or (Get-Item $msi).Length -lt 1MB) {
+              throw "MSI download looks invalid: $msi"
+            }
+          }
+          Write-Host "Installing silently ..."
+          $p = Start-Process -FilePath msiexec.exe `
+                             -ArgumentList @('/i', $msi, '/qn', '/norestart') `
+                             -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            throw "msiexec exited $($p.ExitCode)"
+          }
+          # Verify the binary ended up where Sign-Artifact.ps1 expects it.
+          # The 64-bit MSI installs to `C:\Program Files\` (the real
+          # 64-bit hive), NOT `Program Files (x86)`.
+          $exe = 'C:\Program Files\Certum\SimplySign Desktop\SimplySignDesktop.exe'
+          if (-not (Test-Path $exe)) {
+            # Search both Program Files hives just in case the layout
+            # changed in a newer Certum build — fail loudly with the
+            # actual path so the next bump in SIMPLYSIGN_VERSION is
+            # easy to fix.
+            $found = Get-ChildItem 'C:\Program Files*\' -Recurse -Filter 'SimplySignDesktop.exe' -ErrorAction SilentlyContinue
+            throw "SimplySignDesktop.exe not at expected path. Found instead: $($found.FullName -join '; ')"
+          }
+          Write-Host "Installed: $exe"
+
+      # Sign the DLL BEFORE staging and BEFORE building the installer, so
+      # the signature lands in both the manual-install ZIP and embedded
+      # inside the Setup.exe (Inno Setup just bundles the file as-is).
+      # Setup.exe itself is signed in a later step.
+      - name: Sign DLL (Certum SimplySign)
+        if: steps.signing.outputs.should_sign == 'true'
+        shell: pwsh
+        env:
+          CERTUM_USERNAME:        ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_TOTP_SEED:       ${{ secrets.CERTUM_TOTP_SEED }}
+          CERTUM_CERT_THUMBPRINT: ${{ secrets.CERTUM_CERT_THUMBPRINT }}
+        run: |
+          .\scripts\Sign-Artifact.ps1 -Path "bin\x64\Release\${{ env.LAYER_NAME }}.dll"
+
+      # Run the test binary. It covers two layers:
+      #   - Unit tests (test_crop_math.cpp)    : pure crop-math helpers.
+      #   - Integration tests (test_integration.cpp): drive the real
+      #     OpenXrLayer class against a mock OpenXR runtime, exercising
+      #     xrEnumerateViewConfigurationViews / xrLocateViews / xrEndFrame
+      #     and the swapchain bookkeeping without needing a loader, a GPU,
+      #     or a real HMD. This is the bar every PR must clear.
+      # The binary is built by the same msbuild invocation as the layer DLL
+      # (it's a second project in the .sln) and drops alongside the DLL in
+      # bin\x64\<config>\. A non-zero exit fails the job.
+      - name: Run unit + integration tests (${{ matrix.configuration }} | x64)
+        shell: pwsh
+        run: |
+          $exe = "bin\x64\${{ matrix.configuration }}\openxr-api-layer-tests.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Test binary not found at $exe"
+          }
+          # --reporters=console for a readable log in the GitHub Actions UI;
+          # --force-colors so the Actions terminal renders pass/fail nicely.
+          & $exe --reporters=console --force-colors
+          if ($LASTEXITCODE -ne 0) {
+            throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
+          }
+
+      # ---- Inno Setup installer (Release only) --------------------------
+      # Produces a single Setup.exe that installs the DLL + JSON manifest
+      # to Program Files (correct ACLs for sandboxed identities), registers
+      # the layer in HKLM, and creates an Add/Remove Programs uninstaller.
+      - name: Install Inno Setup
+        if: matrix.configuration == 'Release'
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        if: matrix.configuration == 'Release'
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found at $iscc"
+          }
+          & $iscc /DMyAppVersion=$env:LAYER_VERSION "installer\installer.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe returned $LASTEXITCODE"
+          }
+          $exe = Get-ChildItem "bin\installer\*.exe" | Select-Object -First 1
+          Write-Host "Installer built: $($exe.Name) ($($exe.Length) bytes)"
+
+      # Sign the installer too — SmartScreen "Unknown publisher" warnings
+      # are gated on the installer's own signature, not on whatever it
+      # bundles. We sign AFTER ISCC because Inno Setup rewrites the
+      # generated .exe (compresses payload, embeds the uninstaller stub),
+      # which would invalidate any pre-existing signature.
+      - name: Sign installer (Certum SimplySign)
+        # should_sign already implies matrix.configuration == 'Release',
+        # so no additional matrix gate is needed here.
+        if: steps.signing.outputs.should_sign == 'true'
+        shell: pwsh
+        env:
+          CERTUM_USERNAME:        ${{ secrets.CERTUM_USERNAME }}
+          CERTUM_TOTP_SEED:       ${{ secrets.CERTUM_TOTP_SEED }}
+          CERTUM_CERT_THUMBPRINT: ${{ secrets.CERTUM_CERT_THUMBPRINT }}
+        run: |
+          .\scripts\Sign-Artifact.ps1 -Path "bin\installer\*.exe"
+
+      - name: Upload installer artifact
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.LAYER_NAME }}-Setup-x64
+          path: bin/installer/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # Stage the files a user actually needs to install the layer:
+      # the DLL, its PDB, the processed JSON manifest, and the install scripts.
+      # We do NOT zip here — actions/upload-artifact@v4 zips on its own, and
+      # pre-zipping would double-wrap the payload.
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $configuration = "${{ matrix.configuration }}"
+          $layer         = "${{ env.LAYER_NAME }}"
+          $outDir        = "bin\x64\$configuration"
+          $stageDir      = "stage\$layer-$configuration-x64"
+
+          if (-not (Test-Path $outDir)) {
+            throw "Build output not found at $outDir"
+          }
+
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+          Copy-Item "$outDir\$layer.dll"          $stageDir -ErrorAction Stop
+          Copy-Item "$outDir\$layer.pdb"          $stageDir -ErrorAction SilentlyContinue
+          Copy-Item "$outDir\$layer.json"         $stageDir -ErrorAction Stop
+          Copy-Item "$outDir\Install-Layer.ps1"   $stageDir -ErrorAction Stop
+          Copy-Item "$outDir\Uninstall-Layer.ps1" $stageDir -ErrorAction Stop
+
+          # Short install note so the archive is self-explanatory once unzipped.
+          # Built as an array to avoid YAML/here-string indentation leaking into
+          # the file.
+          $readme = @(
+            "$layer - $configuration x64"
+            "================================================================"
+            ""
+            "Install (HKLM, requires elevated PowerShell):"
+            "  powershell -ExecutionPolicy Bypass -File .\Install-Layer.ps1"
+            ""
+            "Uninstall:"
+            "  powershell -ExecutionPolicy Bypass -File .\Uninstall-Layer.ps1"
+            ""
+            "To disable the layer without uninstalling, set the environment"
+            "variable declared under ``disable_environment`` in $layer.json"
+            "to ""1"" for the target process."
+          ) -join "`r`n"
+          Set-Content -Path "$stageDir\README.txt" -Value $readme -Encoding UTF8
+
+          "Staged:" | Out-Host
+          Get-ChildItem $stageDir | Format-Table Name, Length -AutoSize | Out-Host
+
+      # upload-artifact@v4 wraps `path` in a ZIP named `<name>.zip`.
+      # Pointing at the stage directory (not a pre-made ZIP) gives us a
+      # clean single-level ZIP: `<name>.zip` → DLL + PDB + JSON + PS1 at root.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.LAYER_NAME }}-${{ matrix.configuration }}-x64
+          path: stage/${{ env.LAYER_NAME }}-${{ matrix.configuration }}-x64/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Release: only runs on a v*.*.* tag push. Pulls both matrix artifacts
+  # down from the `build` job and attaches them to a GitHub Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      # download-artifact@v4 materializes each artifact as a folder under
+      # `path`: `artifacts/<artifact-name>/<files>`. We re-zip each folder
+      # into a clean release asset named `<artifact-name>.zip`.
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            if [[ "$name" == *-Setup-* ]]; then
+              # Installer .exe — copy directly, do not zip.
+              cp "$name"/*.exe ../release/
+            else
+              # Standard artifact — zip into release.
+              ( cd "$name" && zip -r "../../release/${name}.zip" . )
+            fi
+          done
+          ls -la ../release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## ${{ env.LAYER_NAME }} ${{ github.ref_name }}
+
+            OpenXR API layer built from commit `${{ github.sha }}`.
+
+            ### Assets
+            | File | Description |
+            |------|-------------|
+            | `${{ env.LAYER_NAME }}-*-x64-Setup.exe` | **Installer (recommended)** — installs to Program Files, registers the layer, creates uninstaller in Add/Remove Programs |
+            | `${{ env.LAYER_NAME }}-Release-x64.zip` | ZIP for manual install (DLL + JSON + PowerShell scripts) |
+            | `${{ env.LAYER_NAME }}-Debug-x64.zip` | Debug build with full symbols, for troubleshooting |
+
+            ### Install (installer)
+            1. Download the `...-Setup.exe` above.
+            2. Run it — admin elevation is handled automatically.
+            3. The layer is installed to `C:\Program Files\OpenXR-Layer-<<LAYER_NAME>>\`
+               and registered with the OpenXR loader.
+
+            ### Install (manual / ZIP)
+            1. Download `...-Release-x64.zip` and unzip to a **permanent** location.
+            2. Open an **elevated** PowerShell and run:
+               ```powershell
+               powershell -ExecutionPolicy Bypass -File .\Install-Layer.ps1
+               ```
+
+            ### Uninstall
+            - **Installer**: Settings → Apps → ${{ env.LAYER_NAME }} → Uninstall
+            - **Manual**: run `Uninstall-Layer.ps1` from an elevated PowerShell
+
+            ### Disable without uninstalling
+            Set the environment variable `DISABLE_${{ env.LAYER_NAME }}=1` for the
+            target process.
+
+            > 🔒 Signed with a **Certum Open Source Code Signing Cloud** certificate
+            > (subject: *Open Source Developer <<AUTHOR_NAME_AS_ON_CERT>>*). Verify locally with:
+            > ```powershell
+            > signtool verify /pa /v <file>.exe
+            > ```
+            > Windows SmartScreen may still warn ("Unknown publisher") on early
+            > downloads until the publisher reputation builds with volume.
+            > Anti-cheat systems may flag any OpenXR layer DLL — even a signed
+            > one — when loaded into a hooked game.

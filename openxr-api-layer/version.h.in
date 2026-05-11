@@ -1,0 +1,20 @@
+// version.h.in
+//
+// Template for the compile-time LAYER_VERSION macro. The adjacent script
+// scripts\Generate-VersionRc.ps1 substitutes @VERSION_STRING@ at pre-build
+// time and writes the result to openxr-api-layer/version.h (which is
+// .gitignore'd and regenerated on every build).
+//
+// layer.h picks up the macro and uses it as the runtime VersionString,
+// so the bootstrap log shows the real release version instead of a
+// hard-coded placeholder. The same placeholder + same script also feeds
+// the DLL's VERSIONINFO resource via openxr-api-layer.rc.in, so the
+// header, the resource, and the git tag stay in lockstep.
+//
+// Do NOT edit the generated openxr-api-layer/version.h by hand — edits
+// will be clobbered on the next build. Edit this template and/or the
+// generator script instead.
+
+#pragma once
+
+#define LAYER_VERSION "@VERSION_STRING@"

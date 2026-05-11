@@ -1,0 +1,4 @@
+{
+  "_comment": "Default template for XR_APILAYER_NOVENDOR_template. Each OpenXR application gets a copy of this file the first time it runs (named <app>_settings.json next to this one). Edit values here to change the defaults that apply to NEW games; per-app files are never touched on subsequent runs.",
+  "enabled": false
+}

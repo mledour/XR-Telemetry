@@ -1,0 +1,47 @@
+// openxr-api-layer.rc.in
+//
+// Template for the DLL's VERSIONINFO resource. The adjacent script
+// scripts\Generate-VersionRc.ps1 substitutes @VERSION_MAJOR@, @VERSION_MINOR@,
+// @VERSION_PATCH@, @VERSION_STRING@, and @SOLUTION_NAME@ at pre-build time
+// and writes the result to openxr-api-layer.rc (which is .gitignore'd).
+//
+// Do NOT edit the generated openxr-api-layer.rc by hand — edits will be
+// clobbered on the next build. Edit this template and/or the generator
+// script instead.
+
+#include <winver.h>
+
+#define VER_FILEVERSION         @VERSION_MAJOR@,@VERSION_MINOR@,@VERSION_PATCH@,0
+#define VER_FILEVERSION_STR     "@VERSION_STRING@\0"
+#define VER_PRODUCTVERSION      @VERSION_MAJOR@,@VERSION_MINOR@,@VERSION_PATCH@,0
+#define VER_PRODUCTVERSION_STR  "@VERSION_STRING@\0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    VER_FILEVERSION
+ PRODUCTVERSION VER_PRODUCTVERSION
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 040904B0: US English (0x0409) + Unicode (0x04B0).
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "<<AUTHOR_NAME>>\0"
+            VALUE "FileDescription",  "OpenXR layer that narrows effective FOV and swapchain resolution to reduce GPU load\0"
+            VALUE "FileVersion",      VER_FILEVERSION_STR
+            VALUE "InternalName",     "<<LAYER_NAME>>\0"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 <<AUTHOR_NAME>>. MIT License.\0"
+            VALUE "OriginalFilename", "@SOLUTION_NAME@.dll\0"
+            VALUE "ProductName",      "@SOLUTION_NAME@\0"
+            VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
