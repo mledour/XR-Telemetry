@@ -76,7 +76,7 @@ param(
 
     # Description embedded in the signature ("More info" line in the UAC
     # prompt).
-    [string] $Description = 'XR_APILAYER_NOVENDOR_template',
+    [string] $Description = 'XR_APILAYER_MLEDOUR_xr_telemetry',
 
     # How many seconds to give /autologin before deciding it failed.
     # A bad OTP / bad username makes the process exit within ~1-2 s in

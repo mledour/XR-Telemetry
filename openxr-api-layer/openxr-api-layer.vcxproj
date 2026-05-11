@@ -357,10 +357,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <None Include="framework\layer_apis.py" />
     <None Include="module.def" />
     <None Include="packages.config" />
-    <None Include="XR_APILAYER_NOVENDOR_template-32.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry-32.json" />
     <None Include="openxr-api-layer.rc.in" />
     <None Include="version.h.in" />
-    <None Include="XR_APILAYER_NOVENDOR_template.json">
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>

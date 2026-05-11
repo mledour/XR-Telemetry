@@ -17,8 +17,8 @@ permissions:
   contents: write
 
 env:
-  SOLUTION: XR_APILAYER_NOVENDOR_template.sln
-  LAYER_NAME: XR_APILAYER_NOVENDOR_template
+  SOLUTION: XR_APILAYER_MLEDOUR_xr_telemetry.sln
+  LAYER_NAME: XR_APILAYER_MLEDOUR_xr_telemetry
   # Hoisted to workflow level so the cache key (Restore step) and the
   # download step (Install step) reference the same version. Bumping
   # this triggers a fresh download because the cache key changes —
@@ -406,7 +406,7 @@ jobs:
             ### Install (installer)
             1. Download the `...-Setup.exe` above.
             2. Run it — admin elevation is handled automatically.
-            3. The layer is installed to `C:\Program Files\OpenXR-Layer-<<LAYER_NAME>>\`
+            3. The layer is installed to `C:\Program Files\OpenXR-Layer-xr_telemetry\`
                and registered with the OpenXR loader.
 
             ### Install (manual / ZIP)
@@ -425,7 +425,7 @@ jobs:
             target process.
 
             > 🔒 Signed with a **Certum Open Source Code Signing Cloud** certificate
-            > (subject: *Open Source Developer <<AUTHOR_NAME_AS_ON_CERT>>*). Verify locally with:
+            > (subject: *Open Source Developer Michael Ledour*). Verify locally with:
             > ```powershell
             > signtool verify /pa /v <file>.exe
             > ```

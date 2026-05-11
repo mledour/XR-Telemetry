@@ -19,7 +19,7 @@ body:
       label: Layer version
       description: |
         Shown in the filename of the installer or ZIP you downloaded
-        (e.g. `XR_APILAYER_NOVENDOR_template-0.0.6-x64-Setup.exe`), or
+        (e.g. `XR_APILAYER_MLEDOUR_xr_telemetry-0.0.6-x64-Setup.exe`), or
         in Windows Explorer → right-click the DLL → Properties → Details
         → Product version.
       placeholder: "0.0.6"
@@ -54,7 +54,7 @@ body:
       description: |
         Visible in [OpenXR Explorer](https://github.com/maluoi/openxr-explorer)
         (open the app, look for "Runtime name"). Or in the layer's own log
-        file at `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        file at `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>.log`
         (sanitized game name, e.g. `le_mans_ultimate.log`) — search for
         "Using OpenXR runtime:".
       options:
@@ -106,7 +106,7 @@ body:
       description: Numbered list. Include anything unusual about your setup.
       placeholder: |
         1. Install the layer with `...-Setup.exe`.
-        2. Edit `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\settings.json`
+        2. Edit `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\settings.json`
            and set `"enabled": true`.
         3. Launch Le Mans Ultimate via Steam.
         4. Enter a car, start a session.
@@ -120,7 +120,7 @@ body:
       label: Active settings file (content)
       description: |
         Paste the content of the per-app file that was in effect —
-        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>_settings.json`
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>_settings.json`
         (or the global `settings.json` if the per-app file doesn't exist
         yet). Redact anything sensitive, which shouldn't be anything in
         practice.
@@ -134,7 +134,7 @@ body:
       label: Log excerpt
       description: |
         The relevant part of
-        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>.log`
         (the file named after the sanitized game name, e.g.
         `le_mans_ultimate.log`).
         Usually the first 30-50 lines show the instance creation and the

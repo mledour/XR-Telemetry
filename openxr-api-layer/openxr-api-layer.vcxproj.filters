@@ -72,8 +72,8 @@
     <None Include="framework\layer_apis.py">
       <Filter>Framework</Filter>
     </None>
-    <None Include="XR_APILAYER_NOVENDOR_template.json" />
-    <None Include="XR_APILAYER_NOVENDOR_template-32.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry-32.json" />
     <None Include="packages.config" />
     <None Include="module.def" />
     <None Include="openxr-api-layer.rc.in">

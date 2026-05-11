@@ -30,11 +30,11 @@ BEGIN
         // 040904B0: US English (0x0409) + Unicode (0x04B0).
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "<<AUTHOR_NAME>>\0"
+            VALUE "CompanyName",      "Michael Ledour\0"
             VALUE "FileDescription",  "OpenXR layer that narrows effective FOV and swapchain resolution to reduce GPU load\0"
             VALUE "FileVersion",      VER_FILEVERSION_STR
-            VALUE "InternalName",     "<<LAYER_NAME>>\0"
-            VALUE "LegalCopyright",   "Copyright (C) 2026 <<AUTHOR_NAME>>. MIT License.\0"
+            VALUE "InternalName",     "xr_telemetry\0"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Michael Ledour. MIT License.\0"
             VALUE "OriginalFilename", "@SOLUTION_NAME@.dll\0"
             VALUE "ProductName",      "@SOLUTION_NAME@\0"
             VALUE "ProductVersion",   VER_PRODUCTVERSION_STR

@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) <<YEAR>> <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Based on https://github.com/mbucchia/OpenXR-Layer-Template.
 // Copyright (c) 2022-2023 Matthieu Bucchianeri
@@ -107,7 +107,7 @@ namespace openxr_api_layer {
             // XrApplicationInfo, plus the runtime that materialised
             // beneath us once the baseclass returns.
             const std::string appName = createInfo->applicationInfo.applicationName;
-            Log(fmt::format("<<LAYER_NAME>> {} starting for application '{}'\n",
+            Log(fmt::format("xr_telemetry {} starting for application '{}'\n",
                              VersionString, appName));
 
             const XrResult result = OpenXrApi::xrCreateInstance(createInfo);
@@ -129,7 +129,7 @@ namespace openxr_api_layer {
                                  XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
             }
 
-            // TODO(<<LAYER_NAME>>): Decide here whether your layer
+            // TODO(xr_telemetry): Decide here whether your layer
             // should be active for this app/runtime combination. If
             // not, set m_bypassApiLayer = true to make every other
             // override below a no-op pass-through. See CLAUDE.md

@@ -55,7 +55,7 @@ Three repos in the lineage:
    — the original framework. Owns everything under
    `openxr-api-layer/framework/`, the dispatch generator, the entry
    point, the logging helpers, and the basic vcxproj structure.
-2. **`<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-Template`** (this repo) —
+2. **`mledour/OpenXR-Layer-Template`** (this repo) —
    adds the CI pipeline, code signing, Inno Setup installer, doctest
    + mock runtime, D3D12 support in `pch.h`, and the post-clone init
    script. Framework code is untouched.
@@ -75,7 +75,7 @@ git submodule update --init --recursive
 powershell -ExecutionPolicy Bypass -File .\scripts\Init-Template.ps1
 ```
 
-Then open `XR_APILAYER_NOVENDOR_template.sln` (real names
+Then open `XR_APILAYER_MLEDOUR_xr_telemetry.sln` (real names
 after init) in Visual Studio and build `Release|x64`. The pre-build
 event chain:
 
@@ -141,11 +141,11 @@ builds `Release` and `Debug` x64 on every push to `main` (as a sanity
 check), every PR, and every `v*.*.*` tag. On a tag push it
 additionally creates a GitHub Release and attaches:
 
-- `XR_APILAYER_NOVENDOR_template-<version>-x64-Setup.exe` —
+- `XR_APILAYER_MLEDOUR_xr_telemetry-<version>-x64-Setup.exe` —
   Inno Setup installer (recommended for end users)
-- `XR_APILAYER_NOVENDOR_template-Release-x64.zip` — raw DLL +
+- `XR_APILAYER_MLEDOUR_xr_telemetry-Release-x64.zip` — raw DLL +
   JSON + PowerShell scripts, for manual installation or development
-- `XR_APILAYER_NOVENDOR_template-Debug-x64.zip` — debug build
+- `XR_APILAYER_MLEDOUR_xr_telemetry-Debug-x64.zip` — debug build
   with full symbols, for troubleshooting
 
 To publish a new release:

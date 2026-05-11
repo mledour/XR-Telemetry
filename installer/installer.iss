@@ -1,4 +1,4 @@
-; installer.iss — Inno Setup script for XR_APILAYER_NOVENDOR_template
+; installer.iss — Inno Setup script for XR_APILAYER_MLEDOUR_xr_telemetry
 ;
 ; Builds a single-file Setup.exe that:
 ;   1. Copies the DLL + JSON manifest to Program Files (correct ACLs for
@@ -12,7 +12,7 @@
 ; The /DMyAppVersion flag is mandatory for tagged builds; for local dev
 ; builds without it, the fallback "0.0.0-dev" is used.
 
-#define MyAppName "XR_APILAYER_NOVENDOR_template"
+#define MyAppName "XR_APILAYER_MLEDOUR_xr_telemetry"
 
 ; Accept version from the ISCC command line (/DMyAppVersion=x.y.z).
 ; Fall back to a dev placeholder when compiling interactively.
@@ -28,10 +28,10 @@ AppId={{60C13550-5D5E-446A-BD00-E85112A7D6A2}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
-AppPublisher=<<AUTHOR_NAME>>
-AppPublisherURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>
-AppSupportURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>/issues
-DefaultDirName={autopf}\OpenXR-Layer-<<LAYER_NAME>>
+AppPublisher=Michael Ledour
+AppPublisherURL=https://github.com/mledour/OpenXR-Layer-xr_telemetry
+AppSupportURL=https://github.com/mledour/OpenXR-Layer-xr_telemetry/issues
+DefaultDirName={autopf}\OpenXR-Layer-xr_telemetry
 ; No Start Menu group — this layer has no user-facing executable.
 DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE

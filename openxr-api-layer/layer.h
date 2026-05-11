@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) <<YEAR>> <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Based on https://github.com/mbucchia/OpenXR-Layer-Template.
 // Copyright (c) 2022-2023 Matthieu Bucchianeri
