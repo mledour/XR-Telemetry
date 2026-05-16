@@ -102,6 +102,147 @@ The `layer.cpp` in the template has commented examples for a typical
 └── README.md                                 # ← rewrite this for your layer
 ```
 
+## CPU Timings Analysis
+
+This layer's runtime job is to record one CSV row per frame, capturing
+**every segment** of the OpenXR frame cycle on CPU. The output lands at
+`%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\sessions\YYYY-MM-DD_HH-MM-SSZ_<AppName>.csv`,
+one file per session, openable directly in Excel / Pandas / LibreOffice.
+
+### Schema
+
+```
+frame, timestamp_qpc,
+wait_block_ns, pre_begin_ns, app_cpu_ns, end_frame_ns, frame_total_ns,
+period_ns, headroom_pct, should_render
+```
+
+| Column | Definition | What it captures |
+|---|---|---|
+| `frame` | Sequential counter, 0-based | Frame index since session start |
+| `timestamp_qpc` | Raw `QueryPerformanceCounter` tick at xrEndFrame entry | Frame-end wall clock; convert to seconds with `QueryPerformanceFrequency` |
+| `wait_block_ns` | `tWaitOut − tWaitIn` | **Compositor throttle.** Time the runtime made the app wait inside `xrWaitFrame`. Big = compositor has headroom and is rate-limiting the app. Small = app is the bottleneck, runtime returned the moment it could. |
+| `pre_begin_ns` | `tBegin − tWaitOut` | **Housekeeping.** Time between `xrWaitFrame` returning and `xrBeginFrame` being called. Game-side input poll, state update before render kickoff. Usually small (~50-300 µs); larger means the app is doing meaningful work here. |
+| `app_cpu_ns` | `tEnd − tWaitOut` | **Wait→End window** = `pre_begin_ns` + render submission. The CPU time the app spent between `xrWaitFrame` returning and `xrEndFrame` being called. Render-thread heaviness. |
+| `end_frame_ns` | Duration of the downstream `xrEndFrame` call | **Runtime/compositor ingest overhead.** Time the runtime + any downstream layer spent inside `xrEndFrame` (layer composition, projection correction, compositor handoff). On mature runtimes (SteamVR / Oculus) typically a few hundred µs; on young runtimes (Pimax OpenXR 0.1.0) can reach 1-2 ms. |
+| `frame_total_ns` | `tEnd_now − tEnd_prev` | **Full cycle duration.** End-to-end wall clock of the previous frame. Includes the post-`xrEndFrame` work (game simulation, physics, AI, input polling) that `app_cpu_ns` cannot see because it happens AFTER the app returned from rendering and BEFORE the next `xrWaitFrame`. `0` on the first frame of a session. |
+| `period_ns` | `XrFrameState.predictedDisplayPeriod` | Target frame budget reported by the runtime. ~11.11 ms @ 90 Hz, ~8.33 ms @ 120 Hz, ~13.89 ms @ 72 Hz. Constant for a given session. |
+| `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **% of the frame budget not spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound this frame. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame where `frame_total_ns = 0`. |
+| `should_render` | `XrFrameState.shouldRender` as 0/1 | Whether the runtime asked the app to render this frame. `0` means a skipped frame (focus loss, scene transition); typically filter these out for steady-state analysis. |
+
+The file is closed with a trailing footer line (commented `#`-prefixed)
+recording total written rows and per-cause dropped counts:
+
+```
+# session_end written=2024 dropped_try_lock=0 dropped_queue_full=0 dropped_disk_write=0
+```
+
+Pandas reads it transparently with `pd.read_csv(path, comment='#')`.
+
+### Anatomy of a frame cycle
+
+Stitched chronologically, the timing columns cover 100% of the cycle:
+
+```
+xrEndFrame_prev ↓
+                ├──────── post_end ────────────┐
+                                               ↓
+                                          xrWaitFrame ↓
+                                          ├ wait_block ┤
+                                                       ↓
+                                              ├ pre_begin ┤
+                                                          ↓ xrBeginFrame
+                                              ├ render_submission ┤
+                                                                  ↓ xrEndFrame ↓
+                                                                  ├ end_frame ┤
+                                                                              ↓
+                ←──────────────────── frame_total ────────────────────────────→
+```
+
+Derived segments (not stored, computed in analysis):
+
+- `render_submission_ns = app_cpu_ns − pre_begin_ns`
+  *time spent in `xrBeginFrame` → `xrEndFrame` submitting draw calls*
+- `post_end_ns = frame_total_ns − wait_block_ns − pre_begin_ns − app_cpu_ns − end_frame_ns`
+  *time spent OUTSIDE OpenXR calls — game simulation, physics, AI,
+  event polling. The metric `app_cpu_ns` alone misses this entirely.*
+
+### What each timing diagnoses
+
+| Symptom | Where to look | Reading |
+|---|---|---|
+| Frame drops, app feels stuttery | `frame_total_ns` > `period_ns` × 1.5 | App is missing the deadline. Then drill down into which segment dominates. |
+| Render thread heavy | `render_submission_ns` (`= app_cpu_ns − pre_begin_ns`) close to `period_ns` | Too many draw calls / state changes / GPU-queue stalls in the submission path. Profile with PIX / RenderDoc. |
+| Game simulation heavy | `post_end_ns` (derived) dominates the cycle while `render_submission_ns` stays small | Physics, AI, scripting between frames is the bottleneck. Render thread is fine; the game logic thread is the problem. |
+| Runtime overhead | `end_frame_ns` consistently > ~1 ms | The runtime / compositor itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) can move the needle. Young runtimes are typical culprits. |
+| Compositor underused | `wait_block_ns` close to `period_ns`, `frame_total_ns` ≈ `period_ns` | Healthy. The app finishes early, runtime throttles, equilibrium. The opposite (small `wait_block_ns`) means the app is keeping up only just. |
+
+### Relationship to other VR frame-analysis tools
+
+**OpenXR-side tools — semantically equivalent to this layer.** Same
+definitions of App CPU / wait block / headroom; this layer just stores
+per-frame to CSV instead of overlaying or aggregating.
+
+- [`xrframetools`](https://github.com/mbucchia/XR-FrameTools) (mbucchia)
+  — CLI that captures OpenXR timings via ETW and writes CSV. Closest
+  conceptual sibling to this layer. Columns line up: their `App CPU`
+  ≈ our `frame_total_ns − wait_block_ns`, their `App GPU` is the
+  V2 work we haven't done yet, their `Compositor` ≈ our
+  `wait_block_ns` + `end_frame_ns`.
+- [**OpenXR Toolkit**](https://github.com/mbucchia/OpenXR-Toolkit)
+  (mbucchia) — live overlay. Its `appCpuTimeUs` is sampled between two
+  consecutive `xrWaitFrame` entries excluding the wait block (we sample
+  between two consecutive `xrEndFrame` entries, same semantics in
+  steady state). OXRT averages over a 1 s window; we store raw
+  per-frame, jitter ±2-3 pp. Match the overlay number with a rolling
+  mean of 90 rows:
+
+  ```python
+  import pandas as pd
+  df = pd.read_csv(path, comment='#').iloc[30:]   # skip warmup
+  df['headroom_smooth'] = df['headroom_pct'].rolling(90).mean()
+  ```
+
+  OXRT's column-by-column mapping: `appCpuTimeUs` ≈
+  `frame_total_ns − wait_block_ns`, `renderCpuTimeUs` ≈
+  `app_cpu_ns − pre_begin_ns`, `endFrameCpuTimeUs` ≈ `end_frame_ns`,
+  `waitCpuTimeUs` ≈ `wait_block_ns`.
+
+- [**fpsVR**](https://store.steampowered.com/app/908520/fpsVR/) — paid
+  Steam overlay, SteamVR-only. Different storage strategy, same idea
+  of CPU vs GPU headroom relative to the predicted display period.
+
+**Complementary / different layer of the stack.** Worth knowing they
+exist; not aliases for what this layer does.
+
+- [**PresentMon**](https://github.com/GameTechDev/PresentMon) (Intel)
+  — captures DXGI/D3DKMT *Present* events via ETW, not OpenXR.
+  Sees `Present()` calls regardless of API (2D, VR, doesn't matter),
+  gives you actual present-to-display latency, GPU busy time, tearing
+  mode. Doesn't know about `xrWaitFrame` / `xrEndFrame` directly. Use
+  alongside this layer if you want to correlate compositor handoff
+  with the actual flip — they capture orthogonal layers of the stack.
+- **GPUView** — lower-level still: DirectX scheduler queue visualised
+  per-context. Diagnoses GPU stalls / context contention that look
+  like CPU time from above.
+
+### Sanity checks on a fresh capture
+
+After a 10-20 s session, opening the CSV should show:
+
+- `period_ns` constant for all rows, equal to `1e9 / target_refresh_rate`.
+- `frame_total_ns` ≈ `period_ns` in steady state (after first ~30 warmup frames).
+- `frame_total_ns ≈ wait_block_ns + pre_begin_ns + app_cpu_ns + end_frame_ns + post_end_ns`
+  for any row (within ~100 ns of rounding). Useful invariant check on the
+  data integrity.
+- `headroom_pct` aligned with what fpsVR / OXRT overlay displayed at
+  the same moment (rolling-mean of 90 rows).
+
+A CSV with `wait_block_ns ≈ 0` and `headroom_pct < 50%` for sustained
+stretches is a hot scene worth investigating; if `post_end_ns` is the
+dominant segment there, your game logic thread is what needs profiling
+— not the renderer.
+
 ## CI / signing setup
 
 Skip this section if you don't care about signed releases — the CI
