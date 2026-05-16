@@ -304,20 +304,42 @@ namespace openxr_api_layer {
         // layer to become a no-op for an unsupported app/runtime.
         // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateInstance
         XrResult xrCreateInstance(const XrInstanceCreateInfo* createInfo) override {
+            // ==========================================================
+            // DIAGNOSTIC BUILD — diag/dr2-crash
+            // Every step prints via ErrorLog (synchronous flush). After a
+            // DR2 crash, the LAST "DIAG_CI: <stage>" line in
+            // %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\
+            // XR_APILAYER_MLEDOUR_xr_telemetry.log pinpoints where the
+            // process died. NOT for production — Log/ErrorLog from this
+            // path is fine because xrCreateInstance runs once, far from
+            // the frame loop.
+            // ==========================================================
+            ErrorLog("DIAG_CI: 01 entered xrCreateInstance\n");
+
             if (createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO) {
+                ErrorLog("DIAG_CI: 01a invalid struct type — returning XR_ERROR_VALIDATION_FAILURE\n");
                 return XR_ERROR_VALIDATION_FAILURE;
             }
+            ErrorLog("DIAG_CI: 02 struct type validated\n");
 
             TraceLoggingWrite(g_traceProvider, "xrCreateInstance");
+            ErrorLog("DIAG_CI: 03 TraceLoggingWrite OK\n");
 
             // Names the loader hands us — application as declared in
             // XrApplicationInfo, plus the runtime that materialised
             // beneath us once the baseclass returns.
             const std::string appName = createInfo->applicationInfo.applicationName;
+            ErrorLog(fmt::format("DIAG_CI: 04 appName='{}' (len={})\n", appName, appName.size()));
+
             Log(fmt::format("xr_telemetry {} starting for application '{}'\n",
                              VersionString, appName));
+            ErrorLog("DIAG_CI: 05 initial Log() returned\n");
 
+            ErrorLog("DIAG_CI: 06 about to call OpenXrApi::xrCreateInstance (chain to next layer / runtime)\n");
             const XrResult result = OpenXrApi::xrCreateInstance(createInfo);
+            ErrorLog(fmt::format("DIAG_CI: 07 base xrCreateInstance returned {} ({})\n",
+                                 static_cast<int>(result),
+                                 XR_SUCCEEDED(result) ? "SUCCESS" : "FAILED"));
             if (XR_FAILED(result)) {
                 return result;
             }
@@ -327,35 +349,41 @@ namespace openxr_api_layer {
             // by name. Skip gracefully if the runtime doesn't fill in
             // properties for any reason; we never want to fail the
             // host's xrCreateInstance because of our own diagnostics.
+            ErrorLog("DIAG_CI: 08 about to query xrGetInstanceProperties\n");
             XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
-            if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProperties(GetXrInstance(), &instanceProperties))) {
+            const XrResult propsResult = OpenXrApi::xrGetInstanceProperties(GetXrInstance(), &instanceProperties);
+            ErrorLog(fmt::format("DIAG_CI: 09 xrGetInstanceProperties returned {}\n", static_cast<int>(propsResult)));
+            if (XR_SUCCEEDED(propsResult)) {
                 Log(fmt::format("Runtime: {} {}.{}.{}\n",
                                  instanceProperties.runtimeName,
                                  XR_VERSION_MAJOR(instanceProperties.runtimeVersion),
                                  XR_VERSION_MINOR(instanceProperties.runtimeVersion),
                                  XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
+                ErrorLog("DIAG_CI: 10 runtime identity Log() returned\n");
+            } else {
+                ErrorLog("DIAG_CI: 10 runtime identity skipped (props query failed)\n");
             }
 
             // Open the per-session CSV file. Failures here are non-fatal —
             // the layer keeps running as a pure pass-through if we can't
-            // create the file (read-only LOCALAPPDATA, disk full, …). We
-            // log the failure once via ErrorLog so post-mortem analysis can
-            // still see it.
+            // create the file (read-only LOCALAPPDATA, disk full, …).
+            ErrorLog("DIAG_CI: 11 about to call buildSessionCsvPath\n");
             m_csvPath = buildSessionCsvPath(appName);
-            if (m_csv.start(m_csvPath)) {
+            ErrorLog(fmt::format("DIAG_CI: 12 csv path = '{}'\n", m_csvPath.string()));
+
+            ErrorLog("DIAG_CI: 13 about to call m_csv.start (file open + thread spawn)\n");
+            const bool csvStarted = m_csv.start(m_csvPath);
+            ErrorLog(fmt::format("DIAG_CI: 14 m_csv.start returned {}\n", csvStarted ? "true" : "false"));
+            if (csvStarted) {
                 Log(fmt::format("xr_telemetry: writing per-frame CSV to {}\n", m_csvPath.string()));
+                ErrorLog("DIAG_CI: 15 csv-path Log() returned\n");
             } else {
                 ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — telemetry disabled for this session\n",
                                      m_csvPath.string()));
+                ErrorLog("DIAG_CI: 15 csv start failed branch returned\n");
             }
 
-            // TODO(xr_telemetry): Decide here whether your layer
-            // should be active for this app/runtime combination. If
-            // not, set m_bypassApiLayer = true to make every other
-            // override below a no-op pass-through. See CLAUDE.md
-            // rule 9 — never crash the host because your layer can't
-            // do its job; degrade to bypass instead.
-
+            ErrorLog(fmt::format("DIAG_CI: 99 returning {} from xrCreateInstance\n", static_cast<int>(result)));
             return result;
         }
 
