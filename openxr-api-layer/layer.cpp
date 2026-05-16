@@ -149,13 +149,15 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // ---- DIAGNOSTIC STEP 2 --------------------------------------------
-        // Diagnostic v0 (pure pass-through + first-call ErrorLog) rendered
-        // correctly on Pimax OpenXR. Full impl (c160ae5) broke HMD rendering.
-        // This step adds back EVERYTHING (QPC sampling, atomic state, headroom
-        // math) EXCEPT the per-frame TraceLoggingWrite and the gated Log()
-        // summary. If this step renders, the culprit is ETW/Log. If not,
-        // we narrow further by removing the atomic-store path next.
+        // ---- DIAGNOSTIC STEP 3 --------------------------------------------
+        // Step 2 (math, no ETW, no Log) rendered. Full impl (c160ae5) didn't.
+        // Step 3 adds back only the per-frame TraceLoggingWrite. If HMD goes
+        // black again, ETW emission is what breaks Pimax — most likely
+        // because something is consuming our provider GUID and pushing the
+        // emit into a kernel transition that the Pimax compositor times
+        // poorly. We then switch to a different output mechanism (lock-free
+        // ring buffer read by an out-of-process viewer, ETW emitted from a
+        // background thread, etc.).
 
         XrResult xrWaitFrame(XrSession session,
                              const XrFrameWaitInfo* frameWaitInfo,
@@ -207,17 +209,24 @@ namespace openxr_api_layer {
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
-            // Keep the compiler from constant-folding everything away.
+            // Keep sinks so the optimiser doesn't elide the math.
             m_lastWaitBlockNs.store(waitBlockNs, std::memory_order_relaxed);
             m_lastAppCpuNs.store(appCpuNs, std::memory_order_relaxed);
             m_lastHeadroomPct.store(headroomPct, std::memory_order_relaxed);
-            (void)frameIndex;
 
-            // INTENTIONALLY NO TraceLoggingWrite, NO Log here. Logged once on
-            // first entry only so the user can confirm this build is the one
-            // running.
-            if (!m_diagStep2Logged.exchange(true)) {
-                ErrorLog("DIAG: step2 (math, no ETW, no Log) — xrEndFrame first compute\n");
+            // STEP 3: add back the per-frame ETW emit. Still no Log() summary.
+            const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
+            TraceLoggingWrite(g_traceProvider,
+                              "FrameMetrics",
+                              TLArg(frameIndex, "frame"),
+                              TLArg(waitBlockNs, "wait_block_ns"),
+                              TLArg(appCpuNs, "app_cpu_ns"),
+                              TLArg(periodNs, "period_ns"),
+                              TLArg(headroomPct, "headroom_pct"),
+                              TLArg(shouldRender, "should_render"));
+
+            if (!m_diagStep3Logged.exchange(true)) {
+                ErrorLog("DIAG: step3 (math + ETW, no Log) — xrEndFrame first emit\n");
             }
             return result;
         }
@@ -275,8 +284,10 @@ namespace openxr_api_layer {
         std::atomic<int64_t> m_lastAppCpuNs{0};
         std::atomic<float> m_lastHeadroomPct{0.0f};
 
-        // One-shot diag marker.
+        // One-shot diag markers (steps stack so we can tell which build is
+        // running just from the log file).
         std::atomic<bool> m_diagStep2Logged{false};
+        std::atomic<bool> m_diagStep3Logged{false};
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
