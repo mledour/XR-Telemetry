@@ -73,7 +73,13 @@ namespace openxr_api_layer {
 
     class OpenXrLayer : public OpenXrApi {
     public:
-        OpenXrLayer() = default;
+        OpenXrLayer() {
+            // Cache QPC frequency once. Used by every frame-thread timestamp
+            // conversion below; constant for the process lifetime.
+            LARGE_INTEGER freq{};
+            QueryPerformanceFrequency(&freq);
+            m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
+        }
         ~OpenXrLayer() override = default;
 
         // ---- xrCreateInstance ---------------------------------------------
@@ -143,34 +149,77 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // ---- DIAGNOSTIC OVERRIDES -----------------------------------------
-        // Game crashes with the full implementation. Strip everything to pure
-        // pass-through + a one-shot ErrorLog at first entry, so we can pin
-        // down which override (if any) the crash correlates with. ErrorLog
-        // flushes synchronously so a post-call crash leaves the marker on
-        // disk in %LOCALAPPDATA%\<layer>\<layer>.log.
+        // ---- DIAGNOSTIC STEP 2 --------------------------------------------
+        // Diagnostic v0 (pure pass-through + first-call ErrorLog) rendered
+        // correctly on Pimax OpenXR. Full impl (c160ae5) broke HMD rendering.
+        // This step adds back EVERYTHING (QPC sampling, atomic state, headroom
+        // math) EXCEPT the per-frame TraceLoggingWrite and the gated Log()
+        // summary. If this step renders, the culprit is ETW/Log. If not,
+        // we narrow further by removing the atomic-store path next.
 
         XrResult xrWaitFrame(XrSession session,
                              const XrFrameWaitInfo* frameWaitInfo,
                              XrFrameState* frameState) override {
-            if (!m_diagLoggedWait.exchange(true)) {
-                ErrorLog("DIAG: xrWaitFrame first call\n");
+            const int64_t tWaitIn = QpcNow();
+            const XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            const int64_t tWaitOut = QpcNow();
+
+            if (XR_SUCCEEDED(result) && frameState) {
+                m_tWaitIn.store(tWaitIn, std::memory_order_relaxed);
+                m_tWaitOut.store(tWaitOut, std::memory_order_relaxed);
+                m_predictedPeriodNs.store(frameState->predictedDisplayPeriod, std::memory_order_relaxed);
+                m_lastShouldRender.store(frameState->shouldRender == XR_TRUE, std::memory_order_relaxed);
             }
-            return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            return result;
         }
 
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
-            if (!m_diagLoggedBegin.exchange(true)) {
-                ErrorLog("DIAG: xrBeginFrame first call\n");
+            const int64_t tBegin = QpcNow();
+            const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            if (XR_SUCCEEDED(result)) {
+                m_tBegin.store(tBegin, std::memory_order_relaxed);
             }
-            return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            return result;
         }
 
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
-            if (!m_diagLoggedEnd.exchange(true)) {
-                ErrorLog("DIAG: xrEndFrame first call\n");
+            const int64_t tEnd = QpcNow();
+            const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
+
+            const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
+            const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
+            const int64_t periodNs = m_predictedPeriodNs.load(std::memory_order_relaxed);
+
+            if (tWaitIn == 0 || tWaitOut == 0) {
+                return result;
             }
-            return OpenXrApi::xrEndFrame(session, frameEndInfo);
+
+            // Math runs but its result goes nowhere this step — the goal is
+            // to exercise the same instruction footprint as the full impl
+            // minus the ETW/Log calls. The volatile sink prevents the
+            // optimiser from deleting the math entirely.
+            const int64_t waitBlockNs = QpcToNs(tWaitOut - tWaitIn);
+            const int64_t appCpuNs = QpcToNs(tEnd - tWaitOut);
+            float headroomPct = 0.0f;
+            if (periodNs > 0) {
+                const double ratio = static_cast<double>(appCpuNs) / static_cast<double>(periodNs);
+                headroomPct = static_cast<float>((1.0 - ratio) * 100.0);
+            }
+            const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
+
+            // Keep the compiler from constant-folding everything away.
+            m_lastWaitBlockNs.store(waitBlockNs, std::memory_order_relaxed);
+            m_lastAppCpuNs.store(appCpuNs, std::memory_order_relaxed);
+            m_lastHeadroomPct.store(headroomPct, std::memory_order_relaxed);
+            (void)frameIndex;
+
+            // INTENTIONALLY NO TraceLoggingWrite, NO Log here. Logged once on
+            // first entry only so the user can confirm this build is the one
+            // running.
+            if (!m_diagStep2Logged.exchange(true)) {
+                ErrorLog("DIAG: step2 (math, no ETW, no Log) — xrEndFrame first compute\n");
+            }
+            return result;
         }
 
         // ----------------------------------------------------------------
@@ -197,18 +246,37 @@ namespace openxr_api_layer {
         // ----------------------------------------------------------------
 
       private:
-        // Set to true in xrCreateInstance when the layer determines it
-        // should not do anything for this particular process (wrong
-        // game, wrong runtime, missing system feature, etc.). Every
-        // override should check this and bypass when set.
-        bool m_bypassApiLayer = false;
+        int64_t QpcNow() const {
+            LARGE_INTEGER c;
+            QueryPerformanceCounter(&c);
+            return c.QuadPart;
+        }
+        int64_t QpcToNs(int64_t ticks) const {
+            const int64_t freq = m_qpcFrequency;
+            const int64_t whole = ticks / freq;
+            const int64_t rem = ticks % freq;
+            return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
+        }
 
-        // DIAGNOSTIC: one-shot flags so we ErrorLog the first call of each
-        // override exactly once. Atomic exchange so we don't multi-log if
-        // OpenComposite calls these from multiple threads concurrently.
-        std::atomic<bool> m_diagLoggedWait{false};
-        std::atomic<bool> m_diagLoggedBegin{false};
-        std::atomic<bool> m_diagLoggedEnd{false};
+        bool m_bypassApiLayer = false;
+        int64_t m_qpcFrequency = 1;
+
+        // Frame timing state (written from Wait/Begin thread, read from End
+        // thread — may differ on OpenComposite).
+        std::atomic<int64_t> m_tWaitIn{0};
+        std::atomic<int64_t> m_tWaitOut{0};
+        std::atomic<int64_t> m_tBegin{0};
+        std::atomic<int64_t> m_predictedPeriodNs{0};
+        std::atomic<bool> m_lastShouldRender{true};
+        std::atomic<uint64_t> m_frameIndex{0};
+
+        // Sinks to keep the optimiser honest in the no-ETW step.
+        std::atomic<int64_t> m_lastWaitBlockNs{0};
+        std::atomic<int64_t> m_lastAppCpuNs{0};
+        std::atomic<float> m_lastHeadroomPct{0.0f};
+
+        // One-shot diag marker.
+        std::atomic<bool> m_diagStep2Logged{false};
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
