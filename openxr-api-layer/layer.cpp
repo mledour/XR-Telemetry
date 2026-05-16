@@ -106,7 +106,26 @@ namespace openxr_api_layer {
             // Returns false on file-open failure; the rest of push() then
             // becomes a no-op. Telemetry is best-effort; we never fail the
             // host's OpenXR call because we couldn't write our CSV.
+            //
+            // IDEMPOTENT: OpenComposite (and OXR Toolkit) creates a "probe"
+            // XrInstance to enumerate extensions, then destroys it and
+            // creates the "real" one. Both runs hit the same OpenXrLayer
+            // singleton (the template's GetInstance() is a process-lifetime
+            // static; ResetInstance() in dispatch.gen.cpp is a no-op because
+            // it resets a g_instance that nothing writes to). A second
+            // start() call on an already-running CsvWriter would do
+            //     m_thread = std::thread(...);
+            // while m_thread is joinable, which is defined to call
+            // std::terminate() — process death, no crash dump, no XR error
+            // code, no try/catch can save it. We saw this happen with
+            // DR2 + OpenComposite and with LMU + OXR Toolkit. Guard the
+            // double-start by returning true (no-op): the first start
+            // wins and the existing writer thread / file keep handling
+            // frames from the surviving "real" instance.
             bool start(const std::filesystem::path& path) {
+                if (m_started.load(std::memory_order_acquire)) {
+                    return true;
+                }
                 m_file.open(path, std::ios::out | std::ios::trunc);
                 if (!m_file.is_open()) {
                     return false;
@@ -167,6 +186,7 @@ namespace openxr_api_layer {
             uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
             uint64_t written() const { return m_written; }
             const std::filesystem::path& path() const { return m_path; }
+            bool isStarted() const { return m_started.load(std::memory_order_acquire); }
 
           private:
             static constexpr size_t kMaxQueueSize = 4096;        // ~45 s @ 90 Hz
@@ -371,7 +391,8 @@ namespace openxr_api_layer {
             m_csvPath = buildSessionCsvPath(appName);
             ErrorLog(fmt::format("DIAG_CI: 12 csv path = '{}'\n", m_csvPath.string()));
 
-            ErrorLog("DIAG_CI: 13 about to call m_csv.start (file open + thread spawn)\n");
+            ErrorLog(fmt::format("DIAG_CI: 13 about to call m_csv.start (CsvWriter already running: {})\n",
+                                 m_csv.isStarted() ? "yes — should be a no-op" : "no — will open file and spawn thread"));
             const bool csvStarted = m_csv.start(m_csvPath);
             ErrorLog(fmt::format("DIAG_CI: 14 m_csv.start returned {}\n", csvStarted ? "true" : "false"));
             if (csvStarted) {
