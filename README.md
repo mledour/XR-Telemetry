@@ -177,19 +177,25 @@ Derived segments (not stored, computed in analysis):
 | Runtime overhead | `end_frame_ns` consistently > ~1 ms | The runtime / compositor itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) can move the needle. Young runtimes are typical culprits. |
 | Compositor underused | `wait_block_ns` close to `period_ns`, `frame_total_ns` ≈ `period_ns` | Healthy. The app finishes early, runtime throttles, equilibrium. The opposite (small `wait_block_ns`) means the app is keeping up only just. |
 
-### Relationship to fpsVR / OpenXR Toolkit / PresentMon-VR
+### Relationship to other VR frame-analysis tools
 
-The `headroom_pct` formula matches OpenXR Toolkit (mbucchia)'s overlay
-to within sampling noise:
+**OpenXR-side tools — semantically equivalent to this layer.** Same
+definitions of App CPU / wait block / headroom; this layer just stores
+per-frame to CSV instead of overlaying or aggregating.
 
-- OXRT measures `appCpuTimeUs` between two consecutive `xrWaitFrame`
-  entries, excluding the wait block. This layer measures
-  `frame_total_ns − wait_block_ns` between two consecutive `xrEndFrame`
-  entries. **Semantically equivalent in steady state.**
-- OXRT averages over a 1 s window before displaying its overlay value.
-  This layer stores per-frame values without smoothing — so the CSV
-  numbers will jitter ±2-3 pp around the overlay reading. Take a
-  rolling mean of 90 frames in analysis to match OXRT's display:
+- [`xrframetools`](https://github.com/mbucchia/XR-FrameTools) (mbucchia)
+  — CLI that captures OpenXR timings via ETW and writes CSV. Closest
+  conceptual sibling to this layer. Columns line up: their `App CPU`
+  ≈ our `frame_total_ns − wait_block_ns`, their `App GPU` is the
+  V2 work we haven't done yet, their `Compositor` ≈ our
+  `wait_block_ns` + `end_frame_ns`.
+- [**OpenXR Toolkit**](https://github.com/mbucchia/OpenXR-Toolkit)
+  (mbucchia) — live overlay. Its `appCpuTimeUs` is sampled between two
+  consecutive `xrWaitFrame` entries excluding the wait block (we sample
+  between two consecutive `xrEndFrame` entries, same semantics in
+  steady state). OXRT averages over a 1 s window; we store raw
+  per-frame, jitter ±2-3 pp. Match the overlay number with a rolling
+  mean of 90 rows:
 
   ```python
   import pandas as pd
@@ -197,12 +203,28 @@ to within sampling noise:
   df['headroom_smooth'] = df['headroom_pct'].rolling(90).mean()
   ```
 
-OXRT also exposes `renderCpuTimeUs` (= `xrBeginFrame` end →
-`xrEndFrame` start) which equals our `app_cpu_ns − pre_begin_ns`, and
-`endFrameCpuTimeUs` which matches our `end_frame_ns` directly. The
-`waitCpuTimeUs` they report is our `wait_block_ns`. Same metrics,
-different storage strategy (their overlay is live, our CSV is offline
-post-mortem).
+  OXRT's column-by-column mapping: `appCpuTimeUs` ≈
+  `frame_total_ns − wait_block_ns`, `renderCpuTimeUs` ≈
+  `app_cpu_ns − pre_begin_ns`, `endFrameCpuTimeUs` ≈ `end_frame_ns`,
+  `waitCpuTimeUs` ≈ `wait_block_ns`.
+
+- [**fpsVR**](https://store.steampowered.com/app/908520/fpsVR/) — paid
+  Steam overlay, SteamVR-only. Different storage strategy, same idea
+  of CPU vs GPU headroom relative to the predicted display period.
+
+**Complementary / different layer of the stack.** Worth knowing they
+exist; not aliases for what this layer does.
+
+- [**PresentMon**](https://github.com/GameTechDev/PresentMon) (Intel)
+  — captures DXGI/D3DKMT *Present* events via ETW, not OpenXR.
+  Sees `Present()` calls regardless of API (2D, VR, doesn't matter),
+  gives you actual present-to-display latency, GPU busy time, tearing
+  mode. Doesn't know about `xrWaitFrame` / `xrEndFrame` directly. Use
+  alongside this layer if you want to correlate compositor handoff
+  with the actual flip — they capture orthogonal layers of the stack.
+- **GPUView** — lower-level still: DirectX scheduler queue visualised
+  per-context. Diagnoses GPU stalls / context contention that look
+  like CPU time from above.
 
 ### Sanity checks on a fresh capture
 
