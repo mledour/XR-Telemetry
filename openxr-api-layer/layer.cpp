@@ -77,10 +77,12 @@ namespace openxr_api_layer {
         // by a single background writer thread.
         struct FrameRecord {
             uint64_t frame_index;
-            int64_t timestamp_qpc;   // raw QPC tick at xrEndFrame entry
-            int64_t wait_block_ns;   // tWaitOut - tWaitIn   (compositor throttle)
-            int64_t pre_begin_ns;    // tBegin - tWaitOut    (wait→begin housekeeping)
-            int64_t app_cpu_ns;      // tEnd - tWaitOut      (full app CPU window)
+            int64_t timestamp_qpc;     // raw QPC tick at xrEndFrame entry
+            int64_t wait_block_ns;     // tWaitOut - tWaitIn   (compositor throttle)
+            int64_t pre_begin_ns;      // tBegin - tWaitOut    (wait→begin housekeeping)
+            int64_t app_cpu_ns;        // tEnd - tWaitOut      (wait→end window)
+            int64_t frame_total_ns;    // tEnd - tEndPrev      (full cycle, includes
+                                       //                       post-end sim/physics)
             int64_t period_ns;
             float headroom_pct;
             bool should_render;
@@ -127,7 +129,7 @@ namespace openxr_api_layer {
                 if (!m_file.is_open()) {
                     return false;
                 }
-                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,period_ns,headroom_pct,should_render\n";
+                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,frame_total_ns,period_ns,headroom_pct,should_render\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -275,12 +277,13 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        m_file << fmt::format("{},{},{},{},{},{},{:.2f},{}\n",
+                        m_file << fmt::format("{},{},{},{},{},{},{},{:.2f},{}\n",
                                               rec.frame_index,
                                               rec.timestamp_qpc,
                                               rec.wait_block_ns,
                                               rec.pre_begin_ns,
                                               rec.app_cpu_ns,
+                                              rec.frame_total_ns,
                                               rec.period_ns,
                                               rec.headroom_pct,
                                               rec.should_render ? 1 : 0);
@@ -583,13 +586,35 @@ namespace openxr_api_layer {
             const int64_t preBeginNs =
                 (tBegin > tWaitOut) ? QpcToNs(tBegin - tWaitOut) : 0;
 
-            // CPU headroom: fraction of the predicted display period the app
-            // did NOT spend. Negative => app is CPU-bound this frame. Gated
-            // on period > 0 because some runtimes briefly report 0 before
-            // the session is fully ready.
+            // Full-cycle duration: end-to-end wall clock of the previous
+            // frame. This is what fpsVR / OpenXR Toolkit / PresentMon
+            // report as "app frame time" because it includes the
+            // post-xrEndFrame work (sim, physics, AI, input polling) that
+            // appCpuNs above cannot see — the app does that work BEFORE
+            // calling xrWaitFrame for the next frame, so it falls
+            // outside our wait→end window. Gated on tEndPrev > 0 (first
+            // frame of session): 0 means "no previous frame to compare".
+            const int64_t tEndPrev = m_tEndPrev.exchange(tEnd, std::memory_order_relaxed);
+            const int64_t frameTotalNs = (tEndPrev > 0) ? QpcToNs(tEnd - tEndPrev) : 0;
+
+            // CPU headroom: fraction of the predicted display period that
+            // is NOT spent on app CPU work. Uses the full-cycle metric
+            // (frame_total - wait_block) so the number matches fpsVR /
+            // OpenXR Toolkit — those subtract the compositor wait from
+            // the cycle duration to get "all app CPU per cycle".
+            //
+            // Falls back to the wait→end window (appCpuNs) only on the
+            // first frame where we don't have a previous cycle yet.
+            //
+            // Negative ⇒ app is CPU-bound this cycle. Gated on period > 0
+            // because some runtimes briefly report 0 before the session
+            // is fully ready.
             float headroomPct = 0.0f;
             if (periodNs > 0) {
-                const double ratio = static_cast<double>(appCpuNs) / static_cast<double>(periodNs);
+                const int64_t appPerCycleNs =
+                    (frameTotalNs > 0) ? (frameTotalNs - waitBlockNs) : appCpuNs;
+                const double ratio =
+                    static_cast<double>(appPerCycleNs) / static_cast<double>(periodNs);
                 headroomPct = static_cast<float>((1.0 - ratio) * 100.0);
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
@@ -603,6 +628,7 @@ namespace openxr_api_layer {
                 waitBlockNs,
                 preBeginNs,
                 appCpuNs,
+                frameTotalNs,
                 periodNs,
                 headroomPct,
                 shouldRender,
@@ -665,6 +691,11 @@ namespace openxr_api_layer {
         std::atomic<int64_t> m_tWaitIn{0};
         std::atomic<int64_t> m_tWaitOut{0};
         std::atomic<int64_t> m_tBegin{0};
+        // Previous frame's tEnd (QPC ticks). Used by xrEndFrame to compute
+        // frame_total_ns = tEnd - tEndPrev, which captures the post-end
+        // app work (sim/physics/AI) that wait→end alone misses. Updated
+        // via atomic exchange so the read+write is one operation.
+        std::atomic<int64_t> m_tEndPrev{0};
         std::atomic<int64_t> m_predictedPeriodNs{0};
         std::atomic<bool> m_lastShouldRender{true};
         std::atomic<uint64_t> m_frameIndex{0};
