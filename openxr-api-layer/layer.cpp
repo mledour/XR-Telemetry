@@ -81,6 +81,8 @@ namespace openxr_api_layer {
             int64_t wait_block_ns;     // tWaitOut - tWaitIn   (compositor throttle)
             int64_t pre_begin_ns;      // tBegin - tWaitOut    (wait→begin housekeeping)
             int64_t app_cpu_ns;        // tEnd - tWaitOut      (wait→end window)
+            int64_t end_frame_ns;      // OpenXrApi::xrEndFrame duration (runtime/
+                                       //                       compositor overhead)
             int64_t frame_total_ns;    // tEnd - tEndPrev      (full cycle, includes
                                        //                       post-end sim/physics)
             int64_t period_ns;
@@ -129,7 +131,7 @@ namespace openxr_api_layer {
                 if (!m_file.is_open()) {
                     return false;
                 }
-                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,frame_total_ns,period_ns,headroom_pct,should_render\n";
+                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,period_ns,headroom_pct,should_render\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -277,12 +279,13 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        m_file << fmt::format("{},{},{},{},{},{},{},{:.2f},{}\n",
+                        m_file << fmt::format("{},{},{},{},{},{},{},{},{:.2f},{}\n",
                                               rec.frame_index,
                                               rec.timestamp_qpc,
                                               rec.wait_block_ns,
                                               rec.pre_begin_ns,
                                               rec.app_cpu_ns,
+                                              rec.end_frame_ns,
                                               rec.frame_total_ns,
                                               rec.period_ns,
                                               rec.headroom_pct,
@@ -563,6 +566,13 @@ namespace openxr_api_layer {
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             const int64_t tEnd = QpcNow();
             const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
+            // end_frame_ns isolates the runtime + downstream layers' work
+            // inside xrEndFrame (layer composition, projection correction,
+            // compositor handoff). Useful for diagnosing runtime overhead —
+            // young runtimes (e.g. Pimax OpenXR 0.1.0) can spend ~ms here
+            // where mature compositors stay in the hundreds of µs.
+            const int64_t tEndExit = QpcNow();
+            const int64_t endFrameNs = QpcToNs(tEndExit - tEnd);
 
             const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
             const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
@@ -628,6 +638,7 @@ namespace openxr_api_layer {
                 waitBlockNs,
                 preBeginNs,
                 appCpuNs,
+                endFrameNs,
                 frameTotalNs,
                 periodNs,
                 headroomPct,
