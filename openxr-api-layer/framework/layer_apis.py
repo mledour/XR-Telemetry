@@ -26,6 +26,21 @@
 #   "xrLocateViews",                      # rewrite per-eye pose / FOV
 #   "xrEndFrame",                         # inspect or extend submitted layers
 override_functions = [
+    # Frame-timing instrumentation. We never mutate any argument — these
+    # are pure observers used to compute app CPU time vs the runtime's
+    # predicted frame period (CPU headroom). Intercepting all three is
+    # required because the three timestamps live in three different
+    # entry points:
+    #   xrWaitFrame  : t_wait_in / t_wait_out (compositor throttle)
+    #                  + XrFrameState.predictedDisplayPeriod
+    #   xrBeginFrame : t_begin (informational, not in headroom math)
+    #   xrEndFrame   : t_end   (closes the app CPU window)
+    # OpenComposite calls Wait/Begin/End on potentially different threads
+    # (sim thread vs render thread). Our state is in std::atomic so this
+    # is safe; we never block in any of these overrides.
+    "xrWaitFrame",
+    "xrBeginFrame",
+    "xrEndFrame",
 ]
 
 # Extra OpenXR functions the layer wants to *call* on the runtime (in
