@@ -73,14 +73,7 @@ namespace openxr_api_layer {
 
     class OpenXrLayer : public OpenXrApi {
     public:
-        OpenXrLayer() {
-            // Cache QueryPerformanceCounter frequency once. Used by every
-            // frame-thread timestamp conversion below — keep this out of
-            // the hot path. The value is constant for the process lifetime.
-            LARGE_INTEGER freq{};
-            QueryPerformanceFrequency(&freq);
-            m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
-        }
+        OpenXrLayer() = default;
         ~OpenXrLayer() override = default;
 
         // ---- xrCreateInstance ---------------------------------------------
@@ -107,6 +100,10 @@ namespace openxr_api_layer {
             if (createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO) {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
+
+            // DIAGNOSTIC: ErrorLog flushes immediately. If the file contains
+            // this line after a crash, we got past xrCreateInstance entry.
+            ErrorLog("DIAG: xrCreateInstance entered\n");
 
             TraceLoggingWrite(g_traceProvider, "xrCreateInstance");
 
@@ -146,138 +143,34 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // ---- xrWaitFrame --------------------------------------------------
-        // Records the QPC timestamps around the runtime's wait, and stashes
-        // the predicted frame period for the headroom computation in
-        // xrEndFrame. We never mutate frameWaitInfo or frameState — this is
-        // pure observation. Returning anything other than the runtime's own
-        // XrResult would break OpenComposite and every other well-behaved
-        // OpenXR app.
-        //
-        // Threading: per spec, the app serialises xrWaitFrame calls on a
-        // session. OpenComposite typically calls Wait on the simulation
-        // thread and End on the render thread; using relaxed atomics for the
-        // shared timestamps is sufficient because there is at most one frame
-        // between Wait and End.
-        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrWaitFrame
+        // ---- DIAGNOSTIC OVERRIDES -----------------------------------------
+        // Game crashes with the full implementation. Strip everything to pure
+        // pass-through + a one-shot ErrorLog at first entry, so we can pin
+        // down which override (if any) the crash correlates with. ErrorLog
+        // flushes synchronously so a post-call crash leaves the marker on
+        // disk in %LOCALAPPDATA%\<layer>\<layer>.log.
+
         XrResult xrWaitFrame(XrSession session,
                              const XrFrameWaitInfo* frameWaitInfo,
                              XrFrameState* frameState) override {
-            if (m_bypassApiLayer) {
-                return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            if (!m_diagLoggedWait.exchange(true)) {
+                ErrorLog("DIAG: xrWaitFrame first call\n");
             }
-
-            const int64_t tWaitIn = QpcNow();
-            const XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
-            const int64_t tWaitOut = QpcNow();
-
-            if (XR_SUCCEEDED(result) && frameState) {
-                m_tWaitIn.store(tWaitIn, std::memory_order_relaxed);
-                m_tWaitOut.store(tWaitOut, std::memory_order_relaxed);
-                // predictedDisplayPeriod is in nanoseconds per spec. Some
-                // runtimes briefly return 0 during early session setup —
-                // xrEndFrame gates the headroom math on period > 0.
-                m_predictedPeriodNs.store(frameState->predictedDisplayPeriod, std::memory_order_relaxed);
-                m_lastShouldRender.store(frameState->shouldRender == XR_TRUE, std::memory_order_relaxed);
-            }
-            return result;
+            return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
         }
 
-        // ---- xrBeginFrame -------------------------------------------------
-        // Captured for completeness (begin→end is sometimes useful to split
-        // "render thread submission" from "wait→begin housekeeping") but not
-        // used in the headroom number itself. Keep it cheap; never block.
-        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrBeginFrame
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
-            if (m_bypassApiLayer) {
-                return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            if (!m_diagLoggedBegin.exchange(true)) {
+                ErrorLog("DIAG: xrBeginFrame first call\n");
             }
-            const int64_t tBegin = QpcNow();
-            const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
-            if (XR_SUCCEEDED(result)) {
-                m_tBegin.store(tBegin, std::memory_order_relaxed);
-            }
-            return result;
+            return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
         }
 
-        // ---- xrEndFrame ---------------------------------------------------
-        // Closes the per-frame timing window and emits the metrics. We sample
-        // t_end BEFORE forwarding so the measurement matches what the app
-        // submitted, not what the runtime did with it. The runtime's own
-        // compositor work belongs in a separate metric (TODO V2: subtract
-        // app GPU time using ID3D11Query timestamps on the swapchain
-        // image release).
-        //
-        // shouldRender == XR_FALSE: the app may legitimately skip rendering
-        // for this cycle (focus loss, scene transitions). We still log the
-        // wait-block + app_cpu numbers, but flag the frame so downstream
-        // analysis can filter — a skipped frame is not a slow frame.
-        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
-            if (m_bypassApiLayer) {
-                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            if (!m_diagLoggedEnd.exchange(true)) {
+                ErrorLog("DIAG: xrEndFrame first call\n");
             }
-
-            const int64_t tEnd = QpcNow();
-            const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
-
-            const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
-            const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
-            const int64_t periodNs = m_predictedPeriodNs.load(std::memory_order_relaxed);
-            const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
-
-            // First frame guard: xrEndFrame can fire before we ever saw a
-            // successful xrWaitFrame (e.g. error retries during session
-            // setup). Skip the math; don't pollute the ETW stream with
-            // bogus deltas.
-            if (tWaitIn == 0 || tWaitOut == 0) {
-                return result;
-            }
-
-            const int64_t waitBlockNs = QpcToNs(tWaitOut - tWaitIn);
-            const int64_t appCpuNs = QpcToNs(tEnd - tWaitOut);
-
-            // CPU headroom: fraction of the predicted display period the
-            // app did NOT spend. Negative => app is CPU-bound this frame.
-            // Gated on period > 0 because some runtimes briefly report 0
-            // before the session is fully ready.
-            float headroomPct = 0.0f;
-            if (periodNs > 0) {
-                const double ratio = static_cast<double>(appCpuNs) / static_cast<double>(periodNs);
-                headroomPct = static_cast<float>((1.0 - ratio) * 100.0);
-            }
-
-            const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
-
-            // Per-frame ETW event. ~50 ns in steady state, captured by the
-            // .wprp profile in scripts\. This is the canonical output of
-            // the layer — the console summary below is just a sanity light.
-            TraceLoggingWrite(g_traceProvider,
-                              "FrameMetrics",
-                              TLArg(frameIndex, "frame"),
-                              TLArg(waitBlockNs, "wait_block_ns"),
-                              TLArg(appCpuNs, "app_cpu_ns"),
-                              TLArg(periodNs, "period_ns"),
-                              TLArg(headroomPct, "headroom_pct"),
-                              TLArg(shouldRender, "should_render"));
-
-            // Human-readable summary once per ~90 frames (~1 s at 90 Hz, the
-            // dominant VR refresh rate). Heavy enough that Log() going to
-            // OutputDebugString + file would be too costly per frame, but
-            // cheap enough at 1 Hz that it doesn't perturb measurements.
-            constexpr uint64_t kSummaryEveryFrames = 90;
-            if ((frameIndex + 1) % kSummaryEveryFrames == 0) {
-                Log(fmt::format("xr_telemetry: frame={} app_cpu={:.2f}ms period={:.2f}ms "
-                                "wait_block={:.2f}ms headroom={:.1f}%{}\n",
-                                frameIndex,
-                                appCpuNs / 1.0e6,
-                                periodNs / 1.0e6,
-                                waitBlockNs / 1.0e6,
-                                headroomPct,
-                                shouldRender ? "" : " [shouldRender=false]"));
-            }
-
-            return result;
+            return OpenXrApi::xrEndFrame(session, frameEndInfo);
         }
 
         // ----------------------------------------------------------------
@@ -304,48 +197,18 @@ namespace openxr_api_layer {
         // ----------------------------------------------------------------
 
       private:
-        // QPC helpers. QueryPerformanceCounter is the right clock for this
-        // measurement: monotonic, sub-microsecond, no per-call kernel
-        // transition on modern Windows. We do NOT use the OpenXR-provided
-        // XrTime in XrFrameState because (a) that is a *predicted display*
-        // time, not a measurement point, and (b) its mapping to QPC is
-        // runtime-defined (see XR_KHR_win32_convert_performance_counter_time
-        // for the conversion extension we'd need if we wanted to mix them).
-        int64_t QpcNow() const {
-            LARGE_INTEGER c;
-            QueryPerformanceCounter(&c);
-            return c.QuadPart;
-        }
-        // Convert QPC ticks to nanoseconds without overflowing on long
-        // intervals: split into whole-seconds + remainder.
-        int64_t QpcToNs(int64_t ticks) const {
-            const int64_t freq = m_qpcFrequency;
-            const int64_t whole = ticks / freq;
-            const int64_t rem = ticks % freq;
-            return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
-        }
-
         // Set to true in xrCreateInstance when the layer determines it
         // should not do anything for this particular process (wrong
         // game, wrong runtime, missing system feature, etc.). Every
         // override should check this and bypass when set.
         bool m_bypassApiLayer = false;
 
-        // QPC frequency cached at construction; constant per process.
-        int64_t m_qpcFrequency = 1;
-
-        // Per-frame timestamps + state. Written by xrWaitFrame /
-        // xrBeginFrame on one thread, read by xrEndFrame on potentially
-        // another thread (OpenComposite, separate render thread). Relaxed
-        // atomics are sufficient: there is at most one frame in flight
-        // between Wait and End per the OpenXR frame-loop contract, so we
-        // never race two writers for the same field.
-        std::atomic<int64_t> m_tWaitIn{0};
-        std::atomic<int64_t> m_tWaitOut{0};
-        std::atomic<int64_t> m_tBegin{0};
-        std::atomic<int64_t> m_predictedPeriodNs{0};
-        std::atomic<bool> m_lastShouldRender{true};
-        std::atomic<uint64_t> m_frameIndex{0};
+        // DIAGNOSTIC: one-shot flags so we ErrorLog the first call of each
+        // override exactly once. Atomic exchange so we don't multi-log if
+        // OpenComposite calls these from multiple threads concurrently.
+        std::atomic<bool> m_diagLoggedWait{false};
+        std::atomic<bool> m_diagLoggedBegin{false};
+        std::atomic<bool> m_diagLoggedEnd{false};
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
