@@ -71,6 +71,195 @@ namespace openxr_api_layer {
     // is a do/while statement macro). The .wprp profile in scripts\
     // captures the matching GUID for Windows Performance Recorder.
 
+    namespace {
+
+        // One row of CSV. Pushed from the frame thread (xrEndFrame), drained
+        // by a single background writer thread. POD so we can copy by value
+        // through the queue without surprises.
+        struct FrameRecord {
+            uint64_t frame_index;
+            int64_t timestamp_qpc;   // raw QPC tick at xrEndFrame entry
+            int64_t wait_block_ns;
+            int64_t app_cpu_ns;
+            int64_t period_ns;
+            float headroom_pct;
+            bool should_render;
+        };
+
+        // Async CSV writer: the frame thread does an O(1) push under a
+        // try_lock; a dedicated background thread (BELOW_NORMAL priority)
+        // batches records and writes them to disk. Disk I/O never lands on
+        // the frame thread.
+        //
+        // Backpressure policy: when the queue hits kMaxQueueSize, the
+        // producer drops the OLDEST record (pop_front before push_back). A
+        // counter is reported at session end. The producer never blocks the
+        // frame thread; if it can't even grab the mutex (consumer mid-batch
+        // copy) it drops the new record and increments the counter — rare
+        // but accepted as the cost of "frame thread is sacred".
+        class CsvWriter {
+          public:
+            ~CsvWriter() {
+                stop();
+            }
+
+            // Returns false on file-open failure; the rest of push() then
+            // becomes a no-op. Telemetry is best-effort; we never fail the
+            // host's OpenXR call because we couldn't write our CSV.
+            bool start(const std::filesystem::path& path) {
+                m_file.open(path, std::ios::out | std::ios::trunc);
+                if (!m_file.is_open()) {
+                    return false;
+                }
+                m_file << "frame,timestamp_qpc,wait_block_ns,app_cpu_ns,period_ns,headroom_pct,should_render\n";
+                m_file.flush();
+                m_path = path;
+                m_started.store(true, std::memory_order_release);
+                m_thread = std::thread(&CsvWriter::writerLoop, this);
+                return true;
+            }
+
+            void stop() {
+                if (!m_started.exchange(false)) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mtx);
+                    m_stopping = true;
+                }
+                m_cv.notify_one();
+                if (m_thread.joinable()) {
+                    m_thread.join();
+                }
+                if (m_file.is_open()) {
+                    // Final footer: writers / dropped counts for the session.
+                    // It's a comment-style line — Pandas / Excel ignore it if
+                    // they only sniff columns past the header. read_csv will
+                    // need skipfooter=1 to parse cleanly; not worth more.
+                    m_file << "# session_end written=" << m_written
+                           << " dropped=" << m_dropped << "\n";
+                    m_file.flush();
+                    m_file.close();
+                }
+            }
+
+            void push(const FrameRecord& rec) {
+                if (!m_started.load(std::memory_order_acquire)) {
+                    return;
+                }
+                // try_lock so the frame thread never blocks on the consumer's
+                // batch copy. Cheap (~25 ns on Windows when uncontended) and
+                // we accept the rare drop on contention.
+                std::unique_lock<std::mutex> lock(m_mtx, std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    m_dropped.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                if (m_queue.size() >= kMaxQueueSize) {
+                    m_queue.pop_front();  // drop oldest (per design choice)
+                    m_dropped.fetch_add(1, std::memory_order_relaxed);
+                }
+                m_queue.push_back(rec);
+                lock.unlock();
+                m_cv.notify_one();
+            }
+
+            uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
+            uint64_t written() const { return m_written; }
+            const std::filesystem::path& path() const { return m_path; }
+
+          private:
+            static constexpr size_t kMaxQueueSize = 4096;        // ~45 s @ 90 Hz
+            static constexpr size_t kFlushEveryRecords = 256;     // ~3 s @ 90 Hz
+
+            void writerLoop() {
+                // Don't preempt the frame thread — disk hiccups stay on us.
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+                std::vector<FrameRecord> batch;
+                batch.reserve(kMaxQueueSize);
+                size_t recordsSinceFlush = 0;
+
+                while (true) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_mtx);
+                        m_cv.wait(lock, [this] { return m_stopping || !m_queue.empty(); });
+                        batch.assign(m_queue.begin(), m_queue.end());
+                        m_queue.clear();
+                        if (m_stopping && batch.empty()) {
+                            break;
+                        }
+                    }
+                    for (const auto& rec : batch) {
+                        // fmt::format here is fine — we're on the writer
+                        // thread, not the frame thread. Output a single
+                        // line per frame; bool as 0/1 for Pandas friendliness.
+                        m_file << fmt::format("{},{},{},{},{},{:.2f},{}\n",
+                                              rec.frame_index,
+                                              rec.timestamp_qpc,
+                                              rec.wait_block_ns,
+                                              rec.app_cpu_ns,
+                                              rec.period_ns,
+                                              rec.headroom_pct,
+                                              rec.should_render ? 1 : 0);
+                    }
+                    m_written += batch.size();
+                    recordsSinceFlush += batch.size();
+                    // Periodic flush — a crash should not lose more than
+                    // kFlushEveryRecords frames of telemetry.
+                    if (recordsSinceFlush >= kFlushEveryRecords) {
+                        m_file.flush();
+                        recordsSinceFlush = 0;
+                    }
+                }
+            }
+
+            std::ofstream m_file;
+            std::filesystem::path m_path;
+            std::thread m_thread;
+            std::mutex m_mtx;
+            std::condition_variable m_cv;
+            std::deque<FrameRecord> m_queue;
+            std::atomic<bool> m_started{false};
+            std::atomic<uint64_t> m_dropped{0};
+            uint64_t m_written = 0;          // writer-thread-only, no atomic
+            bool m_stopping = false;          // guarded by m_mtx
+        };
+
+        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SS_<appName>.csv.
+        // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
+        // '_'. Empty appName falls back to "unknown".
+        std::filesystem::path buildSessionCsvPath(const std::string& appName) {
+            const auto now = std::chrono::system_clock::now();
+            const auto tt = std::chrono::system_clock::to_time_t(now);
+            std::tm tm{};
+            ::localtime_s(&tm, &tt);
+            char timestamp[32];
+            std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", &tm);
+
+            std::string safeName;
+            safeName.reserve(appName.size());
+            for (char c : appName) {
+                const auto uc = static_cast<unsigned char>(c);
+                if (std::isalnum(uc) || c == '-' || c == '_' || c == '.') {
+                    safeName.push_back(c);
+                } else {
+                    safeName.push_back('_');
+                }
+            }
+            if (safeName.empty()) {
+                safeName = "unknown";
+            }
+
+            const auto dir = openxr_api_layer::localAppData / "sessions";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);  // best-effort
+            return dir / fmt::format("{}_{}.csv", timestamp, safeName);
+        }
+
+    }  // anonymous namespace
+
+
     class OpenXrLayer : public OpenXrApi {
     public:
         OpenXrLayer() {
@@ -80,7 +269,19 @@ namespace openxr_api_layer {
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
         }
-        ~OpenXrLayer() override = default;
+        // Singleton lifetime is managed by ResetInstance() in
+        // framework/dispatch.gen.cpp, invoked from the auto-generated
+        // xrDestroyInstance. m_csv.stop() in the destructor joins the writer
+        // thread and writes the final footer with the dropped-frame count.
+        ~OpenXrLayer() override {
+            m_csv.stop();
+            if (m_csvPath.has_filename()) {
+                Log(fmt::format("xr_telemetry: session csv closed ({} records, {} dropped) at {}\n",
+                                m_csv.written(),
+                                m_csv.dropped(),
+                                m_csvPath.string()));
+            }
+        }
 
         // ---- xrCreateInstance ---------------------------------------------
         // First call the loader hands to a freshly-loaded layer. The
@@ -135,6 +336,19 @@ namespace openxr_api_layer {
                                  XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
             }
 
+            // Open the per-session CSV file. Failures here are non-fatal —
+            // the layer keeps running as a pure pass-through if we can't
+            // create the file (read-only LOCALAPPDATA, disk full, …). We
+            // log the failure once via ErrorLog so post-mortem analysis can
+            // still see it.
+            m_csvPath = buildSessionCsvPath(appName);
+            if (m_csv.start(m_csvPath)) {
+                Log(fmt::format("xr_telemetry: writing per-frame CSV to {}\n", m_csvPath.string()));
+            } else {
+                ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — telemetry disabled for this session\n",
+                                     m_csvPath.string()));
+            }
+
             // TODO(xr_telemetry): Decide here whether your layer
             // should be active for this app/runtime combination. If
             // not, set m_bypassApiLayer = true to make every other
@@ -185,14 +399,18 @@ namespace openxr_api_layer {
         // so the measurement matches the moment the app committed the frame,
         // not the runtime's compositor work that follows.
         //
+        // Output goes through the async CsvWriter (push() is a try_lock +
+        // deque op, never blocks; the writer thread does the disk I/O).
+        //
         // IMPORTANT: do NOT call Log() / fmt::format / OutputDebugStringA
         // from this path, not even gated to every Nth frame. OutputDebugString
         // takes the kernel-wide DBWinMutex; the Pimax OpenXR compositor (in
         // a separate process) acquires the same mutex for its own logging
         // and a few-hundred-µs contention spike here is enough to make the
-        // compositor drop frames — manifesting as a black HMD. We discovered
-        // this by bisection: math + ETW = renders, math + ETW + 1Hz Log = no
-        // pixels in HMD. ETW (TraceLoggingWrite) is lock-free and safe.
+        // compositor drop frames — manifesting as a black HMD. Bisected on
+        // PR #1: math + ETW renders fine, math + ETW + 1 Hz Log() kills the
+        // HMD. ETW (TraceLoggingWrite) itself is lock-free and would be safe;
+        // we chose CSV instead for the UX (no wpr/tracerpt round-trip).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             const int64_t tEnd = QpcNow();
@@ -223,16 +441,18 @@ namespace openxr_api_layer {
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
-            // Per-frame ETW event. Lock-free; the canonical output of the
-            // layer. Capture with scripts\Tracing.wprp + WPA/PerfView.
-            TraceLoggingWrite(g_traceProvider,
-                              "FrameMetrics",
-                              TLArg(frameIndex, "frame"),
-                              TLArg(waitBlockNs, "wait_block_ns"),
-                              TLArg(appCpuNs, "app_cpu_ns"),
-                              TLArg(periodNs, "period_ns"),
-                              TLArg(headroomPct, "headroom_pct"),
-                              TLArg(shouldRender, "should_render"));
+            // Push to the async CSV writer. push() is bounded-time (a
+            // try_lock + deque manipulation, ~30-50 ns when uncontended);
+            // disk I/O happens entirely on the writer thread.
+            m_csv.push(FrameRecord{
+                frameIndex,
+                tEnd,           // raw QPC tick; converted to time in analysis
+                waitBlockNs,
+                appCpuNs,
+                periodNs,
+                headroomPct,
+                shouldRender,
+            });
 
             return result;
         }
@@ -294,6 +514,10 @@ namespace openxr_api_layer {
         std::atomic<int64_t> m_predictedPeriodNs{0};
         std::atomic<bool> m_lastShouldRender{true};
         std::atomic<uint64_t> m_frameIndex{0};
+
+        // Async CSV writer + the path we opened (for the destructor log).
+        CsvWriter m_csv;
+        std::filesystem::path m_csvPath;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
