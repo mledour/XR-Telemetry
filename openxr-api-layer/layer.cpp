@@ -107,26 +107,17 @@ namespace openxr_api_layer {
             // becomes a no-op. Telemetry is best-effort; we never fail the
             // host's OpenXR call because we couldn't write our CSV.
             //
-            // IDEMPOTENT & THREAD-SAFE: OpenComposite (and OXR Toolkit when
-            // stacked above us) creates a "probe" XrInstance to enumerate
-            // extensions, then destroys it and creates the "real" instance.
-            // Both runs hit the same OpenXrLayer singleton because the
-            // template's GetInstance() is a process-lifetime static and the
-            // framework's ResetInstance() is a no-op (it resets a g_instance
-            // that nothing writes to). A second start() call on an already-
-            // running writer would assign to a joinable std::thread, which
-            // per [thread.thread.assign] calls std::terminate() — process
-            // death with no XR error, no exception for the framework's
-            // try/catch, and no WER dump. We saw this hang DR2 +
-            // OpenComposite and LMU + OXR Toolkit before this guard.
-            //
-            // First call wins: the existing writer thread + file keep
-            // handling frames from whichever XrInstance survives (the
-            // "real" one — the probe never reaches xrEndFrame). The
-            // lifetime mutex serialises start()/stop() with each other
-            // against any future concurrent caller (the OpenXR loader
-            // serialises instance creation today, but we don't depend on
-            // it staying that way).
+            // IDEMPOTENT & THREAD-SAFE — defence-in-depth, not the steady
+            // state. With the singleton wired to the framework's
+            // g_instance, each XrInstance gets a fresh OpenXrLayer (and a
+            // fresh CsvWriter) — start() is called exactly once per
+            // CsvWriter. This guard catches the static-singleton
+            // anti-pattern (where the same writer would see two start()
+            // calls and the second `m_thread = std::thread(...)` would
+            // call std::terminate via [thread.thread.assign]) in case a
+            // future refactor reintroduces it. It also serialises
+            // concurrent start()/stop() against any caller that doesn't
+            // honour the loader's serialisation guarantee.
             bool start(const std::filesystem::path& path) {
                 std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
                 if (m_started.load(std::memory_order_acquire)) {
@@ -202,20 +193,32 @@ namespace openxr_api_layer {
                 }
 
                 if (m_file.is_open()) {
-                    // Final footer split by drop cause so we can tell apart
-                    // a slow writer (try_lock) from a stuffed queue
-                    // (queue_full) from disk-failure (disk_write).
-                    // It's a comment-style line — Pandas reads it with
-                    // pd.read_csv(p, comment='#'); Excel just sees a row
-                    // it can't parse and ignores.
-                    m_file << "# session_end"
-                           << " written=" << m_written
-                           << " dropped_try_lock=" << m_droppedTryLock.load(std::memory_order_relaxed)
-                           << " dropped_queue_full=" << m_droppedQueueFull.load(std::memory_order_relaxed)
-                           << " dropped_disk_write=" << m_droppedDiskWrite
-                           << "\n";
-                    m_file.flush();
-                    m_file.close();
+                    if (m_written == 0) {
+                        // No frames were written — this is almost certainly
+                        // the OpenComposite / OXR Toolkit probe XrInstance
+                        // (capability-check; never reaches the frame loop)
+                        // OR an instance that was created+destroyed before
+                        // any rendering started. Don't litter the sessions/
+                        // folder with empty CSVs; close and delete.
+                        m_file.close();
+                        std::error_code ec;
+                        std::filesystem::remove(m_path, ec);  // best-effort
+                    } else {
+                        // Real session — write the footer with split drop
+                        // counters so a slow writer (try_lock) is
+                        // distinguishable from a stuffed queue (queue_full)
+                        // and from disk failures (disk_write). Comment-style
+                        // line: Pandas reads it with pd.read_csv(p,
+                        // comment='#'); Excel ignores the unparseable row.
+                        m_file << "# session_end"
+                               << " written=" << m_written
+                               << " dropped_try_lock=" << m_droppedTryLock.load(std::memory_order_relaxed)
+                               << " dropped_queue_full=" << m_droppedQueueFull.load(std::memory_order_relaxed)
+                               << " dropped_disk_write=" << m_droppedDiskWrite
+                               << "\n";
+                        m_file.flush();
+                        m_file.close();
+                    }
                 }
             }
 
@@ -394,28 +397,34 @@ namespace openxr_api_layer {
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
         }
-        // SINGLETON LIFETIME — IMPORTANT: the template's GetInstance()
-        // returns a process-lifetime static unique_ptr (see bottom of this
-        // file), and ResetInstance() in framework/dispatch.gen.cpp resets a
-        // g_instance that nothing writes to (no-op). So this destructor only
-        // runs at static-destruction time, AFTER ExitProcess() has already
-        // terminated every other thread — including our writer.
+        // SINGLETON LIFETIME — this destructor runs from
+        // ResetInstance() (auto-generated xrDestroyInstance), so the
+        // application's threads are still alive and the writer thread can
+        // drain cooperatively in <10 ms. The bounded-time guards in
+        // CsvWriter::stop() (timed_mutex + WaitForSingleObject) are
+        // therefore defence-in-depth for crash / hard-shutdown paths,
+        // not the steady-state contract.
         //
-        // CsvWriter::stop() is therefore designed for this hostile context:
-        // bounded mutex acquisition + bounded thread wait + detach on
-        // timeout. Normal-shutdown sessions (writer alive, drains in <10 ms)
-        // still get the footer written; only the rare hard-shutdown path
-        // skips it.
+        // Probe XrInstances (OpenComposite, OXR Toolkit, capability
+        // checks) never reach xrEndFrame, so CsvWriter::stop() deletes
+        // their empty CSVs rather than leaving header-only litter in the
+        // sessions/ folder.
         ~OpenXrLayer() override {
+            const uint64_t written = m_csv.written();
             m_csv.stop();
             if (m_csvPath.has_filename()) {
-                Log(fmt::format("xr_telemetry: session csv closed "
-                                "(written={}, dropped_try_lock={}, dropped_queue_full={}) "
-                                "at {}\n",
-                                m_csv.written(),
-                                m_csv.droppedTryLock(),
-                                m_csv.droppedQueueFull(),
-                                m_csvPath.string()));
+                if (written == 0) {
+                    Log(fmt::format("xr_telemetry: probe XrInstance — no frames; csv deleted: {}\n",
+                                    m_csvPath.string()));
+                } else {
+                    Log(fmt::format("xr_telemetry: session csv closed "
+                                    "(written={}, dropped_try_lock={}, dropped_queue_full={}) "
+                                    "at {}\n",
+                                    written,
+                                    m_csv.droppedTryLock(),
+                                    m_csv.droppedQueueFull(),
+                                    m_csvPath.string()));
+                }
             }
         }
 
@@ -666,9 +675,29 @@ namespace openxr_api_layer {
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
+    //
+    // IMPORTANT — uses the framework's g_instance (declared in
+    // dispatch.gen.h, defined in dispatch.gen.cpp). The auto-generated
+    // xrDestroyInstance calls ResetInstance() which does
+    // `g_instance.reset()`, so each XrInstance gets a fresh OpenXrLayer
+    // with a fresh CsvWriter, fresh thread, fresh state. ~OpenXrLayer()
+    // therefore runs DURING the application's lifetime (threads alive,
+    // mutexes sane), not at static-destruction time after ExitProcess()
+    // has killed every other thread.
+    //
+    // Do NOT replace this with `static std::unique_ptr<OpenXrLayer>
+    // instance = std::make_unique<OpenXrLayer>();` — that anti-pattern
+    // makes the singleton process-lifetime and ResetInstance() a no-op,
+    // which silently breaks the OpenComposite probe-then-real init flow
+    // (the writer thread from the probe instance is still alive when
+    // the real instance tries to start its own). See
+    // docs/DEVELOPMENT.md in OpenXR-Layer-Template-Plus for the full
+    // story.
     OpenXrApi* GetInstance() {
-        static std::unique_ptr<OpenXrLayer> instance = std::make_unique<OpenXrLayer>();
-        return instance.get();
+        if (!g_instance) {
+            g_instance = std::make_unique<OpenXrLayer>();
+        }
+        return g_instance.get();
     }
 
     // dllHome / localAppData are defined in framework/entry.cpp for the
