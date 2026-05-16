@@ -106,7 +106,27 @@ namespace openxr_api_layer {
             // Returns false on file-open failure; the rest of push() then
             // becomes a no-op. Telemetry is best-effort; we never fail the
             // host's OpenXR call because we couldn't write our CSV.
+            //
+            // IDEMPOTENT: OpenComposite (and OXR Toolkit when stacked above
+            // us) creates a "probe" XrInstance to enumerate extensions,
+            // then destroys it and creates the "real" instance. Both runs
+            // hit the same OpenXrLayer singleton because the template's
+            // GetInstance() is a process-lifetime static and the framework's
+            // ResetInstance() is a no-op (it resets a g_instance that
+            // nothing writes to). A second start() call on an already-
+            // running writer would assign to a joinable std::thread, which
+            // per [thread.thread.assign] calls std::terminate() — process
+            // death with no XR error, no exception for the framework's
+            // try/catch, and no WER dump. We saw this hang DR2 +
+            // OpenComposite and LMU + OXR Toolkit before this guard.
+            //
+            // First call wins: the existing writer thread + file keep
+            // handling frames from whichever XrInstance survives (the
+            // "real" one — the probe never reaches xrEndFrame).
             bool start(const std::filesystem::path& path) {
+                if (m_started.load(std::memory_order_acquire)) {
+                    return true;
+                }
                 m_file.open(path, std::ios::out | std::ios::trunc);
                 if (!m_file.is_open()) {
                     return false;
