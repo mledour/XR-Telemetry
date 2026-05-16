@@ -74,13 +74,13 @@ namespace openxr_api_layer {
     namespace {
 
         // One row of CSV. Pushed from the frame thread (xrEndFrame), drained
-        // by a single background writer thread. POD so we can copy by value
-        // through the queue without surprises.
+        // by a single background writer thread.
         struct FrameRecord {
             uint64_t frame_index;
             int64_t timestamp_qpc;   // raw QPC tick at xrEndFrame entry
-            int64_t wait_block_ns;
-            int64_t app_cpu_ns;
+            int64_t wait_block_ns;   // tWaitOut - tWaitIn   (compositor throttle)
+            int64_t pre_begin_ns;    // tBegin - tWaitOut    (wait→begin housekeeping)
+            int64_t app_cpu_ns;      // tEnd - tWaitOut      (full app CPU window)
             int64_t period_ns;
             float headroom_pct;
             bool should_render;
@@ -107,13 +107,13 @@ namespace openxr_api_layer {
             // becomes a no-op. Telemetry is best-effort; we never fail the
             // host's OpenXR call because we couldn't write our CSV.
             //
-            // IDEMPOTENT: OpenComposite (and OXR Toolkit when stacked above
-            // us) creates a "probe" XrInstance to enumerate extensions,
-            // then destroys it and creates the "real" instance. Both runs
-            // hit the same OpenXrLayer singleton because the template's
-            // GetInstance() is a process-lifetime static and the framework's
-            // ResetInstance() is a no-op (it resets a g_instance that
-            // nothing writes to). A second start() call on an already-
+            // IDEMPOTENT & THREAD-SAFE: OpenComposite (and OXR Toolkit when
+            // stacked above us) creates a "probe" XrInstance to enumerate
+            // extensions, then destroys it and creates the "real" instance.
+            // Both runs hit the same OpenXrLayer singleton because the
+            // template's GetInstance() is a process-lifetime static and the
+            // framework's ResetInstance() is a no-op (it resets a g_instance
+            // that nothing writes to). A second start() call on an already-
             // running writer would assign to a joinable std::thread, which
             // per [thread.thread.assign] calls std::terminate() — process
             // death with no XR error, no exception for the framework's
@@ -122,8 +122,13 @@ namespace openxr_api_layer {
             //
             // First call wins: the existing writer thread + file keep
             // handling frames from whichever XrInstance survives (the
-            // "real" one — the probe never reaches xrEndFrame).
+            // "real" one — the probe never reaches xrEndFrame). The
+            // lifetime mutex serialises start()/stop() with each other
+            // against any future concurrent caller (the OpenXR loader
+            // serialises instance creation today, but we don't depend on
+            // it staying that way).
             bool start(const std::filesystem::path& path) {
+                std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
                 if (m_started.load(std::memory_order_acquire)) {
                     return true;
                 }
@@ -131,33 +136,84 @@ namespace openxr_api_layer {
                 if (!m_file.is_open()) {
                     return false;
                 }
-                m_file << "frame,timestamp_qpc,wait_block_ns,app_cpu_ns,period_ns,headroom_pct,should_render\n";
+                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,period_ns,headroom_pct,should_render\n";
                 m_file.flush();
                 m_path = path;
+                m_stopping = false;  // defensive: clear from any prior stop()
                 m_started.store(true, std::memory_order_release);
                 m_thread = std::thread(&CsvWriter::writerLoop, this);
                 return true;
             }
 
+            // stop() is robust against ExitProcess() shutdown. On Windows,
+            // ExitProcess terminates every thread except the caller BEFORE
+            // running DLL_PROCESS_DETACH (which is where this destructor
+            // chain lives). If the writer thread was killed while holding
+            // m_mtx, naively taking it would deadlock. We:
+            //   1. try to acquire m_mtx with a 100 ms deadline,
+            //   2. wait for the writer thread with a 100 ms deadline,
+            //   3. detach + skip the footer if either step times out.
+            // Normal session shutdown (cooperative, writer alive and free)
+            // completes in well under 10 ms and writes the footer; the
+            // bounded wait only kicks in for hard-shutdown paths.
             void stop() {
+                std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
                 if (!m_started.exchange(false)) {
                     return;
                 }
+
+                using namespace std::chrono_literals;
+
+                // Phase 1: signal m_stopping under m_mtx, with a deadline
+                // so an orphaned mutex (writer killed mid-batch) doesn't
+                // hang us.
+                bool signalled = false;
                 {
-                    std::lock_guard<std::mutex> lock(m_mtx);
-                    m_stopping = true;
+                    std::unique_lock<std::timed_mutex> lock(m_mtx, 100ms);
+                    if (lock.owns_lock()) {
+                        m_stopping = true;
+                        signalled = true;
+                    }
+                }
+                if (!signalled) {
+                    // Mutex unreachable — writer thread is probably dead.
+                    // Detach so ~std::thread doesn't call std::terminate.
+                    if (m_thread.joinable()) {
+                        m_thread.detach();
+                    }
+                    return;
                 }
                 m_cv.notify_one();
+
+                // Phase 2: wait for the writer to exit. WaitForSingleObject
+                // is the Win32 way to do "join with timeout"; std::thread
+                // doesn't expose one.
                 if (m_thread.joinable()) {
-                    m_thread.join();
+                    const HANDLE h = m_thread.native_handle();
+                    const DWORD rc = ::WaitForSingleObject(h, 100);
+                    if (rc == WAIT_OBJECT_0) {
+                        m_thread.join();  // now non-blocking, just bookkeeping
+                    } else {
+                        // Writer didn't exit in 100 ms (or its handle is
+                        // gone). Detach and skip the footer.
+                        m_thread.detach();
+                        return;
+                    }
                 }
+
                 if (m_file.is_open()) {
-                    // Final footer: writers / dropped counts for the session.
-                    // It's a comment-style line — Pandas / Excel ignore it if
-                    // they only sniff columns past the header. read_csv will
-                    // need skipfooter=1 to parse cleanly; not worth more.
-                    m_file << "# session_end written=" << m_written
-                           << " dropped=" << m_dropped << "\n";
+                    // Final footer split by drop cause so we can tell apart
+                    // a slow writer (try_lock) from a stuffed queue
+                    // (queue_full) from disk-failure (disk_write).
+                    // It's a comment-style line — Pandas reads it with
+                    // pd.read_csv(p, comment='#'); Excel just sees a row
+                    // it can't parse and ignores.
+                    m_file << "# session_end"
+                           << " written=" << m_written
+                           << " dropped_try_lock=" << m_droppedTryLock.load(std::memory_order_relaxed)
+                           << " dropped_queue_full=" << m_droppedQueueFull.load(std::memory_order_relaxed)
+                           << " dropped_disk_write=" << m_droppedDiskWrite
+                           << "\n";
                     m_file.flush();
                     m_file.close();
                 }
@@ -170,21 +226,23 @@ namespace openxr_api_layer {
                 // try_lock so the frame thread never blocks on the consumer's
                 // batch copy. Cheap (~25 ns on Windows when uncontended) and
                 // we accept the rare drop on contention.
-                std::unique_lock<std::mutex> lock(m_mtx, std::try_to_lock);
+                std::unique_lock<std::timed_mutex> lock(m_mtx, std::try_to_lock);
                 if (!lock.owns_lock()) {
-                    m_dropped.fetch_add(1, std::memory_order_relaxed);
+                    m_droppedTryLock.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
                 if (m_queue.size() >= kMaxQueueSize) {
                     m_queue.pop_front();  // drop oldest (per design choice)
-                    m_dropped.fetch_add(1, std::memory_order_relaxed);
+                    m_droppedQueueFull.fetch_add(1, std::memory_order_relaxed);
                 }
                 m_queue.push_back(rec);
                 lock.unlock();
                 m_cv.notify_one();
             }
 
-            uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
+            uint64_t droppedTryLock() const { return m_droppedTryLock.load(std::memory_order_relaxed); }
+            uint64_t droppedQueueFull() const { return m_droppedQueueFull.load(std::memory_order_relaxed); }
+            uint64_t droppedTotal() const { return droppedTryLock() + droppedQueueFull() + m_droppedDiskWrite; }
             uint64_t written() const { return m_written; }
             const std::filesystem::path& path() const { return m_path; }
 
@@ -202,7 +260,7 @@ namespace openxr_api_layer {
 
                 while (true) {
                     {
-                        std::unique_lock<std::mutex> lock(m_mtx);
+                        std::unique_lock<std::timed_mutex> lock(m_mtx);
                         m_cv.wait(lock, [this] { return m_stopping || !m_queue.empty(); });
                         batch.assign(m_queue.begin(), m_queue.end());
                         m_queue.clear();
@@ -214,16 +272,36 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        m_file << fmt::format("{},{},{},{},{},{:.2f},{}\n",
+                        m_file << fmt::format("{},{},{},{},{},{},{:.2f},{}\n",
                                               rec.frame_index,
                                               rec.timestamp_qpc,
                                               rec.wait_block_ns,
+                                              rec.pre_begin_ns,
                                               rec.app_cpu_ns,
                                               rec.period_ns,
                                               rec.headroom_pct,
                                               rec.should_render ? 1 : 0);
                     }
-                    m_written += batch.size();
+
+                    // Disk-error detection: if the stream went bad mid-batch
+                    // (disk full, ACL revoked, file handle invalidated) we
+                    // count the batch as dropped, log once, and stop trying.
+                    // Clearing the bits keeps the stream usable for a future
+                    // attempt (the file system may recover) but we conserve
+                    // CPU by skipping further formatting if the failure is
+                    // sticky — we just keep counting drops.
+                    if (!m_file.good()) {
+                        m_droppedDiskWrite += batch.size();
+                        if (!m_diskWriteFailedLogged.exchange(true)) {
+                            ErrorLog("xr_telemetry: CSV write failed mid-session; "
+                                     "subsequent records will be reported in the "
+                                     "dropped_disk_write footer count.\n");
+                        }
+                        m_file.clear();  // reset failbit/badbit so we can retry next batch
+                    } else {
+                        m_written += batch.size();
+                    }
+
                     recordsSinceFlush += batch.size();
                     // Periodic flush — a crash should not lose more than
                     // kFlushEveryRecords frames of telemetry.
@@ -237,25 +315,52 @@ namespace openxr_api_layer {
             std::ofstream m_file;
             std::filesystem::path m_path;
             std::thread m_thread;
-            std::mutex m_mtx;
-            std::condition_variable m_cv;
+            // timed_mutex so stop() can bound its wait via try_lock_for. push()
+            // still uses try_to_lock; writerLoop() uses the standard blocking
+            // acquire (it's the consumer — blocking is the whole point).
+            std::timed_mutex m_mtx;
+            std::condition_variable_any m_cv;     // _any because m_mtx is timed_mutex
             std::deque<FrameRecord> m_queue;
             std::atomic<bool> m_started{false};
-            std::atomic<uint64_t> m_dropped{0};
-            uint64_t m_written = 0;          // writer-thread-only, no atomic
-            bool m_stopping = false;          // guarded by m_mtx
+
+            // Three causes of dropped records, surfaced separately in the
+            // footer so a slow writer is distinguishable from a stuffed
+            // queue and from real disk failures.
+            std::atomic<uint64_t> m_droppedTryLock{0};   // producer try_lock failed
+            std::atomic<uint64_t> m_droppedQueueFull{0}; // queue saturated, oldest popped
+            uint64_t m_droppedDiskWrite = 0;             // writer-thread only
+
+            uint64_t m_written = 0;             // writer-thread only, no atomic
+            bool m_stopping = false;             // guarded by m_mtx
+
+            // One-shot guard so a disk-failure storm only logs once.
+            std::atomic<bool> m_diskWriteFailedLogged{false};
+
+            // Serialises start()/stop() with each other against any future
+            // concurrent caller. The OpenXR loader serialises today; this
+            // doesn't depend on that staying true.
+            std::mutex m_lifetimeMtx;
         };
 
-        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SS_<appName>.csv.
+        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SSZ_<appName>.csv.
+        // UTC (Z suffix) rather than local time: trace files are comparable
+        // across machines and immune to DST transitions mid-session.
         // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
         // '_'. Empty appName falls back to "unknown".
         std::filesystem::path buildSessionCsvPath(const std::string& appName) {
             const auto now = std::chrono::system_clock::now();
             const auto tt = std::chrono::system_clock::to_time_t(now);
             std::tm tm{};
-            ::localtime_s(&tm, &tt);
             char timestamp[32];
-            std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", &tm);
+            if (::gmtime_s(&tm, &tt) == 0) {
+                std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%SZ", &tm);
+            } else {
+                // gmtime_s failed (returns errno_t, non-zero on failure).
+                // Fall back to a tick-based stamp so the filename is still
+                // unique across consecutive sessions even without wallclock.
+                std::snprintf(timestamp, sizeof(timestamp), "unknown-time-%lld",
+                              static_cast<long long>(tt));
+            }
 
             std::string safeName;
             safeName.reserve(appName.size());
@@ -289,16 +394,27 @@ namespace openxr_api_layer {
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
         }
-        // Singleton lifetime is managed by ResetInstance() in
-        // framework/dispatch.gen.cpp, invoked from the auto-generated
-        // xrDestroyInstance. m_csv.stop() in the destructor joins the writer
-        // thread and writes the final footer with the dropped-frame count.
+        // SINGLETON LIFETIME — IMPORTANT: the template's GetInstance()
+        // returns a process-lifetime static unique_ptr (see bottom of this
+        // file), and ResetInstance() in framework/dispatch.gen.cpp resets a
+        // g_instance that nothing writes to (no-op). So this destructor only
+        // runs at static-destruction time, AFTER ExitProcess() has already
+        // terminated every other thread — including our writer.
+        //
+        // CsvWriter::stop() is therefore designed for this hostile context:
+        // bounded mutex acquisition + bounded thread wait + detach on
+        // timeout. Normal-shutdown sessions (writer alive, drains in <10 ms)
+        // still get the footer written; only the rare hard-shutdown path
+        // skips it.
         ~OpenXrLayer() override {
             m_csv.stop();
             if (m_csvPath.has_filename()) {
-                Log(fmt::format("xr_telemetry: session csv closed ({} records, {} dropped) at {}\n",
+                Log(fmt::format("xr_telemetry: session csv closed "
+                                "(written={}, dropped_try_lock={}, dropped_queue_full={}) "
+                                "at {}\n",
                                 m_csv.written(),
-                                m_csv.dropped(),
+                                m_csv.droppedTryLock(),
+                                m_csv.droppedQueueFull(),
                                 m_csvPath.string()));
             }
         }
@@ -438,6 +554,7 @@ namespace openxr_api_layer {
 
             const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
             const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
+            const int64_t tBegin = m_tBegin.load(std::memory_order_relaxed);
             const int64_t periodNs = m_predictedPeriodNs.load(std::memory_order_relaxed);
             const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
 
@@ -449,6 +566,13 @@ namespace openxr_api_layer {
 
             const int64_t waitBlockNs = QpcToNs(tWaitOut - tWaitIn);
             const int64_t appCpuNs = QpcToNs(tEnd - tWaitOut);
+            // pre_begin_ns splits app_cpu_ns into the housekeeping window
+            // (Wait→Begin) and the actual render submission (Begin→End).
+            // Gated on tBegin > 0 because xrBeginFrame may be skipped on
+            // some session-transition frames; report 0 then so the user
+            // can filter.
+            const int64_t preBeginNs =
+                (tBegin > tWaitOut) ? QpcToNs(tBegin - tWaitOut) : 0;
 
             // CPU headroom: fraction of the predicted display period the app
             // did NOT spend. Negative => app is CPU-bound this frame. Gated
@@ -468,6 +592,7 @@ namespace openxr_api_layer {
                 frameIndex,
                 tEnd,           // raw QPC tick; converted to time in analysis
                 waitBlockNs,
+                preBeginNs,
                 appCpuNs,
                 periodNs,
                 headroomPct,
