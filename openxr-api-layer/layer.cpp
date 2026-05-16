@@ -107,10 +107,6 @@ namespace openxr_api_layer {
                 return XR_ERROR_VALIDATION_FAILURE;
             }
 
-            // DIAGNOSTIC: ErrorLog flushes immediately. If the file contains
-            // this line after a crash, we got past xrCreateInstance entry.
-            ErrorLog("DIAG: xrCreateInstance entered\n");
-
             TraceLoggingWrite(g_traceProvider, "xrCreateInstance");
 
             // Names the loader hands us — application as declared in
@@ -149,16 +145,11 @@ namespace openxr_api_layer {
             return result;
         }
 
-        // ---- DIAGNOSTIC STEP 3 --------------------------------------------
-        // Step 2 (math, no ETW, no Log) rendered. Full impl (c160ae5) didn't.
-        // Step 3 adds back only the per-frame TraceLoggingWrite. If HMD goes
-        // black again, ETW emission is what breaks Pimax — most likely
-        // because something is consuming our provider GUID and pushing the
-        // emit into a kernel transition that the Pimax compositor times
-        // poorly. We then switch to a different output mechanism (lock-free
-        // ring buffer read by an out-of-process viewer, ETW emitted from a
-        // background thread, etc.).
-
+        // ---- xrWaitFrame --------------------------------------------------
+        // Pure observation; never mutates frameWaitInfo or frameState. The
+        // QPC samples around the base call let us derive wait_block_ns (how
+        // long the runtime made us wait — high = compositor had headroom).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrWaitFrame
         XrResult xrWaitFrame(XrSession session,
                              const XrFrameWaitInfo* frameWaitInfo,
                              XrFrameState* frameState) override {
@@ -175,6 +166,11 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // ---- xrBeginFrame -------------------------------------------------
+        // Captured for completeness (begin→end split is useful in trace
+        // analysis to separate "wait→begin housekeeping" from "render
+        // submission") but not used in the headroom math itself.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrBeginFrame
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
             const int64_t tBegin = QpcNow();
             const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
@@ -184,6 +180,20 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // ---- xrEndFrame ---------------------------------------------------
+        // Closes the per-frame timing window. Samples tEnd BEFORE forwarding
+        // so the measurement matches the moment the app committed the frame,
+        // not the runtime's compositor work that follows.
+        //
+        // IMPORTANT: do NOT call Log() / fmt::format / OutputDebugStringA
+        // from this path, not even gated to every Nth frame. OutputDebugString
+        // takes the kernel-wide DBWinMutex; the Pimax OpenXR compositor (in
+        // a separate process) acquires the same mutex for its own logging
+        // and a few-hundred-µs contention spike here is enough to make the
+        // compositor drop frames — manifesting as a black HMD. We discovered
+        // this by bisection: math + ETW = renders, math + ETW + 1Hz Log = no
+        // pixels in HMD. ETW (TraceLoggingWrite) is lock-free and safe.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             const int64_t tEnd = QpcNow();
             const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
@@ -191,17 +201,21 @@ namespace openxr_api_layer {
             const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
             const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
             const int64_t periodNs = m_predictedPeriodNs.load(std::memory_order_relaxed);
+            const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
 
+            // First frame guard: xrEndFrame can fire before we ever observed
+            // a successful xrWaitFrame. Skip the math to avoid bogus deltas.
             if (tWaitIn == 0 || tWaitOut == 0) {
                 return result;
             }
 
-            // Math runs but its result goes nowhere this step — the goal is
-            // to exercise the same instruction footprint as the full impl
-            // minus the ETW/Log calls. The volatile sink prevents the
-            // optimiser from deleting the math entirely.
             const int64_t waitBlockNs = QpcToNs(tWaitOut - tWaitIn);
             const int64_t appCpuNs = QpcToNs(tEnd - tWaitOut);
+
+            // CPU headroom: fraction of the predicted display period the app
+            // did NOT spend. Negative => app is CPU-bound this frame. Gated
+            // on period > 0 because some runtimes briefly report 0 before
+            // the session is fully ready.
             float headroomPct = 0.0f;
             if (periodNs > 0) {
                 const double ratio = static_cast<double>(appCpuNs) / static_cast<double>(periodNs);
@@ -209,13 +223,8 @@ namespace openxr_api_layer {
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
-            // Keep sinks so the optimiser doesn't elide the math.
-            m_lastWaitBlockNs.store(waitBlockNs, std::memory_order_relaxed);
-            m_lastAppCpuNs.store(appCpuNs, std::memory_order_relaxed);
-            m_lastHeadroomPct.store(headroomPct, std::memory_order_relaxed);
-
-            // STEP 3: add back the per-frame ETW emit. Still no Log() summary.
-            const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
+            // Per-frame ETW event. Lock-free; the canonical output of the
+            // layer. Capture with scripts\Tracing.wprp + WPA/PerfView.
             TraceLoggingWrite(g_traceProvider,
                               "FrameMetrics",
                               TLArg(frameIndex, "frame"),
@@ -225,9 +234,6 @@ namespace openxr_api_layer {
                               TLArg(headroomPct, "headroom_pct"),
                               TLArg(shouldRender, "should_render"));
 
-            if (!m_diagStep3Logged.exchange(true)) {
-                ErrorLog("DIAG: step3 (math + ETW, no Log) — xrEndFrame first emit\n");
-            }
             return result;
         }
 
@@ -255,11 +261,18 @@ namespace openxr_api_layer {
         // ----------------------------------------------------------------
 
       private:
+        // QPC helpers — QueryPerformanceCounter is monotonic, sub-microsecond,
+        // and free of kernel transitions on modern Windows. We do NOT use
+        // XrFrameState.predictedDisplayTime as a clock: it's a predicted
+        // display point, not a measurement point, and its mapping to QPC is
+        // runtime-defined.
         int64_t QpcNow() const {
             LARGE_INTEGER c;
             QueryPerformanceCounter(&c);
             return c.QuadPart;
         }
+        // Convert QPC ticks to nanoseconds without overflowing on long runs:
+        // split into whole-seconds + remainder.
         int64_t QpcToNs(int64_t ticks) const {
             const int64_t freq = m_qpcFrequency;
             const int64_t whole = ticks / freq;
@@ -270,24 +283,17 @@ namespace openxr_api_layer {
         bool m_bypassApiLayer = false;
         int64_t m_qpcFrequency = 1;
 
-        // Frame timing state (written from Wait/Begin thread, read from End
-        // thread — may differ on OpenComposite).
+        // Frame timing state — written from Wait/Begin thread, read from End
+        // thread (may differ under OpenComposite where sim and render threads
+        // are separate). Relaxed atomics are sufficient because the OpenXR
+        // frame-loop contract guarantees at most one frame in flight between
+        // Wait and End, so no field is concurrently written.
         std::atomic<int64_t> m_tWaitIn{0};
         std::atomic<int64_t> m_tWaitOut{0};
         std::atomic<int64_t> m_tBegin{0};
         std::atomic<int64_t> m_predictedPeriodNs{0};
         std::atomic<bool> m_lastShouldRender{true};
         std::atomic<uint64_t> m_frameIndex{0};
-
-        // Sinks to keep the optimiser honest in the no-ETW step.
-        std::atomic<int64_t> m_lastWaitBlockNs{0};
-        std::atomic<int64_t> m_lastAppCpuNs{0};
-        std::atomic<float> m_lastHeadroomPct{0.0f};
-
-        // One-shot diag markers (steps stack so we can tell which build is
-        // running just from the log file).
-        std::atomic<bool> m_diagStep2Logged{false};
-        std::atomic<bool> m_diagStep3Logged{false};
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
