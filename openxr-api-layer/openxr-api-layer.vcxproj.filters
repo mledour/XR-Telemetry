@@ -44,6 +44,9 @@
     <ClInclude Include="utils\default_settings_template.h">
       <Filter>Utilities</Filter>
     </ClInclude>
+    <ClInclude Include="utils\histogram_ring.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
     <ClInclude Include="utils\hotkey.h">
       <Filter>Utilities</Filter>
     </ClInclude>
@@ -51,6 +54,12 @@
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="utils\overlay_aggregator.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_layout.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_renderer.h">
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="utils\settings.h">
@@ -75,6 +84,9 @@
     </ClCompile>
     <ClCompile Include="framework\log.cpp">
       <Filter>Framework</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\overlay_renderer.cpp">
+      <Filter>Utilities</Filter>
     </ClCompile>
     <!-- Place your layer-specific .cpp files under utils\ and add them
          here under <Filter>Utilities</Filter>. -->

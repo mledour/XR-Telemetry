@@ -330,9 +330,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="pch.h" />
     <ClInclude Include="telemetry_internals.h" />
     <ClInclude Include="utils\default_settings_template.h" />
+    <ClInclude Include="utils\histogram_ring.h" />
     <ClInclude Include="utils\hotkey.h" />
     <ClInclude Include="utils\name_utils.h" />
     <ClInclude Include="utils\overlay_aggregator.h" />
+    <ClInclude Include="utils\overlay_layout.h" />
+    <ClInclude Include="utils\overlay_renderer.h" />
     <ClInclude Include="utils\settings.h" />
   </ItemGroup>
   <ItemGroup>
@@ -341,6 +344,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClCompile Include="framework\entry.cpp" />
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="layer.cpp" />
+    <ClCompile Include="utils\overlay_renderer.cpp" />
     <!-- Place your layer-specific .cpp files under utils\ and register them
          here, e.g. <ClCompile Include="utils\my_logic.cpp" /> -->
     <ClCompile Include="pch.cpp">

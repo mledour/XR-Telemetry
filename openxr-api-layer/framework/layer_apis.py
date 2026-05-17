@@ -67,17 +67,19 @@ override_functions = [
 requested_functions = [
     "xrGetInstanceProperties",
     "xrGetSystemProperties",
-    # Swapchain plumbing (uncomment if you create your own swapchains,
-    # e.g. for an overlay quad):
-    # "xrCreateReferenceSpace",
-    # "xrDestroySpace",
-    # "xrEnumerateSwapchainFormats",
-    # "xrCreateSwapchain",
-    # "xrDestroySwapchain",
-    # "xrEnumerateSwapchainImages",
-    # "xrAcquireSwapchainImage",
-    # "xrWaitSwapchainImage",
-    # "xrReleaseSwapchainImage",
+    # Overlay quad swapchain. The renderer in utils/overlay_renderer.cpp
+    # creates an XR_REFERENCE_SPACE_TYPE_VIEW space + a small BGRA8
+    # swapchain, paints with DirectWrite/D2D into each image, and
+    # appends a composition layer to xrEndFrame.
+    "xrCreateReferenceSpace",
+    "xrDestroySpace",
+    "xrEnumerateSwapchainFormats",
+    "xrCreateSwapchain",
+    "xrDestroySwapchain",
+    "xrEnumerateSwapchainImages",
+    "xrAcquireSwapchainImage",
+    "xrWaitSwapchainImage",
+    "xrReleaseSwapchainImage",
 ]
 
 # OpenXR extensions this layer either provides itself OR consumes from

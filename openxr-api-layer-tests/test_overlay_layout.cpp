@@ -1,0 +1,180 @@
+// MIT License
+//
+// Copyright (c) 2026 Michael Ledour
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// test_overlay_layout.cpp — unit tests on the pure HUD-layout helpers:
+//   - formatOverlayLines (snapshot → list of monospace strings)
+//   - geometryForPosition (settings.position → quad pose/size)
+//   - normaliseBar (sample / max → [0, 1] bar height)
+// =============================================================================
+
+#include <doctest/doctest.h>
+
+#include "utils/overlay_layout.h"
+
+using openxr_api_layer::detail::OverlaySnapshot;
+using openxr_api_layer::detail::formatOverlayLines;
+using openxr_api_layer::detail::geometryForPosition;
+using openxr_api_layer::detail::normaliseBar;
+
+// =============================================================================
+// formatOverlayLines — text formatting.
+// =============================================================================
+
+TEST_CASE("formatOverlayLines: invalid snapshot → empty vector") {
+    OverlaySnapshot snap;  // valid=false by default
+    CHECK(formatOverlayLines(snap).empty());
+}
+
+TEST_CASE("formatOverlayLines: nominal snapshot produces 4 rows in fixed order") {
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 89.8f;
+    snap.fps_avg = 90.1f;
+    snap.target_fps = 90.0f;
+    snap.cpu_frame_ms = 6.78f;
+    snap.cpu_utilisation_pct = 61.0f;
+    snap.gpu_frame_ms = 5.18f;
+    snap.gpu_utilisation_pct = 47.0f;
+
+    const auto lines = formatOverlayLines(snap);
+    REQUIRE(lines.size() == 4);
+    // Row order is part of the contract (renderer assumes top→bottom
+    // matches the source). Spot-check each row contains the right
+    // header + the formatted value.
+    CHECK(lines[0].find("FPS")  != std::string::npos);
+    CHECK(lines[0].find("89.8") != std::string::npos);
+    CHECK(lines[0].find("90.0") != std::string::npos);
+
+    CHECK(lines[1].find("AVG")  != std::string::npos);
+    CHECK(lines[1].find("90.1") != std::string::npos);
+
+    CHECK(lines[2].find("CPU")  != std::string::npos);
+    CHECK(lines[2].find("6.78") != std::string::npos);
+    CHECK(lines[2].find("61")   != std::string::npos);
+
+    CHECK(lines[3].find("GPU")  != std::string::npos);
+    CHECK(lines[3].find("5.18") != std::string::npos);
+    CHECK(lines[3].find("47")   != std::string::npos);
+}
+
+TEST_CASE("formatOverlayLines: zero target_fps still renders without crashing") {
+    // Edge case: a runtime that briefly fails to advertise display
+    // period → snapshot.target_fps stays 0. The label should still
+    // render (the renderer prefers a stable layout over hiding the row).
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 60.0f;
+    snap.target_fps = 0.0f;
+    const auto lines = formatOverlayLines(snap);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0].find("FPS") != std::string::npos);
+    // 0.0 must appear (the "/ 0.0" component).
+    CHECK(lines[0].find("0.0") != std::string::npos);
+}
+
+// =============================================================================
+// geometryForPosition — quad pose lookup.
+// =============================================================================
+
+TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
+    const auto g = geometryForPosition("head_top_right", 1.0f);
+    CHECK(g.pos_x > 0.0f);      // right of view origin
+    CHECK(g.pos_y > 0.0f);      // above
+    CHECK(g.pos_z < 0.0f);      // in front
+    CHECK(g.width_m > 0.0f);
+    CHECK(g.height_m > 0.0f);
+    // Default dimensions documented in the header.
+    CHECK(g.width_m  == doctest::Approx(0.20f).epsilon(0.001));
+    CHECK(g.height_m == doctest::Approx(0.075f).epsilon(0.001));
+}
+
+TEST_CASE("geometryForPosition: head_top_left mirrors X") {
+    const auto right = geometryForPosition("head_top_right", 1.0f);
+    const auto left  = geometryForPosition("head_top_left", 1.0f);
+    CHECK(left.pos_x == doctest::Approx(-right.pos_x).epsilon(0.001));
+    CHECK(left.pos_y == doctest::Approx(right.pos_y).epsilon(0.001));
+    CHECK(left.pos_z == doctest::Approx(right.pos_z).epsilon(0.001));
+}
+
+TEST_CASE("geometryForPosition: head_top_center has zero X offset") {
+    const auto g = geometryForPosition("head_top_center", 1.0f);
+    CHECK(g.pos_x == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(g.pos_y > 0.0f);   // still above the gaze line
+}
+
+TEST_CASE("geometryForPosition: head_center has zero X AND Y offset") {
+    const auto g = geometryForPosition("head_center", 1.0f);
+    CHECK(g.pos_x == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(g.pos_y == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(g.pos_z < 0.0f);
+}
+
+TEST_CASE("geometryForPosition: unknown string falls back to head_top_right") {
+    const auto fallback = geometryForPosition("squiggle", 1.0f);
+    const auto ref      = geometryForPosition("head_top_right", 1.0f);
+    CHECK(fallback.pos_x == doctest::Approx(ref.pos_x).epsilon(0.001));
+    CHECK(fallback.pos_y == doctest::Approx(ref.pos_y).epsilon(0.001));
+}
+
+TEST_CASE("geometryForPosition: scale multiplies width and height") {
+    const auto half   = geometryForPosition("head_top_right", 0.5f);
+    const auto normal = geometryForPosition("head_top_right", 1.0f);
+    const auto double_ = geometryForPosition("head_top_right", 2.0f);
+
+    CHECK(half.width_m   == doctest::Approx(normal.width_m  * 0.5f).epsilon(0.001));
+    CHECK(half.height_m  == doctest::Approx(normal.height_m * 0.5f).epsilon(0.001));
+    CHECK(double_.width_m  == doctest::Approx(normal.width_m  * 2.0f).epsilon(0.001));
+    CHECK(double_.height_m == doctest::Approx(normal.height_m * 2.0f).epsilon(0.001));
+    // Position offsets are NOT scaled — keeping the corner fixed makes
+    // a 2× HUD still hug the same corner of the user's FOV.
+    CHECK(half.pos_x == doctest::Approx(normal.pos_x).epsilon(0.001));
+    CHECK(half.pos_y == doctest::Approx(normal.pos_y).epsilon(0.001));
+}
+
+// =============================================================================
+// normaliseBar — sample → [0, 1] for histogram drawing.
+// =============================================================================
+
+TEST_CASE("normaliseBar: empty ring (max=0) returns 0") {
+    CHECK(normaliseBar(/*sample=*/123, /*max=*/0) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("normaliseBar: sample == max → 1.0") {
+    CHECK(normaliseBar(50, 50) == doctest::Approx(1.0f));
+}
+
+TEST_CASE("normaliseBar: half-of-max → 0.5") {
+    CHECK(normaliseBar(50, 100) == doctest::Approx(0.5f).epsilon(0.001));
+}
+
+TEST_CASE("normaliseBar: zero sample → 0") {
+    CHECK(normaliseBar(0, 100) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("normaliseBar: negative sample (out-of-order ticks etc.) → 0") {
+    CHECK(normaliseBar(-50, 100) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("normaliseBar: sample > max clamps to 1.0 (no overflow)") {
+    CHECK(normaliseBar(200, 100) == doctest::Approx(1.0f));
+}

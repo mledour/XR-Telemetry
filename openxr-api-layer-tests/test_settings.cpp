@@ -55,6 +55,7 @@ namespace {
         CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
         CHECK(p.settings.overlay.refresh_hz == 10);
         CHECK(p.settings.overlay.position == "head_top_right");
+        CHECK(p.settings.overlay.scale == 1.0f);
     }
 }
 
@@ -237,6 +238,18 @@ TEST_CASE("parseSettings: overlay refresh_hz clamped to [1, 60]") {
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":60}})").settings.overlay.refresh_hz == 60);
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":61}})").settings.overlay.refresh_hz == 60);
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":1}})").settings.overlay.refresh_hz == 1);
+}
+
+TEST_CASE("parseSettings: overlay scale clamped to [0.5, 2.0]") {
+    CHECK(parseSettings(R"({"overlay":{"scale":0.0}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":-3.0}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":5.0}})").settings.overlay.scale == 2.0f);
+    CHECK(parseSettings(R"({"overlay":{"scale":1.5}})").settings.overlay.scale == 1.5f);
+    // Boundaries pass through unchanged.
+    CHECK(parseSettings(R"({"overlay":{"scale":0.5}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":2.0}})").settings.overlay.scale == 2.0f);
+    // Integer JSON also accepted (a user writing 1 instead of 1.0).
+    CHECK(parseSettings(R"({"overlay":{"scale":1}})").settings.overlay.scale == 1.0f);
 }
 
 TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {
