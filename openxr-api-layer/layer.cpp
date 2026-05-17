@@ -50,6 +50,7 @@
 
 #include "layer.h"
 #include "telemetry_internals.h"
+#include "utils/default_settings_template.h"
 #include "utils/name_utils.h"
 #include "utils/overlay_aggregator.h"
 #include "utils/settings.h"
@@ -393,10 +394,24 @@ namespace openxr_api_layer {
         // not monotonic across reboots, simulator firing back-to-back
         // calls within the same millisecond, NTP resync rewinding the
         // wallclock mid-bench, …) we suffix _2 / _3 / … until we find
-        // a free slot. Caps at 999 attempts — well above any plausible
-        // bench script burst across an NTP resync — and beyond that
-        // we hand back a colliding name and let CsvWriter::start fail
-        // with a logged error.
+        // a free slot. Caps at 999 attempts.
+        //
+        // Beyond 999 we hand back the suffixed-but-still-colliding
+        // path and let CsvWriter::start truncate it (it opens with
+        // std::ios::trunc, no failure on existing files). That would
+        // overwrite another instance's _999 file — vanishingly
+        // unlikely to ever happen (would require 999 concurrent
+        // captures of the same app slug in the same millisecond),
+        // and the bench-script panic of 999 attempts giving up is a
+        // clearer signal than infinite-loop-checking-disk.
+        //
+        // Strict TOCTOU note: the exists() check and the subsequent
+        // CsvWriter::start aren't atomic. A different process could
+        // win the slot between the check and the open. In practice
+        // this requires two OpenXR sessions of the same app slug
+        // starting within the same millisecond — vanishingly
+        // unlikely. If it ever shows up in support reports, switch
+        // CsvWriter::start to O_EXCL-style open + retry.
         //
         // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
         // '_'. Empty appName falls back to "unknown".
@@ -440,6 +455,10 @@ namespace openxr_api_layer {
 
             const auto baseStem = fmt::format("{}_{}", timestamp, safeName);
             auto candidate = dir / (baseStem + ".csv");
+            // Caps at counter<1000 — see the comment block above the
+            // function for what happens at exhaustion (in short: we
+            // return the suffixed-but-colliding path and let trunc
+            // win the race).
             for (int counter = 2; counter < 1000; ++counter) {
                 if (!std::filesystem::exists(candidate, ec)) break;
                 candidate = dir / fmt::format("{}_{}.csv", baseStem, counter);
@@ -465,44 +484,13 @@ namespace openxr_api_layer {
         //     and a non-empty error string we log once.
         // -------------------------------------------------------------------
 
-        // The JSON body the runtime falls back to when neither the
-        // installer-dropped template nor the per-app file exist. MUST stay
-        // byte-for-byte aligned with installer/default_settings.json —
-        // installer users and ZIP users must see identical first-run
-        // behaviour. A drift here would mean a ZIP user's defaults
-        // disagree with the documented schema.
-        //
-        // No automated drift check today; a future improvement would be
-        // a build-time / test-time comparison that reads
-        // installer/default_settings.json and assert-equals it against
-        // this constexpr. Tracked informally — when overlay PR2 adds
-        // more fields, update BOTH copies in the same commit.
-        constexpr const char* kBuiltInDefaultSettings = R"({
-  "_comment": "Default template for XR_APILAYER_MLEDOUR_xr_telemetry. Each OpenXR application gets a copy of this file the first time it runs (named <app>_settings.json next to this one). Edit values here to change the defaults that apply to NEW games; existing per-app files are never touched on subsequent runs.",
-  "log": {
-    "_comment": "Per-frame CSV capture. mode=auto opens a CSV at session start and closes it at session end (the original always-on behaviour). mode=hotkey keeps the CSV closed until the user presses the configured combo, then toggles open/closed on each subsequent press. The hotkey is polled once per frame inside xrEndFrame, so it only fires while the game has focus and is rendering OpenXR.",
-    "enabled": true,
-    "mode": "auto",
-    "hotkey": {
-      "_comment": "Recognised keys: A-Z, 0-9, F1-F24, Space, Tab, Enter, Escape, Backspace, Insert, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right. Punctuation is intentionally unsupported (locale-dependent). Recognised modifiers: ctrl, shift, alt, win. Unknown modifier names are ignored; an unknown key falls back to the documented default (Ctrl+Shift+T) so a typo never disables the hotkey entirely.",
-      "key": "T",
-      "modifiers": ["ctrl", "shift"]
-    }
-  },
-  "overlay": {
-    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position is reserved for tweaking the placement of the head-locked quad in future versions.",
-    "enabled": false,
-    "mode": "auto",
-    "hotkey": {
-      "_comment": "Distinct from the log hotkey so users running both features in mode=hotkey can drive them independently. Same key/modifier syntax as log.hotkey.",
-      "key": "O",
-      "modifiers": ["ctrl", "shift"]
-    },
-    "refresh_hz": 10,
-    "position": "head_top_right"
-  }
-}
-)";
+        // kBuiltInDefaultSettings lives in utils/default_settings_
+        // template.h so layer.cpp and test_telemetry.cpp share the same
+        // byte sequence. test_telemetry.cpp's "default template
+        // matches installer/default_settings.json" case parses both
+        // this constexpr and the on-disk installer file at every CI
+        // build and fails on semantic drift — no more "update both
+        // copies in the same commit" rule to remember.
 
         // Writes the built-in default JSON to `outputPath` via a
         // write-then-rename pattern: open .tmp sibling, write,
@@ -533,7 +521,7 @@ namespace openxr_api_layer {
             {
                 std::ofstream out(tmpPath, std::ios::out | std::ios::trunc);
                 if (!out.is_open()) return false;
-                out << kBuiltInDefaultSettings;
+                out << detail::kBuiltInDefaultSettings;
                 out.flush();
                 if (!out.good()) {
                     // Disk full / read-only mid-write. Drop the partial
@@ -1311,27 +1299,38 @@ namespace openxr_api_layer {
             // destructor sees the cumulative aggregator state across
             // every session of this instance, which is what we want.
             //
+            // Logging is gated on the snapshot's own `valid` flag (NOT
+            // on m_overlayActive). The user might toggle the overlay
+            // off via hotkey late in the session — losing the summary
+            // for the 30 minutes that ALREADY accumulated would be a
+            // regression. As long as the aggregator finalised at
+            // least one snapshot during the run, the user gets it.
+            //
             // The Log() uses the same "%s" + fmt::format(...).c_str()
             // dance as the CSV log above to dodge vsnprintf's printf-
             // style re-interpretation of "% util" inside the formatted
             // string (verified bug from an earlier build that read
             // "cpu=… (832588922944til)" instead of "(47% util)").
-            if (m_overlayActive) {
-                const auto& snap = m_overlay.snapshot();
-                if (snap.valid) {
-                    const std::string msg = fmt::format(
-                        "xr_telemetry: overlay final snapshot — "
-                        "fps={:.1f} (avg {:.1f}, target {:.1f}), "
-                        "cpu={:.2f} ms ({:.0f}% util), "
-                        "gpu={:.2f} ms ({:.0f}% util)\n",
-                        snap.fps_instant, snap.fps_avg, snap.target_fps,
-                        snap.cpu_frame_ms, snap.cpu_utilisation_pct,
-                        snap.gpu_frame_ms, snap.gpu_utilisation_pct);
-                    Log("%s", msg.c_str());
-                } else {
-                    Log("xr_telemetry: overlay was active but session too short for a "
-                        "snapshot to finalise (need at least one refresh interval of frames)\n");
-                }
+            const auto& snap = m_overlay.snapshot();
+            if (snap.valid) {
+                const std::string msg = fmt::format(
+                    "xr_telemetry: overlay final snapshot — "
+                    "fps={:.1f} (avg {:.1f}, target {:.1f}), "
+                    "cpu={:.2f} ms ({:.0f}% util), "
+                    "gpu={:.2f} ms ({:.0f}% util)\n",
+                    snap.fps_instant, snap.fps_avg, snap.target_fps,
+                    snap.cpu_frame_ms, snap.cpu_utilisation_pct,
+                    snap.gpu_frame_ms, snap.gpu_utilisation_pct);
+                Log("%s", msg.c_str());
+            } else if (m_overlayActive) {
+                // Overlay was on at session end but never reached a
+                // refresh tick — e.g. the user pressed the hotkey
+                // within the last 100 ms of play. Distinct from
+                // "overlay was off" (no log at all): the user
+                // explicitly enabled it but didn't give it enough
+                // time to finalise.
+                Log("xr_telemetry: overlay was active but session too short for a "
+                    "snapshot to finalise (need at least one refresh interval of frames)\n");
             }
         }
 

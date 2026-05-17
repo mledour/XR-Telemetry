@@ -448,6 +448,19 @@ If you bind a combo on an AZERTY / QWERTZ keyboard, prefer Shift +
 F-key (e.g. `Shift+F11`) over Ctrl + letter to dodge this — the
 F-row never overlaps with character-producing AltGr combos.
 
+**Game-binding collision.** `GetAsyncKeyState` is a process-global
+read of the keyboard state — the layer does NOT consume the key
+press, so anything the game itself binds to the same combo will
+**also** fire. The shipped defaults (`Ctrl+Shift+T` for the log
+recorder, `Ctrl+Shift+O` for the overlay) are plausible in flight /
+race sims that bind `Ctrl+Shift+letter` heavily (DCS, MSFS,
+IL-2, …). If the layer's toggle is firing your in-game bindings
+(or vice-versa), pick a combo less likely to clash: `F11` / `F12`
+alone, `Shift+F11`, or add `alt` to the modifier list to drop into
+the under-used Ctrl+Alt+Shift+letter range. The hotkey block in
+your per-app `<app>_settings.json` lets you override the defaults
+per game.
+
 ### Robustness contract
 
 Settings parsing is **permissive on purpose** — corrupt or

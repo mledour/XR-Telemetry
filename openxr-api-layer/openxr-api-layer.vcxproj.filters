@@ -41,6 +41,9 @@
     <ClInclude Include="telemetry_internals.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="utils\default_settings_template.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
     <ClInclude Include="utils\hotkey.h">
       <Filter>Utilities</Filter>
     </ClInclude>
