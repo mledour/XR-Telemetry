@@ -952,11 +952,24 @@ namespace openxr_api_layer {
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
-            // Build the FrameRecord for this frame with gpu_time_ns=0 and
-            // gpu_headroom_pct=0 as placeholders. We can't fill them in
-            // now: the GPU has barely started this frame's commands, much
-            // less finished them. They'll be patched in below as soon as
-            // an older frame's GPU result resolves.
+            // Build the FrameRecord for this frame. gpu_time_ns starts at
+            // 0 (the GPU has barely started this frame's commands, let
+            // alone finished them); patchAndDrainPending() overwrites both
+            // it and gpu_headroom_pct once an older frame's GPU result
+            // resolves.
+            //
+            // gpu_headroom_pct uses the standard formula with gpu_time_ns=0,
+            // which yields 100%. This is what fpsVR / OpenXR Toolkit show
+            // when GPU work isn't measured (e.g. the app uses Vulkan /
+            // OpenGL / D3D12 / no binding — the GpuTimer stays inactive
+            // and gpu_time_ns is 0 for every row of this session). The
+            // alternative — a hardcoded 0.0 placeholder — read as "GPU
+            // 100% saturated" to users comparing with OXRT, which was the
+            // opposite of the intended semantics.
+            //
+            // Analyses that want to exclude unmeasured frames from GPU
+            // statistics should filter `gpu_time_ns > 0`.
+            const float gpuHeadroomPct = (periodNs > 0) ? 100.0f : 0.0f;
             FrameRecord rec{
                 frameIndex,
                 tEnd,
@@ -968,7 +981,7 @@ namespace openxr_api_layer {
                 /*gpu_time_ns=*/0,
                 periodNs,
                 headroomPct,
-                /*gpu_headroom_pct=*/0.0f,
+                gpuHeadroomPct,
                 shouldRender,
             };
 

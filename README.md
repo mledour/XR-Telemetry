@@ -131,7 +131,7 @@ period_ns, headroom_pct, gpu_headroom_pct, should_render
 | `gpu_time_ns` | D3D11 timestamp delta from `xrBeginFrame` to `xrEndFrame` | **App GPU work for this frame.** Measured with `D3D11_QUERY_TIMESTAMP` bracketed by a `D3D11_QUERY_TIMESTAMP_DISJOINT` for frequency validation. `0` when no D3D11 binding was seen at `xrCreateSession` (Vulkan / OpenGL / D3D12 apps), when the disjoint query reported `Disjoint == true` (driver invalidated the range), or when the GPU result wasn't yet ready at session end. |
 | `period_ns` | `XrFrameState.predictedDisplayPeriod` | Target frame budget reported by the runtime. ~11.11 ms @ 90 Hz, ~8.33 ms @ 120 Hz, ~13.89 ms @ 72 Hz. Constant for a given session. |
 | `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **CPU % of the frame budget not spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound this frame. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame where `frame_total_ns = 0`. |
-| `gpu_headroom_pct` | `(1 − gpu_time_ns / period_ns) × 100` | **GPU % of the frame budget not spent on app GPU work this cycle.** Negative ⇒ GPU-bound this frame. `0.00` when `gpu_time_ns == 0` (no D3D11 binding or result unavailable). |
+| `gpu_headroom_pct` | `(1 − gpu_time_ns / period_ns) × 100` | **GPU % of the frame budget not spent on app GPU work this cycle.** Negative ⇒ GPU-bound this frame. `100.00` when `gpu_time_ns == 0` (no D3D11 binding, disjoint range invalid, or result unavailable at session end) — same default as fpsVR / OpenXR Toolkit overlays. Filter on `gpu_time_ns > 0` to exclude unmeasured rows from GPU statistics. |
 | `should_render` | `XrFrameState.shouldRender` as 0/1 | Whether the runtime asked the app to render this frame. `0` means a skipped frame (focus loss, scene transition); typically filter these out for steady-state analysis. |
 
 The file is closed with a trailing footer line (commented `#`-prefixed)
@@ -217,7 +217,7 @@ Practical implications:
 | GPU idle but CPU busy | `gpu_headroom_pct` > 60% while `headroom_pct` < 20% | Classic "app cannot feed the GPU fast enough" — usually render-thread-bound. Look at `render_submission_ns`. |
 | Runtime overhead | `end_frame_ns` consistently > ~1 ms | The runtime / compositor itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) can move the needle. Young runtimes are typical culprits. |
 | Compositor underused | `wait_block_ns` close to `period_ns`, `frame_total_ns` ≈ `period_ns` | Healthy. The app finishes early, runtime throttles, equilibrium. The opposite (small `wait_block_ns`) means the app is keeping up only just. |
-| GPU not measured | `gpu_time_ns == 0` for every row, but the game uses Vulkan / OpenGL / D3D12 | Expected: V2.0 of the layer only instruments D3D11 (and only directly — D3D12-via-D3D11On12 is a V2.1 follow-up). The CPU columns remain accurate; just don't rely on GPU readings for these apps. |
+| GPU not measured | `gpu_time_ns == 0` for every row, but the game uses Vulkan / OpenGL / D3D12 | Expected: V2.0 of the layer only instruments D3D11 (and only directly — D3D12-via-D3D11On12 is a V2.1 follow-up). `gpu_headroom_pct` reads as `100.00` by default in this case (same as OXRT's overlay convention) — that's the formula's natural value with `gpu_time_ns=0`, not a real "GPU is idle" reading. The CPU columns remain accurate; just filter `gpu_time_ns > 0` if you want to exclude these rows from GPU stats. |
 
 ### Relationship to other VR frame-analysis tools
 

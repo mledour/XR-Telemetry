@@ -548,10 +548,12 @@ TEST_CASE("telemetry: layer is pure pass-through w.r.t. downstream call counts")
 // 11. GPU columns degrade gracefully when no D3D11 device is available.
 //    The mock runtime mocks xrCreateSession but the integration tests don't
 //    drive it (no graphics binding), so GpuTimer::init is never called and
-//    isActive() stays false. gpu_time_ns and gpu_headroom_pct should appear
-//    in every row as 0 — present in the schema but unmeasured.
+//    isActive() stays false. gpu_time_ns reads as 0 (no measurement);
+//    gpu_headroom_pct follows the formula with gpu_time_ns=0, yielding
+//    100% — matching fpsVR / OpenXR Toolkit's "GPU unmeasured = 100%
+//    headroom default" convention.
 // ----------------------------------------------------------------------------
-TEST_CASE("telemetry: gpu_time_ns and gpu_headroom_pct are 0 when no D3D11 binding is set up") {
+TEST_CASE("telemetry: gpu_time_ns is 0 and gpu_headroom_pct is 100% when no D3D11 binding is set up") {
     TelemetryFixture fix;
     auto* api = fix.startLayer("NoGpuTimingApp");
 
@@ -570,6 +572,6 @@ TEST_CASE("telemetry: gpu_time_ns and gpu_headroom_pct are 0 when no D3D11 bindi
         const auto cells = split(lines[1 + i]);
         REQUIRE(cells.size() == kColCount);
         CHECK(cells[kColGpuTimeNs] == "0");
-        CHECK(cells[kColGpuHeadroomPct] == "0.00");
+        CHECK(cells[kColGpuHeadroomPct] == "100.00");
     }
 }
