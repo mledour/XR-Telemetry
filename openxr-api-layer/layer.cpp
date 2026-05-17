@@ -413,13 +413,18 @@ namespace openxr_api_layer {
         // We use a small ring of "query trios" (one D3D11_QUERY_TIMESTAMP_-
         // DISJOINT bracketing two D3D11_QUERY_TIMESTAMPs) to keep multiple
         // frames in flight on the GPU while we wait for results to land.
-        // queueAndResolve(frame_index) is called from xrEndFrame:
+        // endFrameAndResolveOldest() is called from xrEndFrame:
         //
         //   1. Issue end-timestamp for the in-flight entry → entry full
         //   2. Advance the ring head
-        //   3. Try to pop and resolve the *oldest* trio whose GPU work has
-        //      completed since we last polled. If ready → return its
-        //      (frame_index, gpu_time_ns); otherwise return nullopt.
+        //   3. Drain every slot whose GPU work has completed since the
+        //      last poll, returning the MOST RECENTLY resolved result
+        //      (older slots are still drained and their slot state is
+        //      reset, but only the last one is returned — see the comment
+        //      above the drain loop). On a clean steady state this means
+        //      we return the slot that's exactly kRingSize-1 frames
+        //      behind the producer; during a stutter several slots may
+        //      resolve at once and only the latest is reported.
         //
         // The caller (OpenXrLayer::xrEndFrame) is responsible for matching
         // the resolved frame_index back to the FrameRecord queued at that
@@ -455,7 +460,18 @@ namespace openxr_api_layer {
             // we release on shutdown().
             bool init(ID3D11Device* device) {
                 if (!device) return false;
-                if (m_active) return true;  // idempotent like CsvWriter
+                if (m_active) {
+                    // Idempotent like CsvWriter — but catch the spec
+                    // violation "second xrCreateSession with a *different*
+                    // ID3D11Device while the first session is still alive"
+                    // in debug builds. Production-safe: we keep the
+                    // first device and ignore the second silently.
+                    assert(device == m_device.Get() &&
+                           "GpuTimer::init called twice with different devices — "
+                           "is the app calling xrCreateSession without "
+                           "xrDestroySession in between?");
+                    return true;
+                }
 
                 m_device = device;
                 m_device->GetImmediateContext(m_context.ReleaseAndGetAddressOf());
@@ -533,7 +549,16 @@ namespace openxr_api_layer {
             std::optional<GpuFrameResult> endFrameAndResolveOldest() {
                 if (!m_active) return std::nullopt;
 
-                // Close the trio that beginFrame() opened.
+                // Close the trio that beginFrame() opened. If the slot
+                // is NOT Started (xrEndFrame fired without a matching
+                // xrBeginFrame this cycle — spec violation, but we
+                // tolerate it), we skip the End() calls but still advance
+                // m_writeIdx. This keeps the ring's "one slot per
+                // xrEndFrame call" cadence — the next xrBeginFrame will
+                // open the next slot, not overwrite this dangling one.
+                // The "self-healing" mode is asymmetric: after kRingSize
+                // dangling cycles in a row, every slot is Idle again and
+                // the next valid frame starts a fresh ring.
                 auto& closing = m_ring[m_writeIdx];
                 if (closing.state == SlotState::Started) {
                     m_context->End(closing.end.Get());
@@ -834,10 +859,25 @@ namespace openxr_api_layer {
             const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
             if (XR_SUCCEEDED(result)) {
                 m_tBegin.store(tBegin, std::memory_order_relaxed);
-                // Open the GPU timestamp window. The frame index used here
-                // is the *next* one we're about to assign in xrEndFrame —
-                // peek without incrementing so the two sides match.
-                m_gpuTimer.beginFrame(m_frameIndex.load(std::memory_order_relaxed));
+                // Only open a GPU timer slot if we have a valid wait pair.
+                // Without one, xrEndFrame's first-frame guard skips the
+                // FrameRecord push but our GpuTimer slot would still be
+                // closed (recorded with frame_index = N), and the next
+                // valid cycle would re-use the same m_frameIndex value N
+                // when its End resolves — mis-attributing the previous
+                // (skipped) cycle's GPU time to the next CPU record.
+                //
+                // Gating the open here on m_tWaitOut > 0 keeps GpuTimer
+                // slots and FrameRecords in lockstep: both are only
+                // produced once we've seen at least one successful
+                // xrWaitFrame. The OpenXR spec forbids the wait-less
+                // pattern anyway, but a hostile or buggy app would
+                // otherwise silently shift gpu_time_ns by one frame.
+                if (m_tWaitOut.load(std::memory_order_relaxed) > 0) {
+                    // peek m_frameIndex without incrementing — xrEndFrame
+                    // does the fetch_add and uses the SAME value.
+                    m_gpuTimer.beginFrame(m_frameIndex.load(std::memory_order_relaxed));
+                }
             }
             return result;
         }
@@ -941,8 +981,11 @@ namespace openxr_api_layer {
             //
             // Negative ⇒ app is CPU-bound this cycle. Gated on period > 0
             // because some runtimes briefly report 0 before the session
-            // is fully ready.
-            float headroomPct = 0.0f;
+            // is fully ready — in that case we use 100% as the
+            // "no measurement available" sentinel, matching the same
+            // convention applied below for gpu_headroom_pct so analyses
+            // can filter both columns the same way (`period_ns > 0`).
+            float headroomPct = 100.0f;
             if (periodNs > 0) {
                 const int64_t appPerCycleNs =
                     (frameTotalNs > 0) ? (frameTotalNs - waitBlockNs) : appCpuNs;
@@ -969,7 +1012,10 @@ namespace openxr_api_layer {
             //
             // Analyses that want to exclude unmeasured frames from GPU
             // statistics should filter `gpu_time_ns > 0`.
-            const float gpuHeadroomPct = (periodNs > 0) ? 100.0f : 0.0f;
+            // 100% when periodNs == 0 (same "unmeasured" sentinel as
+            // headroomPct above); the formula's natural value with
+            // gpu_time_ns=0 also yields 100%, so the two cases merge.
+            const float gpuHeadroomPct = 100.0f;
             FrameRecord rec{
                 frameIndex,
                 tEnd,
