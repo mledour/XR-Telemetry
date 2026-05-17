@@ -11,6 +11,15 @@
     }
   },
   "overlay": {
-    "_reserved": "In-headset overlay (not yet implemented). Will receive its own enabled / position / opacity / etc. fields when shipped. The block exists today so future per-app files generated from this template won't need a migration step."
+    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position is reserved for tweaking the placement of the head-locked quad in future versions.",
+    "enabled": false,
+    "mode": "auto",
+    "hotkey": {
+      "_comment": "Distinct from the log hotkey so users running both features in mode=hotkey can drive them independently. Same key/modifier syntax as log.hotkey.",
+      "key": "O",
+      "modifiers": ["ctrl", "shift"]
+    },
+    "refresh_hz": 10,
+    "position": "head_top_right"
   }
 }

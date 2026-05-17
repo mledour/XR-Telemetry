@@ -49,6 +49,9 @@
 
 #include <layer.h>
 #include <log.h>
+#include <utils/default_settings_template.h>
+#include <utils/hotkey.h>
+#include <utils/settings.h>
 
 #include <chrono>
 #include <filesystem>
@@ -589,6 +592,14 @@ TEST_CASE("telemetry: gpu_time_ns is 0 and gpu_headroom_pct is 100% when no D3D1
 //    wiring that the unit tests in test_settings.cpp cannot reach (they
 //    test the parser; this test checks the parser's output actually
 //    drives m_bypassApiLayer).
+//
+// Note: hotkey mode (log AND overlay) is unit-tested end-to-end in
+// test_hotkey.cpp via the HotkeyEdgeDetector + parseHotkey helpers.
+// Driving it through the layer here would require mocking GetAsync
+// KeyState, which is a Win32 syscall — too invasive for the testing
+// surface area. The integration coverage here intentionally stops at
+// the parser → m_settings → m_bypassApiLayer / m_recording /
+// m_overlayActive boundary.
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing") {
     TelemetryFixture fix;
@@ -624,4 +635,65 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
     CHECK_MESSAGE(!csv.has_value(),
                   "expected no CSV under sessions/ when log.enabled=false; "
                   "found " << (csv ? csv->string() : std::string("<none>")));
+}
+
+// ----------------------------------------------------------------------------
+// 10. Drift check: the in-binary `kBuiltInDefaultSettings` constexpr (the
+//     fallback the layer ships when the installer never ran) MUST parse
+//     to the same TelemetrySettings as installer/default_settings.json
+//     (the file the installer drops). Without this guarantee a ZIP user
+//     and an installer user get different first-run behaviour — exactly
+//     the silent split the README's "Robustness contract" section
+//     promises NOT to ship. Comments and whitespace are ignored (we
+//     compare the PARSED structs, not the byte stream).
+//
+//     Resolves the installer file at runtime by navigating up from the
+//     test binary path: <repo>\bin\<Platform>\<Config>\test.exe → 4
+//     parent_path() calls reach the repo root, then the well-known
+//     installer/ subdir.
+// ----------------------------------------------------------------------------
+TEST_CASE("template constexpr matches installer/default_settings.json (no schema drift)") {
+    using openxr_api_layer::detail::parseSettings;
+    using openxr_api_layer::detail::formatHotkey;
+    using openxr_api_layer::detail::kBuiltInDefaultSettings;
+
+    char exePath[MAX_PATH] = {};
+    REQUIRE(::GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0);
+    const auto exeFile = std::filesystem::path(exePath);
+    // .exe → bin/<Platform>/<Config>/ → bin/<Platform>/ → bin/ → repo root
+    const auto repoRoot = exeFile.parent_path()
+                              .parent_path()
+                              .parent_path()
+                              .parent_path();
+    const auto installerFile = repoRoot / "installer" / "default_settings.json";
+    REQUIRE_MESSAGE(std::filesystem::exists(installerFile),
+                    "Could not locate installer/default_settings.json relative to the "
+                    "test binary. Test binary at: " << exeFile.string()
+                    << ". Looked at: " << installerFile.string()
+                    << ". If the build layout changed, update the parent_path() chain "
+                    "above to match.");
+
+    std::ifstream in(installerFile);
+    REQUIRE(in.is_open());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const std::string installerJson = ss.str();
+
+    const auto installer = parseSettings(installerJson);
+    const auto runtime = parseSettings(kBuiltInDefaultSettings);
+    REQUIRE_MESSAGE(installer.error.empty(),
+                    "installer/default_settings.json failed to parse: " << installer.error);
+    REQUIRE_MESSAGE(runtime.error.empty(),
+                    "in-binary kBuiltInDefaultSettings failed to parse: " << runtime.error);
+
+    const auto& a = installer.settings;
+    const auto& b = runtime.settings;
+    CHECK(a.log.enabled == b.log.enabled);
+    CHECK(a.log.mode    == b.log.mode);
+    CHECK(formatHotkey(a.log.hotkey) == formatHotkey(b.log.hotkey));
+    CHECK(a.overlay.enabled    == b.overlay.enabled);
+    CHECK(a.overlay.mode       == b.overlay.mode);
+    CHECK(formatHotkey(a.overlay.hotkey) == formatHotkey(b.overlay.hotkey));
+    CHECK(a.overlay.refresh_hz == b.overlay.refresh_hz);
+    CHECK(a.overlay.position   == b.overlay.position);
 }

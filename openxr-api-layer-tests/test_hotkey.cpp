@@ -160,6 +160,28 @@ TEST_CASE("formatHotkey: named keys round-trip") {
     CHECK(formatHotkey(parseHotkey("PageUp", {"ctrl"})) == "Ctrl+PageUp");
 }
 
+TEST_CASE("formatHotkey: unrecognised VK code renders as real hex") {
+    // parseHotkey can't produce a spec with an out-of-table VK (the
+    // parser whitelists names), so we construct one manually. This
+    // covers the fallback branch that would otherwise be unreachable
+    // — and verifies the 0x prefix is followed by HEX digits, not
+    // the decimal that std::to_string would have produced.
+    HotkeySpec spec;
+    spec.vk = 0xAB;
+    CHECK(formatHotkey(spec) == "VK(0xAB)");
+
+    spec.vk = 0x42;     // would look identical to ASCII 'B' if we
+                        // mis-routed, but the named-keys table doesn't
+                        // contain 0x42 outside the A-Z range covered
+                        // by the prior branch — here we're explicitly
+                        // testing the unreachable fallback path.
+    spec.ctrl = true;
+    // 0x42 IS in the A-Z range so it actually renders as 'B' — pick
+    // something outside that range for a true fallback hit:
+    spec.vk = 0x0A;     // line feed, not in any branch above
+    CHECK(formatHotkey(spec) == "Ctrl+VK(0x0A)");
+}
+
 // =============================================================================
 // HotkeyEdgeDetector — rising-edge latch.
 // =============================================================================
