@@ -41,6 +41,19 @@ override_functions = [
     "xrWaitFrame",
     "xrBeginFrame",
     "xrEndFrame",
+    # Session lifecycle — we hook these to extract the app's D3D11 device
+    # (from XrGraphicsBindingD3D11KHR in createInfo->next) and stand up
+    # the GPU timestamp query ring. xrDestroySession releases the queries
+    # cleanly so we don't leak D3D11 resources.
+    #
+    # Note: despite layer.cpp's xrCreateInstance comment saying
+    # xrDestroySession is "implicitly handled by the framework", that
+    # comment is wrong — the framework only auto-handles xrCreateInstance,
+    # xrDestroyInstance, xrGetInstanceProcAddr, and
+    # xrEnumerateInstanceExtensionProperties (dispatch_generator.py:42).
+    # fov_crop overrides xrDestroySession via this same mechanism.
+    "xrCreateSession",
+    "xrDestroySession",
 ]
 
 # Extra OpenXR functions the layer wants to *call* on the runtime (in
