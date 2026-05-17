@@ -1523,14 +1523,25 @@ namespace openxr_api_layer {
             if (m_overlayActive) {
                 const auto& snap = m_overlay.snapshot();
                 if (snap.valid) {
-                    Log(fmt::format(
+                    // The framework's Log() funnels through vsnprintf,
+                    // which would re-interpret any bare "%" inside an
+                    // already-formatted result as a printf conversion
+                    // (e.g. "% u" → %u → reads garbage from the stack).
+                    // Verified on live build: without this fix, the
+                    // snapshot log read "cpu=… (832588922944til)"
+                    // instead of "(47% util)". Solution: pass the
+                    // fmt::format result as a string arg to a "%s"
+                    // format, so printf never re-interprets its
+                    // contents.
+                    const std::string msg = fmt::format(
                         "xr_telemetry: overlay final snapshot — "
                         "fps={:.1f} (avg {:.1f}, target {:.1f}), "
                         "cpu={:.2f} ms ({:.0f}% util), "
                         "gpu={:.2f} ms ({:.0f}% util)\n",
                         snap.fps_instant, snap.fps_avg, snap.target_fps,
                         snap.cpu_frame_ms, snap.cpu_utilisation_pct,
-                        snap.gpu_frame_ms, snap.gpu_utilisation_pct));
+                        snap.gpu_frame_ms, snap.gpu_utilisation_pct);
+                    Log("%s", msg.c_str());
                 } else {
                     Log("xr_telemetry: overlay was active but session too short for a "
                         "snapshot to finalise (need at least one refresh interval of frames)\n");
