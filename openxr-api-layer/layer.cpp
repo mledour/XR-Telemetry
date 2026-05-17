@@ -441,16 +441,28 @@ namespace openxr_api_layer {
                 shutdown();
             }
 
-            // device + context come from XrGraphicsBindingD3D11KHR (in the
-            // app's xrCreateSession.next chain). We AddRef them so the GPU
-            // can finish its frames even if the app would otherwise release
-            // them right at xrDestroySession; we release on shutdown().
-            bool init(ID3D11Device* device, ID3D11DeviceContext* context) {
-                if (!device || !context) return false;
+            // device comes from XrGraphicsBindingD3D11KHR (in the app's
+            // xrCreateSession.next chain — that struct only carries
+            // ID3D11Device*, not the context). We pull the immediate
+            // context from it via GetImmediateContext: it's the same
+            // single-threaded context the app submits draws on, which is
+            // what we want — D3D11 timestamp queries must be issued from
+            // the same context that records the surrounding draws.
+            //
+            // Both device and context are AddRef'd by the ComPtr
+            // assignments so the GPU can finish its frames even if the
+            // app would otherwise release them right at xrDestroySession;
+            // we release on shutdown().
+            bool init(ID3D11Device* device) {
+                if (!device) return false;
                 if (m_active) return true;  // idempotent like CsvWriter
 
                 m_device = device;
-                m_context = context;
+                m_device->GetImmediateContext(m_context.ReleaseAndGetAddressOf());
+                if (!m_context) {
+                    m_device.Reset();
+                    return false;
+                }
 
                 D3D11_QUERY_DESC disjointDesc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
                 D3D11_QUERY_DESC tsDesc{D3D11_QUERY_TIMESTAMP, 0};
@@ -759,7 +771,7 @@ namespace openxr_api_layer {
                 return result;
             }
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
-                if (m_gpuTimer.init(d3d11->device, d3d11->deviceContext)) {
+                if (m_gpuTimer.init(d3d11->device)) {
                     Log("xr_telemetry: D3D11 GPU timer active\n");
                 } else {
                     Log("xr_telemetry: D3D11 binding found but query creation failed; "
