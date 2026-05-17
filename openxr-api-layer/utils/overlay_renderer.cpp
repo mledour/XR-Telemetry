@@ -46,6 +46,11 @@
 
 namespace openxr_api_layer::detail {
 
+    // Log() / ErrorLog() live in openxr_api_layer::log. Pull them in so the
+    // call sites below don't have to spell out the namespace every time —
+    // mirrors what layer.cpp does for the same helpers.
+    using namespace ::openxr_api_layer::log;
+
     namespace {
 
         // -------- Layout constants ------------------------------------------
@@ -509,9 +514,14 @@ namespace openxr_api_layer::detail {
                 //    The D3D11 device this returns shares the same
                 //    underlying D3D12 device, so D2D's draws end up in
                 //    the D3D12 queue's command stream.
-                IUnknown* queueAsUnknown = m_d3d12Queue;
+                //
+                //    D3D11On12CreateDevice takes raw `IUnknown*` (not
+                //    ComPtr<>) for both the D3D12 device and the queue
+                //    array, so .Get() the underlying pointers. The
+                //    queue is passed as a length-1 array of IUnknown*.
+                IUnknown* queueAsUnknown = m_d3d12Queue.Get();
                 if (FAILED(::D3D11On12CreateDevice(
-                        m_d3d12Device,
+                        m_d3d12Device.Get(),
                         D3D11_CREATE_DEVICE_BGRA_SUPPORT,    // mandatory for D2D
                         nullptr, 0,
                         &queueAsUnknown, 1,
