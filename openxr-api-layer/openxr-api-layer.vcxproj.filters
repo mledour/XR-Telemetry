@@ -38,8 +38,18 @@
     <ClInclude Include="framework\util.h">
       <Filter>Framework</Filter>
     </ClInclude>
-    <!-- Place your layer-specific headers under utils\ and add them
-         here under <Filter>Utilities</Filter>. -->
+    <ClInclude Include="telemetry_internals.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\hotkey.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\name_utils.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\settings.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">

@@ -301,6 +301,113 @@ dominant segment there, your game logic thread is what needs profiling
 you need to cut on both sides; if only one is low, that's where to
 focus.
 
+## Settings
+
+The layer reads its configuration from a JSON file under
+`%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`. Two flavours of
+file live there:
+
+- **`settings.json`** — the global **template**. Dropped by the
+  installer (or created on first run for ZIP / dev installs). Edit
+  this to change the defaults that apply to **future** games — it's
+  never overwritten on upgrade, and never touched once it exists.
+- **`<app>_settings.json`** — one **per OpenXR application**. The
+  layer creates it on the first run for that app by copying the
+  template. Subsequent runs read the per-app file directly, so you
+  can have different settings for DiRT, hello_xr, LMU, etc., without
+  affecting each other.
+
+The slug is derived from the application name: spaces and special
+characters become `_`, uppercase letters are lowered. `DiRT Rally
+2.0` → `dirt_rally_2_0_settings.json`. The slug rules are
+unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
+
+### Schema
+
+```json
+{
+  "log": {
+    "enabled": true,
+    "mode": "auto",
+    "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
+  },
+  "overlay": {}
+}
+```
+
+The `overlay` block is present today as a placeholder so per-app
+files generated NOW will already have the section when the
+in-headset overlay feature ships. It has no fields and no defaults
+yet; the shipped template carries a `_reserved` string inside it
+purely as a human comment.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `log.enabled` | bool | `true` | Master kill switch. `false` makes the layer a pure pass-through for this app — no CSV, no GPU timer, no instrumentation. |
+| `log.mode` | string | `"auto"` | `auto`: open a CSV at session start, close at session end (original always-on behaviour). `hotkey`: keep the CSV closed until the user presses the configured combo; each press toggles recording on/off. |
+| `log.hotkey.key` | string | `"T"` | Main key. Recognised: `A`-`Z`, `0`-`9`, `F1`-`F24`, `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`. Punctuation is intentionally unsupported (locale-dependent). |
+| `log.hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifier keys required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. The combo must match exactly — pressing `Ctrl+Alt+Shift+T` does NOT trigger a `Ctrl+Shift+T` binding. |
+| `overlay` | object | `{}` | Reserved for the future in-headset overlay. Currently tolerated but not parsed; the block exists in the template today so per-app files generated NOW won't need a migration step when the overlay ships. |
+
+### Hotkey mode UX
+
+The hotkey is polled once per frame inside `xrEndFrame`, so it only
+fires while the **game** has focus and is actively rendering. No
+global `RegisterHotKey` — that would steal the combo from every app
+on the system.
+
+On rising edge (low → high transition of the combo) the layer
+toggles `m_recording`:
+
+- **Off → on**: opens a NEW CSV in `sessions/` with the same
+  `YYYY-MM-DD_HH-MM-SSZ_<app>.csv` naming as auto mode. Each press
+  creates a fresh file, so you can do multiple short runs without
+  one giant log to slice afterwards.
+- **On → off**: stops the writer, writes the `# session_end` footer
+  with per-file drop counters.
+
+Every transition is logged so support sessions can grep `xr_telemetry:
+hotkey pressed` to see when the user thought they started/stopped a
+recording.
+
+**AltGr caveat (European layouts).** Windows reports AltGr as the
+combination of `VK_CONTROL` + `VK_MENU` (Alt), there's no separate
+virtual-key code for it. A hotkey bound with `"modifiers": ["ctrl"]`
+will therefore *also* fire when the user holds AltGr + the main key.
+If you bind a combo on an AZERTY / QWERTZ keyboard, prefer Shift +
+F-key (e.g. `Shift+F11`) over Ctrl + letter to dodge this — the
+F-row never overlaps with character-producing AltGr combos.
+
+### Robustness contract
+
+Settings parsing is **permissive on purpose** — corrupt or
+half-edited files MUST keep the layer running:
+
+- **Missing file**: bootstrap from the template, then the built-in
+  defaults if the template is also gone (ZIP install gone wrong).
+- **Unparseable JSON**: log the error once, fall back to the
+  documented defaults (telemetry stays on).
+- **Wrong type** (`"enabled": "yes"`, `"modifiers": "ctrl"`): fall
+  back silently to the per-field default.
+- **Unknown mode** (`"mode": "burst"`): falls back to `auto`.
+- **Unknown hotkey key name** (`"key": "Squiggle"`): falls back to
+  the documented default `Ctrl+Shift+T` so a typo never disables
+  the hotkey entirely.
+- **Unknown top-level keys**: tolerated, never surface as errors.
+
+All of these branches are unit-tested in
+`openxr-api-layer-tests/test_settings.cpp`.
+
+### What's deliberately NOT here
+
+- **Live edit** — the settings file is read **once** at
+  `xrCreateInstance` and stays cached for the session. A filewatch
+  reload would add steady jitter to the frame loop (we observed
+  this on the sibling fov_crop layer's `live_edit` flag), and
+  xr_telemetry exists to MEASURE frame timings — polluting the
+  measurement with its own bookkeeping defeats the purpose. Restart
+  the game to apply a new settings file.
+
 ## CI / signing setup
 
 Skip this section if you don't care about signed releases — the CI

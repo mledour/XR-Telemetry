@@ -132,6 +132,9 @@
          files here — see test_example.cpp for the doctest pattern. -->
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
+    <ClCompile Include="test_hotkey.cpp" />
+    <ClCompile Include="test_name_utils.cpp" />
+    <ClCompile Include="test_settings.cpp" />
     <ClCompile Include="test_telemetry.cpp" />
     <ClCompile Include="test_telemetry_math.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
