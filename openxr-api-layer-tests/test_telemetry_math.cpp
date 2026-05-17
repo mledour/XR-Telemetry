@@ -46,6 +46,7 @@
 using openxr_api_layer::detail::FrameRecord;
 using openxr_api_layer::detail::qpcToNs;
 using openxr_api_layer::detail::gpuTimestampDeltaToNs;
+using openxr_api_layer::detail::gpuTimestampPairToNs;
 using openxr_api_layer::detail::computeCpuHeadroomPct;
 using openxr_api_layer::detail::computeGpuHeadroomPct;
 using openxr_api_layer::detail::patchAndDrainPending;
