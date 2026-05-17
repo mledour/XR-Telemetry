@@ -249,7 +249,6 @@ namespace openxr_api_layer {
 
           private:
             static constexpr size_t kMaxQueueSize = 4096;        // ~45 s @ 90 Hz
-            static constexpr size_t kFlushEveryRecords = 256;     // ~3 s @ 90 Hz
 
             void writerLoop() {
                 // Don't preempt the frame thread — disk hiccups stay on us.
@@ -257,7 +256,6 @@ namespace openxr_api_layer {
 
                 std::vector<FrameRecord> batch;
                 batch.reserve(kMaxQueueSize);
-                size_t recordsSinceFlush = 0;
 
                 while (true) {
                     {
@@ -307,13 +305,16 @@ namespace openxr_api_layer {
                         m_written += batch.size();
                     }
 
-                    recordsSinceFlush += batch.size();
-                    // Periodic flush — a crash should not lose more than
-                    // kFlushEveryRecords frames of telemetry.
-                    if (recordsSinceFlush >= kFlushEveryRecords) {
-                        m_file.flush();
-                        recordsSinceFlush = 0;
-                    }
+                    // Flush every batch so a hard process termination
+                    // (TerminateProcess paths that bypass DllMain — host
+                    // crash, kernel kill) loses at most one batch of
+                    // buffered rows. flush() pushes the filebuf to the OS
+                    // file cache; it is NOT an fsync, so no disk-wait
+                    // syscall, just one extra user→kernel transition per
+                    // wakeup. Cost lands entirely on the writer thread
+                    // (BELOW_NORMAL priority); the frame thread never sees
+                    // it.
+                    m_file.flush();
                 }
             }
 
