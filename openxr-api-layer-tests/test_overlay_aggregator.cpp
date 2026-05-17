@@ -24,8 +24,12 @@
 // test_overlay_aggregator.cpp — unit tests on the moving-average aggregator.
 // Drives synthetic FrameRecord sequences through OverlayAggregator and checks
 // that the published Snapshot reflects the right averages at the right
-// cadence. Pure tests — no QPC, no OpenXR, no rendering: qpcFrequency=1 makes
-// timestamp_qpc map 1:1 to nanoseconds for easy test inputs.
+// cadence. Pure tests — no QPC, no OpenXR, no rendering.
+//
+// Almost every test relies on the constructor's qpcFrequency default of
+// 1 GHz (1 tick = 1 ns), which makes timestamp_qpc map directly to a
+// nanosecond count. The one test that exercises a non-default frequency
+// passes 10 MHz explicitly to confirm the tick → ns scaling math.
 // =============================================================================
 
 #include <doctest/doctest.h>
@@ -69,7 +73,7 @@ TEST_CASE("OverlayAggregator: snapshot is invalid before any pushFrame") {
 }
 
 TEST_CASE("OverlayAggregator: single frame does NOT publish a snapshot") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
     // The first frame arms the refresh clock; we never publish on N=1.
     CHECK_FALSE(agg.snapshot().valid);
@@ -77,7 +81,7 @@ TEST_CASE("OverlayAggregator: single frame does NOT publish a snapshot") {
 
 TEST_CASE("OverlayAggregator: snapshot stays invalid when frames span < interval") {
     // 5 frames within ~55 ms, interval is 100 ms → no refresh.
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     for (int i = 0; i < 5; ++i) {
         agg.pushFrame(makeRecord(int64_t(i) * 11'111'111LL,
                                   4'000'000, 5'000'000,
@@ -91,7 +95,7 @@ TEST_CASE("OverlayAggregator: snapshot stays invalid when frames span < interval
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Frame 0: arms the clock at t=0. Frame 1: t=120 ms, crosses the 100 ms
     // window → publish.
     agg.pushFrame(makeRecord(0,
@@ -118,7 +122,7 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: averages across the window, not just last frame") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Two frames with different CPU times: 2 ms and 6 ms → avg 4 ms.
     agg.pushFrame(makeRecord(0,
                               2'000'000, 5'000'000,
@@ -135,7 +139,7 @@ TEST_CASE("OverlayAggregator: averages across the window, not just last frame") 
 }
 
 TEST_CASE("OverlayAggregator: fps_instant tracks the LATEST frame, fps_avg the window") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Push at t=0 (arms clock), t=50ms, t=110ms (refresh).
     agg.pushFrame(makeRecord(0,
                               4'000'000, 5'000'000,
@@ -163,7 +167,7 @@ TEST_CASE("OverlayAggregator: fps_instant tracks the LATEST frame, fps_avg the w
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: utilisation is clamped to [0, 100]") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Negative headroom (CPU-bound frame) → util > 100 without clamp.
     agg.pushFrame(makeRecord(0, 0, 0, 1, 1, /*headroom=*/-50.0f, /*gpu_headroom=*/-200.0f));
     agg.pushFrame(makeRecord(120'000'000, 0, 0, 1, 1, -50.0f, -200.0f));
@@ -175,7 +179,7 @@ TEST_CASE("OverlayAggregator: utilisation is clamped to [0, 100]") {
 }
 
 TEST_CASE("OverlayAggregator: target_fps is 0 when period_ns is 0 (no measurement yet)") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000, 11'111'111, /*period=*/0, 100, 100));
     agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000, 11'111'111, 0, 100, 100));
     REQUIRE(agg.snapshot().valid);
@@ -187,7 +191,7 @@ TEST_CASE("OverlayAggregator: target_fps is 0 when period_ns is 0 (no measuremen
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: second window's values do NOT include first window's frames") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Window 1: arm at t=0, mid-window frame at t=50 ms (no publish), then
     // a third frame at t=100 ms that's exactly on the boundary → publish
     // with avg(4, 4, 4) = 4 ms.
@@ -226,7 +230,7 @@ TEST_CASE("OverlayAggregator: second window's values do NOT include first window
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: a frame exactly at the interval boundary triggers publish") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
     agg.pushFrame(makeRecord(100'000'000,
                               4'000'000, 5'000'000,
@@ -235,7 +239,7 @@ TEST_CASE("OverlayAggregator: a frame exactly at the interval boundary triggers 
 }
 
 TEST_CASE("OverlayAggregator: a frame at interval - 1 ns does NOT publish") {
-    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
     agg.pushFrame(makeRecord(99'999'999,
                               4'000'000, 5'000'000,
@@ -244,8 +248,9 @@ TEST_CASE("OverlayAggregator: a frame at interval - 1 ns does NOT publish") {
 }
 
 // =============================================================================
-// QPC frequency — when qpcFreq != 1, the aggregator must convert ticks to
-// nanoseconds correctly.
+// QPC frequency — when the caller passes a non-default frequency (e.g. the
+// real Windows QueryPerformanceFrequency, typically 10 MHz on modern
+// hardware), the aggregator must convert ticks to nanoseconds correctly.
 // =============================================================================
 
 TEST_CASE("OverlayAggregator: respects qpcFrequency when converting ticks → ns") {

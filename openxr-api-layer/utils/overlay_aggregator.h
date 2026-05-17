@@ -74,12 +74,22 @@ namespace openxr_api_layer::detail {
         // qpcFrequency:      pre-cached QueryPerformanceFrequency, used to
         //                    convert FrameRecord::timestamp_qpc into the
         //                    nanoseconds we use for the refresh deadline.
-        //                    Defaulted to 1 so unit tests can pass time-as-
-        //                    ns-ticks directly without computing a fake freq.
+        //                    Defaulted to 1 GHz (1 tick = 1 ns) so unit
+        //                    tests can pass timestamp_qpc as a plain
+        //                    nanosecond count without computing a fake
+        //                    frequency. Production always passes the
+        //                    real QueryPerformanceFrequency cached on
+        //                    OpenXrLayer.
+        //
+        //                    NOTE: do not default to 1 — qpcToNs treats
+        //                    `ticks / freq` as seconds, so freq=1 would
+        //                    interpret `timestamp_qpc=10_000_000` (10 ms
+        //                    in ns) as 10 million SECONDS and trip every
+        //                    refresh deadline immediately.
         explicit OverlayAggregator(int64_t refreshIntervalNs = 100'000'000LL,
-                                   int64_t qpcFrequency = 1) noexcept
+                                   int64_t qpcFrequency = 1'000'000'000LL) noexcept
             : m_intervalNs(refreshIntervalNs > 0 ? refreshIntervalNs : 1),
-              m_qpcFrequency(qpcFrequency > 0 ? qpcFrequency : 1) {}
+              m_qpcFrequency(qpcFrequency > 0 ? qpcFrequency : 1'000'000'000LL) {}
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
         // is its final value, not the in-flight 0). The aggregator
