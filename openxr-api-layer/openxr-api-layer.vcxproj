@@ -331,6 +331,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="telemetry_internals.h" />
     <ClInclude Include="utils\hotkey.h" />
     <ClInclude Include="utils\name_utils.h" />
+    <ClInclude Include="utils\overlay_aggregator.h" />
     <ClInclude Include="utils\settings.h" />
   </ItemGroup>
   <ItemGroup>

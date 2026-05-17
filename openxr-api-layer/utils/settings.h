@@ -50,16 +50,19 @@
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
 namespace openxr_api_layer::detail {
 
-    // How the per-frame CSV writer is driven. Auto: opens at xrCreateSession
-    // and closes at xrEndSession (the original always-on behaviour). Hotkey:
-    // stays closed until the user presses the configured combo; toggles open/
-    // closed on each subsequent press.
+    // How a feature is driven. Auto: active for the whole session. Hotkey:
+    // stays off until the user presses the configured combo; toggles on/off
+    // on each subsequent press. Used by BOTH log and overlay — they have
+    // independent settings blocks and independent hotkeys, but they share
+    // the enum so the parser and the call sites stay symmetric.
     enum class LogMode { Auto, Hotkey };
+    enum class OverlayMode { Auto, Hotkey };
 
     // Parsed "log" block. `hotkey` is only consulted when mode == Hotkey, but
     // it's always populated from the JSON (or the default) so logs can show
@@ -70,15 +73,26 @@ namespace openxr_api_layer::detail {
         HotkeySpec hotkey{};
     };
 
-    // Top-level settings struct. Overlay is reserved — the field exists so
-    // adding overlay parsing later doesn't require renaming anything.
+    // Parsed "overlay" block. Same shape as LogSettings + `refresh_hz` for
+    // the snapshot cadence (and a `position` string reserved for the
+    // future renderer in PR2 — only "head_top_right" is meaningful today,
+    // everything else falls back to it).
+    //
+    // Defaults are deliberately opt-in: enabled=false. A user upgrading
+    // from a pre-overlay layer gets the same CSV-only behaviour they had
+    // before, and the HUD never appears uninvited.
+    struct OverlaySettings {
+        bool enabled = false;
+        OverlayMode mode = OverlayMode::Auto;
+        HotkeySpec hotkey{};
+        int refresh_hz = 10;       // matches fpsvr's cadence
+        std::string position = "head_top_right";
+    };
+
+    // Top-level settings struct.
     struct TelemetrySettings {
         LogSettings log{};
-        // Reserved for the future in-headset overlay. Intentionally empty
-        // today: the parser tolerates an "overlay" block in the JSON but
-        // doesn't extract anything from it yet.
-        struct OverlaySettings {
-        } overlay{};
+        OverlaySettings overlay{};
     };
 
     // Result of parseSettings — the parsed struct plus an optional diagnostic
@@ -91,11 +105,19 @@ namespace openxr_api_layer::detail {
         std::string error;
     };
 
-    // The default hotkey shipped with the template. Defined as a function
-    // (rather than a constexpr) so it can use the same parseHotkey() path
-    // tests exercise — guarantees the documented default is itself valid.
+    // The default hotkey shipped with the template for the LOG feature
+    // (Ctrl+Shift+T). Defined as a function (rather than a constexpr) so
+    // it can use the same parseHotkey() path tests exercise — guarantees
+    // the documented default is itself valid.
     inline HotkeySpec defaultHotkey() noexcept {
         return parseHotkey("T", {"ctrl", "shift"});
+    }
+
+    // The default hotkey for the OVERLAY feature (Ctrl+Shift+O). Different
+    // from the log default so a user with mode=hotkey on BOTH can drive
+    // them independently without a chord collision.
+    inline HotkeySpec defaultOverlayHotkey() noexcept {
+        return parseHotkey("O", {"ctrl", "shift"});
     }
 
     namespace settings_parse_impl {
@@ -125,6 +147,18 @@ namespace openxr_api_layer::detail {
             }
             return out;
         }
+        // Permissive int reader: accepts both integer-typed and float-typed
+        // JSON values, since a user is likely to write `"refresh_hz": 10`
+        // OR `"refresh_hz": 10.0` and both should work. Out-of-range floats
+        // are clamped at the caller's boundary, not here.
+        inline int getIntOr(const rapidjson::Value& obj, const char* key,
+                            int defaultVal) noexcept {
+            const auto it = obj.FindMember(key);
+            if (it == obj.MemberEnd()) return defaultVal;
+            if (it->value.IsInt())     return it->value.GetInt();
+            if (it->value.IsDouble())  return static_cast<int>(it->value.GetDouble());
+            return defaultVal;
+        }
     } // namespace settings_parse_impl
 
     // Parse a settings.json text into a TelemetrySettings + error string.
@@ -139,6 +173,11 @@ namespace openxr_api_layer::detail {
         result.settings.log.enabled = true;
         result.settings.log.mode = LogMode::Auto;
         result.settings.log.hotkey = defaultHotkey();
+        result.settings.overlay.enabled = false;
+        result.settings.overlay.mode = OverlayMode::Auto;
+        result.settings.overlay.hotkey = defaultOverlayHotkey();
+        result.settings.overlay.refresh_hz = 10;
+        result.settings.overlay.position = "head_top_right";
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -191,11 +230,46 @@ namespace openxr_api_layer::detail {
         }
 
         // ---- overlay block ----------------------------------------------
-        // Tolerated, not parsed. rapidjson already ignores unknown
-        // top-level keys, so no action is needed here today; when we
-        // add real overlay settings, extend OverlaySettings and pull
-        // fields from doc["overlay"] below this line. Per-app files
-        // already containing an `overlay` block won't need migration.
+        // Same robustness contract as the log block: anything missing
+        // falls back to the documented default, anything wrongly-typed
+        // is silently ignored (don't break a user's session for a typo).
+        const auto ovIt = doc.FindMember("overlay");
+        if (ovIt != doc.MemberEnd() && ovIt->value.IsObject()) {
+            const auto& ov = ovIt->value;
+            result.settings.overlay.enabled = getBoolOr(ov, "enabled", false);
+
+            const std::string modeStr = getStringOr(ov, "mode", "auto");
+            result.settings.overlay.mode = iequalsAscii(modeStr, "hotkey")
+                ? OverlayMode::Hotkey
+                : OverlayMode::Auto;
+
+            const auto hkIt = ov.FindMember("hotkey");
+            if (hkIt != ov.MemberEnd() && hkIt->value.IsObject()) {
+                const auto& hk = hkIt->value;
+                const std::string keyName = getStringOr(hk, "key", "O");
+                const auto mods = getStringArrayOr(hk, "modifiers", {"ctrl", "shift"});
+                HotkeySpec parsed = parseHotkey(keyName, mods);
+                // Same fallback as the log hotkey: unknown key name →
+                // documented default (Ctrl+Shift+O) rather than disabling
+                // the binding entirely. A typo never breaks the user's
+                // ability to summon the HUD.
+                result.settings.overlay.hotkey = parsed.valid() ? parsed : defaultOverlayHotkey();
+            }
+
+            // refresh_hz clamped to [1, 60]. Above 60 the per-frame jitter
+            // exceeds the refresh window and snapshots stutter; below 1
+            // the HUD goes catatonic. 10 Hz (fpsvr-like) stays the
+            // recommended default.
+            const int rawHz = getIntOr(ov, "refresh_hz", 10);
+            result.settings.overlay.refresh_hz = std::clamp(rawHz, 1, 60);
+
+            // `position` is reserved for PR2's renderer. Currently the only
+            // meaningful value is "head_top_right"; we keep the string
+            // around so users can experiment with future values without
+            // needing a parser update.
+            result.settings.overlay.position =
+                getStringOr(ov, "position", "head_top_right");
+        }
 
         return result;
     }

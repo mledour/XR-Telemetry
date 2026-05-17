@@ -331,44 +331,66 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
     "mode": "auto",
     "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
   },
-  "overlay": {}
+  "overlay": {
+    "enabled": false,
+    "mode": "auto",
+    "hotkey": { "key": "O", "modifiers": ["ctrl", "shift"] },
+    "refresh_hz": 10,
+    "position": "head_top_right"
+  }
 }
 ```
 
-The `overlay` block is present today as a placeholder so per-app
-files generated NOW will already have the section when the
-in-headset overlay feature ships. It has no fields and no defaults
-yet; the shipped template carries a `_reserved` string inside it
-purely as a human comment.
-
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `log.enabled` | bool | `true` | Master kill switch. `false` makes the layer a pure pass-through for this app — no CSV, no GPU timer, no instrumentation. |
+| `log.enabled` | bool | `true` | Master kill switch for the per-frame CSV. `false` skips CSV writing entirely; combined with `overlay.enabled=false`, the layer becomes a pure pass-through. |
 | `log.mode` | string | `"auto"` | `auto`: open a CSV at session start, close at session end (original always-on behaviour). `hotkey`: keep the CSV closed until the user presses the configured combo; each press toggles recording on/off. |
 | `log.hotkey.key` | string | `"T"` | Main key. Recognised: `A`-`Z`, `0`-`9`, `F1`-`F24`, `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`. Punctuation is intentionally unsupported (locale-dependent). |
 | `log.hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifier keys required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. The combo must match exactly — pressing `Ctrl+Alt+Shift+T` does NOT trigger a `Ctrl+Shift+T` binding. |
-| `overlay` | object | `{}` | Reserved for the future in-headset overlay. Currently tolerated but not parsed; the block exists in the template today so per-app files generated NOW won't need a migration step when the overlay ships. |
+| `overlay.enabled` | bool | `false` | Master switch for the in-headset HUD (FPS / avg FPS / CPU+GPU frametime / CPU+GPU utilisation %, fpsvr-style). Off by default so the layer never paints uninvited; opt in via this flag or via the hotkey. |
+| `overlay.mode` | string | `"auto"` | `auto`: HUD visible for the whole session whenever `enabled=true`. `hotkey`: HUD hidden until the user presses the configured combo, then toggles on/off. |
+| `overlay.hotkey.key` / `.modifiers` | string / string[] | `"O"` / `["ctrl", "shift"]` | Independent from `log.hotkey` so the two features can be driven separately. Same syntax + same robustness contract. |
+| `overlay.refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsvr and is the recommended cadence — fast enough that the numbers track reality, slow enough to be readable in motion. |
+| `overlay.position` | string | `"head_top_right"` | Reserved for the future renderer (PR2). The data plumbing is in place; the head-locked quad will land in a follow-up PR. Any other string is accepted and stored verbatim. |
+
+> **PR1 status:** the overlay block is fully parsed, the hotkey
+> toggles a runtime flag, and the moving-average aggregator is fed
+> with every fully-resolved FrameRecord at the configured cadence.
+> The actual in-headset RENDERING (DirectWrite text on a head-
+> locked OpenXR quad layer) ships in **PR2**. Until then the
+> aggregator's last snapshot is dumped to the log file at
+> `xrDestroySession` so users can confirm the data path works end-
+> to-end (`xr_telemetry: overlay final snapshot — fps=89.8 (avg
+> 90.1, target 90.0), cpu=4.32 ms (61% util), gpu=5.18 ms (47%
+> util)`).
 
 ### Hotkey mode UX
 
-The hotkey is polled once per frame inside `xrEndFrame`, so it only
-fires while the **game** has focus and is actively rendering. No
-global `RegisterHotKey` — that would steal the combo from every app
-on the system.
+Both hotkeys (log and overlay) are polled once per frame inside
+`xrEndFrame`, so they only fire while the **game** has focus and is
+actively rendering OpenXR. No global `RegisterHotKey` — that would
+steal the combo from every app on the system.
 
-On rising edge (low → high transition of the combo) the layer
-toggles `m_recording`:
+On rising edge (low → high transition of the combo) the layer toggles
+the corresponding flag:
 
-- **Off → on**: opens a NEW CSV in `sessions/` with the same
-  `YYYY-MM-DD_HH-MM-SSZ_<app>.csv` naming as auto mode. Each press
-  creates a fresh file, so you can do multiple short runs without
-  one giant log to slice afterwards.
-- **On → off**: stops the writer, writes the `# session_end` footer
-  with per-file drop counters.
+- **`log.hotkey` press, off → on**: opens a NEW CSV in `sessions/` with
+  the same `YYYY-MM-DD_HH-MM-SS.mmmZ_<app>.csv` naming as auto mode.
+  Each press creates a fresh file, so multiple short runs don't merge
+  into one giant log.
+- **`log.hotkey` press, on → off**: stops the writer, writes the
+  `# session_end` footer with per-file drop counters.
+- **`overlay.hotkey` press**: toggles `m_overlayActive`. In PR1 this
+  is logged (`xr_telemetry: hotkey pressed — overlay ENABLED/DISABLED`)
+  but produces no visible HUD yet; the renderer ships in PR2.
+
+The two hotkeys default to **different combos** (`Ctrl+Shift+T` for
+log, `Ctrl+Shift+O` for overlay) so users running both features in
+hotkey mode can drive them independently without a chord collision.
 
 Every transition is logged so support sessions can grep `xr_telemetry:
-hotkey pressed` to see when the user thought they started/stopped a
-recording.
+hotkey pressed` to see when the user thought they started/stopped
+something.
 
 **AltGr caveat (European layouts).** Windows reports AltGr as the
 combination of `VK_CONTROL` + `VK_MENU` (Alt), there's no separate

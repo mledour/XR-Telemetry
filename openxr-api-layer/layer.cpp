@@ -51,6 +51,7 @@
 #include "layer.h"
 #include "telemetry_internals.h"
 #include "utils/name_utils.h"
+#include "utils/overlay_aggregator.h"
 #include "utils/settings.h"
 #include <log.h>
 #include <util.h>
@@ -480,7 +481,16 @@ namespace openxr_api_layer {
     }
   },
   "overlay": {
-    "_reserved": "In-headset overlay (not yet implemented). Will receive its own enabled / position / opacity / etc. fields when shipped. The block exists today so future per-app files generated from this template won't need a migration step."
+    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position is reserved for tweaking the placement of the head-locked quad in future versions.",
+    "enabled": false,
+    "mode": "auto",
+    "hotkey": {
+      "_comment": "Distinct from the log hotkey so users running both features in mode=hotkey can drive them independently. Same key/modifier syntax as log.hotkey.",
+      "key": "O",
+      "modifiers": ["ctrl", "shift"]
+    },
+    "refresh_hz": 10,
+    "position": "head_top_right"
   }
 }
 )";
@@ -1321,40 +1331,68 @@ namespace openxr_api_layer {
             m_settings = parsed.settings;
 
             // Master kill switch. CLAUDE.md rule 9 (graceful degradation):
-            // a user who set log.enabled=false in their settings wants
-            // the layer GONE for this app. Flipping m_bypassApiLayer
-            // here makes every per-frame override below a no-op forward,
-            // and the CSV stays closed for the whole session.
-            if (!m_settings.log.enabled) {
+            // if BOTH features are disabled in settings, the layer has
+            // nothing to do for this app — flip m_bypassApiLayer so every
+            // per-frame override forwards through the base class. We
+            // bypass on the AND of the two flags (not just log) so a
+            // user can run overlay-only without the layer disappearing.
+            if (!m_settings.log.enabled && !m_settings.overlay.enabled) {
                 m_bypassApiLayer = true;
-                Log("xr_telemetry: log.enabled=false in settings — "
-                    "layer running as pass-through for this session\n");
+                Log("xr_telemetry: both log.enabled and overlay.enabled are false in "
+                    "settings — layer running as pass-through for this session\n");
                 return result;
             }
 
-            // Auto mode: open the CSV right now and let xrEndFrame
-            // append rows until xrDestroySession closes it. Matches the
-            // pre-settings behaviour.
-            //
-            // Hotkey mode: keep the CSV CLOSED. xrEndFrame polls the
-            // configured combo every frame and toggles the recorder on
-            // rising edge — each new recording window gets its own
-            // timestamped CSV file via buildSessionCsvPath(appName).
-            if (m_settings.log.mode == detail::LogMode::Auto) {
-                m_csvPath = buildSessionCsvPath(appName);
-                if (m_csv.start(m_csvPath)) {
-                    m_recording = true;
-                    Log(fmt::format("xr_telemetry: mode=auto, writing per-frame CSV to {}\n",
-                                     m_csvPath.string()));
+            // ---- log feature -------------------------------------------
+            // Auto mode: open the CSV right now and let xrEndFrame append
+            // rows until xrDestroySession closes it. Hotkey mode: keep
+            // the CSV closed until the user presses the configured combo.
+            // If log.enabled=false but overlay.enabled=true, we skip both
+            // branches — the per-frame instrumentation still runs (to
+            // feed the overlay aggregator) but never writes to disk.
+            if (m_settings.log.enabled) {
+                if (m_settings.log.mode == detail::LogMode::Auto) {
+                    m_csvPath = buildSessionCsvPath(appName);
+                    if (m_csv.start(m_csvPath)) {
+                        m_recording = true;
+                        Log(fmt::format("xr_telemetry: log mode=auto, writing per-frame CSV to {}\n",
+                                         m_csvPath.string()));
+                    } else {
+                        ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — "
+                                              "log disabled for this session\n",
+                                              m_csvPath.string()));
+                    }
                 } else {
-                    ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — "
-                                          "telemetry disabled for this session\n",
-                                          m_csvPath.string()));
+                    Log(fmt::format("xr_telemetry: log mode=hotkey, press {} to start/stop "
+                                     "recording (per-frame CSV opens on the next press)\n",
+                                     detail::formatHotkey(m_settings.log.hotkey)));
                 }
             } else {
-                Log(fmt::format("xr_telemetry: mode=hotkey, press {} to start/stop "
-                                 "recording (per-frame CSV opens on the next press)\n",
-                                 detail::formatHotkey(m_settings.log.hotkey)));
+                Log("xr_telemetry: log.enabled=false — no per-frame CSV will be written "
+                    "this session (overlay still active if its own enabled flag is set)\n");
+            }
+
+            // ---- overlay feature ---------------------------------------
+            // The aggregator is constructed up-front so PR2's renderer
+            // can call snapshot() unconditionally. It needs the real
+            // QPC frequency (cached in the constructor) and the user-
+            // configured refresh cadence converted to nanoseconds.
+            const int64_t overlayIntervalNs =
+                1'000'000'000LL / std::max(1, m_settings.overlay.refresh_hz);
+            m_overlay = detail::OverlayAggregator(overlayIntervalNs, m_qpcFrequency);
+
+            if (m_settings.overlay.enabled) {
+                if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
+                    m_overlayActive = true;
+                    Log(fmt::format("xr_telemetry: overlay mode=auto, refreshing snapshot "
+                                     "at {} Hz (PR1 plumbing only — rendering ships in PR2)\n",
+                                     m_settings.overlay.refresh_hz));
+                } else {
+                    Log(fmt::format("xr_telemetry: overlay mode=hotkey, press {} to toggle "
+                                     "(refreshes at {} Hz when active)\n",
+                                     detail::formatHotkey(m_settings.overlay.hotkey),
+                                     m_settings.overlay.refresh_hz));
+                }
             }
 
             return result;
@@ -1434,6 +1472,28 @@ namespace openxr_api_layer {
                 m_csv.stop(/*deleteIfEmpty=*/
                            m_settings.log.mode == detail::LogMode::Auto);
                 m_recording = false;
+            }
+            // PR1 verification path: the overlay renderer ships in PR2, but
+            // the data plumbing should already be producing sensible
+            // snapshots. Log the final one once per session so a user
+            // running this build can confirm the aggregator saw frames
+            // and that the moving averages look right. Cheap (one Log()
+            // call per session) — no per-frame DBWinMutex contention.
+            if (m_overlayActive) {
+                const auto& snap = m_overlay.snapshot();
+                if (snap.valid) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay final snapshot — "
+                        "fps={:.1f} (avg {:.1f}, target {:.1f}), "
+                        "cpu={:.2f} ms ({:.0f}% util), "
+                        "gpu={:.2f} ms ({:.0f}% util)\n",
+                        snap.fps_instant, snap.fps_avg, snap.target_fps,
+                        snap.cpu_frame_ms, snap.cpu_utilisation_pct,
+                        snap.gpu_frame_ms, snap.gpu_utilisation_pct));
+                } else {
+                    Log("xr_telemetry: overlay was active but session too short for a "
+                        "snapshot to finalise (need at least one refresh interval of frames)\n");
+                }
             }
             return OpenXrApi::xrDestroySession(session);
         }
@@ -1538,7 +1598,8 @@ namespace openxr_api_layer {
             //   - m_csv.stop() during a pending GPU result: the
             //     resolved FrameRecord drains into a now-closed
             //     CsvWriter and push() silently no-ops. No leak.
-            if (m_settings.log.mode == detail::LogMode::Hotkey) {
+            if (m_settings.log.enabled &&
+                m_settings.log.mode == detail::LogMode::Hotkey) {
                 if (m_hotkeyDetector.tick(pollHotkeyPressed(m_settings.log.hotkey))) {
                     if (!m_recording) {
                         m_csvPath = buildSessionCsvPath(m_appName);
@@ -1564,6 +1625,25 @@ namespace openxr_api_layer {
                                          "recording stopped ({} frames written to {})\n",
                                          written, m_csvPath.string()));
                     }
+                }
+            }
+
+            // Same rising-edge pattern for the overlay hotkey. Independent
+            // from the log hotkey: a user can have both running in mode=
+            // hotkey with separate combos. m_overlayHotkeyDetector keeps
+            // its own latch so a press for one doesn't fire the other.
+            //
+            // No file I/O — overlay is purely in-memory state in PR1.
+            // The Log() on toggle is on a user-initiated rising edge
+            // (not every frame), so the per-frame DBWinMutex concern
+            // documented above doesn't apply.
+            if (m_settings.overlay.enabled &&
+                m_settings.overlay.mode == detail::OverlayMode::Hotkey) {
+                if (m_overlayHotkeyDetector.tick(
+                        pollHotkeyPressed(m_settings.overlay.hotkey))) {
+                    m_overlayActive = !m_overlayActive;
+                    Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
+                                     m_overlayActive ? "ENABLED" : "DISABLED"));
                 }
             }
 
@@ -1703,6 +1783,15 @@ namespace openxr_api_layer {
             // Pending deque grows by 1 each frame, shrinks by 1 each time
             // a result resolves. In steady state it stabilises at
             // ~kGpuRingSize entries.
+            //
+            // The drain sink fans the FULLY-RESOLVED FrameRecord out to
+            // every consumer: CsvWriter when m_recording, OverlayAggregator
+            // when m_overlayActive. Both gates are checked here (not
+            // inside the sinks) so a closed CSV / disabled overlay stays
+            // free of even the inner method-call overhead. The aggregator
+            // wants the final gpu_time_ns, not the placeholder 0 — that's
+            // exactly what patchAndDrainPending hands us once the GPU
+            // result arrives.
             if (m_gpuTimer) {
                 m_pendingFrames.push_back(rec);
 
@@ -1710,8 +1799,11 @@ namespace openxr_api_layer {
                     patchAndDrainPending(resolved->frame_index, resolved->gpu_time_ns);
                 }
             } else {
-                // No GPU timer → no deferred path. Push immediately.
-                m_csv.push(rec);
+                // No GPU timer → no deferred path. Push immediately,
+                // gpu_time_ns stays at 0 (which the aggregator clamps
+                // back to 100% headroom via the helper formula).
+                if (m_recording)     m_csv.push(rec);
+                if (m_overlayActive) m_overlay.pushFrame(rec);
             }
 
             return result;
@@ -1765,17 +1857,28 @@ namespace openxr_api_layer {
         // the older ones (if any — could happen on stutter) get 0.
         // Thin wrappers around the pure templates in telemetry_internals.h —
         // the actual drain/patch/flush logic is unit-tested without an
-        // OpenXR session in test_telemetry_math.cpp. Sink lambda forwards
-        // to CsvWriter::push.
+        // OpenXR session in test_telemetry_math.cpp.
+        //
+        // The sink fans the resolved FrameRecord to BOTH consumers:
+        //   - CsvWriter, gated on m_recording (mode=auto active OR
+        //     mode=hotkey toggled on).
+        //   - OverlayAggregator, gated on m_overlayActive.
+        // Each gate avoids the empty-virtual-call cost when the
+        // corresponding feature is dormant.
+        void fanoutRecord(const FrameRecord& r) {
+            if (m_recording)     m_csv.push(r);
+            if (m_overlayActive) m_overlay.pushFrame(r);
+        }
+
         void patchAndDrainPending(uint64_t resolvedFrameIndex, int64_t gpuTimeNs) {
             detail::patchAndDrainPending(
                 m_pendingFrames, resolvedFrameIndex, gpuTimeNs,
-                [this](const FrameRecord& r) { m_csv.push(r); });
+                [this](const FrameRecord& r) { fanoutRecord(r); });
         }
 
         void flushPendingFramesUnresolved() {
             detail::flushPendingFramesUnresolved(
-                m_pendingFrames, [this](const FrameRecord& r) { m_csv.push(r); });
+                m_pendingFrames, [this](const FrameRecord& r) { fanoutRecord(r); });
         }
 
         bool m_bypassApiLayer = false;
@@ -1820,6 +1923,18 @@ namespace openxr_api_layer {
         // press(N) and press(N+1) in hotkey-mode.
         detail::HotkeyEdgeDetector m_hotkeyDetector;
         bool m_recording = false;
+
+        // Overlay state. Symmetric to the log state above. The aggregator
+        // is constructed late (in xrCreateInstance, once we know the
+        // refresh_hz from settings and have the cached m_qpcFrequency).
+        // The renderer that will ship in PR2 reads its Snapshot via
+        // m_overlay.snapshot() once per render tick.
+        //
+        // m_overlayActive mirrors m_recording: true in auto mode, toggled
+        // by press in hotkey mode.
+        detail::OverlayAggregator m_overlay;
+        detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
+        bool m_overlayActive = false;
 
         // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
         // D3D12) is picked at xrCreateSession based on the binding. Null

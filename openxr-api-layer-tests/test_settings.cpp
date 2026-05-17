@@ -35,17 +35,26 @@
 using openxr_api_layer::detail::parseSettings;
 using openxr_api_layer::detail::ParsedSettings;
 using openxr_api_layer::detail::LogMode;
+using openxr_api_layer::detail::OverlayMode;
 using openxr_api_layer::detail::defaultHotkey;
+using openxr_api_layer::detail::defaultOverlayHotkey;
 using openxr_api_layer::detail::formatHotkey;
 
 namespace {
     // The defaults documented in installer/default_settings.json:
-    // log.enabled=true, log.mode=auto, log.hotkey=Ctrl+Shift+T.
+    // log.enabled=true, log.mode=auto, log.hotkey=Ctrl+Shift+T,
+    // overlay.enabled=false, overlay.mode=auto, overlay.hotkey=Ctrl+Shift+O,
+    // overlay.refresh_hz=10, overlay.position=head_top_right.
     void checkDocumentedDefaults(const ParsedSettings& p) {
         CHECK(p.error.empty());
         CHECK(p.settings.log.enabled);
         CHECK(p.settings.log.mode == LogMode::Auto);
         CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
+        CHECK_FALSE(p.settings.overlay.enabled);
+        CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+        CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+        CHECK(p.settings.overlay.refresh_hz == 10);
+        CHECK(p.settings.overlay.position == "head_top_right");
     }
 }
 
@@ -184,18 +193,98 @@ TEST_CASE("parseSettings: root is a JSON array, not an object") {
 }
 
 // =============================================================================
-// overlay block — currently tolerated, not parsed. Exists to lock in the
-// "extra blocks don't surface as errors" guarantee so future per-app files
-// containing an overlay section won't generate noise.
+// overlay block — happy paths.
 // =============================================================================
 
-TEST_CASE("parseSettings: overlay block present is tolerated (no error)") {
+TEST_CASE("parseSettings: full overlay block parses every field") {
     const auto p = parseSettings(R"({
-        "log": { "enabled": true },
-        "overlay": { "enabled": false, "position": "top_right" }
+        "overlay": {
+            "enabled": true,
+            "mode": "hotkey",
+            "hotkey": { "key": "F12", "modifiers": ["alt"] },
+            "refresh_hz": 20,
+            "position": "head_top_left"
+        }
     })");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Alt+F12");
+    CHECK(p.settings.overlay.refresh_hz == 20);
+    CHECK(p.settings.overlay.position == "head_top_left");
+}
+
+TEST_CASE("parseSettings: overlay defaults match the documented shipped template") {
+    // Asserting defaults explicitly here so an accidental change to
+    // defaults forces an update to BOTH the parser and the README.
+    const auto p = parseSettings("{}");
+    REQUIRE(p.error.empty());
+    CHECK_FALSE(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+    CHECK(p.settings.overlay.refresh_hz == 10);
+    CHECK(p.settings.overlay.position == "head_top_right");
+}
+
+TEST_CASE("parseSettings: overlay refresh_hz clamped to [1, 60]") {
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":0}})").settings.overlay.refresh_hz == 1);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":-5}})").settings.overlay.refresh_hz == 1);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":300}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":30}})").settings.overlay.refresh_hz == 30);
+}
+
+TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {
+    // A user pasting from another tool's config might write 10.0 instead
+    // of 10 — the parser should still accept it.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":12.0}})").settings.overlay.refresh_hz == 12);
+}
+
+TEST_CASE("parseSettings: overlay mode strings are case-insensitive") {
+    CHECK(parseSettings(R"({"overlay":{"mode":"HOTKEY"}})").settings.overlay.mode ==
+          OverlayMode::Hotkey);
+    CHECK(parseSettings(R"({"overlay":{"mode":"Auto"}})").settings.overlay.mode ==
+          OverlayMode::Auto);
+}
+
+TEST_CASE("parseSettings: unknown overlay mode falls back to auto (no error surfaced)") {
+    const auto p = parseSettings(R"({"overlay":{"mode":"whatever"}})");
     CHECK(p.error.empty());
+    CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+}
+
+TEST_CASE("parseSettings: overlay hotkey defaults to Ctrl+Shift+O when block missing") {
+    const auto p = parseSettings(R"({"overlay":{"mode":"hotkey"}})");
+    REQUIRE(p.error.empty());
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+}
+
+TEST_CASE("parseSettings: overlay hotkey unknown key falls back to default") {
+    const auto p = parseSettings(R"({
+        "overlay": { "hotkey": { "key": "Squiggle", "modifiers": ["alt"] } }
+    })");
+    REQUIRE(p.error.empty());
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+}
+
+TEST_CASE("parseSettings: overlay enabled with non-bool falls back to false default") {
+    const auto p = parseSettings(R"({"overlay":{"enabled":"yes"}})");
+    CHECK(p.error.empty());
+    CHECK_FALSE(p.settings.overlay.enabled);
+}
+
+TEST_CASE("parseSettings: log and overlay blocks parsed independently") {
+    // Common config: log on, overlay also on with custom hotkey. Both
+    // blocks must read out cleanly without cross-contamination.
+    const auto p = parseSettings(R"({
+        "log":     { "enabled": true,  "mode": "auto",   "hotkey": {"key":"T","modifiers":["ctrl","shift"]} },
+        "overlay": { "enabled": true,  "mode": "hotkey", "hotkey": {"key":"O","modifiers":["ctrl","shift"]}, "refresh_hz": 5 }
+    })");
+    REQUIRE(p.error.empty());
     CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Auto);
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
+    CHECK(p.settings.overlay.refresh_hz == 5);
 }
 
 TEST_CASE("parseSettings: unknown top-level keys are tolerated") {
