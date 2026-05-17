@@ -45,6 +45,32 @@
 
 namespace openxr_api_layer::detail {
 
+    // XrBaseInStructure-style chain walker. Walks `head` looking for the
+    // first entry whose `type` field equals `targetType`, returns nullptr
+    // if none. Used by layer.cpp to locate XrGraphicsBindingD3D{11,12}KHR
+    // (and any future binding type) inside the `createInfo->next` chain
+    // passed to xrCreateSession.
+    //
+    // Exposed here — instead of staying private to layer.cpp — so the
+    // test binary can verify the walk on a synthetic chain without
+    // dragging in <openxr/openxr.h> or the D3D headers. The BaseLike
+    // struct mirrors the XrBaseInStructure layout (an XrStructureType
+    // enum is int32_t, followed by a pointer-to-self), so casting any
+    // valid OpenXR `next` chain to BaseLike* is well-defined under the
+    // common-initial-sequence rule used throughout the OpenXR API.
+    struct BaseLike {
+        int32_t type;
+        const BaseLike* next;
+    };
+    inline const void* findInTypedChain(const void* head, int32_t targetType) noexcept {
+        const auto* base = reinterpret_cast<const BaseLike*>(head);
+        while (base) {
+            if (base->type == targetType) return base;
+            base = base->next;
+        }
+        return nullptr;
+    }
+
     // One row of CSV. Pushed from the frame thread (xrEndFrame), drained by
     // a background writer thread.  POD-like: copyable, no resources owned.
     //
@@ -114,6 +140,31 @@ namespace openxr_api_layer::detail {
         return static_cast<int64_t>(
             whole * 1'000'000'000ULL +
             (rem * 1'000'000'000ULL) / frequency);
+    }
+
+    // Pair-of-timestamps wrapper around gpuTimestampDeltaToNs with two
+    // defensive checks folded in:
+    //
+    //   1. freq == 0  — disjoint sentinel (D3D11) or uninitialized
+    //                   GetTimestampFrequency() (D3D12). Returns 0 ns.
+    //   2. tEnd <= tStart — driver bug. Seen on a handful of WMR drivers
+    //                       where the resolved end-of-frame timestamp comes
+    //                       back below the start. Treating the delta as
+    //                       unsigned would yield a huge bogus number and
+    //                       poison the headroom math downstream, so we
+    //                       swallow it as 0 ns.
+    //
+    // Both D3D11GpuTimer::endFrameAndResolveOldest and D3D12GpuTimer::end
+    // FrameAndResolveOldest funnel through here so the contract — and its
+    // unit tests — stay in one place. The D3D11 path additionally checks
+    // !disjointData.Disjoint at the call site (that flag lives on the
+    // disjoint query, not on the pair of timestamps, so it doesn't belong
+    // in this helper).
+    inline int64_t gpuTimestampPairToNs(uint64_t tStart,
+                                        uint64_t tEnd,
+                                        uint64_t frequency) noexcept {
+        if (frequency == 0 || tEnd <= tStart) return 0;
+        return gpuTimestampDeltaToNs(tEnd - tStart, frequency);
     }
 
     // --- Headroom formulas --------------------------------------------------
