@@ -81,11 +81,6 @@ namespace openxr_api_layer {
 
     namespace {
 
-        // FrameRecord lives in detail:: (telemetry_internals.h) so unit
-        // tests can construct one without faking an OpenXR session. The
-        // file-scope `using detail::FrameRecord;` above brings the name in
-        // for the rest of this TU.
-
         // Async CSV writer: the frame thread does an O(1) push under a
         // try_lock; a dedicated background thread (BELOW_NORMAL priority)
         // batches records and writes them to disk. Disk I/O never lands on
@@ -1071,9 +1066,6 @@ namespace openxr_api_layer {
             QueryPerformanceCounter(&c);
             return c.QuadPart;
         }
-        // Ticks → nanoseconds is detail::qpcToNs() in telemetry_internals.h.
-        // Kept as a free function (not a method) so it's testable without
-        // a layer instance.
 
         // GPU-side helpers ------------------------------------------------
 

@@ -39,6 +39,7 @@
 // stack. Only <cstdint> and <deque> from the standard library.
 // =============================================================================
 
+#include <cassert>
 #include <cstdint>
 #include <deque>
 
@@ -69,8 +70,11 @@ namespace openxr_api_layer::detail {
 
     // QueryPerformanceCounter delta ticks → nanoseconds. Splits into whole
     // and fractional parts so the (delta * 1e9) intermediate never overflows
-    // int64 for any realistic interval (it would take >290 years at 10 MHz
-    // QPC frequency before the whole-part term hits int64 max).
+    // int64 for any realistic interval. Concretely: the whole-part term
+    // `whole * 1e9` stays within int64 as long as `whole < INT64_MAX / 1e9
+    // ≈ 9.22e9`. With a 10 MHz QPC clock that bounds the input at
+    // `ticks < 9.22e9 * 1e7 = 9.22e16 ticks ≈ 9.22e9 seconds ≈ 292 years`.
+    // Process uptimes are not a concern.
     //
     // Returns 0 if freq <= 0 (defensive; never happens with a valid call to
     // QueryPerformanceFrequency).
@@ -88,11 +92,25 @@ namespace openxr_api_layer::detail {
     //
     // Returns 0 if frequency == 0 (defensive; happens when the disjoint
     // query reports Disjoint == true).
+    //
+    // The final static_cast<int64_t> of a uint64_t value is well-defined
+    // as long as the value fits in int64_t, i.e. `whole * 1e9 < 2^63`,
+    // i.e. `whole < ~9.22e9`. With a 1 GHz GPU timestamp clock that bounds
+    // `deltaTicks < 9.22e18 ticks ≈ 9.22e9 seconds ≈ 292 years` — well
+    // beyond any frame interval. The assert catches the corner case where
+    // a buggy driver reports a huge `deltaTicks` after marking the
+    // disjoint range as non-disjoint (it should mark it disjoint instead,
+    // in which case we never get here).
     inline int64_t gpuTimestampDeltaToNs(uint64_t deltaTicks,
                                          uint64_t frequency) noexcept {
         if (frequency == 0) return 0;
         const uint64_t whole = deltaTicks / frequency;
         const uint64_t rem = deltaTicks % frequency;
+        constexpr uint64_t kMaxWhole =
+            static_cast<uint64_t>(INT64_MAX) / 1'000'000'000ULL;
+        assert(whole <= kMaxWhole &&
+               "gpuTimestampDeltaToNs: deltaTicks span >292 years — "
+               "suspect driver-reported timestamp / disjoint Frequency");
         return static_cast<int64_t>(
             whole * 1'000'000'000ULL +
             (rem * 1'000'000'000ULL) / frequency);
@@ -145,6 +163,14 @@ namespace openxr_api_layer::detail {
     // `sink` is any callable accepting `const FrameRecord&`. In production
     // it's a thin lambda that forwards to CsvWriter::push; in tests it's a
     // capture-by-reference into a std::vector for inspection.
+    //
+    // PRECONDITION: `sink` must NOT mutate `pending` (e.g. by reentrantly
+    // calling patchAndDrainPending or flushPendingFramesUnresolved). The
+    // loop holds a reference into `pending.front()` across the sink call
+    // and pop_front; mutating the deque from inside the sink would
+    // invalidate that reference. C++17 has no `std::regular_invocable`
+    // concept to enforce this at compile time — the constraint is on the
+    // caller's discipline.
     template <typename Sink>
     void patchAndDrainPending(std::deque<FrameRecord>& pending,
                               uint64_t resolvedFrameIndex,
@@ -173,6 +199,9 @@ namespace openxr_api_layer::detail {
     // Records keep their placeholder gpu_time_ns (0) and gpu_headroom_pct
     // (100.0f). Analyses should filter `gpu_time_ns > 0` if they want to
     // exclude these last-of-session rows from GPU statistics.
+    //
+    // Same `sink` precondition as patchAndDrainPending: don't mutate
+    // `pending` from inside the callback.
     template <typename Sink>
     void flushPendingFramesUnresolved(std::deque<FrameRecord>& pending,
                                       Sink&& sink) {
