@@ -197,6 +197,19 @@ namespace {
     // Drive one full frame cycle through the layer: wait → begin → end. The
     // mock's xrWaitFrame can sleep (set state.waitFrameSleepMicros) to give
     // the layer a non-zero wait_block_ns to measure.
+    //
+    // The trailing sleep is non-obvious. The CsvWriter's writer thread is
+    // single-consumer; it holds m_mtx for the few µs it takes to drain the
+    // deque into a batch. The producer (push() from xrEndFrame) uses
+    // try_to_lock, so if the test thread races a push against the writer's
+    // drain window, the push is dropped (counted in droppedTryLock). In a
+    // real VR app, the 11 ms inter-frame gap makes this race vanishingly
+    // unlikely; tests that hammer driveOneFrame back-to-back used to drop
+    // ~1 record per 5 frames on the GitHub-hosted Windows runner. 500 µs
+    // is well above the writer's drain time on any realistic machine
+    // (including a noisy CI VM) and well below the 11 ms a real app
+    // would space frames by, so it both deflakes the tests and stays
+    // representative of production.
     void driveOneFrame(openxr_api_layer::OpenXrApi* api) {
         const auto session = reinterpret_cast<XrSession>(0x1234);
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -212,6 +225,8 @@ namespace {
         endInfo.layerCount = 0;
         endInfo.layers = nullptr;
         REQUIRE(api->xrEndFrame(session, &endInfo) == XR_SUCCESS);
+
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
 
     // Column indices in the CSV header. Kept in one place so adding a column
