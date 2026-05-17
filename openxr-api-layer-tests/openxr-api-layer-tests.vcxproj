@@ -133,6 +133,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
     <ClCompile Include="test_telemetry.cpp" />
+    <ClCompile Include="test_telemetry_math.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
     <ClCompile Include="test_stubs.cpp" />
     <!-- Layer sources we link into the test binary. These define the
