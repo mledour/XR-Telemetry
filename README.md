@@ -331,9 +331,15 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
     "mode": "auto",
     "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
   },
-  "overlay": { "_reserved": "future feature, not parsed yet" }
+  "overlay": {}
 }
 ```
+
+The `overlay` block is present today as a placeholder so per-app
+files generated NOW will already have the section when the
+in-headset overlay feature ships. It has no fields and no defaults
+yet; the shipped template carries a `_reserved` string inside it
+purely as a human comment.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -363,6 +369,14 @@ toggles `m_recording`:
 Every transition is logged so support sessions can grep `xr_telemetry:
 hotkey pressed` to see when the user thought they started/stopped a
 recording.
+
+**AltGr caveat (European layouts).** Windows reports AltGr as the
+combination of `VK_CONTROL` + `VK_MENU` (Alt), there's no separate
+virtual-key code for it. A hotkey bound with `"modifiers": ["ctrl"]`
+will therefore *also* fire when the user holds AltGr + the main key.
+If you bind a combo on an AZERTY / QWERTZ keyboard, prefer Shift +
+F-key (e.g. `Shift+F11`) over Ctrl + letter to dodge this — the
+F-row never overlaps with character-producing AltGr combos.
 
 ### Robustness contract
 

@@ -203,6 +203,12 @@ namespace openxr_api_layer::detail {
     // Keeping this stateful object owned by the caller (rather than
     // baking the previous-state into HotkeySpec) lets tests drive it
     // with synthetic sequences without poking statics.
+    //
+    // No reset() — settings are NOT hot-reloaded (see the README "What's
+    // deliberately NOT here" note), so the only consumers of a fresh
+    // detector are a freshly-constructed OpenXrLayer / TelemetryFixture,
+    // which already get one via the default-initialised m_prev. Re-add
+    // a reset path the day live-reload ships.
     class HotkeyEdgeDetector {
       public:
         // Returns true on rising edge, false otherwise. `pressed == false`
@@ -212,9 +218,6 @@ namespace openxr_api_layer::detail {
             m_prev = pressed;
             return rising;
         }
-        // Reset to "never pressed" — useful when reloading settings, so
-        // a key that was held during the reload doesn't fire spuriously.
-        void reset() noexcept { m_prev = false; }
       private:
         bool m_prev = false;
     };

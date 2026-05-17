@@ -191,11 +191,11 @@ namespace openxr_api_layer::detail {
         }
 
         // ---- overlay block ----------------------------------------------
-        // Tolerated, not parsed. When we add real overlay settings later,
-        // extend the OverlaySettings struct and pull fields here. Per-app
-        // files that already contain an `overlay` block (from the future
-        // template) will not need migration.
-        (void)doc.FindMember("overlay");
+        // Tolerated, not parsed. rapidjson already ignores unknown
+        // top-level keys, so no action is needed here today; when we
+        // add real overlay settings, extend OverlaySettings and pull
+        // fields from doc["overlay"] below this line. Per-app files
+        // already containing an `overlay` block won't need migration.
 
         return result;
     }

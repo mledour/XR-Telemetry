@@ -106,6 +106,12 @@ namespace {
             return m_tempDir / "sessions";
         }
 
+        // Exposed so tests can pre-write a settings file at
+        // `<tempDir>/<app>_settings.json` BEFORE startLayer, to exercise
+        // the bypass / hotkey branches without depending on the layer's
+        // bootstrap path.
+        const std::filesystem::path& tempDir() const { return m_tempDir; }
+
         // Common setup: wire the singleton to the mock runtime and call
         // xrCreateInstance. Resolves m_xrWaitFrame / m_xrBeginFrame /
         // m_xrEndFrame / m_xrDestroyInstance so the OpenXrApi virtual
@@ -574,4 +580,48 @@ TEST_CASE("telemetry: gpu_time_ns is 0 and gpu_headroom_pct is 100% when no D3D1
         CHECK(cells[kColGpuTimeNs] == "0");
         CHECK(cells[kColGpuHeadroomPct] == "100.00");
     }
+}
+
+// ----------------------------------------------------------------------------
+// 9. Bypass branch: a per-app settings file with `log.enabled = false`
+//    must turn the layer into a pure pass-through — no CSV, no frame
+//    records, even after multiple xrEndFrame calls. Covers the runtime
+//    wiring that the unit tests in test_settings.cpp cannot reach (they
+//    test the parser; this test checks the parser's output actually
+//    drives m_bypassApiLayer).
+// ----------------------------------------------------------------------------
+TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing") {
+    TelemetryFixture fix;
+
+    // Pre-write the per-app file BEFORE startLayer so bootstrapAndLoad
+    // Settings finds it and skips the template copy. The slug rule
+    // matches sanitizeForFilename: "BypassTest" → "bypasstest".
+    const auto perAppPath = fix.tempDir() / "bypasstest_settings.json";
+    {
+        std::ofstream out(perAppPath);
+        REQUIRE(out.is_open());
+        out << R"({"log":{"enabled":false}})";
+    }
+
+    auto* api = fix.startLayer("BypassTest");
+
+    // Drive a handful of frames — every override should early-return
+    // through the base class without touching CsvWriter or the GPU
+    // timer.
+    constexpr int kFrames = 5;
+    for (int i = 0; i < kFrames; ++i) {
+        driveOneFrame(api);
+    }
+
+    // Force CsvWriter teardown (matches what xrDestroyInstance triggers
+    // in production) so any header-only CSV would be on disk by now.
+    openxr_api_layer::ResetInstance();
+
+    // The bypass branch never opens a writer, so the sessions/ folder
+    // either doesn't exist or is empty. findSessionCsv returns nullopt
+    // in both cases.
+    const auto csv = findSessionCsv(fix.sessionsDir());
+    CHECK_MESSAGE(!csv.has_value(),
+                  "expected no CSV under sessions/ when log.enabled=false; "
+                  "found " << (csv ? csv->string() : std::string("<none>")));
 }

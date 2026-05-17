@@ -158,7 +158,15 @@ namespace openxr_api_layer {
             // Normal session shutdown (cooperative, writer alive and free)
             // completes in well under 10 ms and writes the footer; the
             // bounded wait only kicks in for hard-shutdown paths.
-            void stop() {
+            // `deleteIfEmpty=true` (the default) deletes the file if zero
+            // frames were written — used to suppress empty CSVs from
+            // OpenComposite / OXRT probe XrInstances that never reach
+            // the frame loop. `deleteIfEmpty=false` ALWAYS keeps the
+            // file — used by the hotkey toggle path, where an empty
+            // recording is an intentional user action ("did my hotkey
+            // even fire?") and the trace is the binding-validation
+            // signal we want to surface.
+            void stop(bool deleteIfEmpty = true) {
                 std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
                 if (!m_started.exchange(false)) {
                     return;
@@ -204,7 +212,7 @@ namespace openxr_api_layer {
                 }
 
                 if (m_file.is_open()) {
-                    if (m_written == 0) {
+                    if (m_written == 0 && deleteIfEmpty) {
                         // No frames were written — this is almost certainly
                         // the OpenComposite / OXR Toolkit probe XrInstance
                         // (capability-check; never reaches the frame loop)
@@ -214,6 +222,15 @@ namespace openxr_api_layer {
                         m_file.close();
                         std::error_code ec;
                         std::filesystem::remove(m_path, ec);  // best-effort
+                    } else if (m_written == 0) {
+                        // Hotkey toggle with zero frames between press →
+                        // stop. Keep the empty file (just the header +
+                        // footer) so users can confirm their binding
+                        // fired even when they tap-tap by mistake.
+                        m_file << "# session_end written=0 (hotkey toggle, "
+                                  "no frames captured)\n";
+                        m_file.flush();
+                        m_file.close();
                     } else {
                         // Real session — write the footer with split drop
                         // counters so a slow writer (try_lock) is
@@ -360,18 +377,37 @@ namespace openxr_api_layer {
             std::mutex m_lifetimeMtx;
         };
 
-        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SSZ_<appName>.csv.
+        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SS.mmmZ_<appName>.csv.
         // UTC (Z suffix) rather than local time: trace files are comparable
         // across machines and immune to DST transitions mid-session.
+        //
+        // Millisecond resolution matters in mode=hotkey: a user double-tap
+        // (press → stop → press) lands two paths within the same second,
+        // and CsvWriter::start opens with std::ios::trunc — without the
+        // .mmm component the second press would overwrite the first
+        // recording. The .003-ish resolution we get from system_clock on
+        // Windows is plenty to disambiguate human inputs.
+        //
+        // As an extra safety net, if a path STILL collides (system clock
+        // not monotonic across reboots, simulator firing back-to-back
+        // calls within the same millisecond, …) we suffix _2 / _3 / …
+        // until we find a free slot. Caps at 99 attempts; beyond that
+        // we hand back a colliding name and let CsvWriter::start fail.
+        //
         // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
         // '_'. Empty appName falls back to "unknown".
         std::filesystem::path buildSessionCsvPath(const std::string& appName) {
             const auto now = std::chrono::system_clock::now();
             const auto tt = std::chrono::system_clock::to_time_t(now);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now.time_since_epoch()).count() % 1000;
             std::tm tm{};
-            char timestamp[32];
+            char timestamp[40];
             if (::gmtime_s(&tm, &tt) == 0) {
-                std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%SZ", &tm);
+                const size_t n = std::strftime(timestamp, sizeof(timestamp),
+                                                "%Y-%m-%d_%H-%M-%S", &tm);
+                std::snprintf(timestamp + n, sizeof(timestamp) - n,
+                               ".%03lldZ", static_cast<long long>(ms));
             } else {
                 // gmtime_s failed (returns errno_t, non-zero on failure).
                 // Fall back to a tick-based stamp so the filename is still
@@ -397,7 +433,14 @@ namespace openxr_api_layer {
             const auto dir = openxr_api_layer::localAppData / "sessions";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);  // best-effort
-            return dir / fmt::format("{}_{}.csv", timestamp, safeName);
+
+            const auto baseStem = fmt::format("{}_{}", timestamp, safeName);
+            auto candidate = dir / (baseStem + ".csv");
+            for (int counter = 2; counter < 100; ++counter) {
+                if (!std::filesystem::exists(candidate, ec)) break;
+                candidate = dir / fmt::format("{}_{}.csv", baseStem, counter);
+            }
+            return candidate;
         }
 
         // -------------------------------------------------------------------
@@ -442,15 +485,46 @@ namespace openxr_api_layer {
 }
 )";
 
-        // Writes the built-in default JSON to `outputPath`. Best-effort: a
-        // failed write (read-only LOCALAPPDATA, disk full) is logged but
-        // does not bubble up — the caller falls back to the parser's
-        // baked-in defaults.
+        // Writes the built-in default JSON to `outputPath` atomically:
+        // open .tmp sibling, write, fsync via the destructor flush,
+        // rename over the target. A mid-write disk-full / read-only
+        // failure leaves the .tmp behind (best-effort cleanup) and
+        // returns false — the on-disk `outputPath` either doesn't
+        // exist (fresh install) or stays intact (we never overwrite
+        // a non-existing target with a partial file). Without this,
+        // a torn first-run write would leave a zero-byte
+        // settings.json that the next run sees as "exists" and never
+        // re-tries.
+        //
+        // Caller-side contract: only called when outputPath does NOT
+        // already exist (the bootstrap branch above checks). Rename-
+        // to-existing fails on Windows; we don't bother with replace_
+        // file_t semantics because we never have a target to replace.
         bool writeBuiltInSettings(const std::filesystem::path& outputPath) {
-            std::ofstream out(outputPath, std::ios::out | std::ios::trunc);
-            if (!out.is_open()) return false;
-            out << kBuiltInDefaultSettings;
-            return out.good();
+            const auto tmpPath =
+                std::filesystem::path(outputPath.string() + ".tmp");
+            {
+                std::ofstream out(tmpPath, std::ios::out | std::ios::trunc);
+                if (!out.is_open()) return false;
+                out << kBuiltInDefaultSettings;
+                out.flush();
+                if (!out.good()) {
+                    // Disk full / read-only mid-write. Drop the partial
+                    // file so the next run can retry from scratch.
+                    out.close();
+                    std::error_code ec;
+                    std::filesystem::remove(tmpPath, ec);
+                    return false;
+                }
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmpPath, outputPath, ec);
+            if (ec) {
+                std::error_code ec2;
+                std::filesystem::remove(tmpPath, ec2);  // best-effort
+                return false;
+            }
+            return true;
         }
 
         // Reads `path` into a string. Returns std::nullopt if the file is
@@ -531,13 +605,18 @@ namespace openxr_api_layer {
         // true only when the main key is held AND the modifier state
         // matches bit-for-bit — pressing Ctrl+Alt+Shift+T must NOT fire a
         // Ctrl+Shift+T binding (or every accidental Alt-graveyard would
-        // toggle the recorder).
+        // toggle the recorder). See the README's AltGr caveat: on
+        // European layouts, AltGr is reported as Ctrl+Alt, so a hotkey
+        // bound with `ctrl` is matched by AltGr-augmented presses too.
         //
-        // Uses GetAsyncKeyState, scoped naturally to the foreground
-        // process: when the game loses focus, the key state we read goes
-        // false on the release that we never see, but the next press
-        // while the game's window is up will register normally. This is
-        // exactly the desired UX — no global hotkey hijacking.
+        // GetAsyncKeyState is a process-global, foreground-independent
+        // poll of the keyboard state. The DESIRED foreground-scoping
+        // comes from WHERE we call it: only inside xrEndFrame, which
+        // only fires while this game's render loop is active. A user
+        // running an OpenXR mirror in the background while typing in
+        // Notepad would still see the combo register; we accept that
+        // edge case rather than wire up a Win32 focus check (which
+        // would mis-classify HMD-focused sessions).
         bool pollHotkeyPressed(const detail::HotkeySpec& spec) {
             if (!spec.valid()) return false;
             auto down = [](int vk) {
@@ -1148,9 +1227,17 @@ namespace openxr_api_layer {
             m_gpuTimer.reset();
 
             const uint64_t written = m_csv.written();
-            m_csv.stop();
+            // Auto mode: keep the existing probe-instance protection
+            // (delete an empty CSV from OpenComposite / OXRT capability
+            // probes). Hotkey mode: any open CSV at this point came
+            // from an explicit user press, so KEEP it on disk regardless
+            // of frame count — it's the user-visible signal that their
+            // binding worked.
+            const bool deleteIfEmpty =
+                m_settings.log.mode == detail::LogMode::Auto;
+            m_csv.stop(deleteIfEmpty);
             if (m_csvPath.has_filename()) {
-                if (written == 0) {
+                if (written == 0 && deleteIfEmpty) {
                     Log(fmt::format("xr_telemetry: probe XrInstance — no frames; csv deleted: {}\n",
                                     m_csvPath.string()));
                 } else {
@@ -1342,8 +1429,10 @@ namespace openxr_api_layer {
             // Hotkey mode may have left the recorder open mid-session;
             // close the CSV here so the footer + clean file rotation
             // happen even when the user never pressed the stop key.
+            // deleteIfEmpty mirrors the destructor's policy.
             if (m_recording) {
-                m_csv.stop();
+                m_csv.stop(/*deleteIfEmpty=*/
+                           m_settings.log.mode == detail::LogMode::Auto);
                 m_recording = false;
             }
             return OpenXrApi::xrDestroySession(session);
@@ -1465,7 +1554,11 @@ namespace openxr_api_layer {
                         }
                     } else {
                         const uint64_t written = m_csv.written();
-                        m_csv.stop();
+                        // deleteIfEmpty=false: in hotkey mode, an empty
+                        // recording is the user's explicit signal "did my
+                        // binding fire?" — keep the header+footer file so
+                        // they can confirm in the sessions/ folder.
+                        m_csv.stop(/*deleteIfEmpty=*/false);
                         m_recording = false;
                         Log(fmt::format("xr_telemetry: hotkey pressed — "
                                          "recording stopped ({} frames written to {})\n",

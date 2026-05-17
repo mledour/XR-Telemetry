@@ -187,13 +187,6 @@ TEST_CASE("HotkeyEdgeDetector: re-press after release fires again") {
     CHECK_FALSE(ed.tick(false));
 }
 
-TEST_CASE("HotkeyEdgeDetector: reset clears the latch") {
-    HotkeyEdgeDetector ed;
-    ed.tick(true);                // arms m_prev
-    ed.reset();
-    CHECK(ed.tick(true));         // first tick after reset is a rising edge
-}
-
 // =============================================================================
 // iequalsAscii — sanity check on the case-fold helper.
 // =============================================================================
