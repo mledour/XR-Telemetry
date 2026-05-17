@@ -231,6 +231,12 @@ TEST_CASE("parseSettings: overlay refresh_hz clamped to [1, 60]") {
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":-5}})").settings.overlay.refresh_hz == 1);
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":300}})").settings.overlay.refresh_hz == 60);
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":30}})").settings.overlay.refresh_hz == 30);
+    // Exact boundary checks — 60 passes through, 61 clamps to 60, 1
+    // is the lowest valid value. Locks the std::clamp(rawHz, 1, 60)
+    // contract in case a future refactor changes the range.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":60}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":61}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1}})").settings.overlay.refresh_hz == 1);
 }
 
 TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {

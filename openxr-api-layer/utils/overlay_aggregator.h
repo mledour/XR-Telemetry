@@ -89,7 +89,13 @@ namespace openxr_api_layer::detail {
         explicit OverlayAggregator(int64_t refreshIntervalNs = 100'000'000LL,
                                    int64_t qpcFrequency = 1'000'000'000LL) noexcept
             : m_intervalNs(refreshIntervalNs > 0 ? refreshIntervalNs : 1),
-              m_qpcFrequency(qpcFrequency > 0 ? qpcFrequency : 1'000'000'000LL) {}
+              // Clamp anything < 1 kHz to the 1 GHz default. Real Windows
+              // QPC is always at least 1 MHz, usually 10 MHz; a caller
+              // somehow passing 1 / 2 / 100 is either a test bug or a
+              // broken HAL clock falling through OpenXrLayer's own
+              // fallback. Either way we substitute a value that won't
+              // make every ns conversion explode.
+              m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 1'000'000'000LL) {}
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
         // is its final value, not the in-flight 0). The aggregator

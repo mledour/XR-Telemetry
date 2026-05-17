@@ -589,6 +589,14 @@ TEST_CASE("telemetry: gpu_time_ns is 0 and gpu_headroom_pct is 100% when no D3D1
 //    wiring that the unit tests in test_settings.cpp cannot reach (they
 //    test the parser; this test checks the parser's output actually
 //    drives m_bypassApiLayer).
+//
+// Note: hotkey mode (log AND overlay) is unit-tested end-to-end in
+// test_hotkey.cpp via the HotkeyEdgeDetector + parseHotkey helpers.
+// Driving it through the layer here would require mocking GetAsync
+// KeyState, which is a Win32 syscall — too invasive for the testing
+// surface area. The integration coverage here intentionally stops at
+// the parser → m_settings → m_bypassApiLayer / m_recording /
+// m_overlayActive boundary.
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing") {
     TelemetryFixture fix;

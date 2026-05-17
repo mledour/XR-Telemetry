@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -190,7 +191,14 @@ namespace openxr_api_layer::detail {
             for (const auto& e : kNamed) {
                 if (e.vk == spec.vk) { out += e.name; return out; }
             }
-            out += "VK(0x" + std::to_string(spec.vk) + ")";
+            // Unrecognised VK code (in practice unreachable through
+            // parseHotkey, since the parser whitelists only the names
+            // covered above). Renders as a real hex literal — the prior
+            // `std::to_string(spec.vk)` produced decimal digits inside a
+            // "0x..." prefix, which lied to the reader.
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "VK(0x%02X)", spec.vk);
+            out += buf;
         }
         return out;
     }

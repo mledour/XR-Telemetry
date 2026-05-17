@@ -391,9 +391,12 @@ namespace openxr_api_layer {
         //
         // As an extra safety net, if a path STILL collides (system clock
         // not monotonic across reboots, simulator firing back-to-back
-        // calls within the same millisecond, …) we suffix _2 / _3 / …
-        // until we find a free slot. Caps at 99 attempts; beyond that
-        // we hand back a colliding name and let CsvWriter::start fail.
+        // calls within the same millisecond, NTP resync rewinding the
+        // wallclock mid-bench, …) we suffix _2 / _3 / … until we find
+        // a free slot. Caps at 999 attempts — well above any plausible
+        // bench script burst across an NTP resync — and beyond that
+        // we hand back a colliding name and let CsvWriter::start fail
+        // with a logged error.
         //
         // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
         // '_'. Empty appName falls back to "unknown".
@@ -437,7 +440,7 @@ namespace openxr_api_layer {
 
             const auto baseStem = fmt::format("{}_{}", timestamp, safeName);
             auto candidate = dir / (baseStem + ".csv");
-            for (int counter = 2; counter < 100; ++counter) {
+            for (int counter = 2; counter < 1000; ++counter) {
                 if (!std::filesystem::exists(candidate, ec)) break;
                 candidate = dir / fmt::format("{}_{}.csv", baseStem, counter);
             }
@@ -468,6 +471,12 @@ namespace openxr_api_layer {
         // installer users and ZIP users must see identical first-run
         // behaviour. A drift here would mean a ZIP user's defaults
         // disagree with the documented schema.
+        //
+        // No automated drift check today; a future improvement would be
+        // a build-time / test-time comparison that reads
+        // installer/default_settings.json and assert-equals it against
+        // this constexpr. Tracked informally — when overlay PR2 adds
+        // more fields, update BOTH copies in the same commit.
         constexpr const char* kBuiltInDefaultSettings = R"({
   "_comment": "Default template for XR_APILAYER_MLEDOUR_xr_telemetry. Each OpenXR application gets a copy of this file the first time it runs (named <app>_settings.json next to this one). Edit values here to change the defaults that apply to NEW games; existing per-app files are never touched on subsequent runs.",
   "log": {
@@ -495,16 +504,24 @@ namespace openxr_api_layer {
 }
 )";
 
-        // Writes the built-in default JSON to `outputPath` atomically:
-        // open .tmp sibling, write, fsync via the destructor flush,
-        // rename over the target. A mid-write disk-full / read-only
-        // failure leaves the .tmp behind (best-effort cleanup) and
-        // returns false — the on-disk `outputPath` either doesn't
-        // exist (fresh install) or stays intact (we never overwrite
-        // a non-existing target with a partial file). Without this,
-        // a torn first-run write would leave a zero-byte
-        // settings.json that the next run sees as "exists" and never
-        // re-tries.
+        // Writes the built-in default JSON to `outputPath` via a
+        // write-then-rename pattern: open .tmp sibling, write,
+        // best-effort flush of the user-space buffer, rename over the
+        // target. A mid-write disk-full / read-only failure leaves
+        // the .tmp behind (best-effort cleanup) and returns false —
+        // the on-disk `outputPath` either doesn't exist (fresh
+        // install) or stays intact (we never overwrite a non-existing
+        // target with a partial file). Without this, a torn first-run
+        // write would leave a zero-byte settings.json that the next
+        // run sees as "exists" and never re-tries.
+        //
+        // We do NOT call FlushFileBuffers / fsync — the std::ofstream
+        // flush only drains user-space buffers, and adding a true
+        // disk-level fsync would block bootstrap on the disk's commit
+        // (10s of ms on spinning rust). A hardware crash after rename
+        // but before kernel commit can still lose the file; in that
+        // case the NEXT layer run regenerates it from the constexpr,
+        // so we trade durability for a faster first frame.
         //
         // Caller-side contract: only called when outputPath does NOT
         // already exist (the bootstrap branch above checks). Rename-
@@ -578,10 +595,24 @@ namespace openxr_api_layer {
             //    template (so user edits to global defaults are inherited
             //    by every NEW app), fall back to the built-in if no
             //    template materialised.
+            //
+            //    The exists() check is racy w.r.t. another XR instance
+            //    being launched in parallel for the same app (double-
+            //    click, OpenXR Tools probe firing alongside the game,
+            //    …). copy_options::skip_existing makes the copy_file
+            //    call itself the arbiter: if the perAppPath already
+            //    exists by the time the kernel processes our request,
+            //    it returns without clobbering. The bootstrapped
+            //    bool still flips true (skip_existing is not an
+            //    error), and the subsequent read picks up whichever
+            //    process won the race — same template content either
+            //    way, so the user sees no difference.
             if (!std::filesystem::exists(perAppPath)) {
                 bool bootstrapped = false;
                 if (std::filesystem::exists(templatePath)) {
-                    std::filesystem::copy_file(templatePath, perAppPath, ec);
+                    std::filesystem::copy_file(
+                        templatePath, perAppPath,
+                        std::filesystem::copy_options::skip_existing, ec);
                     if (!ec) {
                         bootstrapped = true;
                         Log(fmt::format("xr_telemetry: bootstrapped {} from template\n",
@@ -1212,9 +1243,19 @@ namespace openxr_api_layer {
         OpenXrLayer() {
             // Cache QPC frequency once. Used by every frame-thread timestamp
             // conversion below; constant for the process lifetime.
+            //
+            // Fallback to 10 MHz (the typical Windows QPC frequency on
+            // modern hardware) rather than 1 if QueryPerformanceFrequency
+            // ever returns 0. qpcToNs interprets `ticks / freq` as
+            // seconds, so freq=1 would make every QPC delta blow up to
+            // ~1e9× the intended nanosecond value — corrupting the CSV,
+            // the headroom math, AND the overlay aggregator's refresh
+            // deadline. 10 MHz is a sane, realistic guess that keeps the
+            // numbers in the right ballpark even on a broken HAL clock.
+            // The aggregator has its own < 1000 clamp as defense in depth.
             LARGE_INTEGER freq{};
             QueryPerformanceFrequency(&freq);
-            m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 1;
+            m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 10'000'000LL;
         }
         // SINGLETON LIFETIME — this destructor runs from
         // ResetInstance() (auto-generated xrDestroyInstance), so the

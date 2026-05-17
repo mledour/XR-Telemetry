@@ -353,6 +353,7 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
 | `overlay.refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsvr and is the recommended cadence — fast enough that the numbers track reality, slow enough to be readable in motion. |
 | `overlay.position` | string | `"head_top_right"` | Reserved for the future renderer (PR2). The data plumbing is in place; the head-locked quad will land in a follow-up PR. Any other string is accepted and stored verbatim. |
 
+<!-- REMOVE-WHEN-PR2-LANDS:start -->
 > **PR1 status:** the overlay block is fully parsed, the hotkey
 > toggles a runtime flag, and the moving-average aggregator is fed
 > with every fully-resolved FrameRecord at the configured cadence.
@@ -363,6 +364,7 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
 > to-end (`xr_telemetry: overlay final snapshot — fps=89.8 (avg
 > 90.1, target 90.0), cpu=4.32 ms (61% util), gpu=5.18 ms (47%
 > util)`).
+<!-- REMOVE-WHEN-PR2-LANDS:end -->
 
 ### Hotkey mode UX
 
