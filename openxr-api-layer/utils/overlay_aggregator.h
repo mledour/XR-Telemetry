@@ -97,11 +97,19 @@ namespace openxr_api_layer::detail {
             ++m_count;
 
             const int64_t nowNs = qpcToNs(rec.timestamp_qpc, m_qpcFrequency);
-            if (m_lastRefreshNs == 0) {
+            if (!m_armed) {
                 // First frame seen: arm the refresh window. We deliberately
                 // do NOT publish a snapshot on a single sample — averaging
                 // over one frame defeats the purpose.
+                //
+                // We use a dedicated boolean rather than a sentinel value
+                // on m_lastRefreshNs because qpcToNs(0, *) == 0 — the
+                // tests legitimately pass timestamp_qpc=0 for the first
+                // frame, and using "lastRefreshNs == 0" as the sentinel
+                // would leave the aggregator perpetually re-arming
+                // instead of publishing.
                 m_lastRefreshNs = nowNs;
+                m_armed = true;
                 return;
             }
             if (nowNs - m_lastRefreshNs >= m_intervalNs && m_count > 0) {
@@ -162,6 +170,7 @@ namespace openxr_api_layer::detail {
         int64_t m_intervalNs;
         int64_t m_qpcFrequency;
         int64_t m_lastRefreshNs = 0;
+        bool    m_armed = false;
         int64_t m_sumCpuNs = 0;
         int64_t m_sumGpuNs = 0;
         int64_t m_sumFrameTotalNs = 0;

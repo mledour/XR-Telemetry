@@ -188,23 +188,33 @@ TEST_CASE("OverlayAggregator: target_fps is 0 when period_ns is 0 (no measuremen
 
 TEST_CASE("OverlayAggregator: second window's values do NOT include first window's frames") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
-    // Window 1: 4 ms CPU.
+    // Window 1: arm at t=0, mid-window frame at t=50 ms (no publish), then
+    // a third frame at t=100 ms that's exactly on the boundary → publish
+    // with avg(4, 4, 4) = 4 ms.
     agg.pushFrame(makeRecord(0,
                               4'000'000, 5'000'000,
                               11'111'111, 11'111'111, 64.0f, 55.0f));
-    agg.pushFrame(makeRecord(110'000'000,
+    agg.pushFrame(makeRecord(50'000'000,
+                              4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f));
+    agg.pushFrame(makeRecord(100'000'000,
                               4'000'000, 5'000'000,
                               11'111'111, 11'111'111, 64.0f, 55.0f));
     REQUIRE(agg.snapshot().valid);
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
 
-    // Window 2: 10 ms CPU. Snapshot should reflect the new window only.
-    agg.pushFrame(makeRecord(220'000'000,
+    // Window 2: first frame at t=150 ms — already 50 ms into window 2 but
+    // still < 100 ms since last refresh → accumulates, no publish, the
+    // public snapshot still reads 4 ms from window 1.
+    agg.pushFrame(makeRecord(150'000'000,
                               10'000'000, 5'000'000,
                               11'111'111, 11'111'111, 10.0f, 55.0f));
-    // Still no refresh yet (one frame in window 2).
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
-    agg.pushFrame(makeRecord(330'000'000,
+
+    // Window 2 second frame at t=200 ms → 100 ms since last refresh
+    // exactly, publish with avg(10, 10) = 10 ms (window 1's 4 ms NEVER
+    // contributes here — that's the whole point of the reset).
+    agg.pushFrame(makeRecord(200'000'000,
                               10'000'000, 5'000'000,
                               11'111'111, 11'111'111, 10.0f, 55.0f));
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(10.0f).epsilon(0.001));
