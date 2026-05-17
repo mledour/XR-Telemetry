@@ -1301,6 +1301,38 @@ namespace openxr_api_layer {
                                     m_csvPath.string()));
                 }
             }
+
+            // PR1 verification: log the aggregator's final snapshot once
+            // per xrInstance lifetime. Moved here from xrDestroySession
+            // because OpenComposite's probe pattern fires xrDestroy
+            // Session BEFORE the real gameplay session has accumulated
+            // any frames — logging there produced a "session too short"
+            // message even when the real session ran for minutes. The
+            // destructor sees the cumulative aggregator state across
+            // every session of this instance, which is what we want.
+            //
+            // The Log() uses the same "%s" + fmt::format(...).c_str()
+            // dance as the CSV log above to dodge vsnprintf's printf-
+            // style re-interpretation of "% util" inside the formatted
+            // string (verified bug from an earlier build that read
+            // "cpu=… (832588922944til)" instead of "(47% util)").
+            if (m_overlayActive) {
+                const auto& snap = m_overlay.snapshot();
+                if (snap.valid) {
+                    const std::string msg = fmt::format(
+                        "xr_telemetry: overlay final snapshot — "
+                        "fps={:.1f} (avg {:.1f}, target {:.1f}), "
+                        "cpu={:.2f} ms ({:.0f}% util), "
+                        "gpu={:.2f} ms ({:.0f}% util)\n",
+                        snap.fps_instant, snap.fps_avg, snap.target_fps,
+                        snap.cpu_frame_ms, snap.cpu_utilisation_pct,
+                        snap.gpu_frame_ms, snap.gpu_utilisation_pct);
+                    Log("%s", msg.c_str());
+                } else {
+                    Log("xr_telemetry: overlay was active but session too short for a "
+                        "snapshot to finalise (need at least one refresh interval of frames)\n");
+                }
+            }
         }
 
         // ---- xrCreateInstance ---------------------------------------------
@@ -1501,52 +1533,27 @@ namespace openxr_api_layer {
             if (m_bypassApiLayer) {
                 return OpenXrApi::xrDestroySession(session);
             }
-            // Flush any FrameRecords still waiting on a GPU result before
-            // we release the queries. They'll be written with gpu_time_ns=0.
+            // Session-scoped cleanup only. Flush any FrameRecords still
+            // waiting on a GPU result before we release the queries
+            // (they'll land in the CSV with gpu_time_ns=0), then drop
+            // the D3D timer so its query heap / command lists / fence
+            // don't outlive the dying session's device.
             flushPendingFramesUnresolved();
             m_gpuTimer.reset();
-            // Hotkey mode may have left the recorder open mid-session;
-            // close the CSV here so the footer + clean file rotation
-            // happen even when the user never pressed the stop key.
-            // deleteIfEmpty mirrors the destructor's policy.
-            if (m_recording) {
-                m_csv.stop(/*deleteIfEmpty=*/
-                           m_settings.log.mode == detail::LogMode::Auto);
-                m_recording = false;
-            }
-            // PR1 verification path: the overlay renderer ships in PR2, but
-            // the data plumbing should already be producing sensible
-            // snapshots. Log the final one once per session so a user
-            // running this build can confirm the aggregator saw frames
-            // and that the moving averages look right. Cheap (one Log()
-            // call per session) — no per-frame DBWinMutex contention.
-            if (m_overlayActive) {
-                const auto& snap = m_overlay.snapshot();
-                if (snap.valid) {
-                    // The framework's Log() funnels through vsnprintf,
-                    // which would re-interpret any bare "%" inside an
-                    // already-formatted result as a printf conversion
-                    // (e.g. "% u" → %u → reads garbage from the stack).
-                    // Verified on live build: without this fix, the
-                    // snapshot log read "cpu=… (832588922944til)"
-                    // instead of "(47% util)". Solution: pass the
-                    // fmt::format result as a string arg to a "%s"
-                    // format, so printf never re-interprets its
-                    // contents.
-                    const std::string msg = fmt::format(
-                        "xr_telemetry: overlay final snapshot — "
-                        "fps={:.1f} (avg {:.1f}, target {:.1f}), "
-                        "cpu={:.2f} ms ({:.0f}% util), "
-                        "gpu={:.2f} ms ({:.0f}% util)\n",
-                        snap.fps_instant, snap.fps_avg, snap.target_fps,
-                        snap.cpu_frame_ms, snap.cpu_utilisation_pct,
-                        snap.gpu_frame_ms, snap.gpu_utilisation_pct);
-                    Log("%s", msg.c_str());
-                } else {
-                    Log("xr_telemetry: overlay was active but session too short for a "
-                        "snapshot to finalise (need at least one refresh interval of frames)\n");
-                }
-            }
+            // DO NOT touch m_csv / m_recording / m_overlay / m_overlay
+            // Active here. The OpenXR spec allows multiple xrCreateSession
+            // / xrDestroySession cycles within a single xrInstance, and
+            // OpenComposite uses exactly that pattern: a probe session
+            // first (capability check, no frame loop), then the real
+            // gameplay session. If we closed the CsvWriter at the probe's
+            // xrDestroySession, the real session's frames would land in
+            // a now-closed writer (m_csv.push() silently no-ops on
+            // !m_started), and the user would see "no frames; csv
+            // deleted" in the log — exactly the bug live-confirmed on
+            // OpenComposite + LMU. The CsvWriter, m_recording, and the
+            // overlay snapshot log all live for the xrInstance's full
+            // lifetime; they're torn down by ~OpenXrLayer at
+            // xrDestroyInstance instead.
             return OpenXrApi::xrDestroySession(session);
         }
 
