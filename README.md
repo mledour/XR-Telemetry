@@ -102,10 +102,11 @@ The `layer.cpp` in the template has commented examples for a typical
 └── README.md                                 # ← rewrite this for your layer
 ```
 
-## CPU Timings Analysis
+## Frame-timing analysis
 
 This layer's runtime job is to record one CSV row per frame, capturing
-**every segment** of the OpenXR frame cycle on CPU. The output lands at
+**every CPU + GPU segment** of the OpenXR frame cycle. The output lands
+at
 `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\sessions\YYYY-MM-DD_HH-MM-SSZ_<AppName>.csv`,
 one file per session, openable directly in Excel / Pandas / LibreOffice.
 
@@ -114,7 +115,8 @@ one file per session, openable directly in Excel / Pandas / LibreOffice.
 ```
 frame, timestamp_qpc,
 wait_block_ns, pre_begin_ns, app_cpu_ns, end_frame_ns, frame_total_ns,
-period_ns, headroom_pct, should_render
+gpu_time_ns,
+period_ns, headroom_pct, gpu_headroom_pct, should_render
 ```
 
 | Column | Definition | What it captures |
@@ -126,8 +128,10 @@ period_ns, headroom_pct, should_render
 | `app_cpu_ns` | `tEnd − tWaitOut` | **Wait→End window** = `pre_begin_ns` + render submission. The CPU time the app spent between `xrWaitFrame` returning and `xrEndFrame` being called. Render-thread heaviness. |
 | `end_frame_ns` | Duration of the downstream `xrEndFrame` call | **Runtime/compositor ingest overhead.** Time the runtime + any downstream layer spent inside `xrEndFrame` (layer composition, projection correction, compositor handoff). On mature runtimes (SteamVR / Oculus) typically a few hundred µs; on young runtimes (Pimax OpenXR 0.1.0) can reach 1-2 ms. |
 | `frame_total_ns` | `tEnd_now − tEnd_prev` | **Full cycle duration.** End-to-end wall clock of the previous frame. Includes the post-`xrEndFrame` work (game simulation, physics, AI, input polling) that `app_cpu_ns` cannot see because it happens AFTER the app returned from rendering and BEFORE the next `xrWaitFrame`. `0` on the first frame of a session. |
+| `gpu_time_ns` | D3D11 timestamp delta from `xrBeginFrame` to `xrEndFrame` | **App GPU work for this frame.** Measured with `D3D11_QUERY_TIMESTAMP` bracketed by a `D3D11_QUERY_TIMESTAMP_DISJOINT` for frequency validation. `0` when no D3D11 binding was seen at `xrCreateSession` (Vulkan / OpenGL / D3D12 apps), when the disjoint query reported `Disjoint == true` (driver invalidated the range), or when the GPU result wasn't yet ready at session end. |
 | `period_ns` | `XrFrameState.predictedDisplayPeriod` | Target frame budget reported by the runtime. ~11.11 ms @ 90 Hz, ~8.33 ms @ 120 Hz, ~13.89 ms @ 72 Hz. Constant for a given session. |
-| `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **% of the frame budget not spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound this frame. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame where `frame_total_ns = 0`. |
+| `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **CPU % of the frame budget not spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound this frame. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame where `frame_total_ns = 0`. |
+| `gpu_headroom_pct` | `(1 − gpu_time_ns / period_ns) × 100` | **GPU % of the frame budget not spent on app GPU work this cycle.** Negative ⇒ GPU-bound this frame. `0.00` when `gpu_time_ns == 0` (no D3D11 binding or result unavailable). |
 | `should_render` | `XrFrameState.shouldRender` as 0/1 | Whether the runtime asked the app to render this frame. `0` means a skipped frame (focus loss, scene transition); typically filter these out for steady-state analysis. |
 
 The file is closed with a trailing footer line (commented `#`-prefixed)
@@ -141,9 +145,13 @@ Pandas reads it transparently with `pd.read_csv(path, comment='#')`.
 
 ### Anatomy of a frame cycle
 
-Stitched chronologically, the timing columns cover 100% of the cycle:
+Stitched chronologically, the CPU columns cover 100% of the cycle.
+The GPU column runs in parallel (the GPU is processing the app's draws
+while the CPU is already moving on to the next frame's sim work):
 
 ```
+CPU timeline:
+
 xrEndFrame_prev ↓
                 ├──────── post_end ────────────┐
                                                ↓
@@ -157,6 +165,13 @@ xrEndFrame_prev ↓
                                                                   ├ end_frame ┤
                                                                               ↓
                 ←──────────────────── frame_total ────────────────────────────→
+
+
+GPU timeline (parallel, may overlap with the next CPU frame):
+
+                                              xrBeginFrame ↓
+                                                        ├──── gpu_time ───┤
+                                                                          ↓ xrEndFrame
 ```
 
 Derived segments (not stored, computed in analysis):
@@ -167,15 +182,42 @@ Derived segments (not stored, computed in analysis):
   *time spent OUTSIDE OpenXR calls — game simulation, physics, AI,
   event polling. The metric `app_cpu_ns` alone misses this entirely.*
 
+### Note on GPU result latency
+
+GPU timestamp queries are asynchronous: a query issued on the CPU at
+`xrBeginFrame_N` returns its result only after the GPU has actually
+processed that point of the command stream, which is typically 1-3
+frames later. The layer therefore **defers each CSV row by ~3-4 frames**
+so every row has `gpu_time_ns` aligned with its own `frame_index`.
+Practical implications:
+
+- The CSV always lags the live frame loop by a few frames. Invisible
+  in offline analysis; just be aware if you `tail -f` the file
+  during a session — the latest few frames haven't been written yet.
+- Frames that are pending when `xrDestroySession` fires (or when the
+  process exits) flush with `gpu_time_ns = 0` rather than vanishing.
+  In analysis, treat the last ~4 rows of a session as "GPU result
+  unavailable", or filter `gpu_time_ns > 0` before computing GPU
+  averages.
+- `gpu_time_ns` measures the **app's** GPU work between
+  `xrBeginFrame` and `xrEndFrame`. The compositor / reprojection /
+  warp work the runtime adds after the app submits the frame is NOT
+  captured — runtimes don't expose those timings to layers in any
+  portable way.
+
 ### What each timing diagnoses
 
 | Symptom | Where to look | Reading |
 |---|---|---|
 | Frame drops, app feels stuttery | `frame_total_ns` > `period_ns` × 1.5 | App is missing the deadline. Then drill down into which segment dominates. |
+| **CPU-bound vs GPU-bound** | Compare `headroom_pct` and `gpu_headroom_pct` averages | Whichever is **lower** is your bottleneck. If both are low and similar, you're balanced and would need to optimise both to gain headroom. If only CPU is low, simplify game logic / render submission. If only GPU is low, reduce shader complexity / resolution / pixel-shader-heavy effects. |
 | Render thread heavy | `render_submission_ns` (`= app_cpu_ns − pre_begin_ns`) close to `period_ns` | Too many draw calls / state changes / GPU-queue stalls in the submission path. Profile with PIX / RenderDoc. |
 | Game simulation heavy | `post_end_ns` (derived) dominates the cycle while `render_submission_ns` stays small | Physics, AI, scripting between frames is the bottleneck. Render thread is fine; the game logic thread is the problem. |
+| GPU-bound | `gpu_headroom_pct` consistently < 5%, `gpu_time_ns` ≈ `period_ns` | The GPU is saturated on app work — pixel shaders, post-processing, MSAA, resolution scaling. Drop one of those before touching CPU side. |
+| GPU idle but CPU busy | `gpu_headroom_pct` > 60% while `headroom_pct` < 20% | Classic "app cannot feed the GPU fast enough" — usually render-thread-bound. Look at `render_submission_ns`. |
 | Runtime overhead | `end_frame_ns` consistently > ~1 ms | The runtime / compositor itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) can move the needle. Young runtimes are typical culprits. |
 | Compositor underused | `wait_block_ns` close to `period_ns`, `frame_total_ns` ≈ `period_ns` | Healthy. The app finishes early, runtime throttles, equilibrium. The opposite (small `wait_block_ns`) means the app is keeping up only just. |
+| GPU not measured | `gpu_time_ns == 0` for every row, but the game uses Vulkan / OpenGL / D3D12 | Expected: V2.0 of the layer only instruments D3D11 (and only directly — D3D12-via-D3D11On12 is a V2.1 follow-up). The CPU columns remain accurate; just don't rely on GPU readings for these apps. |
 
 ### Relationship to other VR frame-analysis tools
 
@@ -206,7 +248,9 @@ per-frame to CSV instead of overlaying or aggregating.
   OXRT's column-by-column mapping: `appCpuTimeUs` ≈
   `frame_total_ns − wait_block_ns`, `renderCpuTimeUs` ≈
   `app_cpu_ns − pre_begin_ns`, `endFrameCpuTimeUs` ≈ `end_frame_ns`,
-  `waitCpuTimeUs` ≈ `wait_block_ns`.
+  `waitCpuTimeUs` ≈ `wait_block_ns`, `appGpuTimeUs` ≈ `gpu_time_ns`
+  (both measure the app's `xrBeginFrame → xrEndFrame` GPU window via
+  D3D11 timestamp queries).
 
 - [**fpsVR**](https://store.steampowered.com/app/908520/fpsVR/) — paid
   Steam overlay, SteamVR-only. Different storage strategy, same idea
@@ -237,11 +281,23 @@ After a 10-20 s session, opening the CSV should show:
   data integrity.
 - `headroom_pct` aligned with what fpsVR / OXRT overlay displayed at
   the same moment (rolling-mean of 90 rows).
+- For a D3D11 app, `gpu_time_ns > 0` for every row past the first ~4
+  frames (the warmup window the layer needs to drain its query ring).
+  For Vulkan / OpenGL / D3D12 apps, `gpu_time_ns == 0` for every row
+  — that's expected, the layer just doesn't instrument those graphics
+  APIs yet. CPU columns remain accurate.
+- `gpu_headroom_pct` aligned with what fpsVR / OXRT overlay reports as
+  "GPU headroom" (also rolling-mean 90 rows; sampling noise per frame
+  is larger on GPU than CPU because the GPU schedules work in larger
+  chunks).
 
 A CSV with `wait_block_ns ≈ 0` and `headroom_pct < 50%` for sustained
 stretches is a hot scene worth investigating; if `post_end_ns` is the
 dominant segment there, your game logic thread is what needs profiling
-— not the renderer.
+— not the renderer. If both `headroom_pct` and `gpu_headroom_pct` are
+< 20% on the same frames, the workload is balanced at the limit and
+you need to cut on both sides; if only one is low, that's where to
+focus.
 
 ## CI / signing setup
 
