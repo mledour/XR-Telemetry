@@ -387,7 +387,7 @@ namespace openxr_api_layer {
         }
 
         // -------------------------------------------------------------------
-        // GpuTimer — D3D11 GPU-side timing for app frames.
+        // GPU-side timing for app frames.
         //
         // GPU timestamps are inherently asynchronous: a timestamp issued in
         // the command stream at xrBeginFrame_N's exit reflects the GPU's
@@ -396,64 +396,83 @@ namespace openxr_api_layer {
         // CPU thread can only READ a frame's GPU timings once the GPU is
         // done with that frame.
         //
-        // We use a small ring of "query trios" (one D3D11_QUERY_TIMESTAMP_-
-        // DISJOINT bracketing two D3D11_QUERY_TIMESTAMPs) to keep multiple
-        // frames in flight on the GPU while we wait for results to land.
-        // endFrameAndResolveOldest() is called from xrEndFrame:
+        // We support two paths, picked at xrCreateSession based on which
+        // graphics binding the app provided:
         //
-        //   1. Issue end-timestamp for the in-flight entry → entry full
-        //   2. Advance the ring head
-        //   3. Drain every slot whose GPU work has completed since the
-        //      last poll, returning the MOST RECENTLY resolved result
-        //      (older slots are still drained and their slot state is
-        //      reset, but only the last one is returned — see the comment
-        //      above the drain loop). On a clean steady state this means
-        //      we return the slot that's exactly kRingSize-1 frames
-        //      behind the producer; during a stutter several slots may
-        //      resolve at once and only the latest is reported.
+        //   D3D11GpuTimer — issues D3D11 timestamp queries (a disjoint pair
+        //                   bracketing two D3D11_QUERY_TIMESTAMPs) on the
+        //                   app's immediate context.
         //
-        // The caller (OpenXrLayer::xrEndFrame) is responsible for matching
-        // the resolved frame_index back to the FrameRecord queued at that
-        // frame's xrEndFrame_N — see the m_pendingFrames deque on
-        // OpenXrLayer below.
+        //   D3D12GpuTimer — records D3D12_QUERY_TYPE_TIMESTAMP queries on
+        //                   our own short command lists, submitted to the
+        //                   app's command queue alongside the app's draws.
+        //                   No D3D11On12 wrapper — we go straight to D3D12
+        //                   so there's no translation layer between us and
+        //                   the queue, and no risk of the wrapper inserting
+        //                   barriers in our measured range. Matches the
+        //                   pattern used by OpenXR Toolkit / fpsVR.
         //
-        // If init() couldn't get a D3D11 device (Vulkan / OpenGL / null
-        // binding / D3D12 not yet supported via D3D11On12), isActive()
-        // stays false and beginFrame/queueAndResolve become no-ops that
-        // return 0 — gpu_time_ns just reads as 0 in the CSV.
+        // Both expose the same IGpuTimer interface so OpenXrLayer holds a
+        // single unique_ptr<IGpuTimer> and routes Begin/End/Resolve
+        // through it without caring about the underlying API.
+        //
+        // Each timer uses a small ring of slots (kRingSize) to keep
+        // multiple frames in flight. endFrameAndResolveOldest():
+        //
+        //   1. Closes the in-flight slot opened by beginFrame()
+        //   2. Advances the ring head
+        //   3. Drains every slot whose GPU work has completed since the
+        //      last poll, returning the MOST RECENTLY resolved result.
+        //      Older slots are still drained and their state reset, but
+        //      only the latest is returned — brief stutters produce a few
+        //      CSV rows with gpu_time_ns=0 instead of being held back
+        //      further.
+        //
+        // The caller (OpenXrLayer::xrEndFrame) matches the resolved
+        // frame_index back to the FrameRecord queued at that frame's
+        // xrEndFrame_N — see the m_pendingFrames deque on OpenXrLayer.
+        //
+        // If no compatible graphics binding is found (Vulkan / OpenGL /
+        // null), m_gpuTimer stays null and beginFrame/queueAndResolve are
+        // simply not called — gpu_time_ns reads as 0 in the CSV.
         struct GpuFrameResult {
             uint64_t frame_index;
             int64_t gpu_time_ns;
         };
 
-        class GpuTimer {
+        // Common shape both backends implement so OpenXrLayer doesn't need
+        // to branch on the graphics API at the frame-loop call sites.
+        class IGpuTimer {
           public:
-            ~GpuTimer() {
+            virtual ~IGpuTimer() = default;
+            virtual void beginFrame(uint64_t frame_index) = 0;
+            virtual std::optional<GpuFrameResult> endFrameAndResolveOldest() = 0;
+        };
+
+        // Shared ring constants. kRingSize=4 → ~44 ms in flight at 90 Hz,
+        // comfortably above any realistic GPU→CPU latency. Keep small to
+        // limit pending CSV records the layer holds back at session end.
+        constexpr size_t kGpuRingSize = 4;
+        enum class GpuSlotState { Idle, Started, Pending };
+
+        // ---- D3D11 path -----------------------------------------------------
+
+        class D3D11GpuTimer : public IGpuTimer {
+          public:
+            ~D3D11GpuTimer() override {
                 shutdown();
             }
 
-            // device comes from XrGraphicsBindingD3D11KHR (in the app's
-            // xrCreateSession.next chain — that struct only carries
-            // ID3D11Device*, not the context). We pull the immediate
-            // context from it via GetImmediateContext: it's the same
-            // single-threaded context the app submits draws on, which is
-            // what we want — D3D11 timestamp queries must be issued from
-            // the same context that records the surrounding draws.
-            //
-            // Both device and context are AddRef'd by the ComPtr
-            // assignments so the GPU can finish its frames even if the
-            // app would otherwise release them right at xrDestroySession;
-            // we release on shutdown().
+            // device comes from XrGraphicsBindingD3D11KHR. We pull the
+            // immediate context from it via GetImmediateContext — same
+            // single-threaded context the app submits draws on, so D3D11
+            // timestamp queries land in command-stream order vs the draws
+            // without any explicit Flush.
             bool init(ID3D11Device* device) {
                 if (!device) return false;
                 if (m_active) {
-                    // Idempotent like CsvWriter — but catch the spec
-                    // violation "second xrCreateSession with a *different*
-                    // ID3D11Device while the first session is still alive"
-                    // in debug builds. Production-safe: we keep the
-                    // first device and ignore the second silently.
                     assert(device == m_device.Get() &&
-                           "GpuTimer::init called twice with different devices — "
+                           "D3D11GpuTimer::init called twice with different devices — "
                            "is the app calling xrCreateSession without "
                            "xrDestroySession in between?");
                     return true;
@@ -472,8 +491,6 @@ namespace openxr_api_layer {
                     if (FAILED(m_device->CreateQuery(&disjointDesc, slot.disjoint.GetAddressOf())) ||
                         FAILED(m_device->CreateQuery(&tsDesc, slot.start.GetAddressOf())) ||
                         FAILED(m_device->CreateQuery(&tsDesc, slot.end.GetAddressOf()))) {
-                        // Some driver / debug-layer combination refused the
-                        // query — degrade to "no GPU timing".
                         for (auto& s : m_ring) {
                             s.disjoint.Reset();
                             s.start.Reset();
@@ -481,7 +498,7 @@ namespace openxr_api_layer {
                         }
                         return false;
                     }
-                    slot.state = SlotState::Idle;
+                    slot.state = GpuSlotState::Idle;
                 }
                 m_writeIdx = 0;
                 m_readIdx = 0;
@@ -489,92 +506,51 @@ namespace openxr_api_layer {
                 return true;
             }
 
-            void shutdown() {
-                if (!m_active) return;
-                for (auto& slot : m_ring) {
-                    slot.disjoint.Reset();
-                    slot.start.Reset();
-                    slot.end.Reset();
-                    slot.state = SlotState::Idle;
-                    slot.frame_index = 0;
-                }
-                m_context.Reset();
-                m_device.Reset();
-                m_active = false;
-            }
-
-            // Called from xrBeginFrame. Picks the next ring slot, issues
-            // Begin(disjoint) and End(start). If the slot we want to use
-            // is still in flight (the ring is full), we silently overwrite
-            // it — the corresponding pending FrameRecord will get
-            // gpu_time_ns = 0 because the resolve below won't see it.
-            // Realistic with kRingSize=4: full ring only happens if the GPU
-            // is >4 frames behind, in which case the app is dropping frames
-            // anyway and a missing gpu_time on those frames is the least of
-            // their problems.
-            void beginFrame(uint64_t frame_index) {
+            void beginFrame(uint64_t frame_index) override {
                 if (!m_active) return;
                 auto& slot = m_ring[m_writeIdx];
                 m_context->Begin(slot.disjoint.Get());
                 m_context->End(slot.start.Get());
                 slot.frame_index = frame_index;
-                slot.state = SlotState::Started;
+                slot.state = GpuSlotState::Started;
             }
 
-            // Called from xrEndFrame, AFTER OpenXrApi::xrEndFrame returned.
-            // Closes the in-flight slot's end-timestamp + disjoint, advances
-            // the write head, then walks readIdx forward popping every slot
-            // whose GPU work has finished. Returns the most-recently-resolved
-            // result (or nullopt if no slot is ready this call).
-            //
-            // Multiple slots may resolve in one call after a stutter; we
-            // currently return only the latest, which means brief stutters
-            // produce a few CSV rows with gpu_time_ns=0 instead of holding
-            // them back further. Good enough for V1; if it matters we'll
-            // return std::vector<GpuFrameResult> later.
-            std::optional<GpuFrameResult> endFrameAndResolveOldest() {
+            std::optional<GpuFrameResult> endFrameAndResolveOldest() override {
                 if (!m_active) return std::nullopt;
 
-                // Close the trio that beginFrame() opened. If the slot
-                // is NOT Started (xrEndFrame fired without a matching
+                // Close the trio that beginFrame() opened. If the slot is
+                // NOT Started (xrEndFrame fired without a matching
                 // xrBeginFrame this cycle — spec violation, but we
                 // tolerate it), we skip the End() calls but still advance
-                // m_writeIdx. This keeps the ring's "one slot per
-                // xrEndFrame call" cadence — the next xrBeginFrame will
-                // open the next slot, not overwrite this dangling one.
-                // The "self-healing" mode is asymmetric: after kRingSize
-                // dangling cycles in a row, every slot is Idle again and
-                // the next valid frame starts a fresh ring.
+                // m_writeIdx. Self-healing: after kGpuRingSize dangling
+                // cycles every slot is Idle again.
                 auto& closing = m_ring[m_writeIdx];
-                if (closing.state == SlotState::Started) {
+                if (closing.state == GpuSlotState::Started) {
                     m_context->End(closing.end.Get());
                     m_context->End(closing.disjoint.Get());
-                    closing.state = SlotState::Pending;
+                    closing.state = GpuSlotState::Pending;
                 }
-                m_writeIdx = (m_writeIdx + 1) % kRingSize;
+                m_writeIdx = (m_writeIdx + 1) % kGpuRingSize;
 
-                // Drain everything that's ready, keep the LAST result.
                 std::optional<GpuFrameResult> latest;
                 while (true) {
                     auto& slot = m_ring[m_readIdx];
-                    if (slot.state != SlotState::Pending) break;
+                    if (slot.state != GpuSlotState::Pending) break;
 
                     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
                     const HRESULT hr = m_context->GetData(slot.disjoint.Get(),
                                                           &disjointData,
                                                           sizeof(disjointData),
                                                           D3D11_ASYNC_GETDATA_DONOTFLUSH);
-                    if (hr != S_OK) break;  // not ready yet, stop draining
+                    if (hr != S_OK) break;
 
                     UINT64 tStart = 0, tEnd = 0;
                     if (m_context->GetData(slot.start.Get(), &tStart, sizeof(tStart),
                                            D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
                         m_context->GetData(slot.end.Get(), &tEnd, sizeof(tEnd),
                                            D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
-                        // Disjoint resolved but timestamps didn't — should
-                        // not happen, but reset the slot and move on.
-                        slot.state = SlotState::Idle;
-                        m_readIdx = (m_readIdx + 1) % kRingSize;
+                        slot.state = GpuSlotState::Idle;
+                        m_readIdx = (m_readIdx + 1) % kGpuRingSize;
                         continue;
                     }
 
@@ -584,34 +560,332 @@ namespace openxr_api_layer {
                                                               disjointData.Frequency);
                     }
                     latest = GpuFrameResult{slot.frame_index, gpuNs};
-                    slot.state = SlotState::Idle;
-                    m_readIdx = (m_readIdx + 1) % kRingSize;
+                    slot.state = GpuSlotState::Idle;
+                    m_readIdx = (m_readIdx + 1) % kGpuRingSize;
                 }
                 return latest;
             }
 
-            bool isActive() const { return m_active; }
-
           private:
-            // Latency budget: at 90 Hz, 4 frames = ~44 ms — comfortably
-            // above any realistic GPU→CPU result latency. Keep small to
-            // limit pending CSV records the layer holds back at session
-            // end.
-            static constexpr size_t kRingSize = 4;
-
-            enum class SlotState { Idle, Started, Pending };
+            void shutdown() {
+                if (!m_active) return;
+                for (auto& slot : m_ring) {
+                    slot.disjoint.Reset();
+                    slot.start.Reset();
+                    slot.end.Reset();
+                    slot.state = GpuSlotState::Idle;
+                    slot.frame_index = 0;
+                }
+                m_context.Reset();
+                m_device.Reset();
+                m_active = false;
+            }
 
             struct Slot {
                 ComPtr<ID3D11Query> disjoint;
                 ComPtr<ID3D11Query> start;
                 ComPtr<ID3D11Query> end;
                 uint64_t frame_index = 0;
-                SlotState state = SlotState::Idle;
+                GpuSlotState state = GpuSlotState::Idle;
             };
 
             ComPtr<ID3D11Device> m_device;
             ComPtr<ID3D11DeviceContext> m_context;
-            std::array<Slot, kRingSize> m_ring;
+            std::array<Slot, kGpuRingSize> m_ring;
+            size_t m_writeIdx = 0;
+            size_t m_readIdx = 0;
+            bool m_active = false;
+        };
+
+        // ---- D3D12 path -----------------------------------------------------
+
+        // D3D12 native timing. Records two D3D12_QUERY_TYPE_TIMESTAMP queries
+        // per frame on our own command lists, submitted to the app's command
+        // queue. ResolveQueryData copies the timestamps into a readback
+        // buffer; we Map() that buffer when the per-slot fence has signaled
+        // past the relevant ExecuteCommandLists.
+        //
+        // Why two separate command lists per slot (one for the start
+        // timestamp, one for the end + resolve) rather than a single one?
+        // Because the app submits its draws DIRECTLY to the queue between
+        // our two timestamps — we have to submit the start half BEFORE the
+        // app's draws (at xrBeginFrame) and the end half AFTER (at
+        // xrEndFrame). One ExecuteCommandLists each, so 2 extra submissions
+        // per frame on the app's queue. Same cost class as the explicit
+        // Flushes a D3D11On12 wrapper would force; no translation layer.
+        //
+        // D3D12 has no disjoint query. We get the GPU clock frequency once
+        // at init via ID3D12CommandQueue::GetTimestampFrequency() and trust
+        // it for the session — same convention as OpenXR Toolkit /
+        // xrframetools.
+        class D3D12GpuTimer : public IGpuTimer {
+          public:
+            ~D3D12GpuTimer() override {
+                shutdown();
+            }
+
+            bool init(ID3D12Device* device, ID3D12CommandQueue* queue) {
+                if (!device || !queue) return false;
+                if (m_active) {
+                    assert(device == m_device.Get() && queue == m_queue.Get() &&
+                           "D3D12GpuTimer::init called twice with different "
+                           "(device, queue) — xrCreateSession without "
+                           "xrDestroySession in between?");
+                    return true;
+                }
+                m_device = device;
+                m_queue = queue;
+                m_frequency = 0;
+                if (FAILED(m_queue->GetTimestampFrequency(&m_frequency)) || m_frequency == 0) {
+                    // The queue type doesn't support timestamps (copy
+                    // queues historically didn't on some HW). Degrade.
+                    m_queue.Reset();
+                    m_device.Reset();
+                    return false;
+                }
+
+                // Query heap: 2 timestamp slots per ring entry (start, end).
+                D3D12_QUERY_HEAP_DESC qhDesc{};
+                qhDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+                qhDesc.Count = static_cast<UINT>(kGpuRingSize * 2);
+                if (FAILED(m_device->CreateQueryHeap(&qhDesc, IID_PPV_ARGS(m_queryHeap.GetAddressOf())))) {
+                    m_queue.Reset();
+                    m_device.Reset();
+                    return false;
+                }
+
+                // Readback buffer: UINT64 × 2 per slot.
+                D3D12_HEAP_PROPERTIES heapProps{};
+                heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bufDesc{};
+                bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bufDesc.Width = sizeof(UINT64) * 2 * kGpuRingSize;
+                bufDesc.Height = 1;
+                bufDesc.DepthOrArraySize = 1;
+                bufDesc.MipLevels = 1;
+                bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+                bufDesc.SampleDesc.Count = 1;
+                bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(m_device->CreateCommittedResource(
+                        &heapProps, D3D12_HEAP_FLAG_NONE,
+                        &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(m_readback.GetAddressOf())))) {
+                    shutdownInternal();
+                    return false;
+                }
+
+                // Per-slot (allocator, command list) pairs — one for the
+                // begin submission, one for the end+resolve submission.
+                // Created closed so the first Reset() in beginFrame /
+                // endFrame works.
+                for (auto& slot : m_ring) {
+                    for (auto* pair : { &slot.beginPair, &slot.endPair }) {
+                        if (FAILED(m_device->CreateCommandAllocator(
+                                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                IID_PPV_ARGS(pair->allocator.GetAddressOf()))) ||
+                            FAILED(m_device->CreateCommandList(
+                                0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                pair->allocator.Get(), nullptr,
+                                IID_PPV_ARGS(pair->cmdList.GetAddressOf())))) {
+                            shutdownInternal();
+                            return false;
+                        }
+                        pair->cmdList->Close();
+                    }
+                    slot.state = GpuSlotState::Idle;
+                }
+
+                if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                                 IID_PPV_ARGS(m_fence.GetAddressOf())))) {
+                    shutdownInternal();
+                    return false;
+                }
+                m_fenceValue = 0;
+                m_writeIdx = 0;
+                m_readIdx = 0;
+                m_active = true;
+                return true;
+            }
+
+            void beginFrame(uint64_t frame_index) override {
+                if (!m_active) return;
+                auto& slot = m_ring[m_writeIdx];
+                auto& pair = slot.beginPair;
+
+                // Allocator reset requires the previous submission using
+                // it to have completed on the GPU. In steady state at
+                // kGpuRingSize frames behind this is always true, but be
+                // explicit — the D3D12 debug layer flags violations
+                // viciously and a single missed reset corrupts later
+                // recordings.
+                if (slot.fenceValueAtBegin > 0 &&
+                    !waitForFenceBounded(slot.fenceValueAtBegin, /*timeoutMs=*/100)) {
+                    // GPU is >100 ms behind on this slot — drop the begin
+                    // for this frame, the slot stays whatever it was. The
+                    // matching end will see state != Started and skip too.
+                    return;
+                }
+
+                if (FAILED(pair.allocator->Reset()) ||
+                    FAILED(pair.cmdList->Reset(pair.allocator.Get(), nullptr))) {
+                    return;
+                }
+                const UINT startIdx = static_cast<UINT>(m_writeIdx * 2);
+                pair.cmdList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, startIdx);
+                if (FAILED(pair.cmdList->Close())) {
+                    return;
+                }
+                ID3D12CommandList* lists[] = { pair.cmdList.Get() };
+                m_queue->ExecuteCommandLists(1, lists);
+                slot.fenceValueAtBegin = ++m_fenceValue;
+                m_queue->Signal(m_fence.Get(), slot.fenceValueAtBegin);
+
+                slot.frame_index = frame_index;
+                slot.state = GpuSlotState::Started;
+            }
+
+            std::optional<GpuFrameResult> endFrameAndResolveOldest() override {
+                if (!m_active) return std::nullopt;
+
+                auto& closing = m_ring[m_writeIdx];
+                if (closing.state == GpuSlotState::Started) {
+                    auto& pair = closing.endPair;
+                    if (closing.fenceValueAtEnd > 0 &&
+                        !waitForFenceBounded(closing.fenceValueAtEnd, /*timeoutMs=*/100)) {
+                        // Same degrade as beginFrame: skip the close, the
+                        // slot becomes orphan — its data will never be
+                        // resolved but the ring keeps cycling.
+                        closing.state = GpuSlotState::Idle;
+                    } else if (SUCCEEDED(pair.allocator->Reset()) &&
+                               SUCCEEDED(pair.cmdList->Reset(pair.allocator.Get(), nullptr))) {
+                        const UINT startIdx = static_cast<UINT>(m_writeIdx * 2);
+                        const UINT endIdx = startIdx + 1;
+                        pair.cmdList->EndQuery(m_queryHeap.Get(),
+                                               D3D12_QUERY_TYPE_TIMESTAMP, endIdx);
+                        // Copy this slot's two timestamps from the query
+                        // heap into the readback buffer at our per-slot
+                        // offset. ResolveQueryData is a GPU operation —
+                        // we Map() the buffer once the fence below
+                        // signals.
+                        pair.cmdList->ResolveQueryData(
+                            m_queryHeap.Get(),
+                            D3D12_QUERY_TYPE_TIMESTAMP,
+                            startIdx, /*NumQueries=*/2,
+                            m_readback.Get(),
+                            /*AlignedDestinationBufferOffset=*/sizeof(UINT64) * startIdx);
+                        if (SUCCEEDED(pair.cmdList->Close())) {
+                            ID3D12CommandList* lists[] = { pair.cmdList.Get() };
+                            m_queue->ExecuteCommandLists(1, lists);
+                            closing.fenceValueAtEnd = ++m_fenceValue;
+                            m_queue->Signal(m_fence.Get(), closing.fenceValueAtEnd);
+                            closing.state = GpuSlotState::Pending;
+                        } else {
+                            closing.state = GpuSlotState::Idle;
+                        }
+                    } else {
+                        closing.state = GpuSlotState::Idle;
+                    }
+                }
+                m_writeIdx = (m_writeIdx + 1) % kGpuRingSize;
+
+                std::optional<GpuFrameResult> latest;
+                while (true) {
+                    auto& slot = m_ring[m_readIdx];
+                    if (slot.state != GpuSlotState::Pending) break;
+                    if (m_fence->GetCompletedValue() < slot.fenceValueAtEnd) break;
+
+                    // Read the two timestamps from the readback buffer.
+                    // D3D12_RANGE narrows the Map to only the bytes we
+                    // actually need.
+                    const SIZE_T begin = sizeof(UINT64) * m_readIdx * 2;
+                    const D3D12_RANGE readRange{begin, begin + sizeof(UINT64) * 2};
+                    void* mapped = nullptr;
+                    UINT64 tStart = 0, tEnd = 0;
+                    if (SUCCEEDED(m_readback->Map(0, &readRange, &mapped)) && mapped) {
+                        const auto* ts = reinterpret_cast<const UINT64*>(
+                            reinterpret_cast<const std::byte*>(mapped) + begin);
+                        tStart = ts[0];
+                        tEnd = ts[1];
+                        const D3D12_RANGE noWrite{0, 0};
+                        m_readback->Unmap(0, &noWrite);
+                    }
+
+                    int64_t gpuNs = 0;
+                    if (m_frequency > 0 && tEnd > tStart) {
+                        gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart, m_frequency);
+                    }
+                    latest = GpuFrameResult{slot.frame_index, gpuNs};
+                    slot.state = GpuSlotState::Idle;
+                    m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                }
+                return latest;
+            }
+
+          private:
+            void shutdown() {
+                // Drain any in-flight GPU work before releasing query heap
+                // and command objects — D3D12 spec is strict that
+                // resources referenced by submitted command lists must
+                // outlive their execution.
+                if (m_active && m_fence && m_queue) {
+                    const UINT64 v = ++m_fenceValue;
+                    m_queue->Signal(m_fence.Get(), v);
+                    waitForFenceBounded(v, /*timeoutMs=*/1000);
+                }
+                shutdownInternal();
+            }
+
+            void shutdownInternal() {
+                for (auto& slot : m_ring) {
+                    slot.beginPair.allocator.Reset();
+                    slot.beginPair.cmdList.Reset();
+                    slot.endPair.allocator.Reset();
+                    slot.endPair.cmdList.Reset();
+                    slot.state = GpuSlotState::Idle;
+                    slot.frame_index = 0;
+                    slot.fenceValueAtBegin = 0;
+                    slot.fenceValueAtEnd = 0;
+                }
+                m_readback.Reset();
+                m_queryHeap.Reset();
+                m_fence.Reset();
+                m_queue.Reset();
+                m_device.Reset();
+                m_active = false;
+            }
+
+            // Returns true if the fence reached `value` within timeoutMs,
+            // false on timeout. Used both to ensure allocator reuse is
+            // safe and to wait for resolve readback to be ready.
+            bool waitForFenceBounded(UINT64 value, DWORD timeoutMs) {
+                if (m_fence->GetCompletedValue() >= value) return true;
+                wil::unique_event_nothrow ev;
+                if (FAILED(ev.create())) return false;
+                if (FAILED(m_fence->SetEventOnCompletion(value, ev.get()))) return false;
+                return WaitForSingleObject(ev.get(), timeoutMs) == WAIT_OBJECT_0;
+            }
+
+            struct AllocatorListPair {
+                ComPtr<ID3D12CommandAllocator> allocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+            };
+            struct Slot {
+                AllocatorListPair beginPair;
+                AllocatorListPair endPair;
+                UINT64 fenceValueAtBegin = 0;
+                UINT64 fenceValueAtEnd = 0;
+                uint64_t frame_index = 0;
+                GpuSlotState state = GpuSlotState::Idle;
+            };
+
+            ComPtr<ID3D12Device> m_device;
+            ComPtr<ID3D12CommandQueue> m_queue;
+            ComPtr<ID3D12QueryHeap> m_queryHeap;
+            ComPtr<ID3D12Resource> m_readback;
+            ComPtr<ID3D12Fence> m_fence;
+            UINT64 m_fenceValue = 0;
+            UINT64 m_frequency = 0;
+            std::array<Slot, kGpuRingSize> m_ring;
             size_t m_writeIdx = 0;
             size_t m_readIdx = 0;
             bool m_active = false;
@@ -619,13 +893,29 @@ namespace openxr_api_layer {
 
         // Walks the XrBaseInStructure-style `next` chain looking for the
         // first XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses
-        // a different graphics API (Vulkan, OpenGL, or D3D12 — the latter
-        // is reachable via D3D11On12 in a follow-up commit).
+        // a different graphics API (Vulkan, OpenGL, D3D12).
         const XrGraphicsBindingD3D11KHR* findD3D11Binding(const void* nextChain) {
             const auto* base = reinterpret_cast<const XrBaseInStructure*>(nextChain);
             while (base) {
                 if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
                     return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(base);
+                }
+                base = base->next;
+            }
+            return nullptr;
+        }
+
+        // Same walk for XrGraphicsBindingD3D12KHR. The struct carries an
+        // ID3D12Device* AND an ID3D12CommandQueue* (unlike the D3D11
+        // binding which is just the device) because D3D12 has no
+        // immediate context — the app submits commands to a queue it
+        // owns. We need that queue handle so D3D12GpuTimer can
+        // ExecuteCommandLists onto the same stream the app draws on.
+        const XrGraphicsBindingD3D12KHR* findD3D12Binding(const void* nextChain) {
+            const auto* base = reinterpret_cast<const XrBaseInStructure*>(nextChain);
+            while (base) {
+                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+                    return reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(base);
                 }
                 base = base->next;
             }
@@ -662,7 +952,7 @@ namespace openxr_api_layer {
             // FrameRecord still waiting on a GPU result so they end up in
             // the CSV with gpu_time_ns=0 rather than disappearing.
             flushPendingFramesUnresolved();
-            m_gpuTimer.shutdown();
+            m_gpuTimer.reset();
 
             const uint64_t written = m_csv.written();
             m_csv.stop();
@@ -759,16 +1049,19 @@ namespace openxr_api_layer {
         }
 
         // ---- xrCreateSession ----------------------------------------------
-        // Inspects createInfo->next for an XrGraphicsBindingD3D11KHR. If
-        // present, stands up the D3D11 query ring used by xrBeginFrame /
-        // xrEndFrame to measure app GPU time per frame. We never mutate
-        // createInfo and we never fail the host's xrCreateSession over GPU-
-        // timer init issues (CLAUDE.md rule 9: degrade gracefully). If the
-        // app uses Vulkan, OpenGL, D3D12, or no binding at all, the timer
-        // stays inactive and gpu_time_ns reads as 0 in the CSV.
+        // Inspects createInfo->next for a graphics binding we support and
+        // stands up the matching GPU timer:
         //
-        // TODO V2.1: handle XrGraphicsBindingD3D12KHR via the D3D11On12
-        // bridge already wired into pch.h.
+        //   D3D11 → D3D11GpuTimer (D3D11 timestamp queries on the app's
+        //           immediate context)
+        //   D3D12 → D3D12GpuTimer (native D3D12_QUERY_TYPE_TIMESTAMP on the
+        //           app's command queue; no D3D11On12 bridge)
+        //   any other (Vulkan / OpenGL / null) → no timer, gpu_time_ns
+        //           reads as 0 in the CSV.
+        //
+        // We never mutate createInfo and we never fail the host's
+        // xrCreateSession over GPU-timer init issues (CLAUDE.md rule 9:
+        // degrade gracefully).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
         XrResult xrCreateSession(XrInstance instance,
                                  const XrSessionCreateInfo* createInfo,
@@ -778,32 +1071,43 @@ namespace openxr_api_layer {
                 return result;
             }
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
-                if (m_gpuTimer.init(d3d11->device)) {
+                auto timer = std::make_unique<D3D11GpuTimer>();
+                if (timer->init(d3d11->device)) {
+                    m_gpuTimer = std::move(timer);
                     Log("xr_telemetry: D3D11 GPU timer active\n");
                 } else {
                     Log("xr_telemetry: D3D11 binding found but query creation failed; "
                         "gpu_time_ns will be 0 for this session\n");
                 }
+            } else if (const auto* d3d12 = findD3D12Binding(createInfo->next)) {
+                auto timer = std::make_unique<D3D12GpuTimer>();
+                if (timer->init(d3d12->device, d3d12->queue)) {
+                    m_gpuTimer = std::move(timer);
+                    Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
+                } else {
+                    Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
+                        "creation failed; gpu_time_ns will be 0 for this session\n");
+                }
             } else {
-                Log("xr_telemetry: no D3D11 binding in xrCreateSession.next (Vulkan / "
-                    "OpenGL / D3D12 / null); gpu_time_ns will be 0 for this session\n");
+                Log("xr_telemetry: no D3D11 or D3D12 binding in xrCreateSession.next "
+                    "(Vulkan / OpenGL / null); gpu_time_ns will be 0 for this session\n");
             }
             return result;
         }
 
         // ---- xrDestroySession ---------------------------------------------
-        // Tears down the D3D11 query objects so we don't leak. The framework
-        // does NOT auto-handle xrDestroySession (the comment about that is
-        // wrong; dispatch_generator.py only auto-handles xrCreateInstance,
-        // xrDestroyInstance, xrGetInstanceProcAddr, and
-        // xrEnumerateInstanceExtensionProperties). We have to override it
-        // ourselves, like fov_crop does.
+        // Tears down the GPU timer so we don't leak query heaps / command
+        // lists / D3D objects. The framework does NOT auto-handle
+        // xrDestroySession (only xrCreateInstance, xrDestroyInstance,
+        // xrGetInstanceProcAddr, and xrEnumerateInstanceExtensionProperties
+        // are routed automatically by dispatch_generator.py). We have to
+        // override it ourselves, like fov_crop does.
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrDestroySession
         XrResult xrDestroySession(XrSession session) override {
             // Flush any FrameRecords still waiting on a GPU result before
             // we release the queries. They'll be written with gpu_time_ns=0.
             flushPendingFramesUnresolved();
-            m_gpuTimer.shutdown();
+            m_gpuTimer.reset();
             return OpenXrApi::xrDestroySession(session);
         }
 
@@ -855,10 +1159,10 @@ namespace openxr_api_layer {
                 // xrWaitFrame. The OpenXR spec forbids the wait-less
                 // pattern anyway, but a hostile or buggy app would
                 // otherwise silently shift gpu_time_ns by one frame.
-                if (m_tWaitOut.load(std::memory_order_relaxed) > 0) {
+                if (m_gpuTimer && m_tWaitOut.load(std::memory_order_relaxed) > 0) {
                     // peek m_frameIndex without incrementing — xrEndFrame
                     // does the fetch_add and uses the SAME value.
-                    m_gpuTimer.beginFrame(m_frameIndex.load(std::memory_order_relaxed));
+                    m_gpuTimer->beginFrame(m_frameIndex.load(std::memory_order_relaxed));
                 }
             }
             return result;
@@ -908,7 +1212,8 @@ namespace openxr_api_layer {
             // appGpuTimer.stop() position. The runtime's xrEndFrame
             // commands queue AFTER ours and are excluded from the
             // measurement.
-            const auto resolved = m_gpuTimer.endFrameAndResolveOldest();
+            const auto resolved =
+                m_gpuTimer ? m_gpuTimer->endFrameAndResolveOldest() : std::nullopt;
 
             const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
             // end_frame_ns isolates the runtime + downstream layers' work
@@ -1012,13 +1317,13 @@ namespace openxr_api_layer {
             // above (see the long comment up top). `resolved` is the
             // GpuFrameResult for whichever older frame's GPU work has
             // since finished — or std::nullopt if nothing is ready yet,
-            // or the GpuTimer is inactive (no D3D11).
+            // or m_gpuTimer is null (no supported binding).
             //
             // Queue this frame's record and (if active) wait for GPU.
             // Pending deque grows by 1 each frame, shrinks by 1 each time
-            // a result resolves. In steady state it stabilises at ~kRingSize
-            // entries.
-            if (m_gpuTimer.isActive()) {
+            // a result resolves. In steady state it stabilises at
+            // ~kGpuRingSize entries.
+            if (m_gpuTimer) {
                 m_pendingFrames.push_back(rec);
 
                 if (resolved.has_value()) {
@@ -1117,13 +1422,19 @@ namespace openxr_api_layer {
         CsvWriter m_csv;
         std::filesystem::path m_csvPath;
 
-        // GPU timing — single-threaded access from the frame-loop thread.
-        // No atomics: every call into beginFrame / endFrameAndResolveOldest
-        // is from xrBeginFrame / xrEndFrame, which the OpenXR spec
-        // serialises within a session. The pending deque holds FrameRecords
-        // waiting on a GPU result to land — typically kRingSize entries in
-        // steady state, drains when xrDestroySession is called.
-        GpuTimer m_gpuTimer;
+        // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
+        // D3D12) is picked at xrCreateSession based on the binding. Null
+        // when the app uses Vulkan / OpenGL / no binding, in which case
+        // m_pendingFrames stays empty and FrameRecords are pushed to the
+        // CsvWriter immediately with gpu_time_ns = 0.
+        //
+        // Single-threaded access from the frame-loop thread: every call
+        // into beginFrame / endFrameAndResolveOldest is from xrBeginFrame /
+        // xrEndFrame, which the OpenXR spec serialises within a session.
+        // The pending deque holds FrameRecords waiting on a GPU result to
+        // land — typically kGpuRingSize entries in steady state, drains
+        // when xrDestroySession is called.
+        std::unique_ptr<IGpuTimer> m_gpuTimer;
         std::deque<FrameRecord> m_pendingFrames;
     };
 

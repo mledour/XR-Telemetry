@@ -128,7 +128,7 @@ period_ns, headroom_pct, gpu_headroom_pct, should_render
 | `app_cpu_ns` | `tEnd − tWaitOut` | **Wait→End window** = `pre_begin_ns` + render submission. The CPU time the app spent between `xrWaitFrame` returning and `xrEndFrame` being called. Render-thread heaviness. |
 | `end_frame_ns` | Duration of the downstream `xrEndFrame` call | **Runtime/compositor ingest overhead.** Time the runtime + any downstream layer spent inside `xrEndFrame` (layer composition, projection correction, compositor handoff). On mature runtimes (SteamVR / Oculus) typically a few hundred µs; on young runtimes (Pimax OpenXR 0.1.0) can reach 1-2 ms. |
 | `frame_total_ns` | `tEnd_now − tEnd_prev` | **Full cycle duration.** End-to-end wall clock of the previous frame. Includes the post-`xrEndFrame` work (game simulation, physics, AI, input polling) that `app_cpu_ns` cannot see because it happens AFTER the app returned from rendering and BEFORE the next `xrWaitFrame`. `0` on the first frame of a session. |
-| `gpu_time_ns` | D3D11 timestamp delta from `xrBeginFrame` to `xrEndFrame` | **App GPU work for this frame.** Measured with `D3D11_QUERY_TIMESTAMP` bracketed by a `D3D11_QUERY_TIMESTAMP_DISJOINT` for frequency validation. `0` when no D3D11 binding was seen at `xrCreateSession` (Vulkan / OpenGL / D3D12 apps), when the disjoint query reported `Disjoint == true` (driver invalidated the range), or when the GPU result wasn't yet ready at session end. |
+| `gpu_time_ns` | GPU timestamp delta from `xrBeginFrame` to `xrEndFrame` | **App GPU work for this frame.** D3D11 apps: measured with `D3D11_QUERY_TIMESTAMP` bracketed by a `D3D11_QUERY_TIMESTAMP_DISJOINT` for frequency validation. D3D12 apps: measured with `D3D12_QUERY_TYPE_TIMESTAMP` recorded on the layer's own short command lists, submitted to the app's command queue alongside the app's draws (no D3D11On12 wrapper — straight native D3D12). `0` when the app uses Vulkan / OpenGL / no binding, when a D3D11 disjoint query reported `Disjoint == true`, or when the GPU result wasn't yet ready at session end. |
 | `period_ns` | `XrFrameState.predictedDisplayPeriod` | Target frame budget reported by the runtime. ~11.11 ms @ 90 Hz, ~8.33 ms @ 120 Hz, ~13.89 ms @ 72 Hz. Constant for a given session. |
 | `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **CPU % of the frame budget not spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound this frame. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame where `frame_total_ns = 0`. Reads `100.00` when `period_ns == 0` (some runtimes report 0 transiently on the very first frame of a session) — same "no measurement available" sentinel as `gpu_headroom_pct` below. Filter on `period_ns > 0` to exclude those frames from headroom statistics. |
 | `gpu_headroom_pct` | `(1 − gpu_time_ns / period_ns) × 100` | **GPU % of the frame budget not spent on app GPU work this cycle.** Negative ⇒ GPU-bound this frame. `100.00` when `gpu_time_ns == 0` (no D3D11 binding, disjoint range invalid, or result unavailable at session end) OR when `period_ns == 0` — same default as fpsVR / OpenXR Toolkit overlays. Filter on `gpu_time_ns > 0` to exclude unmeasured rows from GPU statistics. |
@@ -217,7 +217,7 @@ Practical implications:
 | GPU idle but CPU busy | `gpu_headroom_pct` > 60% while `headroom_pct` < 20% | Classic "app cannot feed the GPU fast enough" — usually render-thread-bound. Look at `render_submission_ns`. |
 | Runtime overhead | `end_frame_ns` consistently > ~1 ms | The runtime / compositor itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) can move the needle. Young runtimes are typical culprits. |
 | Compositor underused | `wait_block_ns` close to `period_ns`, `frame_total_ns` ≈ `period_ns` | Healthy. The app finishes early, runtime throttles, equilibrium. The opposite (small `wait_block_ns`) means the app is keeping up only just. |
-| GPU not measured | `gpu_time_ns == 0` for every row, but the game uses Vulkan / OpenGL / D3D12 | Expected: V2.0 of the layer only instruments D3D11 (and only directly — D3D12-via-D3D11On12 is a V2.1 follow-up). `gpu_headroom_pct` reads as `100.00` by default in this case (same as OXRT's overlay convention) — that's the formula's natural value with `gpu_time_ns=0`, not a real "GPU is idle" reading. The CPU columns remain accurate; just filter `gpu_time_ns > 0` if you want to exclude these rows from GPU stats. |
+| GPU not measured | `gpu_time_ns == 0` for every row, and the game uses Vulkan or OpenGL | Expected: only D3D11 and D3D12 graphics bindings are instrumented (each via its native query API — no D3D11On12 wrapping). Vulkan / OpenGL apps remain unmeasured; instrumenting their command-stream model would need a separate per-API timer that's not in scope yet. `gpu_headroom_pct` reads as `100.00` by default in this case (same as OXRT's overlay convention) — that's the formula's natural value with `gpu_time_ns=0`, not a real "GPU is idle" reading. The CPU columns remain accurate; just filter `gpu_time_ns > 0` if you want to exclude these rows from GPU stats. |
 
 ### Relationship to other VR frame-analysis tools
 
@@ -281,11 +281,13 @@ After a 10-20 s session, opening the CSV should show:
   data integrity.
 - `headroom_pct` aligned with what fpsVR / OXRT overlay displayed at
   the same moment (rolling-mean of 90 rows).
-- For a D3D11 app, `gpu_time_ns > 0` for every row past the first ~4
-  frames (the warmup window the layer needs to drain its query ring).
-  For Vulkan / OpenGL / D3D12 apps, `gpu_time_ns == 0` for every row
-  — that's expected, the layer just doesn't instrument those graphics
-  APIs yet. CPU columns remain accurate.
+- For a D3D11 or D3D12 app, `gpu_time_ns > 0` for every row past the
+  first ~4 frames (the warmup window the layer needs to drain its
+  query ring). The layer log line at session start tells you which
+  path activated ("D3D11 GPU timer active" vs "D3D12 GPU timer active
+  (native query heap)"). For Vulkan or OpenGL apps, `gpu_time_ns == 0`
+  for every row — that's expected, the layer doesn't instrument those
+  graphics APIs. CPU columns remain accurate either way.
 - `gpu_headroom_pct` aligned with what fpsVR / OXRT overlay reports as
   "GPU headroom" (also rolling-mean 90 rows; sampling noise per frame
   is larger on GPU than CPU because the GPU schedules work in larger
