@@ -49,12 +49,20 @@
 #include "pch.h"
 
 #include "layer.h"
+#include "telemetry_internals.h"
 #include <log.h>
 #include <util.h>
 
 namespace openxr_api_layer {
 
     using namespace log;
+    // FrameRecord, qpcToNs, gpuTimestampDeltaToNs, computeCpuHeadroomPct,
+    // computeGpuHeadroomPct, patchAndDrainPending, flushPendingFramesUnresolved
+    // all live in openxr_api_layer::detail (telemetry_internals.h) so the
+    // test binary can exercise the math + bookkeeping bits without faking
+    // an OpenXR session. Bring the type alias in here so the rest of this
+    // file doesn't have to spell out detail:: every time.
+    using detail::FrameRecord;
 
     // Extensions the layer cares about. Empty = pass-through, the
     // layer never appears in xrEnumerateApiLayerProperties' extension
@@ -73,27 +81,10 @@ namespace openxr_api_layer {
 
     namespace {
 
-        // One row of CSV. Pushed from the frame thread (xrEndFrame), drained
-        // by a single background writer thread.
-        struct FrameRecord {
-            uint64_t frame_index;
-            int64_t timestamp_qpc;     // raw QPC tick at xrEndFrame entry
-            int64_t wait_block_ns;     // tWaitOut - tWaitIn   (compositor throttle)
-            int64_t pre_begin_ns;      // tBegin - tWaitOut    (wait→begin housekeeping)
-            int64_t app_cpu_ns;        // tEnd - tWaitOut      (wait→end window)
-            int64_t end_frame_ns;      // OpenXrApi::xrEndFrame duration (runtime/
-                                       //                       compositor overhead)
-            int64_t frame_total_ns;    // tEnd - tEndPrev      (full cycle, includes
-                                       //                       post-end sim/physics)
-            int64_t gpu_time_ns;       // D3D11 timestamp delta (xrBeginFrame →
-                                       //                       xrEndFrame on the GPU).
-                                       //                       0 if no D3D11 binding or
-                                       //                       result not yet available.
-            int64_t period_ns;
-            float headroom_pct;        // CPU headroom
-            float gpu_headroom_pct;    // GPU headroom
-            bool should_render;
-        };
+        // FrameRecord lives in detail:: (telemetry_internals.h) so unit
+        // tests can construct one without faking an OpenXR session. The
+        // file-scope `using detail::FrameRecord;` above brings the name in
+        // for the rest of this TU.
 
         // Async CSV writer: the frame thread does an O(1) push under a
         // try_lock; a dedicated background thread (BELOW_NORMAL priority)
@@ -594,12 +585,8 @@ namespace openxr_api_layer {
 
                     int64_t gpuNs = 0;
                     if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd > tStart) {
-                        // (delta_ticks * 1e9) / Frequency without overflow.
-                        const UINT64 delta = tEnd - tStart;
-                        gpuNs = static_cast<int64_t>(
-                            (delta / disjointData.Frequency) * 1'000'000'000ULL +
-                            ((delta % disjointData.Frequency) * 1'000'000'000ULL) /
-                                disjointData.Frequency);
+                        gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart,
+                                                              disjointData.Frequency);
                     }
                     latest = GpuFrameResult{slot.frame_index, gpuNs};
                     slot.state = SlotState::Idle;
@@ -935,7 +922,7 @@ namespace openxr_api_layer {
             // young runtimes (e.g. Pimax OpenXR 0.1.0) can spend ~ms here
             // where mature compositors stay in the hundreds of µs.
             const int64_t tEndExit = QpcNow();
-            const int64_t endFrameNs = QpcToNs(tEndExit - tEnd);
+            const int64_t endFrameNs = detail::qpcToNs(tEndExit - tEnd, m_qpcFrequency);
 
             const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
             const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
@@ -949,15 +936,15 @@ namespace openxr_api_layer {
                 return result;
             }
 
-            const int64_t waitBlockNs = QpcToNs(tWaitOut - tWaitIn);
-            const int64_t appCpuNs = QpcToNs(tEnd - tWaitOut);
+            const int64_t waitBlockNs = detail::qpcToNs(tWaitOut - tWaitIn, m_qpcFrequency);
+            const int64_t appCpuNs = detail::qpcToNs(tEnd - tWaitOut, m_qpcFrequency);
             // pre_begin_ns splits app_cpu_ns into the housekeeping window
             // (Wait→Begin) and the actual render submission (Begin→End).
             // Gated on tBegin > 0 because xrBeginFrame may be skipped on
             // some session-transition frames; report 0 then so the user
             // can filter.
             const int64_t preBeginNs =
-                (tBegin > tWaitOut) ? QpcToNs(tBegin - tWaitOut) : 0;
+                (tBegin > tWaitOut) ? detail::qpcToNs(tBegin - tWaitOut, m_qpcFrequency) : 0;
 
             // Full-cycle duration: end-to-end wall clock of the previous
             // frame. This is what fpsVR / OpenXR Toolkit / PresentMon
@@ -968,7 +955,7 @@ namespace openxr_api_layer {
             // outside our wait→end window. Gated on tEndPrev > 0 (first
             // frame of session): 0 means "no previous frame to compare".
             const int64_t tEndPrev = m_tEndPrev.exchange(tEnd, std::memory_order_relaxed);
-            const int64_t frameTotalNs = (tEndPrev > 0) ? QpcToNs(tEnd - tEndPrev) : 0;
+            const int64_t frameTotalNs = (tEndPrev > 0) ? detail::qpcToNs(tEnd - tEndPrev, m_qpcFrequency) : 0;
 
             // CPU headroom: fraction of the predicted display period that
             // is NOT spent on app CPU work. Uses the full-cycle metric
@@ -979,20 +966,12 @@ namespace openxr_api_layer {
             // Falls back to the wait→end window (appCpuNs) only on the
             // first frame where we don't have a previous cycle yet.
             //
-            // Negative ⇒ app is CPU-bound this cycle. Gated on period > 0
-            // because some runtimes briefly report 0 before the session
-            // is fully ready — in that case we use 100% as the
-            // "no measurement available" sentinel, matching the same
-            // convention applied below for gpu_headroom_pct so analyses
-            // can filter both columns the same way (`period_ns > 0`).
-            float headroomPct = 100.0f;
-            if (periodNs > 0) {
-                const int64_t appPerCycleNs =
-                    (frameTotalNs > 0) ? (frameTotalNs - waitBlockNs) : appCpuNs;
-                const double ratio =
-                    static_cast<double>(appPerCycleNs) / static_cast<double>(periodNs);
-                headroomPct = static_cast<float>((1.0 - ratio) * 100.0);
-            }
+            // The formula + period <= 0 sentinel live in detail::
+            // (telemetry_internals.h) so they're independently unit-
+            // tested.
+            const int64_t appPerCycleNs =
+                (frameTotalNs > 0) ? (frameTotalNs - waitBlockNs) : appCpuNs;
+            const float headroomPct = detail::computeCpuHeadroomPct(appPerCycleNs, periodNs);
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
             // Build the FrameRecord for this frame. gpu_time_ns starts at
@@ -1012,10 +991,13 @@ namespace openxr_api_layer {
             //
             // Analyses that want to exclude unmeasured frames from GPU
             // statistics should filter `gpu_time_ns > 0`.
-            // 100% when periodNs == 0 (same "unmeasured" sentinel as
-            // headroomPct above); the formula's natural value with
-            // gpu_time_ns=0 also yields 100%, so the two cases merge.
-            const float gpuHeadroomPct = 100.0f;
+            // gpu_time_ns starts at 0 (the GPU hasn't finished this frame
+            // yet). detail::computeGpuHeadroomPct with gpuTimeNs=0 yields
+            // 100% — the standard "unmeasured" sentinel — and also handles
+            // the periodNs == 0 transient with the same value. If a GPU
+            // result lands later, patchAndDrainPending() recomputes the
+            // pct against the resolved gpu_time_ns.
+            const float gpuHeadroomPct = detail::computeGpuHeadroomPct(/*gpuTimeNs=*/0, periodNs);
             FrameRecord rec{
                 frameIndex,
                 tEnd,
@@ -1089,14 +1071,9 @@ namespace openxr_api_layer {
             QueryPerformanceCounter(&c);
             return c.QuadPart;
         }
-        // Convert QPC ticks to nanoseconds without overflowing on long runs:
-        // split into whole-seconds + remainder.
-        int64_t QpcToNs(int64_t ticks) const {
-            const int64_t freq = m_qpcFrequency;
-            const int64_t whole = ticks / freq;
-            const int64_t rem = ticks % freq;
-            return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
-        }
+        // Ticks → nanoseconds is detail::qpcToNs() in telemetry_internals.h.
+        // Kept as a free function (not a method) so it's testable without
+        // a layer instance.
 
         // GPU-side helpers ------------------------------------------------
 
@@ -1109,41 +1086,19 @@ namespace openxr_api_layer {
         // for frame R arrives, every record at the front with frame_index
         // <= R is settled: the matching one gets the resolved gpu_time,
         // the older ones (if any — could happen on stutter) get 0.
+        // Thin wrappers around the pure templates in telemetry_internals.h —
+        // the actual drain/patch/flush logic is unit-tested without an
+        // OpenXR session in test_telemetry_math.cpp. Sink lambda forwards
+        // to CsvWriter::push.
         void patchAndDrainPending(uint64_t resolvedFrameIndex, int64_t gpuTimeNs) {
-            while (!m_pendingFrames.empty()) {
-                auto& front = m_pendingFrames.front();
-                if (front.frame_index > resolvedFrameIndex) {
-                    break;  // resolved older than everything pending — nothing to drain
-                }
-                if (front.frame_index == resolvedFrameIndex) {
-                    front.gpu_time_ns = gpuTimeNs;
-                    if (front.period_ns > 0) {
-                        const double ratio =
-                            static_cast<double>(gpuTimeNs) / static_cast<double>(front.period_ns);
-                        front.gpu_headroom_pct = static_cast<float>((1.0 - ratio) * 100.0);
-                    }
-                }
-                // Stale entries (frame_index < resolvedFrameIndex) keep
-                // gpu_time_ns=0 — the ring overran them; their GPU work
-                // result is gone. Push them anyway so the CSV stays
-                // chronologically complete.
-                m_csv.push(front);
-                m_pendingFrames.pop_front();
-                if (front.frame_index == resolvedFrameIndex) {
-                    break;  // the matched frame is now flushed; stop here
-                }
-            }
+            detail::patchAndDrainPending(
+                m_pendingFrames, resolvedFrameIndex, gpuTimeNs,
+                [this](const FrameRecord& r) { m_csv.push(r); });
         }
 
-        // Called from xrDestroySession and from ~OpenXrLayer to flush
-        // FrameRecords that never got a GPU result back (kRingSize-1 of
-        // them in the steady state when the session ends, more on a stutter).
-        // gpu_time_ns stays 0 — better an unmeasured row than a missing row.
         void flushPendingFramesUnresolved() {
-            while (!m_pendingFrames.empty()) {
-                m_csv.push(m_pendingFrames.front());
-                m_pendingFrames.pop_front();
-            }
+            detail::flushPendingFramesUnresolved(
+                m_pendingFrames, [this](const FrameRecord& r) { m_csv.push(r); });
         }
 
         bool m_bypassApiLayer = false;

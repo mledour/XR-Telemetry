@@ -1,0 +1,185 @@
+// MIT License
+//
+// Copyright (c) 2026 Michael Ledour
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#pragma once
+
+// =============================================================================
+// telemetry_internals.h — pure helpers extracted from layer.cpp for testing.
+//
+// layer.cpp's anonymous namespace hides CsvWriter, GpuTimer, and the
+// FrameRecord struct from the test binary, which is what we want for the
+// production ABI but blocks unit-testing of the math + bookkeeping bits
+// that don't actually need any OpenXR / D3D11 state to verify.
+//
+// This header exposes the parts that ARE pure (no side effects, no
+// platform calls) under `openxr_api_layer::detail` so a test_*.cpp can
+// `#include "telemetry_internals.h"` and assert on them directly.
+//
+// Stays self-contained — does NOT include pch.h, so the test binary can
+// pick it up without pulling the full Windows / D3D / OpenXR header
+// stack. Only <cstdint> and <deque> from the standard library.
+// =============================================================================
+
+#include <cstdint>
+#include <deque>
+
+namespace openxr_api_layer::detail {
+
+    // One row of CSV. Pushed from the frame thread (xrEndFrame), drained by
+    // a background writer thread.  POD-like: copyable, no resources owned.
+    //
+    // This used to live in layer.cpp's anonymous namespace; moved here so
+    // tests on patchAndDrainPending() / flushPendingFramesUnresolved() can
+    // construct one without faking an OpenXR session.
+    struct FrameRecord {
+        uint64_t frame_index;
+        int64_t timestamp_qpc;     // raw QPC tick at xrEndFrame entry
+        int64_t wait_block_ns;     // tWaitOut - tWaitIn   (compositor throttle)
+        int64_t pre_begin_ns;      // tBegin - tWaitOut    (wait→begin housekeeping)
+        int64_t app_cpu_ns;        // tEnd - tWaitOut      (wait→end window)
+        int64_t end_frame_ns;      // OpenXrApi::xrEndFrame duration
+        int64_t frame_total_ns;    // tEnd - tEndPrev      (full cycle)
+        int64_t gpu_time_ns;       // D3D11 timestamp delta (begin→end on GPU)
+        int64_t period_ns;
+        float headroom_pct;        // CPU headroom
+        float gpu_headroom_pct;    // GPU headroom
+        bool should_render;
+    };
+
+    // --- Time conversions ---------------------------------------------------
+
+    // QueryPerformanceCounter delta ticks → nanoseconds. Splits into whole
+    // and fractional parts so the (delta * 1e9) intermediate never overflows
+    // int64 for any realistic interval (it would take >290 years at 10 MHz
+    // QPC frequency before the whole-part term hits int64 max).
+    //
+    // Returns 0 if freq <= 0 (defensive; never happens with a valid call to
+    // QueryPerformanceFrequency).
+    inline int64_t qpcToNs(int64_t ticks, int64_t freq) noexcept {
+        if (freq <= 0) return 0;
+        const int64_t whole = ticks / freq;
+        const int64_t rem = ticks % freq;
+        return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
+    }
+
+    // D3D11 GPU timestamp delta ticks → nanoseconds, with the same split-
+    // and-recombine strategy as qpcToNs. Inputs come from
+    // D3D11_QUERY_DATA_TIMESTAMP_DISJOINT::Frequency (UINT64) and the
+    // delta of two D3D11_QUERY_TIMESTAMP results.
+    //
+    // Returns 0 if frequency == 0 (defensive; happens when the disjoint
+    // query reports Disjoint == true).
+    inline int64_t gpuTimestampDeltaToNs(uint64_t deltaTicks,
+                                         uint64_t frequency) noexcept {
+        if (frequency == 0) return 0;
+        const uint64_t whole = deltaTicks / frequency;
+        const uint64_t rem = deltaTicks % frequency;
+        return static_cast<int64_t>(
+            whole * 1'000'000'000ULL +
+            (rem * 1'000'000'000ULL) / frequency);
+    }
+
+    // --- Headroom formulas --------------------------------------------------
+
+    // CPU headroom % = (1 - appPerCycleNs / periodNs) * 100.
+    //
+    // Returns 100.0f when periodNs <= 0 — the "no measurement available"
+    // sentinel for the rare transient case where the runtime hadn't
+    // committed predictedDisplayPeriod yet on the very first frame. Same
+    // convention as gpu_headroom_pct below so analyses can filter both
+    // with `period_ns > 0`.
+    //
+    // Negative result ⇒ app exceeded the period budget this cycle (CPU-
+    // bound this frame); positive ⇒ headroom available; 100 ⇒ no work.
+    inline float computeCpuHeadroomPct(int64_t appPerCycleNs,
+                                       int64_t periodNs) noexcept {
+        if (periodNs <= 0) return 100.0f;
+        const double ratio =
+            static_cast<double>(appPerCycleNs) / static_cast<double>(periodNs);
+        return static_cast<float>((1.0 - ratio) * 100.0);
+    }
+
+    // GPU headroom % = (1 - gpuTimeNs / periodNs) * 100.
+    //
+    // Same sentinel rule as computeCpuHeadroomPct. Reads 100% when
+    // gpuTimeNs == 0 (no D3D11 binding, disjoint range invalid, or session-
+    // end flush with no GPU result) — the natural value of the formula
+    // when the numerator is 0, matching fpsVR / OpenXR Toolkit overlays.
+    inline float computeGpuHeadroomPct(int64_t gpuTimeNs,
+                                       int64_t periodNs) noexcept {
+        if (periodNs <= 0) return 100.0f;
+        const double ratio =
+            static_cast<double>(gpuTimeNs) / static_cast<double>(periodNs);
+        return static_cast<float>((1.0 - ratio) * 100.0);
+    }
+
+    // --- Pending-frame deque bookkeeping ------------------------------------
+
+    // Drain pending FrameRecords up to (and including) the one matching
+    // `resolvedFrameIndex`, patching its gpu_time_ns and gpu_headroom_pct
+    // with the resolved values. Stale entries (frame_index <
+    // resolvedFrameIndex — possible when the ring overran and lost results)
+    // are pushed as-is, with gpu_time_ns staying at its placeholder 0.
+    // Future entries (frame_index > resolvedFrameIndex) stop the drain so
+    // they remain pending for their own resolution.
+    //
+    // `sink` is any callable accepting `const FrameRecord&`. In production
+    // it's a thin lambda that forwards to CsvWriter::push; in tests it's a
+    // capture-by-reference into a std::vector for inspection.
+    template <typename Sink>
+    void patchAndDrainPending(std::deque<FrameRecord>& pending,
+                              uint64_t resolvedFrameIndex,
+                              int64_t gpuTimeNs,
+                              Sink&& sink) {
+        while (!pending.empty()) {
+            auto& front = pending.front();
+            if (front.frame_index > resolvedFrameIndex) {
+                break;  // future entry — stop the drain
+            }
+            if (front.frame_index == resolvedFrameIndex) {
+                front.gpu_time_ns = gpuTimeNs;
+                front.gpu_headroom_pct =
+                    computeGpuHeadroomPct(gpuTimeNs, front.period_ns);
+            }
+            // Capture the match flag BEFORE pop_front invalidates `front`.
+            const bool wasMatch = (front.frame_index == resolvedFrameIndex);
+            sink(front);
+            pending.pop_front();
+            if (wasMatch) break;
+        }
+    }
+
+    // Drain every pending FrameRecord through `sink` without patching, used
+    // at xrDestroySession / ~OpenXrLayer when no more GPU results will land.
+    // Records keep their placeholder gpu_time_ns (0) and gpu_headroom_pct
+    // (100.0f). Analyses should filter `gpu_time_ns > 0` if they want to
+    // exclude these last-of-session rows from GPU statistics.
+    template <typename Sink>
+    void flushPendingFramesUnresolved(std::deque<FrameRecord>& pending,
+                                      Sink&& sink) {
+        while (!pending.empty()) {
+            sink(pending.front());
+            pending.pop_front();
+        }
+    }
+
+} // namespace openxr_api_layer::detail
