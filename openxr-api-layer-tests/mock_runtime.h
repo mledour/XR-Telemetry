@@ -53,6 +53,18 @@ namespace mock {
         // Defaults to a roughly-symmetric stereo HMD at ~±50° / ±40°.
         std::vector<XrFovf> locateFovs;
 
+        // xrWaitFrame fills these into XrFrameState. predictedDisplayPeriod
+        // is in ns (11_111_111 = ~90 Hz). shouldRender follows the OpenXR
+        // convention (XR_TRUE / XR_FALSE).
+        int64_t predictedDisplayTime = 1'000'000'000;       // arbitrary monotonic XrTime
+        int64_t predictedDisplayPeriod = 11'111'111;        // ~90 Hz
+        XrBool32 shouldRender = XR_TRUE;
+
+        // If non-zero, xrWaitFrame sleeps this many microseconds before
+        // returning, simulating compositor throttle. The layer's
+        // wait_block_ns measurement captures this sleep.
+        uint32_t waitFrameSleepMicros = 0;
+
         // ---- Recorded outputs (what the layer submitted downstream) ---------
 
         // Last xrEndFrame payload that reached the mock runtime, deep-copied
@@ -64,6 +76,8 @@ namespace mock {
         };
         std::vector<RecordedProjLayer> lastEndFrameProjLayers;
         uint32_t endFrameCallCount = 0;
+        uint32_t waitFrameCallCount = 0;
+        uint32_t beginFrameCallCount = 0;
 
         // ---- Fake handle plumbing -------------------------------------------
 

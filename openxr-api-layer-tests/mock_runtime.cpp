@@ -22,8 +22,10 @@
 
 #include "mock_runtime.h"
 
+#include <chrono>
 #include <cstring>
 #include <string_view>
+#include <thread>
 
 namespace mock {
 
@@ -216,6 +218,34 @@ namespace mock {
             return XR_SUCCESS;
         }
 
+        // Frame-loop mocks for the telemetry layer's wait/begin/end overrides.
+        // xrWaitFrame optionally sleeps (waitFrameSleepMicros) to give the
+        // layer a non-zero wait_block_ns to measure. xrBeginFrame is a pure
+        // counter — the layer only times around it.
+        XrResult XRAPI_CALL m_xrWaitFrame(XrSession /*session*/,
+                                         const XrFrameWaitInfo* /*frameWaitInfo*/,
+                                         XrFrameState* frameState) {
+            if (!frameState) return XR_ERROR_VALIDATION_FAILURE;
+            g_state.waitFrameCallCount++;
+            if (g_state.waitFrameSleepMicros > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(g_state.waitFrameSleepMicros));
+            }
+            // Advance predictedDisplayTime by one period each call, so the
+            // layer sees a plausible monotonic XrTime stream.
+            frameState->predictedDisplayTime = g_state.predictedDisplayTime;
+            frameState->predictedDisplayPeriod = g_state.predictedDisplayPeriod;
+            frameState->shouldRender = g_state.shouldRender;
+            g_state.predictedDisplayTime += g_state.predictedDisplayPeriod;
+            return XR_SUCCESS;
+        }
+
+        XrResult XRAPI_CALL m_xrBeginFrame(XrSession /*session*/,
+                                          const XrFrameBeginInfo* /*frameBeginInfo*/) {
+            g_state.beginFrameCallCount++;
+            return XR_SUCCESS;
+        }
+
         XrResult XRAPI_CALL m_xrEndFrame(XrSession /*session*/, const XrFrameEndInfo* info) {
             g_state.endFrameCallCount++;
             g_state.lastEndFrameProjLayers.clear();
@@ -288,6 +318,10 @@ namespace mock {
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrWaitSwapchainImage);
         else if (n == "xrReleaseSwapchainImage")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrReleaseSwapchainImage);
+        else if (n == "xrWaitFrame")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrWaitFrame);
+        else if (n == "xrBeginFrame")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrBeginFrame);
         else if (n == "xrEndFrame")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrEndFrame);
         else {
