@@ -43,13 +43,19 @@ using openxr_api_layer::detail::OverlaySnapshot;
 namespace {
     // Construct a FrameRecord with the fields the aggregator actually reads.
     // Other fields stay zero — the aggregator never reads them.
+    //
+    // wait_block_ns matters because cpu_frame_ms is computed as
+    // (frame_total - wait_block), so tests asserting specific cpu_frame_ms
+    // values need to set both. Defaults to 0 for tests that only care
+    // about fps or refresh cadence.
     FrameRecord makeRecord(int64_t qpc_ticks,
                             int64_t app_cpu_ns,
                             int64_t gpu_time_ns,
                             int64_t frame_total_ns,
                             int64_t period_ns,
                             float headroom_pct,
-                            float gpu_headroom_pct) {
+                            float gpu_headroom_pct,
+                            int64_t wait_block_ns = 0) {
         FrameRecord r{};
         r.timestamp_qpc   = qpc_ticks;
         r.app_cpu_ns      = app_cpu_ns;
@@ -58,6 +64,7 @@ namespace {
         r.period_ns       = period_ns;
         r.headroom_pct    = headroom_pct;
         r.gpu_headroom_pct = gpu_headroom_pct;
+        r.wait_block_ns   = wait_block_ns;
         return r;
     }
 }
@@ -98,12 +105,18 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Frame 0: arms the clock at t=0. Frame 1: t=120 ms, crosses the 100 ms
     // window → publish.
+    //
+    // cpu_frame_ms = per_cycle = frame_total - wait_block. Setting
+    // frame_total=11.11ms (90 fps target) and wait_block=7.11ms yields
+    // per_cycle = 4ms, matching the expected assertion below.
     agg.pushFrame(makeRecord(0,
                               4'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 64.0f, 55.0f));
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111));
     agg.pushFrame(makeRecord(120'000'000,
                               4'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 64.0f, 55.0f));
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111));
     REQUIRE(agg.snapshot().valid);
     const auto& s = agg.snapshot();
     CHECK(s.cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
@@ -121,16 +134,43 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
 // Moving average — values are averaged across the window, not the latest.
 // =============================================================================
 
+TEST_CASE("OverlayAggregator: first frame with frame_total_ns=0 falls back to app_cpu_ns") {
+    // On the very first frame of a session, frame_total_ns is 0 (no
+    // previous tEnd to subtract from). The aggregator must fall back to
+    // app_cpu_ns for that frame's CPU contribution — otherwise the
+    // window 1 average would include a `0 - wait_block` ≤ 0 value and
+    // skew the displayed cpu_frame_ms low. Mirrors the identical fall
+    // back inside xrEndFrame's headroom math.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    // Frame 1: first-frame sentinel (frame_total=0, app_cpu=3ms).
+    agg.pushFrame(makeRecord(0,
+                              /*app_cpu=*/3'000'000, 5'000'000,
+                              /*frame_total=*/0, 11'111'111, 64.0f, 55.0f));
+    // Frame 2: full cycle established, per_cycle = 5ms via wait_block.
+    agg.pushFrame(makeRecord(120'000'000,
+                              /*app_cpu=*/3'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 55.0f, 55.0f,
+                              /*wait_block=*/6'111'111));
+    REQUIRE(agg.snapshot().valid);
+    // (3 [from app_cpu fallback] + 5 [from per_cycle]) / 2 = 4 ms
+    CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
+}
+
 TEST_CASE("OverlayAggregator: averages across the window, not just last frame") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
-    // Two frames with different CPU times: 2 ms and 6 ms → avg 4 ms.
+    // Vary wait_block so per_cycle differs across the two frames:
+    // Frame 1: frame_total=11.11ms, wait_block=9.11ms → per_cycle=2ms.
+    // Frame 2: frame_total=11.11ms, wait_block=5.11ms → per_cycle=6ms.
+    // Average → 4ms, matching the assertion below.
     agg.pushFrame(makeRecord(0,
-                              2'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 82.0f, 55.0f));
+                              /*app_cpu=*/0, 5'000'000,
+                              11'111'111, 11'111'111, 82.0f, 55.0f,
+                              /*wait_block=*/9'111'111));
     // Second frame at t=120 ms (crosses 100 ms window).
     agg.pushFrame(makeRecord(120'000'000,
-                              6'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 46.0f, 55.0f));
+                              /*app_cpu=*/0, 5'000'000,
+                              11'111'111, 11'111'111, 46.0f, 55.0f,
+                              /*wait_block=*/5'111'111));
     REQUIRE(agg.snapshot().valid);
     // (2 + 6) / 2 = 4 ms
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
@@ -194,25 +234,30 @@ TEST_CASE("OverlayAggregator: second window's values do NOT include first window
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     // Window 1: arm at t=0, mid-window frame at t=50 ms (no publish), then
     // a third frame at t=100 ms that's exactly on the boundary → publish
-    // with avg(4, 4, 4) = 4 ms.
+    // with avg(4, 4, 4) = 4 ms. wait_block=7.11ms keeps per_cycle = 4ms.
     agg.pushFrame(makeRecord(0,
                               4'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 64.0f, 55.0f));
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111));
     agg.pushFrame(makeRecord(50'000'000,
                               4'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 64.0f, 55.0f));
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111));
     agg.pushFrame(makeRecord(100'000'000,
                               4'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 64.0f, 55.0f));
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111));
     REQUIRE(agg.snapshot().valid);
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
 
     // Window 2: first frame at t=150 ms — already 50 ms into window 2 but
     // still < 100 ms since last refresh → accumulates, no publish, the
-    // public snapshot still reads 4 ms from window 1.
+    // public snapshot still reads 4 ms from window 1. wait_block=1.11ms
+    // makes per_cycle = 10 ms for the window 2 frames.
     agg.pushFrame(makeRecord(150'000'000,
                               10'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 10.0f, 55.0f));
+                              11'111'111, 11'111'111, 10.0f, 55.0f,
+                              /*wait_block=*/1'111'111));
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
 
     // Window 2 second frame at t=200 ms → 100 ms since last refresh
@@ -220,7 +265,8 @@ TEST_CASE("OverlayAggregator: second window's values do NOT include first window
     // contributes here — that's the whole point of the reset).
     agg.pushFrame(makeRecord(200'000'000,
                               10'000'000, 5'000'000,
-                              11'111'111, 11'111'111, 10.0f, 55.0f));
+                              11'111'111, 11'111'111, 10.0f, 55.0f,
+                              /*wait_block=*/1'111'111));
     CHECK(agg.snapshot().cpu_frame_ms == doctest::Approx(10.0f).epsilon(0.001));
 }
 

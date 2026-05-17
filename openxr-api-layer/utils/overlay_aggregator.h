@@ -56,7 +56,13 @@ namespace openxr_api_layer::detail {
     struct OverlaySnapshot {
         float fps_instant = 0;          // 1e9 / last frame_total_ns
         float fps_avg = 0;              // 1e9 / mean(frame_total_ns over the refresh window)
-        float cpu_frame_ms = 0;         // mean(app_cpu_ns) / 1e6
+        // CPU time the app spends PER CYCLE (frame_total - wait_block).
+        // Matches the metric used by `cpu_utilisation_pct` and by the
+        // CSV's `headroom_pct` column, so the displayed time and util%
+        // are coherent. Falls back to app_cpu_ns on the first frame
+        // (no previous cycle yet), same as xrEndFrame does for
+        // headroom computation.
+        float cpu_frame_ms = 0;
         float gpu_frame_ms = 0;         // mean(gpu_time_ns) / 1e6
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
@@ -103,7 +109,21 @@ namespace openxr_api_layer::detail {
         // delta since the previous refresh exceeds refreshIntervalNs.
         void pushFrame(const FrameRecord& rec) noexcept {
             // Accumulate every per-frame field we'll need for the snapshot.
-            m_sumCpuNs        += rec.app_cpu_ns;
+            //
+            // `cpu_frame_ms` must align with `cpu_utilisation_pct` so the
+            // HUD reads coherently (fpsvr convention: same metric for
+            // displayed time + util%). headroom_pct is derived from
+            // `app_per_cycle_ns = frame_total - wait_block` in
+            // OpenXrLayer::xrEndFrame, so we accumulate THE SAME quantity
+            // here — NOT rec.app_cpu_ns (which is just the wait→end
+            // sub-window and lands much smaller than the per-cycle
+            // total). Fallback to app_cpu_ns for the first frame of a
+            // session where frame_total_ns is still 0 (matches the
+            // identical fallback inside xrEndFrame).
+            const int64_t perCycleCpuNs = (rec.frame_total_ns > 0)
+                ? (rec.frame_total_ns - rec.wait_block_ns)
+                : rec.app_cpu_ns;
+            m_sumCpuNs        += perCycleCpuNs;
             m_sumGpuNs        += rec.gpu_time_ns;
             m_sumFrameTotalNs += rec.frame_total_ns;
             m_sumPeriodNs     += rec.period_ns;

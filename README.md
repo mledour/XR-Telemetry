@@ -362,8 +362,16 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
 > aggregator's last snapshot is dumped to the log file at
 > `xrDestroySession` so users can confirm the data path works end-
 > to-end (`xr_telemetry: overlay final snapshot — fps=89.8 (avg
-> 90.1, target 90.0), cpu=4.32 ms (61% util), gpu=5.18 ms (47%
+> 90.1, target 90.0), cpu=6.78 ms (61% util), gpu=5.18 ms (47%
 > util)`).
+>
+> **CPU semantic:** `cpu_frame_ms` reports the app's per-cycle CPU
+> work (frame_total − wait_block), matching fpsvr / OpenXR Toolkit
+> convention. This makes `cpu_frame_ms` × `target_fps` ≈ `cpu_
+> utilisation_pct`, so the two displayed numbers are coherent. It
+> is NOT the wait→end window (`app_cpu_ns` in the CSV) — that's a
+> sub-window of the full cycle that excludes sim / physics / input
+> polling done AFTER xrEndFrame returns.
 <!-- REMOVE-WHEN-PR2-LANDS:end -->
 
 ### Hotkey mode UX
