@@ -45,6 +45,32 @@
 
 namespace openxr_api_layer::detail {
 
+    // XrBaseInStructure-style chain walker. Walks `head` looking for the
+    // first entry whose `type` field equals `targetType`, returns nullptr
+    // if none. Used by layer.cpp to locate XrGraphicsBindingD3D{11,12}KHR
+    // (and any future binding type) inside the `createInfo->next` chain
+    // passed to xrCreateSession.
+    //
+    // Exposed here — instead of staying private to layer.cpp — so the
+    // test binary can verify the walk on a synthetic chain without
+    // dragging in <openxr/openxr.h> or the D3D headers. The BaseLike
+    // struct mirrors the XrBaseInStructure layout (an XrStructureType
+    // enum is int32_t, followed by a pointer-to-self), so casting any
+    // valid OpenXR `next` chain to BaseLike* is well-defined under the
+    // common-initial-sequence rule used throughout the OpenXR API.
+    struct BaseLike {
+        int32_t type;
+        const BaseLike* next;
+    };
+    inline const void* findInTypedChain(const void* head, int32_t targetType) noexcept {
+        const auto* base = reinterpret_cast<const BaseLike*>(head);
+        while (base) {
+            if (base->type == targetType) return base;
+            base = base->next;
+        }
+        return nullptr;
+    }
+
     // One row of CSV. Pushed from the frame thread (xrEndFrame), drained by
     // a background writer thread.  POD-like: copyable, no resources owned.
     //

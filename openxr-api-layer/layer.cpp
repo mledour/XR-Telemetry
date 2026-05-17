@@ -416,7 +416,7 @@ namespace openxr_api_layer {
         // single unique_ptr<IGpuTimer> and routes Begin/End/Resolve
         // through it without caring about the underlying API.
         //
-        // Each timer uses a small ring of slots (kRingSize) to keep
+        // Each timer uses a small ring of slots (kGpuRingSize) to keep
         // multiple frames in flight. endFrameAndResolveOldest():
         //
         //   1. Closes the in-flight slot opened by beginFrame()
@@ -449,7 +449,7 @@ namespace openxr_api_layer {
             virtual std::optional<GpuFrameResult> endFrameAndResolveOldest() = 0;
         };
 
-        // Shared ring constants. kRingSize=4 → ~44 ms in flight at 90 Hz,
+        // Shared ring constants. kGpuRingSize=4 → ~44 ms in flight at 90 Hz,
         // comfortably above any realistic GPU→CPU latency. Keep small to
         // limit pending CSV records the layer holds back at session end.
         constexpr size_t kGpuRingSize = 4;
@@ -470,13 +470,14 @@ namespace openxr_api_layer {
             // without any explicit Flush.
             bool init(ID3D11Device* device) {
                 if (!device) return false;
-                if (m_active) {
-                    assert(device == m_device.Get() &&
-                           "D3D11GpuTimer::init called twice with different devices — "
-                           "is the app calling xrCreateSession without "
-                           "xrDestroySession in between?");
-                    return true;
-                }
+                // init() is called once per session from
+                // std::make_unique<D3D11GpuTimer> in xrCreateSession.
+                // Catch double-init in debug rather than papering over
+                // it with a silent no-op that would mask the bug in
+                // release.
+                assert(!m_active &&
+                       "D3D11GpuTimer::init called twice — call site should "
+                       "use std::make_unique to ensure a fresh timer.");
 
                 m_device = device;
                 m_device->GetImmediateContext(m_context.ReleaseAndGetAddressOf());
@@ -555,6 +556,10 @@ namespace openxr_api_layer {
                     }
 
                     int64_t gpuNs = 0;
+                    // out-of-order ticks → 0 (driver bug; rare in practice).
+                    // Same defensive check as the D3D12 path: a tEnd<tStart
+                    // reading would feed a negative duration to the headroom
+                    // formula and poison the per-frame CSV row.
                     if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd > tStart) {
                         gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart,
                                                               disjointData.Frequency);
@@ -626,13 +631,33 @@ namespace openxr_api_layer {
 
             bool init(ID3D12Device* device, ID3D12CommandQueue* queue) {
                 if (!device || !queue) return false;
-                if (m_active) {
-                    assert(device == m_device.Get() && queue == m_queue.Get() &&
-                           "D3D12GpuTimer::init called twice with different "
-                           "(device, queue) — xrCreateSession without "
-                           "xrDestroySession in between?");
-                    return true;
+                // The init function is only called once per session via
+                // std::make_unique<D3D12GpuTimer> in xrCreateSession. Catch
+                // any future double-init in debug rather than papering
+                // over it with a silent no-op (which would mask the bug
+                // in release).
+                assert(!m_active &&
+                       "D3D12GpuTimer::init called twice — call site should "
+                       "use std::make_unique to ensure a fresh timer.");
+
+                // Validate the queue is one we can ExecuteCommandLists
+                // direct command lists onto. The OpenXR spec requires this
+                // (XR_KHR_D3D12_enable: "queue must be a direct queue"),
+                // but a buggy app could pass a compute / copy queue, in
+                // which case the rest of our init would succeed and
+                // ExecuteCommandLists would fail silently every frame.
+                const D3D12_COMMAND_QUEUE_DESC queueDesc = queue->GetDesc();
+                if (queueDesc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    return false;
                 }
+                // Propagate the queue's NodeMask to every D3D12 object we
+                // create. Hardcoding 0 (node 0) breaks silently on multi-
+                // adapter rigs where the app put its queue on node 1+ —
+                // ExecuteCommandLists would fail at runtime. 99% of VR rigs
+                // are single-GPU so NodeMask is 1<<0 = 1 → we route to
+                // node 0 anyway; the propagation is the defensive move.
+                const UINT nodeMask = queueDesc.NodeMask;
+
                 m_device = device;
                 m_queue = queue;
                 m_frequency = 0;
@@ -648,6 +673,7 @@ namespace openxr_api_layer {
                 D3D12_QUERY_HEAP_DESC qhDesc{};
                 qhDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
                 qhDesc.Count = static_cast<UINT>(kGpuRingSize * 2);
+                qhDesc.NodeMask = nodeMask;
                 if (FAILED(m_device->CreateQueryHeap(&qhDesc, IID_PPV_ARGS(m_queryHeap.GetAddressOf())))) {
                     m_queue.Reset();
                     m_device.Reset();
@@ -657,6 +683,8 @@ namespace openxr_api_layer {
                 // Readback buffer: UINT64 × 2 per slot.
                 D3D12_HEAP_PROPERTIES heapProps{};
                 heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+                heapProps.CreationNodeMask = nodeMask;
+                heapProps.VisibleNodeMask = nodeMask;
                 D3D12_RESOURCE_DESC bufDesc{};
                 bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
                 bufDesc.Width = sizeof(UINT64) * 2 * kGpuRingSize;
@@ -677,14 +705,14 @@ namespace openxr_api_layer {
                 // Per-slot (allocator, command list) pairs — one for the
                 // begin submission, one for the end+resolve submission.
                 // Created closed so the first Reset() in beginFrame /
-                // endFrame works.
+                // endFrame works. Both use the same NodeMask as the queue.
                 for (auto& slot : m_ring) {
                     for (auto* pair : { &slot.beginPair, &slot.endPair }) {
                         if (FAILED(m_device->CreateCommandAllocator(
                                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                                 IID_PPV_ARGS(pair->allocator.GetAddressOf()))) ||
                             FAILED(m_device->CreateCommandList(
-                                0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                nodeMask, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                 pair->allocator.Get(), nullptr,
                                 IID_PPV_ARGS(pair->cmdList.GetAddressOf())))) {
                             shutdownInternal();
@@ -723,6 +751,14 @@ namespace openxr_api_layer {
                     // GPU is >100 ms behind on this slot — drop the begin
                     // for this frame, the slot stays whatever it was. The
                     // matching end will see state != Started and skip too.
+                    //
+                    // Contract with OpenXrLayer::m_pendingFrames: xrEndFrame
+                    // unconditionally pushes a FrameRecord for `frame_index`,
+                    // so the orphan stays in the pending deque until either
+                    // a later frame's GpuFrameResult arrives (patchAndDrain
+                    // Pending flushes everything older than the resolved
+                    // index with gpu_time_ns=0) or xrDestroySession runs
+                    // flushPendingFramesUnresolved. No leak, no stuck row.
                     return;
                 }
 
@@ -811,6 +847,11 @@ namespace openxr_api_layer {
                     }
 
                     int64_t gpuNs = 0;
+                    // out-of-order ticks → 0 (driver bug; rare in practice).
+                    // We've seen this on a handful of WMR drivers where the
+                    // resolved end-of-frame timestamp comes back below the
+                    // start; reporting a negative duration would corrupt all
+                    // downstream headroom math, so swallow it.
                     if (m_frequency > 0 && tEnd > tStart) {
                         gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart, m_frequency);
                     }
@@ -894,15 +935,13 @@ namespace openxr_api_layer {
         // Walks the XrBaseInStructure-style `next` chain looking for the
         // first XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses
         // a different graphics API (Vulkan, OpenGL, D3D12).
+        //
+        // The actual walk lives in detail::findInTypedChain (header-only,
+        // pure pointer arithmetic) so a unit test can exercise it without
+        // pulling in the OpenXR/D3D headers — see test_telemetry_math.cpp.
         const XrGraphicsBindingD3D11KHR* findD3D11Binding(const void* nextChain) {
-            const auto* base = reinterpret_cast<const XrBaseInStructure*>(nextChain);
-            while (base) {
-                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
-                    return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(base);
-                }
-                base = base->next;
-            }
-            return nullptr;
+            return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(
+                detail::findInTypedChain(nextChain, XR_TYPE_GRAPHICS_BINDING_D3D11_KHR));
         }
 
         // Same walk for XrGraphicsBindingD3D12KHR. The struct carries an
@@ -912,14 +951,8 @@ namespace openxr_api_layer {
         // owns. We need that queue handle so D3D12GpuTimer can
         // ExecuteCommandLists onto the same stream the app draws on.
         const XrGraphicsBindingD3D12KHR* findD3D12Binding(const void* nextChain) {
-            const auto* base = reinterpret_cast<const XrBaseInStructure*>(nextChain);
-            while (base) {
-                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
-                    return reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(base);
-                }
-                base = base->next;
-            }
-            return nullptr;
+            return reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(
+                detail::findInTypedChain(nextChain, XR_TYPE_GRAPHICS_BINDING_D3D12_KHR));
         }
 
     }  // anonymous namespace

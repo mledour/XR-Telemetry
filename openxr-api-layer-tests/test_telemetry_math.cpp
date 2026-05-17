@@ -367,3 +367,75 @@ TEST_CASE("flushPendingFramesUnresolved: empty deque is a no-op") {
     CHECK(sink.log.empty());
     CHECK(pending.empty());
 }
+
+// =============================================================================
+// findInTypedChain — generic XrBaseInStructure-style chain walker used by
+// the D3D11 / D3D12 graphics-binding finders in layer.cpp. Tested here on a
+// synthetic chain of BaseLike nodes (the same layout XrBaseInStructure has)
+// so we never need to drag in <openxr/openxr.h> for this unit.
+// =============================================================================
+
+namespace {
+    // A chain node that extends BaseLike with a payload so we can verify
+    // the returned pointer actually addresses the matching entry, not a
+    // bystander with the same type tag.
+    struct ChainNode : openxr_api_layer::detail::BaseLike {
+        int payload;
+    };
+
+    // Tag values picked to mirror real OpenXR enum integers without
+    // requiring the header; they're arbitrary so long as they're distinct.
+    constexpr int32_t kTagA = 1001;
+    constexpr int32_t kTagB = 1002;
+    constexpr int32_t kTagC = 1003;
+}
+
+TEST_CASE("findInTypedChain: null head returns nullptr") {
+    using openxr_api_layer::detail::findInTypedChain;
+    CHECK(findInTypedChain(nullptr, kTagA) == nullptr);
+}
+
+TEST_CASE("findInTypedChain: single-node chain, type matches") {
+    using openxr_api_layer::detail::findInTypedChain;
+    ChainNode a{{kTagA, nullptr}, 42};
+    const auto* hit = static_cast<const ChainNode*>(findInTypedChain(&a, kTagA));
+    REQUIRE(hit != nullptr);
+    CHECK(hit->payload == 42);
+}
+
+TEST_CASE("findInTypedChain: single-node chain, type does not match") {
+    using openxr_api_layer::detail::findInTypedChain;
+    ChainNode a{{kTagA, nullptr}, 42};
+    CHECK(findInTypedChain(&a, kTagB) == nullptr);
+}
+
+TEST_CASE("findInTypedChain: walks past non-matching prefix to find target") {
+    using openxr_api_layer::detail::findInTypedChain;
+    ChainNode c{{kTagC, nullptr}, 30};
+    ChainNode b{{kTagB, &c}, 20};
+    ChainNode a{{kTagA, &b}, 10};
+    // Find the middle node — exercise that we don't stop at A and don't
+    // overshoot to C.
+    const auto* hit = static_cast<const ChainNode*>(findInTypedChain(&a, kTagB));
+    REQUIRE(hit != nullptr);
+    CHECK(hit->payload == 20);
+}
+
+TEST_CASE("findInTypedChain: returns the FIRST match when duplicates exist") {
+    using openxr_api_layer::detail::findInTypedChain;
+    ChainNode second{{kTagB, nullptr}, 200};
+    ChainNode first{{kTagB, &second}, 100};
+    ChainNode head{{kTagA, &first}, 1};
+    const auto* hit = static_cast<const ChainNode*>(findInTypedChain(&head, kTagB));
+    REQUIRE(hit != nullptr);
+    CHECK(hit->payload == 100);  // not 200 — early-out on first hit
+}
+
+TEST_CASE("findInTypedChain: target not present in any chain entry") {
+    using openxr_api_layer::detail::findInTypedChain;
+    ChainNode c{{kTagC, nullptr}, 30};
+    ChainNode b{{kTagB, &c}, 20};
+    ChainNode a{{kTagA, &b}, 10};
+    // Look for a tag value nothing in the chain carries.
+    CHECK(findInTypedChain(&a, 9999) == nullptr);
+}
