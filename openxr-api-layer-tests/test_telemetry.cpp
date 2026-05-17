@@ -238,14 +238,17 @@ namespace {
     constexpr int kColAppCpuNs = 4;
     constexpr int kColEndFrameNs = 5;
     constexpr int kColFrameTotalNs = 6;
-    constexpr int kColPeriodNs = 7;
-    constexpr int kColHeadroomPct = 8;
-    constexpr int kColShouldRender = 9;
-    constexpr int kColCount = 10;
+    constexpr int kColGpuTimeNs = 7;
+    constexpr int kColPeriodNs = 8;
+    constexpr int kColHeadroomPct = 9;
+    constexpr int kColGpuHeadroomPct = 10;
+    constexpr int kColShouldRender = 11;
+    constexpr int kColCount = 12;
 
     const std::string kExpectedHeader =
         "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,"
-        "frame_total_ns,period_ns,headroom_pct,should_render";
+        "frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,"
+        "should_render";
 
 } // namespace
 
@@ -539,4 +542,34 @@ TEST_CASE("telemetry: layer is pure pass-through w.r.t. downstream call counts")
     CHECK(mock::state().waitFrameCallCount == kFrames);
     CHECK(mock::state().beginFrameCallCount == kFrames);
     CHECK(mock::state().endFrameCallCount == kFrames);
+}
+
+// ----------------------------------------------------------------------------
+// 11. GPU columns degrade gracefully when no D3D11 device is available.
+//    The mock runtime mocks xrCreateSession but the integration tests don't
+//    drive it (no graphics binding), so GpuTimer::init is never called and
+//    isActive() stays false. gpu_time_ns and gpu_headroom_pct should appear
+//    in every row as 0 — present in the schema but unmeasured.
+// ----------------------------------------------------------------------------
+TEST_CASE("telemetry: gpu_time_ns and gpu_headroom_pct are 0 when no D3D11 binding is set up") {
+    TelemetryFixture fix;
+    auto* api = fix.startLayer("NoGpuTimingApp");
+
+    constexpr int kFrames = 3;
+    for (int i = 0; i < kFrames; ++i) {
+        driveOneFrame(api);
+    }
+    openxr_api_layer::ResetInstance();
+
+    const auto csv = findSessionCsv(fix.sessionsDir());
+    REQUIRE(csv.has_value());
+    const auto lines = readLines(*csv);
+    REQUIRE(lines.size() == kFrames + 2);  // header + N + footer
+
+    for (int i = 0; i < kFrames; ++i) {
+        const auto cells = split(lines[1 + i]);
+        REQUIRE(cells.size() == kColCount);
+        CHECK(cells[kColGpuTimeNs] == "0");
+        CHECK(cells[kColGpuHeadroomPct] == "0.00");
+    }
 }

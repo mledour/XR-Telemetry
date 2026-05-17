@@ -85,8 +85,13 @@ namespace openxr_api_layer {
                                        //                       compositor overhead)
             int64_t frame_total_ns;    // tEnd - tEndPrev      (full cycle, includes
                                        //                       post-end sim/physics)
+            int64_t gpu_time_ns;       // D3D11 timestamp delta (xrBeginFrame →
+                                       //                       xrEndFrame on the GPU).
+                                       //                       0 if no D3D11 binding or
+                                       //                       result not yet available.
             int64_t period_ns;
-            float headroom_pct;
+            float headroom_pct;        // CPU headroom
+            float gpu_headroom_pct;    // GPU headroom
             bool should_render;
         };
 
@@ -131,7 +136,9 @@ namespace openxr_api_layer {
                 if (!m_file.is_open()) {
                     return false;
                 }
-                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,period_ns,headroom_pct,should_render\n";
+                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
+                          "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
+                          "headroom_pct,gpu_headroom_pct,should_render\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -279,7 +286,7 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        m_file << fmt::format("{},{},{},{},{},{},{},{},{:.2f},{}\n",
+                        m_file << fmt::format("{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{}\n",
                                               rec.frame_index,
                                               rec.timestamp_qpc,
                                               rec.wait_block_ns,
@@ -287,8 +294,10 @@ namespace openxr_api_layer {
                                               rec.app_cpu_ns,
                                               rec.end_frame_ns,
                                               rec.frame_total_ns,
+                                              rec.gpu_time_ns,
                                               rec.period_ns,
                                               rec.headroom_pct,
+                                              rec.gpu_headroom_pct,
                                               rec.should_render ? 1 : 0);
                     }
 
@@ -391,6 +400,219 @@ namespace openxr_api_layer {
             return dir / fmt::format("{}_{}.csv", timestamp, safeName);
         }
 
+        // -------------------------------------------------------------------
+        // GpuTimer — D3D11 GPU-side timing for app frames.
+        //
+        // GPU timestamps are inherently asynchronous: a timestamp issued in
+        // the command stream at xrBeginFrame_N's exit reflects the GPU's
+        // wall clock at the moment that command actually runs on the GPU,
+        // which is usually 1-3 frames after the CPU submitted it. So the
+        // CPU thread can only READ a frame's GPU timings once the GPU is
+        // done with that frame.
+        //
+        // We use a small ring of "query trios" (one D3D11_QUERY_TIMESTAMP_-
+        // DISJOINT bracketing two D3D11_QUERY_TIMESTAMPs) to keep multiple
+        // frames in flight on the GPU while we wait for results to land.
+        // queueAndResolve(frame_index) is called from xrEndFrame:
+        //
+        //   1. Issue end-timestamp for the in-flight entry → entry full
+        //   2. Advance the ring head
+        //   3. Try to pop and resolve the *oldest* trio whose GPU work has
+        //      completed since we last polled. If ready → return its
+        //      (frame_index, gpu_time_ns); otherwise return nullopt.
+        //
+        // The caller (OpenXrLayer::xrEndFrame) is responsible for matching
+        // the resolved frame_index back to the FrameRecord queued at that
+        // frame's xrEndFrame_N — see the m_pendingFrames deque on
+        // OpenXrLayer below.
+        //
+        // If init() couldn't get a D3D11 device (Vulkan / OpenGL / null
+        // binding / D3D12 not yet supported via D3D11On12), isActive()
+        // stays false and beginFrame/queueAndResolve become no-ops that
+        // return 0 — gpu_time_ns just reads as 0 in the CSV.
+        struct GpuFrameResult {
+            uint64_t frame_index;
+            int64_t gpu_time_ns;
+        };
+
+        class GpuTimer {
+          public:
+            ~GpuTimer() {
+                shutdown();
+            }
+
+            // device + context come from XrGraphicsBindingD3D11KHR (in the
+            // app's xrCreateSession.next chain). We AddRef them so the GPU
+            // can finish its frames even if the app would otherwise release
+            // them right at xrDestroySession; we release on shutdown().
+            bool init(ID3D11Device* device, ID3D11DeviceContext* context) {
+                if (!device || !context) return false;
+                if (m_active) return true;  // idempotent like CsvWriter
+
+                m_device = device;
+                m_context = context;
+
+                D3D11_QUERY_DESC disjointDesc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+                D3D11_QUERY_DESC tsDesc{D3D11_QUERY_TIMESTAMP, 0};
+                for (auto& slot : m_ring) {
+                    if (FAILED(m_device->CreateQuery(&disjointDesc, slot.disjoint.GetAddressOf())) ||
+                        FAILED(m_device->CreateQuery(&tsDesc, slot.start.GetAddressOf())) ||
+                        FAILED(m_device->CreateQuery(&tsDesc, slot.end.GetAddressOf()))) {
+                        // Some driver / debug-layer combination refused the
+                        // query — degrade to "no GPU timing".
+                        for (auto& s : m_ring) {
+                            s.disjoint.Reset();
+                            s.start.Reset();
+                            s.end.Reset();
+                        }
+                        return false;
+                    }
+                    slot.state = SlotState::Idle;
+                }
+                m_writeIdx = 0;
+                m_readIdx = 0;
+                m_active = true;
+                return true;
+            }
+
+            void shutdown() {
+                if (!m_active) return;
+                for (auto& slot : m_ring) {
+                    slot.disjoint.Reset();
+                    slot.start.Reset();
+                    slot.end.Reset();
+                    slot.state = SlotState::Idle;
+                    slot.frame_index = 0;
+                }
+                m_context.Reset();
+                m_device.Reset();
+                m_active = false;
+            }
+
+            // Called from xrBeginFrame. Picks the next ring slot, issues
+            // Begin(disjoint) and End(start). If the slot we want to use
+            // is still in flight (the ring is full), we silently overwrite
+            // it — the corresponding pending FrameRecord will get
+            // gpu_time_ns = 0 because the resolve below won't see it.
+            // Realistic with kRingSize=4: full ring only happens if the GPU
+            // is >4 frames behind, in which case the app is dropping frames
+            // anyway and a missing gpu_time on those frames is the least of
+            // their problems.
+            void beginFrame(uint64_t frame_index) {
+                if (!m_active) return;
+                auto& slot = m_ring[m_writeIdx];
+                m_context->Begin(slot.disjoint.Get());
+                m_context->End(slot.start.Get());
+                slot.frame_index = frame_index;
+                slot.state = SlotState::Started;
+            }
+
+            // Called from xrEndFrame, AFTER OpenXrApi::xrEndFrame returned.
+            // Closes the in-flight slot's end-timestamp + disjoint, advances
+            // the write head, then walks readIdx forward popping every slot
+            // whose GPU work has finished. Returns the most-recently-resolved
+            // result (or nullopt if no slot is ready this call).
+            //
+            // Multiple slots may resolve in one call after a stutter; we
+            // currently return only the latest, which means brief stutters
+            // produce a few CSV rows with gpu_time_ns=0 instead of holding
+            // them back further. Good enough for V1; if it matters we'll
+            // return std::vector<GpuFrameResult> later.
+            std::optional<GpuFrameResult> endFrameAndResolveOldest() {
+                if (!m_active) return std::nullopt;
+
+                // Close the trio that beginFrame() opened.
+                auto& closing = m_ring[m_writeIdx];
+                if (closing.state == SlotState::Started) {
+                    m_context->End(closing.end.Get());
+                    m_context->End(closing.disjoint.Get());
+                    closing.state = SlotState::Pending;
+                }
+                m_writeIdx = (m_writeIdx + 1) % kRingSize;
+
+                // Drain everything that's ready, keep the LAST result.
+                std::optional<GpuFrameResult> latest;
+                while (true) {
+                    auto& slot = m_ring[m_readIdx];
+                    if (slot.state != SlotState::Pending) break;
+
+                    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+                    const HRESULT hr = m_context->GetData(slot.disjoint.Get(),
+                                                          &disjointData,
+                                                          sizeof(disjointData),
+                                                          D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                    if (hr != S_OK) break;  // not ready yet, stop draining
+
+                    UINT64 tStart = 0, tEnd = 0;
+                    if (m_context->GetData(slot.start.Get(), &tStart, sizeof(tStart),
+                                           D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                        m_context->GetData(slot.end.Get(), &tEnd, sizeof(tEnd),
+                                           D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                        // Disjoint resolved but timestamps didn't — should
+                        // not happen, but reset the slot and move on.
+                        slot.state = SlotState::Idle;
+                        m_readIdx = (m_readIdx + 1) % kRingSize;
+                        continue;
+                    }
+
+                    int64_t gpuNs = 0;
+                    if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd > tStart) {
+                        // (delta_ticks * 1e9) / Frequency without overflow.
+                        const UINT64 delta = tEnd - tStart;
+                        gpuNs = static_cast<int64_t>(
+                            (delta / disjointData.Frequency) * 1'000'000'000ULL +
+                            ((delta % disjointData.Frequency) * 1'000'000'000ULL) /
+                                disjointData.Frequency);
+                    }
+                    latest = GpuFrameResult{slot.frame_index, gpuNs};
+                    slot.state = SlotState::Idle;
+                    m_readIdx = (m_readIdx + 1) % kRingSize;
+                }
+                return latest;
+            }
+
+            bool isActive() const { return m_active; }
+
+          private:
+            // Latency budget: at 90 Hz, 4 frames = ~44 ms — comfortably
+            // above any realistic GPU→CPU result latency. Keep small to
+            // limit pending CSV records the layer holds back at session
+            // end.
+            static constexpr size_t kRingSize = 4;
+
+            enum class SlotState { Idle, Started, Pending };
+
+            struct Slot {
+                ComPtr<ID3D11Query> disjoint;
+                ComPtr<ID3D11Query> start;
+                ComPtr<ID3D11Query> end;
+                uint64_t frame_index = 0;
+                SlotState state = SlotState::Idle;
+            };
+
+            ComPtr<ID3D11Device> m_device;
+            ComPtr<ID3D11DeviceContext> m_context;
+            std::array<Slot, kRingSize> m_ring;
+            size_t m_writeIdx = 0;
+            size_t m_readIdx = 0;
+            bool m_active = false;
+        };
+
+        // Walks the XrBaseInStructure-style `next` chain looking for the
+        // first XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses
+        // a different graphics API (Vulkan, OpenGL, or D3D12 — the latter
+        // is reachable via D3D11On12 in a follow-up commit).
+        const XrGraphicsBindingD3D11KHR* findD3D11Binding(const void* nextChain) {
+            const auto* base = reinterpret_cast<const XrBaseInStructure*>(nextChain);
+            while (base) {
+                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+                    return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(base);
+                }
+                base = base->next;
+            }
+            return nullptr;
+        }
+
     }  // anonymous namespace
 
 
@@ -416,6 +638,13 @@ namespace openxr_api_layer {
         // their empty CSVs rather than leaving header-only litter in the
         // sessions/ folder.
         ~OpenXrLayer() override {
+            // If xrDestroySession was never called (e.g. host process is
+            // tearing down without a graceful OpenXR shutdown), flush any
+            // FrameRecord still waiting on a GPU result so they end up in
+            // the CSV with gpu_time_ns=0 rather than disappearing.
+            flushPendingFramesUnresolved();
+            m_gpuTimer.shutdown();
+
             const uint64_t written = m_csv.written();
             m_csv.stop();
             if (m_csvPath.has_filename()) {
@@ -510,6 +739,55 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // ---- xrCreateSession ----------------------------------------------
+        // Inspects createInfo->next for an XrGraphicsBindingD3D11KHR. If
+        // present, stands up the D3D11 query ring used by xrBeginFrame /
+        // xrEndFrame to measure app GPU time per frame. We never mutate
+        // createInfo and we never fail the host's xrCreateSession over GPU-
+        // timer init issues (CLAUDE.md rule 9: degrade gracefully). If the
+        // app uses Vulkan, OpenGL, D3D12, or no binding at all, the timer
+        // stays inactive and gpu_time_ns reads as 0 in the CSV.
+        //
+        // TODO V2.1: handle XrGraphicsBindingD3D12KHR via the D3D11On12
+        // bridge already wired into pch.h.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
+        XrResult xrCreateSession(XrInstance instance,
+                                 const XrSessionCreateInfo* createInfo,
+                                 XrSession* session) override {
+            const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
+            if (XR_FAILED(result) || !createInfo) {
+                return result;
+            }
+            if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
+                if (m_gpuTimer.init(d3d11->device, d3d11->deviceContext)) {
+                    Log("xr_telemetry: D3D11 GPU timer active\n");
+                } else {
+                    Log("xr_telemetry: D3D11 binding found but query creation failed; "
+                        "gpu_time_ns will be 0 for this session\n");
+                }
+            } else {
+                Log("xr_telemetry: no D3D11 binding in xrCreateSession.next (Vulkan / "
+                    "OpenGL / D3D12 / null); gpu_time_ns will be 0 for this session\n");
+            }
+            return result;
+        }
+
+        // ---- xrDestroySession ---------------------------------------------
+        // Tears down the D3D11 query objects so we don't leak. The framework
+        // does NOT auto-handle xrDestroySession (the comment about that is
+        // wrong; dispatch_generator.py only auto-handles xrCreateInstance,
+        // xrDestroyInstance, xrGetInstanceProcAddr, and
+        // xrEnumerateInstanceExtensionProperties). We have to override it
+        // ourselves, like fov_crop does.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrDestroySession
+        XrResult xrDestroySession(XrSession session) override {
+            // Flush any FrameRecords still waiting on a GPU result before
+            // we release the queries. They'll be written with gpu_time_ns=0.
+            flushPendingFramesUnresolved();
+            m_gpuTimer.shutdown();
+            return OpenXrApi::xrDestroySession(session);
+        }
+
         // ---- xrWaitFrame --------------------------------------------------
         // Pure observation; never mutates frameWaitInfo or frameState. The
         // QPC samples around the base call let us derive wait_block_ns (how
@@ -532,15 +810,22 @@ namespace openxr_api_layer {
         }
 
         // ---- xrBeginFrame -------------------------------------------------
-        // Captured for completeness (begin→end split is useful in trace
-        // analysis to separate "wait→begin housekeeping" from "render
-        // submission") but not used in the headroom math itself.
+        // Captured for two purposes:
+        //   (1) tBegin sample → pre_begin_ns split (Wait→Begin housekeeping
+        //       vs Begin→End render submission), used in CSV analysis.
+        //   (2) Open the GPU timestamp window. The matching close happens in
+        //       xrEndFrame; the resolved gpu_time_ns lands in a later CSV
+        //       row (3-4 frame deferral due to GPU→CPU result latency).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrBeginFrame
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
             const int64_t tBegin = QpcNow();
             const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
             if (XR_SUCCEEDED(result)) {
                 m_tBegin.store(tBegin, std::memory_order_relaxed);
+                // Open the GPU timestamp window. The frame index used here
+                // is the *next* one we're about to assign in xrEndFrame —
+                // peek without incrementing so the two sides match.
+                m_gpuTimer.beginFrame(m_frameIndex.load(std::memory_order_relaxed));
             }
             return result;
         }
@@ -629,21 +914,46 @@ namespace openxr_api_layer {
             }
             const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
 
-            // Push to the async CSV writer. push() is bounded-time (a
-            // try_lock + deque manipulation, ~30-50 ns when uncontended);
-            // disk I/O happens entirely on the writer thread.
-            m_csv.push(FrameRecord{
+            // Build the FrameRecord for this frame with gpu_time_ns=0 and
+            // gpu_headroom_pct=0 as placeholders. We can't fill them in
+            // now: the GPU has barely started this frame's commands, much
+            // less finished them. They'll be patched in below as soon as
+            // an older frame's GPU result resolves.
+            FrameRecord rec{
                 frameIndex,
-                tEnd,           // raw QPC tick; converted to time in analysis
+                tEnd,
                 waitBlockNs,
                 preBeginNs,
                 appCpuNs,
                 endFrameNs,
                 frameTotalNs,
+                /*gpu_time_ns=*/0,
                 periodNs,
                 headroomPct,
+                /*gpu_headroom_pct=*/0.0f,
                 shouldRender,
-            });
+            };
+
+            // Close the GPU timestamp window and try to resolve an older
+            // pending frame. If the GpuTimer is inactive (no D3D11), this
+            // returns nullopt every call and we push the FrameRecord
+            // immediately with gpu_time_ns=0.
+            const auto resolved = m_gpuTimer.endFrameAndResolveOldest();
+
+            // Queue this frame's record and (if active) wait for GPU.
+            // Pending deque grows by 1 each frame, shrinks by 1 each time
+            // a result resolves. In steady state it stabilises at ~kRingSize
+            // entries.
+            if (m_gpuTimer.isActive()) {
+                m_pendingFrames.push_back(rec);
+
+                if (resolved.has_value()) {
+                    patchAndDrainPending(resolved->frame_index, resolved->gpu_time_ns);
+                }
+            } else {
+                // No GPU timer → no deferred path. Push immediately.
+                m_csv.push(rec);
+            }
 
             return result;
         }
@@ -691,6 +1001,54 @@ namespace openxr_api_layer {
             return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
         }
 
+        // GPU-side helpers ------------------------------------------------
+
+        // The GpuTimer resolves frame N's GPU time in xrEndFrame_{N+latency}.
+        // We hold each FrameRecord in m_pendingFrames between its own
+        // xrEndFrame and the call where its GPU result arrives, then patch
+        // the gpu_time_ns + gpu_headroom_pct in and push to the CsvWriter.
+        //
+        // Pending entries are FIFO and ordered by frame_index. When a result
+        // for frame R arrives, every record at the front with frame_index
+        // <= R is settled: the matching one gets the resolved gpu_time,
+        // the older ones (if any — could happen on stutter) get 0.
+        void patchAndDrainPending(uint64_t resolvedFrameIndex, int64_t gpuTimeNs) {
+            while (!m_pendingFrames.empty()) {
+                auto& front = m_pendingFrames.front();
+                if (front.frame_index > resolvedFrameIndex) {
+                    break;  // resolved older than everything pending — nothing to drain
+                }
+                if (front.frame_index == resolvedFrameIndex) {
+                    front.gpu_time_ns = gpuTimeNs;
+                    if (front.period_ns > 0) {
+                        const double ratio =
+                            static_cast<double>(gpuTimeNs) / static_cast<double>(front.period_ns);
+                        front.gpu_headroom_pct = static_cast<float>((1.0 - ratio) * 100.0);
+                    }
+                }
+                // Stale entries (frame_index < resolvedFrameIndex) keep
+                // gpu_time_ns=0 — the ring overran them; their GPU work
+                // result is gone. Push them anyway so the CSV stays
+                // chronologically complete.
+                m_csv.push(front);
+                m_pendingFrames.pop_front();
+                if (front.frame_index == resolvedFrameIndex) {
+                    break;  // the matched frame is now flushed; stop here
+                }
+            }
+        }
+
+        // Called from xrDestroySession and from ~OpenXrLayer to flush
+        // FrameRecords that never got a GPU result back (kRingSize-1 of
+        // them in the steady state when the session ends, more on a stutter).
+        // gpu_time_ns stays 0 — better an unmeasured row than a missing row.
+        void flushPendingFramesUnresolved() {
+            while (!m_pendingFrames.empty()) {
+                m_csv.push(m_pendingFrames.front());
+                m_pendingFrames.pop_front();
+            }
+        }
+
         bool m_bypassApiLayer = false;
         int64_t m_qpcFrequency = 1;
 
@@ -714,6 +1072,15 @@ namespace openxr_api_layer {
         // Async CSV writer + the path we opened (for the destructor log).
         CsvWriter m_csv;
         std::filesystem::path m_csvPath;
+
+        // GPU timing — single-threaded access from the frame-loop thread.
+        // No atomics: every call into beginFrame / endFrameAndResolveOldest
+        // is from xrBeginFrame / xrEndFrame, which the OpenXR spec
+        // serialises within a session. The pending deque holds FrameRecords
+        // waiting on a GPU result to land — typically kRingSize entries in
+        // steady state, drains when xrDestroySession is called.
+        GpuTimer m_gpuTimer;
+        std::deque<FrameRecord> m_pendingFrames;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
