@@ -374,6 +374,44 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
 > polling done AFTER xrEndFrame returns.
 <!-- REMOVE-WHEN-PR2-LANDS:end -->
 
+<!-- REMOVE-WHEN-PR3-LANDS:start -->
+> **Known limitation (PR3 will address):** `cpu_frame_ms` is
+> derived from `frame_total - wait_block`, which conflates *real
+> CPU work* with *the app sleeping on its own vsync*. On in-game
+> menus running at a 60 Hz vsync cap (LMU, MSFS, …) on a 90 Hz
+> HMD, the app does ~1 ms of real work and then sleeps ~15 ms
+> waiting for its monitor refresh — outside of `xrWaitFrame`, so
+> the compositor doesn't see the idle and `wait_block` stays
+> small. The metric then reads `cpu ≈ 16 ms (≈100% util)` while
+> the app is actually idle. In-game (real driving / flying)
+> the same metric works correctly because the compositor
+> throttles via `wait_block` whenever the app has spare time.
+>
+> **PR3 plan: real thread CPU time via `QueryThreadCycleTime`.**
+> User-mode Win32 API, no admin / no kernel ETW required, anti-
+> cheat friendly. The layer already sees every thread that enters
+> `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame`; we snapshot
+> `QueryThreadCycleTime` at each entry/exit, calibrate cycles →
+> nanoseconds once at startup via a busy-loop against QPC, and
+> publish a NEW field `cpu_thread_ms` alongside `cpu_frame_ms`.
+> The snapshot then reads e.g.:
+>
+>     cpu=10.9 ms (98% slot) | thread=1.2 ms     ← menu, sleeping
+>     cpu= 8.4 ms (76% slot) | thread=7.9 ms     ← in-game, real work
+>
+> `cpu_frame_ms` (per-cycle slot occupancy) stays useful for
+> "is the app keeping up with the display"; `cpu_thread_ms`
+> (actual on-CPU thread time) answers "where does the time
+> actually go". Both ship together so users can read either lens
+> without one replacing the other. fpsvr does roughly this; we
+> stop short of the kernel-ETW context-switch tracker that would
+> trip anti-cheat for unclear extra value on a layer-shaped tool.
+>
+> Sequencing: ships after PR2 (rendering) so the two PRs are
+> reviewable independently — PR2 is "draw the existing numbers",
+> PR3 is "add a more truthful CPU number".
+<!-- REMOVE-WHEN-PR3-LANDS:end -->
+
 ### Hotkey mode UX
 
 Both hotkeys (log and overlay) are polled once per frame inside
