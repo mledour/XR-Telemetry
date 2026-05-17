@@ -862,6 +862,32 @@ namespace openxr_api_layer {
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             const int64_t tEnd = QpcNow();
+
+            // CLOSE THE GPU TIMESTAMP WINDOW BEFORE FORWARDING.
+            //
+            // GPU timestamps record the GPU's wall clock at the moment a
+            // query command is executed in the command stream — they do
+            // NOT depend on CPU-side timing. So the placement of
+            // End(end)/End(disjoint) in the *stream* is what determines
+            // what the gpu_time delta covers.
+            //
+            // If we issued these after OpenXrApi::xrEndFrame, the runtime
+            // would have appended its own compositor / layer-composition
+            // / projection-correction work to the stream first, and our
+            // End commands would land AFTER it — folding the runtime's
+            // GPU work into our app-frame measurement. On DR2 +
+            // OpenComposite + Pimax OpenXR 0.1.0 that's ~7 ms of texture
+            // copy and handoff, swamping the app's actual ~4 ms of work
+            // and reporting ~0% GPU headroom instead of the ~64% an
+            // OpenXR Toolkit overlay shows.
+            //
+            // Issuing them BEFORE the forward puts them in the stream
+            // right after the app's last draw call, matching OXRT's
+            // appGpuTimer.stop() position. The runtime's xrEndFrame
+            // commands queue AFTER ours and are excluded from the
+            // measurement.
+            const auto resolved = m_gpuTimer.endFrameAndResolveOldest();
+
             const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
             // end_frame_ns isolates the runtime + downstream layers' work
             // inside xrEndFrame (layer composition, projection correction,
@@ -946,12 +972,12 @@ namespace openxr_api_layer {
                 shouldRender,
             };
 
-            // Close the GPU timestamp window and try to resolve an older
-            // pending frame. If the GpuTimer is inactive (no D3D11), this
-            // returns nullopt every call and we push the FrameRecord
-            // immediately with gpu_time_ns=0.
-            const auto resolved = m_gpuTimer.endFrameAndResolveOldest();
-
+            // GPU timestamps were already closed BEFORE the OpenXrApi call
+            // above (see the long comment up top). `resolved` is the
+            // GpuFrameResult for whichever older frame's GPU work has
+            // since finished — or std::nullopt if nothing is ready yet,
+            // or the GpuTimer is inactive (no D3D11).
+            //
             // Queue this frame's record and (if active) wait for GPU.
             // Pending deque grows by 1 each frame, shrinks by 1 each time
             // a result resolves. In steady state it stabilises at ~kRingSize
