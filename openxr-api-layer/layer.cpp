@@ -50,6 +50,8 @@
 
 #include "layer.h"
 #include "telemetry_internals.h"
+#include "utils/name_utils.h"
+#include "utils/settings.h"
 #include <log.h>
 #include <util.h>
 
@@ -129,6 +131,17 @@ namespace openxr_api_layer {
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
+                // Reset per-file stat counters so the footer reflects only
+                // THIS recording window. Matters in mode=hotkey where the
+                // same CsvWriter is started/stopped multiple times per
+                // session — otherwise drop counts would accumulate across
+                // windows and the footer of the Nth file would show the
+                // sum of all preceding ones.
+                m_written = 0;
+                m_droppedTryLock.store(0, std::memory_order_relaxed);
+                m_droppedQueueFull.store(0, std::memory_order_relaxed);
+                m_droppedDiskWrite = 0;
+                m_diskWriteFailedLogged.store(false, std::memory_order_relaxed);
                 m_started.store(true, std::memory_order_release);
                 m_thread = std::thread(&CsvWriter::writerLoop, this);
                 return true;
@@ -385,6 +398,158 @@ namespace openxr_api_layer {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);  // best-effort
             return dir / fmt::format("{}_{}.csv", timestamp, safeName);
+        }
+
+        // -------------------------------------------------------------------
+        // Settings bootstrap + load. Mirrors the fov_crop sibling layer's
+        // contract: an installer drops `settings.json` into the user's
+        // %LOCALAPPDATA%\<layer>\ as a TEMPLATE, and on first run for each
+        // OpenXR application we copy that template to <app>_settings.json
+        // (the per-app file). Subsequent runs read the per-app file
+        // directly; the template is never re-touched.
+        //
+        // Three failure paths, all non-fatal — telemetry must keep
+        // working even if the filesystem misbehaves:
+        //   - template missing (ZIP install, never ran installer) →
+        //     writeDefaultTemplate() drops a copy of the schema below.
+        //   - per-app file missing → bootstrap from template, or from
+        //     built-in defaults if the template is also absent.
+        //   - parse error → parseSettings() returns documented defaults
+        //     and a non-empty error string we log once.
+        // -------------------------------------------------------------------
+
+        // The JSON body the runtime falls back to when neither the
+        // installer-dropped template nor the per-app file exist. MUST stay
+        // byte-for-byte aligned with installer/default_settings.json —
+        // installer users and ZIP users must see identical first-run
+        // behaviour. A drift here would mean a ZIP user's defaults
+        // disagree with the documented schema.
+        constexpr const char* kBuiltInDefaultSettings = R"({
+  "_comment": "Default template for XR_APILAYER_MLEDOUR_xr_telemetry. Each OpenXR application gets a copy of this file the first time it runs (named <app>_settings.json next to this one). Edit values here to change the defaults that apply to NEW games; existing per-app files are never touched on subsequent runs.",
+  "log": {
+    "_comment": "Per-frame CSV capture. mode=auto opens a CSV at session start and closes it at session end (the original always-on behaviour). mode=hotkey keeps the CSV closed until the user presses the configured combo, then toggles open/closed on each subsequent press. The hotkey is polled once per frame inside xrEndFrame, so it only fires while the game has focus and is rendering OpenXR.",
+    "enabled": true,
+    "mode": "auto",
+    "hotkey": {
+      "_comment": "Recognised keys: A-Z, 0-9, F1-F24, Space, Tab, Enter, Escape, Backspace, Insert, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right. Punctuation is intentionally unsupported (locale-dependent). Recognised modifiers: ctrl, shift, alt, win. Unknown modifier names are ignored; an unknown key falls back to the documented default (Ctrl+Shift+T) so a typo never disables the hotkey entirely.",
+      "key": "T",
+      "modifiers": ["ctrl", "shift"]
+    }
+  },
+  "overlay": {
+    "_reserved": "In-headset overlay (not yet implemented). Will receive its own enabled / position / opacity / etc. fields when shipped. The block exists today so future per-app files generated from this template won't need a migration step."
+  }
+}
+)";
+
+        // Writes the built-in default JSON to `outputPath`. Best-effort: a
+        // failed write (read-only LOCALAPPDATA, disk full) is logged but
+        // does not bubble up — the caller falls back to the parser's
+        // baked-in defaults.
+        bool writeBuiltInSettings(const std::filesystem::path& outputPath) {
+            std::ofstream out(outputPath, std::ios::out | std::ios::trunc);
+            if (!out.is_open()) return false;
+            out << kBuiltInDefaultSettings;
+            return out.good();
+        }
+
+        // Reads `path` into a string. Returns std::nullopt if the file is
+        // absent or unreadable (the caller treats both as "use defaults").
+        std::optional<std::string> readWholeFile(const std::filesystem::path& path) {
+            std::ifstream in(path, std::ios::in | std::ios::binary);
+            if (!in.is_open()) return std::nullopt;
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            if (!in.good() && !in.eof()) return std::nullopt;
+            return ss.str();
+        }
+
+        // The full bootstrap-and-parse flow. Called once at xrCreateInstance
+        // when we know the app name. Returns a parsed ParsedSettings that
+        // the caller stores on OpenXrLayer.
+        detail::ParsedSettings bootstrapAndLoadSettings(
+            const std::filesystem::path& configDir,
+            const std::string& appName) {
+
+            std::error_code ec;
+            std::filesystem::create_directories(configDir, ec);  // best-effort
+
+            const std::filesystem::path templatePath = configDir / "settings.json";
+            const std::filesystem::path perAppPath =
+                openxr_api_layer::resolvePerAppConfigPath(configDir, appName);
+
+            // 1. Ensure the global template exists. ZIP / dev installs
+            //    bypass the Inno Setup script that drops it; rebuild it
+            //    from the built-in default so the user has something to
+            //    edit. Never overwrites an existing template — preserves
+            //    any user edits to global defaults.
+            if (!std::filesystem::exists(templatePath)) {
+                if (writeBuiltInSettings(templatePath)) {
+                    Log(fmt::format("xr_telemetry: created template at {}\n",
+                                     templatePath.string()));
+                }
+            }
+
+            // 2. Bootstrap the per-app file if missing. Prefer copying the
+            //    template (so user edits to global defaults are inherited
+            //    by every NEW app), fall back to the built-in if no
+            //    template materialised.
+            if (!std::filesystem::exists(perAppPath)) {
+                bool bootstrapped = false;
+                if (std::filesystem::exists(templatePath)) {
+                    std::filesystem::copy_file(templatePath, perAppPath, ec);
+                    if (!ec) {
+                        bootstrapped = true;
+                        Log(fmt::format("xr_telemetry: bootstrapped {} from template\n",
+                                         perAppPath.string()));
+                    }
+                }
+                if (!bootstrapped && writeBuiltInSettings(perAppPath)) {
+                    Log(fmt::format("xr_telemetry: bootstrapped {} with built-in defaults\n",
+                                     perAppPath.string()));
+                }
+            }
+
+            // 3. Read + parse. Missing file (everything above failed) =
+            //    parser returns documented defaults; we log it once.
+            const auto fileContent = readWholeFile(perAppPath);
+            if (!fileContent) {
+                Log(fmt::format("xr_telemetry: settings file unreadable at {}, "
+                                 "using built-in defaults\n", perAppPath.string()));
+                return detail::parseSettings("");
+            }
+            auto parsed = detail::parseSettings(*fileContent);
+            if (!parsed.error.empty()) {
+                ErrorLog(fmt::format("xr_telemetry: settings parse error at {}: {} — "
+                                      "using built-in defaults\n",
+                                      perAppPath.string(), parsed.error));
+            }
+            return parsed;
+        }
+
+        // Polls the OS for the exact combo described by `spec`. Returns
+        // true only when the main key is held AND the modifier state
+        // matches bit-for-bit — pressing Ctrl+Alt+Shift+T must NOT fire a
+        // Ctrl+Shift+T binding (or every accidental Alt-graveyard would
+        // toggle the recorder).
+        //
+        // Uses GetAsyncKeyState, scoped naturally to the foreground
+        // process: when the game loses focus, the key state we read goes
+        // false on the release that we never see, but the next press
+        // while the game's window is up will register normally. This is
+        // exactly the desired UX — no global hotkey hijacking.
+        bool pollHotkeyPressed(const detail::HotkeySpec& spec) {
+            if (!spec.valid()) return false;
+            auto down = [](int vk) {
+                return (::GetAsyncKeyState(vk) & 0x8000) != 0;
+            };
+            if (!down(spec.vk)) return false;
+            if (spec.ctrl != down(VK_CONTROL)) return false;
+            if (spec.shift != down(VK_SHIFT)) return false;
+            if (spec.alt != down(VK_MENU)) return false;  // VK_MENU = Alt
+            const bool winDown = down(VK_LWIN) || down(VK_RWIN);
+            if (spec.win != winDown) return false;
+            return true;
         }
 
         // -------------------------------------------------------------------
@@ -1053,25 +1218,57 @@ namespace openxr_api_layer {
                                  XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
             }
 
-            // Open the per-session CSV file. Failures here are non-fatal —
-            // the layer keeps running as a pure pass-through if we can't
-            // create the file (read-only LOCALAPPDATA, disk full, …). We
-            // log the failure once via ErrorLog so post-mortem analysis can
-            // still see it.
-            m_csvPath = buildSessionCsvPath(appName);
-            if (m_csv.start(m_csvPath)) {
-                Log(fmt::format("xr_telemetry: writing per-frame CSV to {}\n", m_csvPath.string()));
-            } else {
-                ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — telemetry disabled for this session\n",
-                                     m_csvPath.string()));
+            // Stash the application name — we need it later both for
+            // building CSV paths (auto AND hotkey modes derive the file
+            // name from it) and for the log lines that announce mode
+            // transitions.
+            m_appName = appName;
+
+            // Load the per-app settings file (bootstrap from the global
+            // template if missing). bootstrapAndLoadSettings always
+            // returns a usable struct, even on filesystem or parse
+            // failure — defaults preserve the original always-on
+            // behaviour.
+            const auto parsed = bootstrapAndLoadSettings(
+                openxr_api_layer::localAppData, appName);
+            m_settings = parsed.settings;
+
+            // Master kill switch. CLAUDE.md rule 9 (graceful degradation):
+            // a user who set log.enabled=false in their settings wants
+            // the layer GONE for this app. Flipping m_bypassApiLayer
+            // here makes every per-frame override below a no-op forward,
+            // and the CSV stays closed for the whole session.
+            if (!m_settings.log.enabled) {
+                m_bypassApiLayer = true;
+                Log("xr_telemetry: log.enabled=false in settings — "
+                    "layer running as pass-through for this session\n");
+                return result;
             }
 
-            // TODO(xr_telemetry): Decide here whether your layer
-            // should be active for this app/runtime combination. If
-            // not, set m_bypassApiLayer = true to make every other
-            // override below a no-op pass-through. See CLAUDE.md
-            // rule 9 — never crash the host because your layer can't
-            // do its job; degrade to bypass instead.
+            // Auto mode: open the CSV right now and let xrEndFrame
+            // append rows until xrDestroySession closes it. Matches the
+            // pre-settings behaviour.
+            //
+            // Hotkey mode: keep the CSV CLOSED. xrEndFrame polls the
+            // configured combo every frame and toggles the recorder on
+            // rising edge — each new recording window gets its own
+            // timestamped CSV file via buildSessionCsvPath(appName).
+            if (m_settings.log.mode == detail::LogMode::Auto) {
+                m_csvPath = buildSessionCsvPath(appName);
+                if (m_csv.start(m_csvPath)) {
+                    m_recording = true;
+                    Log(fmt::format("xr_telemetry: mode=auto, writing per-frame CSV to {}\n",
+                                     m_csvPath.string()));
+                } else {
+                    ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — "
+                                          "telemetry disabled for this session\n",
+                                          m_csvPath.string()));
+                }
+            } else {
+                Log(fmt::format("xr_telemetry: mode=hotkey, press {} to start/stop "
+                                 "recording (per-frame CSV opens on the next press)\n",
+                                 detail::formatHotkey(m_settings.log.hotkey)));
+            }
 
             return result;
         }
@@ -1095,7 +1292,10 @@ namespace openxr_api_layer {
                                  const XrSessionCreateInfo* createInfo,
                                  XrSession* session) override {
             const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
-            if (XR_FAILED(result) || !createInfo) {
+            // log.enabled=false → don't stand up the GPU timer either.
+            // The session is created normally by the base call above;
+            // we just skip our own instrumentation hooks.
+            if (m_bypassApiLayer || XR_FAILED(result) || !createInfo) {
                 return result;
             }
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
@@ -1132,10 +1332,20 @@ namespace openxr_api_layer {
         // override it ourselves, like fov_crop does.
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrDestroySession
         XrResult xrDestroySession(XrSession session) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrDestroySession(session);
+            }
             // Flush any FrameRecords still waiting on a GPU result before
             // we release the queries. They'll be written with gpu_time_ns=0.
             flushPendingFramesUnresolved();
             m_gpuTimer.reset();
+            // Hotkey mode may have left the recorder open mid-session;
+            // close the CSV here so the footer + clean file rotation
+            // happen even when the user never pressed the stop key.
+            if (m_recording) {
+                m_csv.stop();
+                m_recording = false;
+            }
             return OpenXrApi::xrDestroySession(session);
         }
 
@@ -1147,6 +1357,9 @@ namespace openxr_api_layer {
         XrResult xrWaitFrame(XrSession session,
                              const XrFrameWaitInfo* frameWaitInfo,
                              XrFrameState* frameState) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            }
             const int64_t tWaitIn = QpcNow();
             const XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
             const int64_t tWaitOut = QpcNow();
@@ -1169,6 +1382,9 @@ namespace openxr_api_layer {
         //       row (3-4 frame deferral due to GPU→CPU result latency).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrBeginFrame
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            }
             const int64_t tBegin = QpcNow();
             const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
             if (XR_SUCCEEDED(result)) {
@@ -1215,6 +1431,49 @@ namespace openxr_api_layer {
         // we chose CSV instead for the UX (no wpr/tracerpt round-trip).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
+
+            // Hotkey mode: poll the configured combo once per frame, BEFORE
+            // any timing capture. The edge detector returns true exactly
+            // on the low→high transition, so a held key fires once even
+            // if the game runs at 120 Hz. Toggling the recorder is cheap
+            // — open/close start/stop the writer thread for that window.
+            //
+            // Edge cases handled by callees:
+            //   - m_csv.start() returning false (read-only LOCALAPPDATA,
+            //     disk full) leaves m_recording = false and the next
+            //     press will try again. We log once per failure so a
+            //     broken setup is visible in the support log.
+            //   - m_csv.stop() during a pending GPU result: the
+            //     resolved FrameRecord drains into a now-closed
+            //     CsvWriter and push() silently no-ops. No leak.
+            if (m_settings.log.mode == detail::LogMode::Hotkey) {
+                if (m_hotkeyDetector.tick(pollHotkeyPressed(m_settings.log.hotkey))) {
+                    if (!m_recording) {
+                        m_csvPath = buildSessionCsvPath(m_appName);
+                        if (m_csv.start(m_csvPath)) {
+                            m_recording = true;
+                            Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                             "recording started, writing to {}\n",
+                                             m_csvPath.string()));
+                        } else {
+                            ErrorLog(fmt::format("xr_telemetry: hotkey pressed but "
+                                                  "could not open {} — recording NOT started\n",
+                                                  m_csvPath.string()));
+                        }
+                    } else {
+                        const uint64_t written = m_csv.written();
+                        m_csv.stop();
+                        m_recording = false;
+                        Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                         "recording stopped ({} frames written to {})\n",
+                                         written, m_csvPath.string()));
+                    }
+                }
+            }
+
             const int64_t tEnd = QpcNow();
 
             // CLOSE THE GPU TIMESTAMP WINDOW BEFORE FORWARDING.
@@ -1447,8 +1706,27 @@ namespace openxr_api_layer {
         std::atomic<uint64_t> m_frameIndex{0};
 
         // Async CSV writer + the path we opened (for the destructor log).
+        // In mode=hotkey, m_csvPath is re-derived on each rising edge of
+        // the hotkey so every recording window gets its own timestamped
+        // file under sessions/.
         CsvWriter m_csv;
         std::filesystem::path m_csvPath;
+
+        // Settings + per-app application name, loaded once at
+        // xrCreateInstance. m_settings is read-only after init (we don't
+        // hot-reload — see the README's "live_edit deliberately omitted"
+        // note). m_appName drives both the CSV filename slug and the
+        // hotkey log messages.
+        detail::TelemetrySettings m_settings;
+        std::string m_appName;
+
+        // Hotkey-mode bookkeeping. m_hotkeyDetector rising-edge-filters
+        // pollHotkeyPressed() so a held key fires the toggle exactly
+        // once. m_recording tracks whether the CsvWriter is currently
+        // open — true in auto-mode for the whole session, true between
+        // press(N) and press(N+1) in hotkey-mode.
+        detail::HotkeyEdgeDetector m_hotkeyDetector;
+        bool m_recording = false;
 
         // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
         // D3D12) is picked at xrCreateSession based on the binding. Null

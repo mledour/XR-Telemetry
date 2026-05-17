@@ -328,8 +328,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="framework\util.h" />
     <ClInclude Include="layer.h" />
     <ClInclude Include="pch.h" />
-    <!-- Place your layer-specific headers under utils\ and register them
-         here, e.g. <ClInclude Include="utils\my_logic.h" /> -->
+    <ClInclude Include="telemetry_internals.h" />
+    <ClInclude Include="utils\hotkey.h" />
+    <ClInclude Include="utils\name_utils.h" />
+    <ClInclude Include="utils\settings.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="framework\dispatch.cpp" />
