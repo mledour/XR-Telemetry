@@ -49,15 +49,23 @@ namespace openxr_api_layer::log {
         std::mutex g_logMutex;
 
         // Writes a timestamped line through the framework log pipeline.
-        // forceFlush=true persists the line to disk immediately — used by
-        // ErrorLog so a post-error crash still leaves the message on disk.
-        // forceFlush=false leaves the line in the std::ofstream buffer (a
-        // few KB) and lets the OS persist on the next overflow or on
-        // process exit (logStream's destructor flushes when it closes).
-        // The init burst — xrCreateInstance fires ~15 Log() calls in
-        // sequence — used to be ~15 forced fsyncs; with forceFlush=false
-        // it's now one buffered write per call and a single implicit
-        // flush at shutdown.
+        // forceFlush=true persists the line to disk immediately. Both
+        // Log() and ErrorLog() set this — xr_telemetry users watch the
+        // log file mid-session to confirm hotkeys fire / mode=auto
+        // actually engaged / GPU timer attached, and the std::ofstream
+        // user-space buffer (~4 KB) would otherwise hide every line
+        // emitted after xrCreateInstance until the game closes (no
+        // per-frame Log()s in the hot path means the buffer rarely
+        // overflows mid-session).
+        //
+        // The cost is one fsync per Log() — ~15 at startup
+        // (xrCreateInstance burst), ≈0 per frame (banned from the hot
+        // path by the DBWinMutex caveat documented in layer.cpp), one
+        // per hotkey toggle. ~50-150 ms cumulative startup penalty,
+        // invisible against OpenXR's own load time. Reverted from the
+        // original "buffered Log, flushed ErrorLog" split because
+        // observing live behaviour matters more for a telemetry layer
+        // than saving 15 fsyncs of session-init overhead.
         void InternalLog(const char* fmt, va_list va, bool forceFlush) {
             const std::time_t now = std::time(nullptr);
 
@@ -90,7 +98,11 @@ namespace openxr_api_layer::log {
     void Log(const char* fmt, ...) {
         va_list va;
         va_start(va, fmt);
-        InternalLog(fmt, va, /*forceFlush=*/false);
+        // forceFlush=true so mid-session log lines (hotkey toggles,
+        // overlay state changes, runtime diagnostics) hit disk
+        // immediately and are visible to a tail-f'ing user. See the
+        // long comment above InternalLog for the rationale + cost.
+        InternalLog(fmt, va, /*forceFlush=*/true);
         va_end(va);
     }
 
