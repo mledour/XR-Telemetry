@@ -161,6 +161,50 @@ TEST_CASE("gpuTimestampDeltaToNs: handles large deltas without overflow") {
 }
 
 // =============================================================================
+// gpuTimestampPairToNs — pair-of-timestamps wrapper used by BOTH the D3D11
+// and D3D12 timer resolve loops. Concentrates the freq==0 + tEnd<=tStart
+// defensive checks so they live in exactly one place.
+// =============================================================================
+
+TEST_CASE("gpuTimestampPairToNs: nominal pair → delta in nanoseconds") {
+    // 1 GHz GPU clock, 4 ms of work between two timestamps. Resolves to
+    // 4_000_000 ns (4 ms), same as gpuTimestampDeltaToNs(4_000_000, 1e9).
+    constexpr uint64_t freq = 1'000'000'000ULL;
+    constexpr uint64_t tStart = 1'234'567'890ULL;
+    constexpr uint64_t tEnd = tStart + 4'000'000ULL;
+    CHECK(gpuTimestampPairToNs(tStart, tEnd, freq) == 4'000'000);
+}
+
+TEST_CASE("gpuTimestampPairToNs: tEnd == tStart → 0 (no work spans 0 ticks)") {
+    // Equal timestamps imply zero-duration work. Don't divide-by-anything,
+    // don't return a negative — the helper short-circuits at the guard.
+    CHECK(gpuTimestampPairToNs(1'000ULL, 1'000ULL, 1'000'000'000ULL) == 0);
+}
+
+TEST_CASE("gpuTimestampPairToNs: tEnd < tStart → 0 (WMR driver bug)") {
+    // Some WMR drivers occasionally return an end-of-frame timestamp below
+    // the start. Without this guard the unsigned subtraction would wrap to
+    // ~2^64 and produce a giant bogus duration; the helper returns 0
+    // instead so the per-frame headroom math stays sane.
+    CHECK(gpuTimestampPairToNs(2'000ULL, 1'000ULL, 1'000'000'000ULL) == 0);
+}
+
+TEST_CASE("gpuTimestampPairToNs: freq == 0 → 0 (disjoint / uninitialized)") {
+    // Disjoint query reports Frequency=0 on D3D11; GetTimestampFrequency
+    // returning 0 would be an init failure on D3D12. Either way we return
+    // 0 ns rather than risk a divide-by-zero in the underlying helper.
+    CHECK(gpuTimestampPairToNs(1'000ULL, 5'000ULL, 0) == 0);
+}
+
+TEST_CASE("gpuTimestampPairToNs: realistic 11.1 ms frame at 1.2 GHz") {
+    // RTX-class card, an 11.1 ms frame ≈ 13_320_000 GPU ticks.
+    constexpr uint64_t freq = 1'200'000'000ULL;
+    constexpr uint64_t tStart = 999'999'999'000ULL;
+    constexpr uint64_t tEnd = tStart + 13'320'000ULL;
+    CHECK(gpuTimestampPairToNs(tStart, tEnd, freq) == 11'100'000);
+}
+
+// =============================================================================
 // computeCpuHeadroomPct / computeGpuHeadroomPct — % of period not spent.
 // =============================================================================
 

@@ -142,6 +142,31 @@ namespace openxr_api_layer::detail {
             (rem * 1'000'000'000ULL) / frequency);
     }
 
+    // Pair-of-timestamps wrapper around gpuTimestampDeltaToNs with two
+    // defensive checks folded in:
+    //
+    //   1. freq == 0  — disjoint sentinel (D3D11) or uninitialized
+    //                   GetTimestampFrequency() (D3D12). Returns 0 ns.
+    //   2. tEnd <= tStart — driver bug. Seen on a handful of WMR drivers
+    //                       where the resolved end-of-frame timestamp comes
+    //                       back below the start. Treating the delta as
+    //                       unsigned would yield a huge bogus number and
+    //                       poison the headroom math downstream, so we
+    //                       swallow it as 0 ns.
+    //
+    // Both D3D11GpuTimer::endFrameAndResolveOldest and D3D12GpuTimer::end
+    // FrameAndResolveOldest funnel through here so the contract — and its
+    // unit tests — stay in one place. The D3D11 path additionally checks
+    // !disjointData.Disjoint at the call site (that flag lives on the
+    // disjoint query, not on the pair of timestamps, so it doesn't belong
+    // in this helper).
+    inline int64_t gpuTimestampPairToNs(uint64_t tStart,
+                                        uint64_t tEnd,
+                                        uint64_t frequency) noexcept {
+        if (frequency == 0 || tEnd <= tStart) return 0;
+        return gpuTimestampDeltaToNs(tEnd - tStart, frequency);
+    }
+
     // --- Headroom formulas --------------------------------------------------
 
     // CPU headroom % = (1 - appPerCycleNs / periodNs) * 100.

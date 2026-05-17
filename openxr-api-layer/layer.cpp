@@ -56,9 +56,10 @@
 namespace openxr_api_layer {
 
     using namespace log;
-    // FrameRecord, qpcToNs, gpuTimestampDeltaToNs, computeCpuHeadroomPct,
-    // computeGpuHeadroomPct, patchAndDrainPending, flushPendingFramesUnresolved
-    // all live in openxr_api_layer::detail (telemetry_internals.h) so the
+    // FrameRecord, qpcToNs, gpuTimestampDeltaToNs, gpuTimestampPairToNs,
+    // computeCpuHeadroomPct, computeGpuHeadroomPct, patchAndDrainPending,
+    // flushPendingFramesUnresolved, findInTypedChain all live in
+    // openxr_api_layer::detail (telemetry_internals.h) so the
     // test binary can exercise the math + bookkeeping bits without faking
     // an OpenXR session. Bring the type alias in here so the rest of this
     // file doesn't have to spell out detail:: every time.
@@ -555,15 +556,14 @@ namespace openxr_api_layer {
                         continue;
                     }
 
-                    int64_t gpuNs = 0;
-                    // out-of-order ticks → 0 (driver bug; rare in practice).
-                    // Same defensive check as the D3D12 path: a tEnd<tStart
-                    // reading would feed a negative duration to the headroom
-                    // formula and poison the per-frame CSV row.
-                    if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd > tStart) {
-                        gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart,
-                                                              disjointData.Frequency);
-                    }
+                    // The Disjoint flag lives on the disjoint query, not
+                    // on the timestamp pair, so it stays at the call site.
+                    // freq==0 and tEnd<=tStart are handled by the helper
+                    // (shared with the D3D12 path).
+                    const int64_t gpuNs = disjointData.Disjoint
+                        ? 0
+                        : detail::gpuTimestampPairToNs(tStart, tEnd,
+                                                       disjointData.Frequency);
                     latest = GpuFrameResult{slot.frame_index, gpuNs};
                     slot.state = GpuSlotState::Idle;
                     m_readIdx = (m_readIdx + 1) % kGpuRingSize;
@@ -846,15 +846,10 @@ namespace openxr_api_layer {
                         m_readback->Unmap(0, &noWrite);
                     }
 
-                    int64_t gpuNs = 0;
-                    // out-of-order ticks → 0 (driver bug; rare in practice).
-                    // We've seen this on a handful of WMR drivers where the
-                    // resolved end-of-frame timestamp comes back below the
-                    // start; reporting a negative duration would corrupt all
-                    // downstream headroom math, so swallow it.
-                    if (m_frequency > 0 && tEnd > tStart) {
-                        gpuNs = detail::gpuTimestampDeltaToNs(tEnd - tStart, m_frequency);
-                    }
+                    // freq==0 and tEnd<=tStart (the WMR-driver out-of-order
+                    // bug) are handled by the helper, shared with D3D11.
+                    const int64_t gpuNs =
+                        detail::gpuTimestampPairToNs(tStart, tEnd, m_frequency);
                     latest = GpuFrameResult{slot.frame_index, gpuNs};
                     slot.state = GpuSlotState::Idle;
                     m_readIdx = (m_readIdx + 1) % kGpuRingSize;
