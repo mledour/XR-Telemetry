@@ -387,16 +387,18 @@ way of the cockpit.
 
 ### What gets displayed
 
-Four monospace rows + two mini histograms of the last 50 frames:
+Two-column fpsVR-style layout — GPU on the left, CPU on the right.
+Each column shows the metric (top), a 144-sample frametime
+histogram (middle), and the utilisation % (bottom):
 
 ```
-FPS  89.8 / 90.0
-AVG  90.1
-CPU  6.78 ms (61%)
-GPU  5.18 ms (47%)
-▂▃▂▄▃▂▃▄▂▃▂▄▃▂▄▃▂▃▄▂▃▂▄▃▂  ← frame_total over the last 50 frames
-▁▂▂▃▂▁▂▃▂▃▂▂▃▂▂▁▂▂▃▂▁▂▃▂▂  ← gpu_time over the last 50 frames
+ FPS  89.8 / 90.0          AVG  90.1
+ GPU  5.18 ms              CPU  6.78 ms
+ ▁▂▃▂▃▂▁▂▃▂▃▂▁▂▃▂▃▂▁▂▃▂   ▂▃▂▄▃▂▃▄▂▃▂▄▃▂▄▃▂▃▄▂▃▂
+ GPU  47 %                 CPU  61 %
 ```
+
+(Future row, reserved: GPU/CPU temperature.)
 
 The histograms are **budget-anchored** in fpsvr / OpenXR Toolkit
 style:

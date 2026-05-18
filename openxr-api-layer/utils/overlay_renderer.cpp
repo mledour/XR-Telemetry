@@ -68,23 +68,34 @@ namespace openxr_api_layer::detail {
         // -------- Layout constants ------------------------------------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 256×144 gives readable
-        // 13pt Consolas at most HMD pixel densities.
-        constexpr int32_t  kTexW         = 256;
-        constexpr int32_t  kTexH         = 144;
+        // QUAD in 3D scales, not the resolution. 320×96 gives a fpsVR-
+        // style two-column HUD: GPU on the left, CPU on the right,
+        // with histograms below each frametime line.
+        constexpr int32_t  kTexW         = 320;
+        constexpr int32_t  kTexH         = 96;
         constexpr float    kPadX         = 8.0f;
         constexpr float    kPadTop       = 6.0f;
         constexpr float    kFontSize     = 13.0f;
         constexpr float    kLineHeight   = 16.0f;
-        constexpr float    kHistoHeight  = 18.0f;
-        constexpr float    kHistoGap     = 3.0f;
-        // No gap between bars — fpsVR-style dense waveform. With
-        // kRingSize=150 over a ~240 px strip, that's ~1.6 px per
-        // bar, which renders as a near-continuous trace at HMD
-        // resolutions and lets a single overrun stand out without
-        // squashing the rest of the history.
+        // Vertical gap inside a column between consecutive text rows
+        // (smaller than kLineHeight; tightens the column visually).
+        constexpr float    kRowGap       = 3.0f;
+        // The histogram strip's height. Smaller than the original 18
+        // because we now place the strip BELOW the per-column frame
+        // time and ABOVE the per-column utilisation, so the strip is
+        // the visual middle of each column rather than a footer.
+        constexpr float    kHistoHeight  = 22.0f;
+        constexpr float    kHistoGap     = 2.0f;
+        // Center gap between the two columns (width-wise). Both text
+        // and histogram strips honour this — the budget reference
+        // line never crosses it.
+        constexpr float    kColGap       = 8.0f;
+        // No gap between bars within a strip — fpsVR-style dense
+        // waveform. Per-strip width is ~148 px; with kRingSize=144,
+        // each bar is ~1 px and the strip reads as a continuous
+        // trace at HMD pixel densities.
         constexpr float    kHistoBarGap  = 0.0f;
-        constexpr std::size_t kRingSize  = 150;      // ~1.7 s @ 90 Hz, ~1.3 s @ 120 Hz
+        constexpr std::size_t kRingSize  = 144;      // ~1.6 s @ 90 Hz, ~1.2 s @ 120 Hz
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -155,9 +166,24 @@ namespace openxr_api_layer::detail {
             // Paint into a pre-created render target (one per swapchain
             // image). The render target is created by the outer class
             // from a DXGI surface obtained from the texture.
+            //
+            // Layout (fpsVR-style two-column):
+            //   row 0: [FPS instant / target]      | [AVG fps]
+            //   row 1: [GPU XX.XX ms]              | [CPU XX.XX ms]
+            //   row 2: [GPU histogram strip]       | [CPU histogram strip]
+            //   row 3: [GPU NN %]                  | [CPU NN %]
+            // The histograms sit directly under their respective
+            // frametime label, so the visual flow inside each column
+            // is value → trace → utilisation, matching what fpsVR /
+            // OpenXR Toolkit users expect.
+            //
+            // `m_cpuRing` carries per-cycle CPU samples (frame_total -
+            // wait_block) so the strip aligns with the cpu_frame_ms
+            // value drawn above it; `m_gpuRing` carries gpu_time_ns
+            // directly.
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
-                       const HistogramRing<kRingSize>& frameRing,
+                       const HistogramRing<kRingSize>& cpuRing,
                        const HistogramRing<kRingSize>& gpuRing) const {
                 if (!rt) return false;
 
@@ -166,12 +192,7 @@ namespace openxr_api_layer::detail {
                 // game visible behind the HUD when the quad is overlaid.
                 rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.6f));
 
-                // Brushes are cheap to create per-frame; D2D caches its
-                // own resources. Skipping the cache here keeps the
-                // renderer state-light (no resource invalidation on
-                // device-lost paths). Four tiers for the histograms
-                // (green/yellow/red bars + a half-transparent white
-                // budget line) — matches fpsvr's colour code.
+                // Brushes — cheap per-frame, no need to cache.
                 ComPtr<ID2D1SolidColorBrush> textBrush;
                 ComPtr<ID2D1SolidColorBrush> greenBrush, yellowBrush, redBrush;
                 ComPtr<ID2D1SolidColorBrush> budgetLineBrush;
@@ -191,41 +212,59 @@ namespace openxr_api_layer::detail {
                     D2D1::ColorF(1.00f, 1.00f, 1.00f, 0.45f),
                     budgetLineBrush.GetAddressOf());
 
-                // ---- Text rows -----------------------------------------
-                const auto lines = formatOverlayLines(snap);
-                for (std::size_t i = 0; i < lines.size(); ++i) {
-                    const float y = kPadTop + static_cast<float>(i) * kLineHeight;
-                    // ASCII-only — formatOverlayLines uses printf-style
-                    // formatting that never produces non-ASCII bytes,
-                    // so the narrow→wide copy is safe.
-                    std::wstring wide(lines[i].begin(), lines[i].end());
-                    const D2D1_RECT_F layout = D2D1::RectF(
-                        kPadX, y, static_cast<float>(kTexW) - kPadX, y + kLineHeight);
+                // Column boundaries: split the available width minus
+                // padding into two equal halves separated by kColGap.
+                const float texW = static_cast<float>(kTexW);
+                const float midX = texW * 0.5f;
+                const float leftL  = kPadX;
+                const float leftR  = midX - kColGap * 0.5f;
+                const float rightL = midX + kColGap * 0.5f;
+                const float rightR = texW - kPadX;
+
+                // Vertical positions, top → bottom.
+                const float row0Y  = kPadTop;
+                const float row1Y  = row0Y + kLineHeight + kRowGap;
+                const float histoY = row1Y + kLineHeight + kHistoGap;
+                const float row3Y  = histoY + kHistoHeight + kHistoGap;
+
+                const auto rows = formatOverlayRows(snap);
+                auto drawText = [&](const std::string& s, float l, float t,
+                                     float r) {
+                    std::wstring wide(s.begin(), s.end());
+                    const D2D1_RECT_F rect = D2D1::RectF(l, t, r, t + kLineHeight);
                     rt->DrawTextW(
                         wide.c_str(),
                         static_cast<UINT32>(wide.length()),
                         m_textFormat.Get(),
-                        layout,
+                        rect,
                         textBrush.Get());
+                };
+
+                if (rows.size() >= 3) {
+                    drawText(rows[0].left,  leftL,  row0Y, leftR);
+                    drawText(rows[0].right, rightL, row0Y, rightR);
+                    drawText(rows[1].left,  leftL,  row1Y, leftR);
+                    drawText(rows[1].right, rightL, row1Y, rightR);
+                    drawText(rows[2].left,  leftL,  row3Y, leftR);
+                    drawText(rows[2].right, rightL, row3Y, rightR);
                 }
 
-                // ---- Histograms (frame_total + gpu_time) ---------------
-                // Two strips below the text rows. Each uses the
-                // runtime's predicted display period as the budget
-                // (target_fps → 1e9 / target_fps), so both strips share
-                // the same scale and the budget line sits at the same
-                // visual height across them.
-                const float histo1Y = kPadTop + 4.0f * kLineHeight + kHistoGap;
-                const float histo2Y = histo1Y + kHistoHeight + kHistoGap;
+                // Two histogram strips side-by-side. Both share the
+                // same budget (runtime's predicted display period →
+                // 1e9 / target_fps), so the white reference line
+                // sits at the same Y in both — easy visual compare
+                // GPU vs CPU.
                 const int64_t budgetNs = snap.target_fps > 0.0f
                     ? static_cast<int64_t>(1.0e9f / snap.target_fps)
                     : 0;
                 paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
                                 redBrush.Get(), budgetLineBrush.Get(),
-                                frameRing, budgetNs, histo1Y);
+                                gpuRing, budgetNs,
+                                leftL, histoY, leftR);
                 paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
                                 redBrush.Get(), budgetLineBrush.Get(),
-                                gpuRing, budgetNs, histo2Y);
+                                cpuRing, budgetNs,
+                                rightL, histoY, rightR);
 
                 // EndDraw flushes the command list. D2DERR_RECREATE_TARGET
                 // returned here means the underlying device went away —
@@ -253,11 +292,9 @@ namespace openxr_api_layer::detail {
                                  ID2D1Brush* budgetLineBrush,
                                  const HistogramRing<kRingSize>& ring,
                                  int64_t budgetNs,
-                                 float top) const {
+                                 float left, float top, float right) const {
                 if (budgetNs <= 0) return;
-
-                const float left = kPadX;
-                const float right = static_cast<float>(kTexW) - kPadX;
+                if (right <= left) return;
                 const float fullW = right - left;
                 const std::size_t n = ring.size();
                 if (n == 0) return;
@@ -271,9 +308,9 @@ namespace openxr_api_layer::detail {
                     right, lineY + 0.5f);
                 rt->FillRectangle(lineRect, budgetLineBrush);
 
-                // One bar per ring entry. With kRingSize=50 and a 240 px
-                // wide strip that's ~4.8 px per bar — readable, no need
-                // for sub-pixel cleverness.
+                // Per-strip width is ~148 px with kRingSize=144 → each
+                // bar is ~1 px. Bars touch (kHistoBarGap = 0) to form
+                // the fpsVR-style continuous waveform.
                 const float barW =
                     (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
                     static_cast<float>(n);
@@ -330,9 +367,9 @@ namespace openxr_api_layer::detail {
 
             bool isReady() const noexcept override { return m_ready; }
 
-            void pushFrameSample(int64_t frame_total_ns,
+            void pushFrameSample(int64_t cpu_per_cycle_ns,
                                   int64_t gpu_time_ns) override {
-                m_frameRing.push(frame_total_ns);
+                m_cpuRing.push(cpu_per_cycle_ns);
                 m_gpuRing.push(gpu_time_ns);
             }
 
@@ -385,7 +422,7 @@ namespace openxr_api_layer::detail {
                     // cost on the previous frame.
                     if (m_myShimMutex->AcquireSync(0, 50) == S_OK) {
                         painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
-                                                m_frameRing, m_gpuRing);
+                                                m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
                     }
                 }
@@ -705,7 +742,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
 
             CoreRenderer                m_core;
-            HistogramRing<kRingSize>    m_frameRing;
+            HistogramRing<kRingSize>    m_cpuRing;
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
             bool                        m_ready = false;
@@ -747,9 +784,9 @@ namespace openxr_api_layer::detail {
 
             bool isReady() const noexcept override { return m_ready; }
 
-            void pushFrameSample(int64_t frame_total_ns,
+            void pushFrameSample(int64_t cpu_per_cycle_ns,
                                   int64_t gpu_time_ns) override {
-                m_frameRing.push(frame_total_ns);
+                m_cpuRing.push(cpu_per_cycle_ns);
                 m_gpuRing.push(gpu_time_ns);
             }
 
@@ -782,7 +819,7 @@ namespace openxr_api_layer::detail {
                 // back to the runtime's compositor.
                 const bool painted =
                     m_core.paint(m_shimRenderTarget.Get(), snap,
-                                  m_frameRing, m_gpuRing);
+                                  m_cpuRing, m_gpuRing);
                 ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
                 if (painted && wrapped && m_d3d11Context) {
                     m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
@@ -1006,7 +1043,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11Texture2D>               m_shimTexture;
             ComPtr<ID2D1RenderTarget>             m_shimRenderTarget;
             CoreRenderer                          m_core;
-            HistogramRing<kRingSize>              m_frameRing;
+            HistogramRing<kRingSize>              m_cpuRing;
             HistogramRing<kRingSize>              m_gpuRing;
             XrCompositionLayerQuad                m_quadLayer{};
             bool                                  m_ready = false;

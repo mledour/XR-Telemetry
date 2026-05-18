@@ -59,8 +59,9 @@ namespace openxr_api_layer::detail {
     //            isReady() returns false and the rest of the API is a
     //            no-op. The caller logs and degrades.
     //   2. pushFrameSample: per-frame, fed from fanoutRecord — adds
-    //                       samples to the frame_total / gpu_time
-    //                       histogram rings.
+    //                       samples to the per-cycle CPU and GPU time
+    //                       histogram rings (one per column of the
+    //                       two-column fpsVR-style HUD).
     //   3. renderAndCompose: per-frame from xrEndFrame, paints the
     //                        latest snapshot into the next swapchain
     //                        image, returns a pointer to the
@@ -84,7 +85,7 @@ namespace openxr_api_layer::detail {
         // HistogramRing::push calls). Safe to call every frame even
         // when the overlay is currently hidden — the rings stay warm
         // so toggling the HUD back on shows recent history immediately.
-        virtual void pushFrameSample(int64_t frame_total_ns, int64_t gpu_time_ns) = 0;
+        virtual void pushFrameSample(int64_t cpu_per_cycle_ns, int64_t gpu_time_ns) = 0;
 
         // Paint the snapshot into the next swapchain image and return
         // the composition layer to append to xrEndFrame. Returns nullptr

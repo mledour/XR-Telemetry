@@ -22,9 +22,12 @@
 
 // =============================================================================
 // test_overlay_layout.cpp — unit tests on the pure HUD-layout helpers:
-//   - formatOverlayLines (snapshot → list of monospace strings)
+//   - formatOverlayRows (snapshot → 3 (left, right) pairs)
+//   - formatOverlayLines (legacy flat view of the same data, 6 strings)
 //   - geometryForPosition (settings.position → quad pose/size)
-//   - normaliseBar (sample / max → [0, 1] bar height)
+//   - normaliseBar (sample / max → [0, 1] bar height, legacy helper)
+//   - barVisualForSample (sample / budget → (heightFraction, BarTier))
+//   - budgetLineFraction (reference line position in the strip)
 // =============================================================================
 
 #include <doctest/doctest.h>
@@ -32,7 +35,9 @@
 #include "utils/overlay_layout.h"
 
 using openxr_api_layer::detail::OverlaySnapshot;
+using openxr_api_layer::detail::OverlayRow;
 using openxr_api_layer::detail::formatOverlayLines;
+using openxr_api_layer::detail::formatOverlayRows;
 using openxr_api_layer::detail::geometryForPosition;
 using openxr_api_layer::detail::normaliseBar;
 using openxr_api_layer::detail::BarTier;
@@ -40,15 +45,19 @@ using openxr_api_layer::detail::barVisualForSample;
 using openxr_api_layer::detail::budgetLineFraction;
 
 // =============================================================================
-// formatOverlayLines — text formatting.
+// formatOverlayRows — two-column fpsVR-style text formatting.
+// Returns 3 (left, right) pairs:
+//   row 0: FPS / AVG
+//   row 1: GPU frametime / CPU frametime
+//   row 2: GPU util / CPU util
 // =============================================================================
 
-TEST_CASE("formatOverlayLines: invalid snapshot → empty vector") {
+TEST_CASE("formatOverlayRows: invalid snapshot → empty vector") {
     OverlaySnapshot snap;  // valid=false by default
-    CHECK(formatOverlayLines(snap).empty());
+    CHECK(formatOverlayRows(snap).empty());
 }
 
-TEST_CASE("formatOverlayLines: nominal snapshot produces 4 rows in fixed order") {
+TEST_CASE("formatOverlayRows: nominal snapshot produces 3 rows × 2 columns") {
     OverlaySnapshot snap;
     snap.valid = true;
     snap.fps_instant = 89.8f;
@@ -59,28 +68,62 @@ TEST_CASE("formatOverlayLines: nominal snapshot produces 4 rows in fixed order")
     snap.gpu_frame_ms = 5.18f;
     snap.gpu_utilisation_pct = 47.0f;
 
-    const auto lines = formatOverlayLines(snap);
-    REQUIRE(lines.size() == 4);
-    // Row order is part of the contract (renderer assumes top→bottom
-    // matches the source). Spot-check each row contains the right
-    // header + the formatted value.
-    CHECK(lines[0].find("FPS")  != std::string::npos);
-    CHECK(lines[0].find("89.8") != std::string::npos);
-    CHECK(lines[0].find("90.0") != std::string::npos);
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 3);
 
-    CHECK(lines[1].find("AVG")  != std::string::npos);
-    CHECK(lines[1].find("90.1") != std::string::npos);
+    // Row 0: FPS (left) / AVG (right). Renderer draws the left column
+    // anchored to the left half of the quad — GPU stuff goes there
+    // visually, but the FPS row pairs FPS-instant with FPS-avg, not
+    // GPU-with-anything.
+    CHECK(rows[0].left.find("FPS")   != std::string::npos);
+    CHECK(rows[0].left.find("89.8")  != std::string::npos);
+    CHECK(rows[0].left.find("90.0")  != std::string::npos);
+    CHECK(rows[0].right.find("AVG")  != std::string::npos);
+    CHECK(rows[0].right.find("90.1") != std::string::npos);
 
-    CHECK(lines[2].find("CPU")  != std::string::npos);
-    CHECK(lines[2].find("6.78") != std::string::npos);
-    CHECK(lines[2].find("61")   != std::string::npos);
+    // Row 1: GPU frametime (left) / CPU frametime (right).
+    CHECK(rows[1].left.find("GPU")   != std::string::npos);
+    CHECK(rows[1].left.find("5.18")  != std::string::npos);
+    CHECK(rows[1].left.find("ms")    != std::string::npos);
+    CHECK(rows[1].right.find("CPU")  != std::string::npos);
+    CHECK(rows[1].right.find("6.78") != std::string::npos);
+    CHECK(rows[1].right.find("ms")   != std::string::npos);
 
-    CHECK(lines[3].find("GPU")  != std::string::npos);
-    CHECK(lines[3].find("5.18") != std::string::npos);
-    CHECK(lines[3].find("47")   != std::string::npos);
+    // Row 2: GPU util (left) / CPU util (right).
+    CHECK(rows[2].left.find("GPU")   != std::string::npos);
+    CHECK(rows[2].left.find("47")    != std::string::npos);
+    CHECK(rows[2].left.find("%")     != std::string::npos);
+    CHECK(rows[2].right.find("CPU")  != std::string::npos);
+    CHECK(rows[2].right.find("61")   != std::string::npos);
+    CHECK(rows[2].right.find("%")    != std::string::npos);
 }
 
-TEST_CASE("formatOverlayLines: zero target_fps still renders without crashing") {
+TEST_CASE("formatOverlayLines: legacy flat view matches formatOverlayRows order") {
+    // formatOverlayLines is the legacy flattened view used by older
+    // call sites. It MUST emit the 3 rows in left-then-right order,
+    // so a freshly-grown test using either function sees the same
+    // visual ordering of values.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+    snap.fps_avg = 89.5f;
+    snap.target_fps = 90.0f;
+    snap.cpu_frame_ms = 4.0f;
+    snap.cpu_utilisation_pct = 36.0f;
+    snap.gpu_frame_ms = 3.0f;
+    snap.gpu_utilisation_pct = 27.0f;
+
+    const auto lines = formatOverlayLines(snap);
+    REQUIRE(lines.size() == 6);
+    CHECK(lines[0].find("FPS") != std::string::npos);   // row 0 left
+    CHECK(lines[1].find("AVG") != std::string::npos);   // row 0 right
+    CHECK(lines[2].find("GPU") != std::string::npos);   // row 1 left
+    CHECK(lines[3].find("CPU") != std::string::npos);   // row 1 right
+    CHECK(lines[4].find("GPU") != std::string::npos);   // row 2 left
+    CHECK(lines[5].find("CPU") != std::string::npos);   // row 2 right
+}
+
+TEST_CASE("formatOverlayRows: zero target_fps still renders without crashing") {
     // Edge case: a runtime that briefly fails to advertise display
     // period → snapshot.target_fps stays 0. The label should still
     // render (the renderer prefers a stable layout over hiding the row).
@@ -88,11 +131,11 @@ TEST_CASE("formatOverlayLines: zero target_fps still renders without crashing") 
     snap.valid = true;
     snap.fps_instant = 60.0f;
     snap.target_fps = 0.0f;
-    const auto lines = formatOverlayLines(snap);
-    REQUIRE(lines.size() == 4);
-    CHECK(lines[0].find("FPS") != std::string::npos);
-    // 0.0 must appear (the "/ 0.0" component).
-    CHECK(lines[0].find("0.0") != std::string::npos);
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].left.find("FPS") != std::string::npos);
+    // 0.0 must appear (the "/ 0.0" component of "FPS  60.0 /  0.0").
+    CHECK(rows[0].left.find("0.0") != std::string::npos);
 }
 
 // =============================================================================

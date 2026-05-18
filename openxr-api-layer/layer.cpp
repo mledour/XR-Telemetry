@@ -2007,11 +2007,18 @@ namespace openxr_api_layer {
             if (m_overlayActive) {
                 m_overlay.pushFrame(r);
                 if (m_overlayRenderer) {
-                    // Mini-histogram samples — the renderer keeps its
-                    // own ring (decoupled from the aggregator's moving
-                    // average) so the bars track the LATEST 50 frames
-                    // independent of the snapshot refresh cadence.
-                    m_overlayRenderer->pushFrameSample(r.frame_total_ns,
+                    // The CPU histogram strip displays per-cycle CPU
+                    // work (frame_total − wait_block), matching the
+                    // cpu_frame_ms value drawn above the strip — that's
+                    // the same per_cycle metric OverlayAggregator uses.
+                    // Fallback to app_cpu_ns on the very first frame
+                    // (no previous tEnd to subtract from), same as
+                    // xrEndFrame's headroom math.
+                    const int64_t cpu_per_cycle_ns =
+                        (r.frame_total_ns > 0)
+                            ? (r.frame_total_ns - r.wait_block_ns)
+                            : r.app_cpu_ns;
+                    m_overlayRenderer->pushFrameSample(cpu_per_cycle_ns,
                                                        r.gpu_time_ns);
                 }
             }

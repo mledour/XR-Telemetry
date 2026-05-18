@@ -44,24 +44,30 @@
 
 namespace openxr_api_layer::detail {
 
-    // The four rows the HUD displays, top-to-bottom. Each row is a
-    // monospace string with column-aligned fields. fpsvr-style:
+    // One row of the side-by-side fpsVR-style HUD: a (left, right)
+    // pair the renderer draws in the two column rectangles. The
+    // current rows (top-to-bottom):
     //
-    //   FPS    89.8 / 90.0
-    //   AVG    90.1
-    //   CPU    6.78 ms (61%)
-    //   GPU    5.18 ms (47%)
+    //   row 0:  FPS instant / target     |  AVG fps
+    //   row 1:  GPU frametime ms          |  CPU frametime ms
+    //   ── histograms drawn between row 1 and row 2 ──
+    //   row 2:  GPU util %                |  CPU util %
     //
-    // Returns an empty vector if the snapshot hasn't finalised yet —
-    // the caller should not draw anything in that case.
-    inline std::vector<std::string> formatOverlayLines(const OverlaySnapshot& snap) {
+    // Empty vector if the snapshot hasn't finalised yet — the
+    // caller skips text drawing in that case.
+    struct OverlayRow {
+        std::string left;
+        std::string right;
+    };
+
+    inline std::vector<OverlayRow> formatOverlayRows(const OverlaySnapshot& snap) {
         if (!snap.valid) return {};
-        std::vector<std::string> out;
-        out.reserve(4);
+        std::vector<OverlayRow> rows;
+        rows.reserve(3);
 
         // Small string helpers without dragging in fmt/format.h.
         auto fmtFps = [](float fps) {
-            // 4-char-wide right-aligned float (matches monospace columns).
+            // 5-char-wide right-aligned float (matches monospace columns).
             char buf[16];
             std::snprintf(buf, sizeof(buf), "%5.1f", fps);
             return std::string(buf);
@@ -77,10 +83,32 @@ namespace openxr_api_layer::detail {
             return std::string(buf);
         };
 
-        out.push_back("FPS  " + fmtFps(snap.fps_instant) + " / " + fmtFps(snap.target_fps));
-        out.push_back("AVG  " + fmtFps(snap.fps_avg));
-        out.push_back("CPU  " + fmtMs(snap.cpu_frame_ms) + " ms (" + fmtPct(snap.cpu_utilisation_pct) + "%)");
-        out.push_back("GPU  " + fmtMs(snap.gpu_frame_ms) + " ms (" + fmtPct(snap.gpu_utilisation_pct) + "%)");
+        rows.push_back({
+            "FPS " + fmtFps(snap.fps_instant) + " / " + fmtFps(snap.target_fps),
+            "AVG " + fmtFps(snap.fps_avg)
+        });
+        rows.push_back({
+            "GPU " + fmtMs(snap.gpu_frame_ms) + " ms",
+            "CPU " + fmtMs(snap.cpu_frame_ms) + " ms"
+        });
+        rows.push_back({
+            "GPU " + fmtPct(snap.gpu_utilisation_pct) + " %",
+            "CPU " + fmtPct(snap.cpu_utilisation_pct) + " %"
+        });
+        return rows;
+    }
+
+    // Legacy flat-list view: returns the 6 strings the new
+    // formatOverlayRows produces, ordered left-then-right per row.
+    // Kept for the existing test_overlay_layout cases that already
+    // grep individual lines — saves churn on those. New code paths
+    // should prefer formatOverlayRows directly.
+    inline std::vector<std::string> formatOverlayLines(const OverlaySnapshot& snap) {
+        std::vector<std::string> out;
+        for (const auto& r : formatOverlayRows(snap)) {
+            out.push_back(r.left);
+            out.push_back(r.right);
+        }
         return out;
     }
 
