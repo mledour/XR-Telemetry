@@ -250,6 +250,13 @@ namespace openxr_api_layer::detail {
                 if (m_swapchain != XR_NULL_HANDLE && m_api) {
                     m_api->xrDestroySwapchain(m_swapchain);
                 }
+                // The shared NT handle outlives the resource pair — close
+                // it so a long-running app doesn't leak kernel handles
+                // session-after-session.
+                if (m_sharedHandle) {
+                    ::CloseHandle(m_sharedHandle);
+                    m_sharedHandle = nullptr;
+                }
             }
 
             bool isReady() const noexcept override { return m_ready; }
@@ -281,28 +288,51 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // 2. Paint into the shim texture (typed BGRA8 we own) —
-                //    D2D refuses the typeless DXGI_FORMAT_B8G8R8A8_TYPELESS
-                //    Pimax OpenXR 0.1.0 hands back as the swapchain image
-                //    (verified empirically: D2D returns E_INVALIDARG on
-                //    CreateDxgiSurfaceRenderTarget against any typeless
-                //    surface, regardless of which PixelFormat we ask for).
-                //    The shim is created once at init in
-                //    DXGI_FORMAT_B8G8R8A8_UNORM with RENDER_TARGET bind,
-                //    painted every frame here, and copied to the OpenXR
-                //    image below via CopyResource (typeless ↔ typed of
-                //    the same byte layout is allowed).
-                const bool painted =
-                    m_core.paint(m_shimRenderTarget.Get(), snap,
-                                  m_frameRing, m_gpuRing);
+                // 2. Paint into the shim texture (typed BGRA8 we own)
+                //    on OUR private D3D11 device. The app's device may
+                //    not have been created with D3D11_CREATE_DEVICE_
+                //    BGRA_SUPPORT (verified empirically: D2D returns
+                //    E_INVALIDARG on CreateDxgiSurfaceRenderTarget on
+                //    any texture from a non-BGRA-flag device, even when
+                //    the texture itself is BGRA8_UNORM). The shim
+                //    lives on m_myDevice (always created with BGRA
+                //    support) and is shared into the app's device via
+                //    DXGI_RESOURCE_MISC_SHARED_NTHANDLE so we can copy
+                //    it to the runtime's swapchain image without
+                //    crossing process boundaries.
+                //
+                //    Cross-device sync uses a keyed mutex pair:
+                //      key=0 : owned by app side (initial state after
+                //              CreateSharedHandle / OpenSharedResource1)
+                //      key=1 : owned by our render side after we paint
+                //    Each side AcquireSyncs the key it expects, then
+                //    ReleaseSyncs the OTHER key once it's done, handing
+                //    over to the next side.
+                bool painted = false;
+                if (m_myShimMutex && m_myShimRenderTarget) {
+                    // Bounded acquire so an upstream sync failure on
+                    // the app side doesn't hang the frame thread
+                    // forever. 50 ms is well above any realistic copy
+                    // cost on the previous frame.
+                    if (m_myShimMutex->AcquireSync(0, 50) == S_OK) {
+                        painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
+                                                m_frameRing, m_gpuRing);
+                        m_myShimMutex->ReleaseSync(1);
+                    }
+                }
 
                 // 3. Copy the painted shim into the OpenXR swapchain
-                //    image. The two textures are in the same "type
-                //    group" (B8G8R8A8 family), so D3D11 allows the copy
-                //    even though one side is typeless.
-                if (painted && m_context && imageIdx < m_images.size()) {
-                    m_context->CopyResource(m_images[imageIdx].Get(),
-                                             m_shimTexture.Get());
+                //    image via the app's device. The two textures are
+                //    in the same "type group" (B8G8R8A8 family), so
+                //    D3D11 allows the copy even though one side is
+                //    typeless.
+                if (painted && m_appShimMutex && m_context &&
+                    imageIdx < m_images.size()) {
+                    if (m_appShimMutex->AcquireSync(1, 50) == S_OK) {
+                        m_context->CopyResource(m_images[imageIdx].Get(),
+                                                 m_appShim.Get());
+                        m_appShimMutex->ReleaseSync(0);
+                    }
                 }
 
                 // 4. Release regardless of paint success — the runtime
@@ -409,9 +439,71 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // Create the shim texture: typed BGRA8_UNORM, render-
-                // target-bindable, on the app's D3D11 device. D2D can
-                // wrap this surface without trouble.
+                // Diagnostic for the app's D3D11 device — D2D requires
+                // it to have been created with D3D11_CREATE_DEVICE_BGRA
+                // _SUPPORT (= 0x20). If the app didn't ask for that
+                // flag (LMU / DR2 / etc. don't, since they don't use
+                // D2D), every D2D RT-creation against textures from
+                // this device returns E_INVALIDARG. Below we sidestep
+                // this by allocating our OWN D3D11 device with the
+                // flag set, paint with D2D on that device, and share
+                // the result back to the app's device via a shared
+                // NT handle + keyed mutex.
+                const UINT appFlags = m_device->GetCreationFlags();
+                const D3D_FEATURE_LEVEL appLevel = m_device->GetFeatureLevel();
+                const bool appHasBgra =
+                    (appFlags & D3D11_CREATE_DEVICE_BGRA_SUPPORT) != 0;
+                Log(fmt::format(
+                    "xr_telemetry: app D3D11 device flags={:#x} "
+                    "(BGRA_SUPPORT={}), feature_level={:#x}\n",
+                    static_cast<unsigned int>(appFlags),
+                    appHasBgra ? "yes" : "no",
+                    static_cast<unsigned int>(appLevel)));
+
+                // 1. Reach the adapter the app's device sits on; we
+                //    want our private device on the SAME GPU so the
+                //    shared-resource path stays in-VRAM (driver-side
+                //    optimisation; cross-adapter shares fall back to
+                //    a CPU bounce).
+                ComPtr<IDXGIDevice> appDxgi;
+                if (FAILED(m_device.As(&appDxgi))) {
+                    Log("xr_telemetry: overlay disabled — app device "
+                        "QueryInterface IDXGIDevice failed\n");
+                    return false;
+                }
+                ComPtr<IDXGIAdapter> adapter;
+                if (FAILED(appDxgi->GetAdapter(adapter.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — IDXGIDevice "
+                        "GetAdapter failed\n");
+                    return false;
+                }
+
+                // 2. Create our private D3D11 device on the same
+                //    adapter, force BGRA_SUPPORT so D2D works on
+                //    anything we allocate. SINGLETHREADED is the
+                //    sensible default since only this object's
+                //    renderAndCompose ever touches it.
+                D3D_FEATURE_LEVEL outLevel{};
+                HRESULT hr = ::D3D11CreateDevice(
+                    adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                        D3D11_CREATE_DEVICE_SINGLETHREADED,
+                    nullptr, 0, D3D11_SDK_VERSION,
+                    m_myDevice.GetAddressOf(),
+                    &outLevel,
+                    m_myContext.GetAddressOf());
+                if (FAILED(hr) || !m_myDevice) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay disabled — D3D11CreateDevice "
+                        "(BGRA-capable secondary) failed (HRESULT={:#x})\n",
+                        static_cast<unsigned int>(hr)));
+                    return false;
+                }
+
+                // 3. Create the shim texture on OUR device with the
+                //    shared-NT-handle flag + keyed mutex. The keyed
+                //    mutex serialises access between our paint side
+                //    and the app's copy side per frame.
                 D3D11_TEXTURE2D_DESC shimDesc{};
                 shimDesc.Width = static_cast<UINT>(kTexW);
                 shimDesc.Height = static_cast<UINT>(kTexH);
@@ -419,22 +511,67 @@ namespace openxr_api_layer::detail {
                 shimDesc.ArraySize = 1;
                 shimDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 shimDesc.SampleDesc.Count = 1;
-                shimDesc.SampleDesc.Quality = 0;
                 shimDesc.Usage = D3D11_USAGE_DEFAULT;
                 shimDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-                HRESULT hr = m_device->CreateTexture2D(
-                    &shimDesc, nullptr, m_shimTexture.GetAddressOf());
+                shimDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                      D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+                hr = m_myDevice->CreateTexture2D(
+                    &shimDesc, nullptr, m_myShim.GetAddressOf());
                 if (FAILED(hr)) {
                     Log(fmt::format(
                         "xr_telemetry: overlay disabled — CreateTexture2D "
-                        "(shim) failed (HRESULT={:#x})\n",
+                        "(shared shim) failed (HRESULT={:#x})\n",
                         static_cast<unsigned int>(hr)));
                     return false;
                 }
 
-                ComPtr<IDXGISurface> shimSurface;
-                if (FAILED(m_shimTexture.As(&shimSurface))) {
+                // 4. Get the shared NT handle from our shim.
+                ComPtr<IDXGIResource1> myShimResource;
+                if (FAILED(m_myShim.As(&myShimResource))) {
                     Log("xr_telemetry: overlay disabled — shim QueryInterface "
+                        "IDXGIResource1 failed\n");
+                    return false;
+                }
+                if (FAILED(myShimResource->CreateSharedHandle(
+                        nullptr,
+                        DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                        nullptr,
+                        &m_sharedHandle))) {
+                    Log("xr_telemetry: overlay disabled — CreateSharedHandle "
+                        "failed\n");
+                    return false;
+                }
+
+                // 5. Open the shared handle on the app's device so we
+                //    can CopyResource from it via the app's context.
+                ComPtr<ID3D11Device1> appDevice1;
+                if (FAILED(m_device.As(&appDevice1))) {
+                    Log("xr_telemetry: overlay disabled — app device "
+                        "QueryInterface ID3D11Device1 failed\n");
+                    return false;
+                }
+                if (FAILED(appDevice1->OpenSharedResource1(
+                        m_sharedHandle, __uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(m_appShim.GetAddressOf())))) {
+                    Log("xr_telemetry: overlay disabled — OpenSharedResource1 "
+                        "failed\n");
+                    return false;
+                }
+
+                // 6. Cache the keyed-mutex interfaces on both sides.
+                if (FAILED(m_myShim.As(&m_myShimMutex)) ||
+                    FAILED(m_appShim.As(&m_appShimMutex))) {
+                    Log("xr_telemetry: overlay disabled — keyed mutex "
+                        "QueryInterface failed on shim\n");
+                    return false;
+                }
+
+                // 7. Create the D2D render target on our shim (BGRA-
+                //    capable device, no typeless surface, no E_INVALID
+                //    ARG this time).
+                ComPtr<IDXGISurface> shimSurface;
+                if (FAILED(m_myShim.As(&shimSurface))) {
+                    Log("xr_telemetry: overlay disabled — myShim QueryInterface "
                         "IDXGISurface failed\n");
                     return false;
                 }
@@ -446,34 +583,58 @@ namespace openxr_api_layer::detail {
                             D2D1_ALPHA_MODE_PREMULTIPLIED));
                 hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
                     shimSurface.Get(), &props,
-                    m_shimRenderTarget.GetAddressOf());
+                    m_myShimRenderTarget.GetAddressOf());
                 if (FAILED(hr)) {
                     Log(fmt::format(
                         "xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
-                        "Target (shim) failed (HRESULT={:#x})\n",
+                        "Target (private-device shim) failed (HRESULT={:#x})\n",
                         static_cast<unsigned int>(hr)));
                     return false;
                 }
-                Log("xr_telemetry: overlay D3D11 renderer ready ("
-                    + std::to_string(imgCount) +
-                    " swapchain images, shim BGRA8 RT)\n");
+
+                Log(fmt::format(
+                    "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
+                    "images, private-device shim BGRA8 RT, feature_level={:#x})\n",
+                    imgCount, static_cast<unsigned int>(outLevel)));
                 return true;
             }
 
             OpenXrApi*                  m_api = nullptr;
             XrSession                   m_session = XR_NULL_HANDLE;
+            // App's D3D11 device + context (whatever flags it was
+            // created with — typically no BGRA_SUPPORT). Used only for
+            // CopyResource'ing into the OpenXR swapchain image.
             ComPtr<ID3D11Device>        m_device;
             ComPtr<ID3D11DeviceContext> m_context;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
-            // OpenXR swapchain images, kept as a typeless BGRA8 texture
-            // we DON'T render to directly. The Pimax OpenXR 0.1.0
-            // runtime (and likely others) creates these as
-            // DXGI_FORMAT_B8G8R8A8_TYPELESS, which D2D refuses.
+            // OpenXR swapchain images. Typically DXGI_FORMAT_B8G8R8A8_
+            // TYPELESS on Pimax OpenXR 0.1.0; we never render directly
+            // to these, only CopyResource into them from our shared
+            // shim once the D2D paint is done.
             std::vector<ComPtr<ID3D11Texture2D>>   m_images;
-            // Shim: typed BGRA8 we own + paint into via D2D, then copy
-            // to the chosen m_images[idx] per frame.
-            ComPtr<ID3D11Texture2D>     m_shimTexture;
-            ComPtr<ID2D1RenderTarget>   m_shimRenderTarget;
+
+            // Our private D3D11 device — same adapter as the app's,
+            // but explicitly created with D3D11_CREATE_DEVICE_BGRA
+            // _SUPPORT so D2D works. Holds the shim texture we paint.
+            ComPtr<ID3D11Device>        m_myDevice;
+            ComPtr<ID3D11DeviceContext> m_myContext;
+            // The shim, twice. m_myShim lives on m_myDevice and is the
+            // D2D render target. m_appShim is the SAME underlying
+            // GPU resource, opened on the app's device via OpenShared
+            // Resource1, so we can CopyResource from it on the app's
+            // context.
+            ComPtr<ID3D11Texture2D>     m_myShim;
+            ComPtr<ID3D11Texture2D>     m_appShim;
+            // Keyed mutex pair, one interface per side of the shim,
+            // serialises paint vs copy. AcquireSync(key) waits for the
+            // other side to ReleaseSync(key); the two sides toggle
+            // between key=0 (app side owns) and key=1 (our side owns).
+            ComPtr<IDXGIKeyedMutex>     m_myShimMutex;
+            ComPtr<IDXGIKeyedMutex>     m_appShimMutex;
+            HANDLE                      m_sharedHandle = nullptr;
+            // D2D render target on m_myShim — the actual paint surface.
+            ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
+
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_frameRing;
             HistogramRing<kRingSize>    m_gpuRing;
