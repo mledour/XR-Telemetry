@@ -31,6 +31,8 @@
 
 #include <doctest/doctest.h>
 
+#include <limits>
+
 #include "utils/overlay_layout.h"
 
 using openxr_api_layer::detail::OverlaySnapshot;
@@ -109,6 +111,41 @@ TEST_CASE("formatOverlayRows: zero target_fps still renders without crashing") {
     CHECK(rows[0].left.find("FPS") != std::string::npos);
     // 0.0 must appear (the "/ 0.0" component of "FPS  60.0 /  0.0").
     CHECK(rows[0].left.find("0.0") != std::string::npos);
+}
+
+TEST_CASE("formatOverlayRows: non-finite snapshot floats render as '--' placeholders") {
+    // Guard contract — the aggregator can briefly accumulate a NaN or
+    // ±Inf if QPC samples are mis-ordered (negative
+    // `frame_total - wait_block`), and %5.1f would render that as
+    // " nan" / " inf" / "-inf" — wrong width, breaks the monospace
+    // column grid. formatOverlayRows is the single chokepoint that
+    // catches the bad floats and substitutes a fixed-width sentinel.
+    const float kNan = std::numeric_limits<float>::quiet_NaN();
+    const float kInf = std::numeric_limits<float>::infinity();
+
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant         = kNan;
+    snap.fps_avg             = kInf;
+    snap.cpu_frame_ms        = kNan;
+    snap.gpu_frame_ms        = -kInf;
+    snap.cpu_utilisation_pct = kNan;
+    snap.gpu_utilisation_pct = kInf;
+    snap.target_fps          = kNan;
+
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 3);
+    // No "nan" / "inf" tokens anywhere in the formatted output —
+    // the placeholder strings replace them.
+    for (const auto& row : rows) {
+        CHECK(row.left.find("nan")  == std::string::npos);
+        CHECK(row.left.find("inf")  == std::string::npos);
+        CHECK(row.right.find("nan") == std::string::npos);
+        CHECK(row.right.find("inf") == std::string::npos);
+        // The "--" placeholder is present in every cell.
+        CHECK(row.left.find("--")  != std::string::npos);
+        CHECK(row.right.find("--") != std::string::npos);
+    }
 }
 
 // =============================================================================

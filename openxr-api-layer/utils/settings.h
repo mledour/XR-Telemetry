@@ -287,8 +287,21 @@ namespace openxr_api_layer::detail {
             // stored verbatim — the renderer falls back to head_top_right
             // when it can't decode them, so a typo never disables the
             // overlay, it just lands in the default corner.
-            result.settings.overlay.position =
-                getStringOr(ov, "position", "head_top_right");
+            //
+            // Hard length cap: the recognised values are all <= 16
+            // chars; anything past 64 is either junk or a malicious /
+            // corrupted JSON trying to make us hold a multi-MB string
+            // verbatim. Clamp to the default rather than allocate.
+            // This matches the broader settings-parser philosophy
+            // (validate inputs aggressively, fall back to documented
+            // defaults rather than propagating garbage).
+            {
+                std::string rawPosition = getStringOr(ov, "position", "head_top_right");
+                if (rawPosition.size() > 64) {
+                    rawPosition = "head_top_right";
+                }
+                result.settings.overlay.position = std::move(rawPosition);
+            }
 
             // `scale` clamped to [0.5, 2.0]. 1.0 ≙ default quad size
             // (~0.20 m × 0.075 m at 1 m view-space distance).

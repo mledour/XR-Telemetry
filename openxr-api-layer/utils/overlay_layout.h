@@ -66,20 +66,44 @@ namespace openxr_api_layer::detail {
         rows.reserve(3);
 
         // Small string helpers without dragging in fmt/format.h.
+        //
+        // Each helper checks std::isfinite() before %f-printing: the
+        // aggregator already guards against division by zero, but a
+        // momentarily-negative `frame_total_ns - wait_block_ns` (caused
+        // by a missed QPC sample or by a runtime mis-ordering the
+        // begin/wait pair) can accumulate into a NaN or ±Inf, which
+        // %5.1f renders as " nan" / " inf" / "-inf" — breaking the
+        // monospace alignment of the right-aligned columns. Rendering
+        // "  --.-" / "  --" instead keeps the grid intact and signals
+        // "no data" visually, at zero extra cost. The fix sits here
+        // rather than in the aggregator because the aggregator's job is
+        // to publish what it sees; the renderer's job is to keep the
+        // HUD readable even when the input is briefly garbage.
         auto fmtFps = [](float fps) {
-            // 5-char-wide right-aligned float (matches monospace columns).
             char buf[16];
-            std::snprintf(buf, sizeof(buf), "%5.1f", fps);
+            if (std::isfinite(fps)) {
+                std::snprintf(buf, sizeof(buf), "%5.1f", fps);
+            } else {
+                std::snprintf(buf, sizeof(buf), " --.-");
+            }
             return std::string(buf);
         };
         auto fmtMs = [](float ms) {
             char buf[16];
-            std::snprintf(buf, sizeof(buf), "%5.2f", ms);
+            if (std::isfinite(ms)) {
+                std::snprintf(buf, sizeof(buf), "%5.2f", ms);
+            } else {
+                std::snprintf(buf, sizeof(buf), " --.-");
+            }
             return std::string(buf);
         };
         auto fmtPct = [](float pct) {
             char buf[8];
-            std::snprintf(buf, sizeof(buf), "%3.0f", pct);
+            if (std::isfinite(pct)) {
+                std::snprintf(buf, sizeof(buf), "%3.0f", pct);
+            } else {
+                std::snprintf(buf, sizeof(buf), " --");
+            }
             return std::string(buf);
         };
 

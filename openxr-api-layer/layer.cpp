@@ -1241,7 +1241,11 @@ namespace openxr_api_layer {
             // the headroom math, AND the overlay aggregator's refresh
             // deadline. 10 MHz is a sane, realistic guess that keeps the
             // numbers in the right ballpark even on a broken HAL clock.
-            // The aggregator has its own < 1000 clamp as defense in depth.
+            // The aggregator has its own < 1000 clamp as defense in
+            // depth, and it falls back to the SAME 10 MHz — so the
+            // CSV side and the overlay side stay numerically coherent
+            // even in the broken-clock case (no 100× drift between
+            // CSV.period_ns and overlay.fps_target).
             LARGE_INTEGER freq{};
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 10'000'000LL;
@@ -1496,6 +1500,19 @@ namespace openxr_api_layer {
             if (m_bypassApiLayer || XR_FAILED(result) || !createInfo) {
                 return result;
             }
+            // Reset session-scoped one-shot warnings — m_loggedLayerCap
+            // Exceeded is logged at most once per session because a
+            // sustained "app submits 17+ composition layers" condition
+            // could otherwise flood the log file. A new session is the
+            // natural granularity to give the user another chance to
+            // see the warning if their composition pattern changes
+            // (e.g. they restarted the headset between sessions and
+            // the runtime's quad-layer setup differs). The flag itself
+            // lives on the OpenXrLayer instance because the layer cap
+            // applies to the augmented-layer scratch buffer in
+            // xrEndFrame, which uses stack memory not tied to any
+            // particular session handle.
+            m_loggedLayerCapExceeded = false;
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
                 auto timer = std::make_unique<D3D11GpuTimer>();
                 if (timer->init(d3d11->device)) {

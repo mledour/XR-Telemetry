@@ -99,17 +99,28 @@ namespace openxr_api_layer::detail {
         //                    `ticks / freq` as seconds, so freq=1 would
         //                    interpret `timestamp_qpc=10_000_000` (10 ms
         //                    in ns) as 10 million SECONDS and trip every
-        //                    refresh deadline immediately.
+        //                    refresh deadline immediately. The clamp
+        //                    below catches that case and substitutes
+        //                    10 MHz (matching OpenXrLayer's broken-HAL
+        //                    fallback, see comment near the clamp).
         explicit OverlayAggregator(int64_t refreshIntervalNs = 100'000'000LL,
                                    int64_t qpcFrequency = 1'000'000'000LL) noexcept
             : m_intervalNs(refreshIntervalNs > 0 ? refreshIntervalNs : 1),
-              // Clamp anything < 1 kHz to the 1 GHz default. Real Windows
-              // QPC is always at least 1 MHz, usually 10 MHz; a caller
-              // somehow passing 1 / 2 / 100 is either a test bug or a
-              // broken HAL clock falling through OpenXrLayer's own
-              // fallback. Either way we substitute a value that won't
-              // make every ns conversion explode.
-              m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 1'000'000'000LL) {}
+              // Clamp anything < 1 kHz to the 10 MHz fallback. Real
+              // Windows QPC is always at least 1 MHz, usually exactly
+              // 10 MHz on modern hardware; a caller somehow passing
+              // 1 / 2 / 100 is either a test bug or a broken HAL clock
+              // falling through OpenXrLayer's own fallback. Picking
+              // 10 MHz here (vs. 1 GHz historically) matches the
+              // OpenXrLayer constructor's identical broken-clock
+              // fallback — so the CSV's qpcToNs path and the
+              // aggregator's refresh-deadline path stay numerically
+              // coherent (same period_ns → same fps_target). The
+              // default argument above stays at 1 GHz on purpose: it's
+              // the "1 tick = 1 ns" identity test convention, and no
+              // production caller hits that path (OpenXrLayer always
+              // passes the cached QueryPerformanceFrequency).
+              m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 10'000'000LL) {}
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
         // is its final value, not the in-flight 0). The aggregator

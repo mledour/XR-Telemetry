@@ -240,6 +240,25 @@ TEST_CASE("parseSettings: overlay refresh_hz clamped to [1, 60]") {
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":1}})").settings.overlay.refresh_hz == 1);
 }
 
+TEST_CASE("parseSettings: oversized overlay.position string clamps to default") {
+    // A corrupted or malicious settings.json could put an arbitrarily-
+    // long string in the position field. The recognised values are all
+    // <= 16 chars; anything past 64 is junk. Parser substitutes the
+    // documented default so the layer doesn't end up holding a multi-
+    // megabyte string verbatim for the whole session.
+    std::string huge(2048, 'x');
+    const std::string json = R"({"overlay":{"position":")" + huge + R"("}})";
+    const auto p = parseSettings(json);
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.position == "head_top_right");
+    // Boundary: 64 chars exactly is still stored verbatim (then the
+    // renderer's unknown-string fallback handles it). Lock the
+    // > 64 cutoff so a future refactor doesn't drift it.
+    std::string sixtyFour(64, 'y');
+    const std::string okJson = R"({"overlay":{"position":")" + sixtyFour + R"("}})";
+    CHECK(parseSettings(okJson).settings.overlay.position == sixtyFour);
+}
+
 TEST_CASE("parseSettings: overlay scale clamped to [0.5, 2.0]") {
     CHECK(parseSettings(R"({"overlay":{"scale":0.0}})").settings.overlay.scale == 0.5f);
     CHECK(parseSettings(R"({"overlay":{"scale":-3.0}})").settings.overlay.scale == 0.5f);

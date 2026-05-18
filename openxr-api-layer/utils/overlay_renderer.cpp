@@ -377,9 +377,11 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_budgetLineBrush;
             // Formatting cache. paint() refreshes the row strings only
             // when m_cachedSnapshotVersion != snap.version — typically
-            // ~10× per second on a 144 Hz HMD, not 144×.
-            mutable std::vector<OverlayRow> m_cachedRows;
-            mutable uint64_t                m_cachedSnapshotVersion = 0;
+            // ~10× per second on a 144 Hz HMD, not 144×. Not `mutable`
+            // because paint() is already non-const (it mutates this
+            // cache by design).
+            std::vector<OverlayRow> m_cachedRows;
+            uint64_t                m_cachedSnapshotVersion = 0;
         };
 
         // -------- D3D11 native renderer --------------------------------------
@@ -458,7 +460,20 @@ namespace openxr_api_layer::detail {
                 //    Each side AcquireSyncs the key it expects, then
                 //    ReleaseSyncs the OTHER key once it's done, handing
                 //    over to the next side.
-                bool painted = false;
+                //
+                //    CRITICAL INVARIANT: every frame must end with the
+                //    mutex back at key=0. If we transition 0→1 (via a
+                //    successful paint-side AcquireSync+ReleaseSync) but
+                //    fail to perform the matching 1→0 transition on the
+                //    copy side, the next frame's AcquireSync(0,50) will
+                //    time out forever and the HUD freezes for the rest
+                //    of the session — and the one-shot timeout log hides
+                //    the symptom from us. So the copy block below treats
+                //    the 1→0 handover as MANDATORY whenever we hold the
+                //    key, falling back to an empty handover if the
+                //    happy-path copy is gated off.
+                bool painted     = false;
+                bool weHaveKey1  = false;  // we owe a 1→0 transition to the mutex pair
                 if (m_myShimMutex && m_myShimRenderTarget) {
                     // Bounded acquire so an upstream sync failure on
                     // the app side doesn't hang the frame thread
@@ -469,6 +484,7 @@ namespace openxr_api_layer::detail {
                         painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
                                                 m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
+                        weHaveKey1 = true;
                     } else if (!m_loggedMyMutexTimeout) {
                         // One-shot log: enough to point a support
                         // report at the symptom without spamming the
@@ -486,21 +502,57 @@ namespace openxr_api_layer::detail {
                 //    image via the app's device. The two textures are
                 //    in the same "type group" (B8G8R8A8 family), so
                 //    D3D11 allows the copy even though one side is
-                //    typeless.
-                if (painted && m_appShimMutex && m_context &&
-                    imageIdx < m_images.size()) {
-                    HRESULT hr = m_appShimMutex->AcquireSync(1, 50);
-                    if (hr == S_OK) {
-                        m_context->CopyResource(m_images[imageIdx].Get(),
-                                                 m_appShim.Get());
-                        m_appShimMutex->ReleaseSync(0);
-                    } else if (!m_loggedAppMutexTimeout) {
-                        m_loggedAppMutexTimeout = true;
-                        Log(fmt::format(
-                            "xr_telemetry: overlay copy mutex acquire timed "
-                            "out (HRESULT={:#x}, key=1). HUD will skip frames "
-                            "until sync recovers; subsequent timeouts silenced.\n",
-                            static_cast<unsigned int>(hr)));
+                //    typeless. If anything in the copy gate is missing
+                //    (no app context, runtime returned a bogus image
+                //    index, or paint itself returned false), we still
+                //    MUST perform the empty 1→0 handover to satisfy
+                //    the keyed-mutex invariant — see the long comment
+                //    in step 2.
+                if (weHaveKey1) {
+                    const bool canCopy = painted && m_context &&
+                                          imageIdx < m_images.size();
+                    bool handedBack = false;
+                    if (m_appShimMutex) {
+                        HRESULT hr = m_appShimMutex->AcquireSync(1, 50);
+                        if (hr == S_OK) {
+                            if (canCopy) {
+                                m_context->CopyResource(m_images[imageIdx].Get(),
+                                                         m_appShim.Get());
+                            }
+                            m_appShimMutex->ReleaseSync(0);
+                            handedBack = true;
+                        } else if (!m_loggedAppMutexTimeout) {
+                            m_loggedAppMutexTimeout = true;
+                            Log(fmt::format(
+                                "xr_telemetry: overlay copy mutex acquire timed "
+                                "out (HRESULT={:#x}, key=1). HUD will skip frames "
+                                "until sync recovers; subsequent timeouts silenced.\n",
+                                static_cast<unsigned int>(hr)));
+                        }
+                    }
+                    if (!handedBack) {
+                        // Recovery path: the happy-path handover failed
+                        // (app-side acquire timed out, or m_appShimMutex
+                        // is somehow null after a successful init). The
+                        // mutex pair is still at key=1 — fix it via the
+                        // paint-side handle. We own the key (we just
+                        // ReleaseSync(1)'d it three lines up), so the
+                        // AcquireSync(1) should be instant; we then
+                        // ReleaseSync(0) WITHOUT copying. The swapchain
+                        // image keeps whatever it had last frame; we
+                        // suppress this frame's composition layer
+                        // below so the runtime doesn't repaint stale
+                        // bytes as fresh telemetry.
+                        if (m_myShimMutex &&
+                            m_myShimMutex->AcquireSync(1, 50) == S_OK) {
+                            m_myShimMutex->ReleaseSync(0);
+                        }
+                        // If even this fails (the mutex is genuinely
+                        // broken — kernel object corrupted, app-side
+                        // device removed mid-handover, etc.), the next
+                        // frame's AcquireSync(0) will time out and we
+                        // log + bail cleanly. No spin, no deadlock.
+                        painted = false;
                     }
                 }
 
