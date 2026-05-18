@@ -214,19 +214,23 @@ TEST_CASE("barVisualForSample: sample at half-budget → quarter-height + green"
 }
 
 TEST_CASE("barVisualForSample: tier thresholds are strict (80% yellow, 100% red)") {
-    // 79 % of budget → green
-    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.79), 11'111'111).tier
-          == BarTier::Green);
+    // Use a budget divisible by 100 so the percentage→ns conversion
+    // stays in integer arithmetic — multiplying by 0.80 then
+    // casting to int64 truncates 11'111'111 × 0.80 to 8'888'888,
+    // which works out to 0.79999... of budget and slips into the
+    // Green tier on a `ratio >= 0.8` strict-greater comparison.
+    constexpr int64_t budget = 10'000'000;  // 10 ms — clean tenths
+
+    // 79 % → green
+    CHECK(barVisualForSample(7'900'000, budget).tier == BarTier::Green);
     // exactly 80 % → yellow
-    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.80), 11'111'111).tier
-          == BarTier::Yellow);
-    // 99.9 % → still yellow
-    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.999), 11'111'111).tier
-          == BarTier::Yellow);
+    CHECK(barVisualForSample(8'000'000, budget).tier == BarTier::Yellow);
+    // 99 % → still yellow
+    CHECK(barVisualForSample(9'900'000, budget).tier == BarTier::Yellow);
     // exactly 100 % → red
-    CHECK(barVisualForSample(11'111'111, 11'111'111).tier == BarTier::Red);
+    CHECK(barVisualForSample(budget,    budget).tier == BarTier::Red);
     // 200 % → red
-    CHECK(barVisualForSample(22'222'222, 11'111'111).tier == BarTier::Red);
+    CHECK(barVisualForSample(2 * budget, budget).tier == BarTier::Red);
 }
 
 TEST_CASE("barVisualForSample: 2× budget saturates at full height") {
