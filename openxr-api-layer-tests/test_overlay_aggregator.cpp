@@ -77,6 +77,10 @@ namespace {
 TEST_CASE("OverlayAggregator: snapshot is invalid before any pushFrame") {
     OverlayAggregator agg;
     CHECK_FALSE(agg.snapshot().valid);
+    // Version stays at 0 until the first publish, so a fresh
+    // CoreRenderer cache (also default-zero) matches and skips
+    // formatting an empty snapshot. Documented contract.
+    CHECK(agg.snapshot().version == 0);
 }
 
 TEST_CASE("OverlayAggregator: single frame does NOT publish a snapshot") {
@@ -324,4 +328,48 @@ TEST_CASE("OverlayAggregator: respects qpcFrequency when converting ticks → ns
                               4'000'000, 5'000'000,
                               11'111'111, 11'111'111, 64, 55));
     CHECK(agg.snapshot().valid);
+}
+
+// =============================================================================
+// version — monotonic publish counter. The renderer caches its formatted
+// row strings keyed on this value, so the contract is:
+//   * version 0 = "no valid snapshot yet" (default-constructed)
+//   * first publish bumps to 1, second to 2, etc.
+//   * never resets, never decreases
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: version is 1 after the first publish") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    CHECK(agg.snapshot().version == 0);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    // First frame arms the clock — no publish yet, version unchanged.
+    CHECK(agg.snapshot().version == 0);
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    CHECK(agg.snapshot().valid);
+    CHECK(agg.snapshot().version == 1);
+}
+
+TEST_CASE("OverlayAggregator: version increments by exactly 1 per refresh tick") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    // Arm.
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    // First publish → version 1.
+    agg.pushFrame(makeRecord(110'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().version == 1);
+    // Same window: no publish, version unchanged.
+    agg.pushFrame(makeRecord(150'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    CHECK(agg.snapshot().version == 1);
+    // Second publish → version 2.
+    agg.pushFrame(makeRecord(220'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    CHECK(agg.snapshot().version == 2);
+    // Third publish → version 3.
+    agg.pushFrame(makeRecord(330'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    CHECK(agg.snapshot().version == 3);
 }

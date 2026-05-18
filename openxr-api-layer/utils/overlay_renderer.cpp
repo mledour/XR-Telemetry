@@ -215,7 +215,7 @@ namespace openxr_api_layer::detail {
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
                        const HistogramRing<kRingSize>& cpuRing,
-                       const HistogramRing<kRingSize>& gpuRing) const {
+                       const HistogramRing<kRingSize>& gpuRing) {
                 if (!rt) return false;
 
                 rt->BeginDraw();
@@ -248,7 +248,18 @@ namespace openxr_api_layer::detail {
                 const float histoY = row1Y + kLineHeight + kHistoGap;
                 const float row3Y  = histoY + kHistoHeight + kHistoGap;
 
-                const auto rows = formatOverlayRows(snap);
+                // Re-format the row strings only when the snapshot
+                // changed. paint() runs at the host frame rate (90-
+                // 144 Hz); snapshots refresh at the configured 10 Hz
+                // by default, so this cache skips ~10-14 redundant
+                // snprintf passes per frame in the steady state.
+                // The version comparison is a single 8-byte load —
+                // dwarfed by any single snprintf call.
+                if (snap.version != m_cachedSnapshotVersion) {
+                    m_cachedRows = formatOverlayRows(snap);
+                    m_cachedSnapshotVersion = snap.version;
+                }
+                const auto& rows = m_cachedRows;
                 auto drawText = [&](const std::string& s, float l, float t,
                                      float r) {
                     // ASCII-only input: formatOverlayRows uses
@@ -364,6 +375,11 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_yellowBrush;
             ComPtr<ID2D1SolidColorBrush> m_redBrush;
             ComPtr<ID2D1SolidColorBrush> m_budgetLineBrush;
+            // Formatting cache. paint() refreshes the row strings only
+            // when m_cachedSnapshotVersion != snap.version — typically
+            // ~10× per second on a 144 Hz HMD, not 144×.
+            mutable std::vector<OverlayRow> m_cachedRows;
+            mutable uint64_t                m_cachedSnapshotVersion = 0;
         };
 
         // -------- D3D11 native renderer --------------------------------------
@@ -496,33 +512,17 @@ namespace openxr_api_layer::detail {
 
                 if (!painted) return nullptr;
 
-                // 4. Build the composition layer pose.
+                // 4. Build the composition layer pose. The immutable
+                //    fields (type, layerFlags, swapchain ref, imageRect,
+                //    identity orientation) were filled once in init();
+                //    here we just write the three values that vary per
+                //    frame: the head-locked view space (a session-
+                //    scoped XrSpace that the caller may rotate via
+                //    settings if we ever expose it), and the
+                //    position/size pair derived from the user's
+                //    settings.overlay.position + scale.
                 const auto geo = geometryForPosition(position, scale);
-                m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-                m_quadLayer.next = nullptr;
-                // SOURCE_ALPHA blending so the semi-transparent
-                // background composites over the game's frame instead
-                // of replacing it. NOT setting UNPREMULTIPLIED_ALPHA
-                // _BIT because D2D paints into our shim with
-                // D2D1_ALPHA_MODE_PREMULTIPLIED — the runtime then
-                // treats the texture as already-premultiplied (the
-                // default when UNPREMULTIPLIED_ALPHA_BIT is absent).
-                // Setting both would cause the runtime to re-
-                // premultiply already-premultiplied pixels, darkening
-                // the semi-transparent background + all coloured
-                // bars by ~10 % proportional to their alpha.
-                m_quadLayer.layerFlags =
-                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 m_quadLayer.space = viewSpace;
-                m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                m_quadLayer.subImage.swapchain = m_swapchain;
-                m_quadLayer.subImage.imageRect.offset = {0, 0};
-                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
-                m_quadLayer.subImage.imageArrayIndex = 0;
-                // Identity orientation. View-space's -Z faces the viewer,
-                // so an identity-rotated quad at z<0 displays right-
-                // side-up directly facing the user. Keeps the math simple.
-                m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
                 m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
                 m_quadLayer.size = {geo.width_m, geo.height_m};
 
@@ -759,11 +759,38 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
+                // Fill the immutable XrCompositionLayerQuad fields
+                // now that m_swapchain is alive. SOURCE_ALPHA blending
+                // + identity orientation are documented in the long
+                // comment up in renderAndCompose; everything else
+                // (space, pose.position, size) is per-frame.
+                initQuadLayerConstants();
+
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
                     "images, private-device shim BGRA8 RT, feature_level={:#x})\n",
                     imgCount, static_cast<unsigned int>(outLevel)));
                 return true;
+            }
+
+            // One-time fill of the XrCompositionLayerQuad fields that
+            // never change frame-to-frame. SOURCE_ALPHA without
+            // UNPREMULTIPLIED_ALPHA_BIT matches the D2D RT's
+            // premultiplied alpha; identity orientation displays the
+            // quad facing the user since view-space's -Z is the
+            // gaze direction. Called once at end of init(); paint
+            // path only writes space + pose.position + size.
+            void initQuadLayerConstants() {
+                m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                m_quadLayer.next = nullptr;
+                m_quadLayer.layerFlags =
+                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                m_quadLayer.subImage.swapchain = m_swapchain;
+                m_quadLayer.subImage.imageRect.offset = {0, 0};
+                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
+                m_quadLayer.subImage.imageArrayIndex = 0;
+                m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
             }
 
             OpenXrApi*                  m_api = nullptr;
@@ -905,18 +932,11 @@ namespace openxr_api_layer::detail {
 
                 if (!painted) return nullptr;
 
+                // Immutable quad fields filled once in init(); per-
+                // frame writes only the view-space + the position/
+                // size pair (see the D3D11 path's longer comment).
                 const auto geo = geometryForPosition(position, scale);
-                m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-                m_quadLayer.next = nullptr;
-                m_quadLayer.layerFlags =
-                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 m_quadLayer.space = viewSpace;
-                m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                m_quadLayer.subImage.swapchain = m_swapchain;
-                m_quadLayer.subImage.imageRect.offset = {0, 0};
-                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
-                m_quadLayer.subImage.imageArrayIndex = 0;
-                m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
                 m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
                 m_quadLayer.size = {geo.width_m, geo.height_m};
 
@@ -1094,10 +1114,30 @@ namespace openxr_api_layer::detail {
                         "path) failed\n");
                     return false;
                 }
+
+                // One-time fill of the immutable quad-layer fields;
+                // mirror of the D3D11 path's helper (no need to share
+                // since each renderer owns its own m_swapchain and
+                // m_quadLayer).
+                initQuadLayerConstants();
+
                 Log("xr_telemetry: overlay D3D12 renderer ready ("
                     + std::to_string(imgCount) +
                     " swapchain images, D3D11On12 bridge + shim BGRA8 RT)\n");
                 return true;
+            }
+
+            void initQuadLayerConstants() {
+                m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                m_quadLayer.next = nullptr;
+                m_quadLayer.layerFlags =
+                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                m_quadLayer.subImage.swapchain = m_swapchain;
+                m_quadLayer.subImage.imageRect.offset = {0, 0};
+                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
+                m_quadLayer.subImage.imageArrayIndex = 0;
+                m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
             }
 
             OpenXrApi*                            m_api = nullptr;

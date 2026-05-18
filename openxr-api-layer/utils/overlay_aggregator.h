@@ -68,6 +68,14 @@ namespace openxr_api_layer::detail {
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
         bool  valid = false;            // false until the first refresh tick has finalised
+        // Monotonic publish counter — bumped by OverlayAggregator on
+        // every successful refresh tick. Lets the renderer cheaply
+        // detect "did the snapshot actually change?" (version compare
+        // = 8 bytes) and reuse cached formatting work the rest of
+        // the frame budget. Default 0 (matches the cache's default-
+        // initialised state, so the first valid snapshot triggers
+        // a fresh format).
+        uint64_t version = 0;
     };
 
     class OverlayAggregator {
@@ -192,6 +200,12 @@ namespace openxr_api_layer::detail {
             m_snapshot.gpu_utilisation_pct = std::clamp(100.0f - gpuHeadroomMean, 0.0f, 100.0f);
 
             m_snapshot.valid = true;
+            // Bump the version monotonically — starting at 1 the very
+            // first time so the renderer's default-zero cache always
+            // sees a mismatch on the first valid snapshot. Wraps at
+            // 2^64 ticks (≈ 5.8e9 years at 100 ms cadence — not a
+            // worry).
+            m_snapshot.version = ++m_publishCount;
 
             // Reset the window. lastRefreshNs ratchets to `nowNs` rather
             // than `lastRefreshNs + intervalNs` to avoid catch-up bursts
@@ -215,6 +229,12 @@ namespace openxr_api_layer::detail {
         double  m_sumGpuHeadroomPct = 0;     // floats accumulate rounding error
         int64_t m_lastFrameTotalNs = 0;
         int     m_count = 0;
+        // Monotonic publish counter — increments by 1 each time
+        // publishAndReset runs. Stored into m_snapshot.version so
+        // downstream caches can detect "this is the same data I
+        // already formatted last frame" without comparing every
+        // numeric field for equality.
+        uint64_t m_publishCount = 0;
         OverlaySnapshot m_snapshot;
     };
 
