@@ -28,7 +28,7 @@
 #include "overlay_layout.h"
 
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
-#include <log.h>
+#include "framework/log.h"            // Log / ErrorLog
 
 #include <d2d1.h>
 #include <dwrite.h>
@@ -46,10 +46,14 @@
 
 namespace openxr_api_layer::detail {
 
-    // Log() / ErrorLog() live in openxr_api_layer::log. Pull them in so the
-    // call sites below don't have to spell out the namespace every time —
-    // mirrors what layer.cpp does for the same helpers.
-    using namespace ::openxr_api_layer::log;
+    // Log() / ErrorLog() live in openxr_api_layer::log. Pull them in with
+    // EXPLICIT using-declarations (not a using-directive) so MSVC's name
+    // lookup unambiguously routes the unqualified Log()/ErrorLog() calls
+    // inside the anonymous namespace below to the framework helpers — a
+    // using-directive in the same spot was tripping some MSVC builds
+    // even though it should be equivalent per the standard.
+    using ::openxr_api_layer::log::Log;
+    using ::openxr_api_layer::log::ErrorLog;
 
     namespace {
 
@@ -761,11 +765,14 @@ namespace openxr_api_layer::detail {
                 //
                 //    D3D11On12CreateDevice takes raw `IUnknown*` (not
                 //    ComPtr<>) for both the D3D12 device and the queue
-                //    array, so .Get() the underlying pointers. The
-                //    queue is passed as a length-1 array of IUnknown*.
-                IUnknown* queueAsUnknown = m_d3d12Queue.Get();
+                //    array. ComPtr<>::Get() returns the underlying T*,
+                //    which IUnknown is a base of — a static_cast makes
+                //    the upcast explicit so MSVC can't get confused.
+                //    The queue is passed as a length-1 array of
+                //    IUnknown*.
+                IUnknown* queueAsUnknown = static_cast<IUnknown*>(m_d3d12Queue.Get());
                 if (FAILED(::D3D11On12CreateDevice(
-                        m_d3d12Device.Get(),
+                        static_cast<IUnknown*>(m_d3d12Device.Get()),
                         D3D11_CREATE_DEVICE_BGRA_SUPPORT,    // mandatory for D2D
                         nullptr, 0,
                         &queueAsUnknown, 1,
