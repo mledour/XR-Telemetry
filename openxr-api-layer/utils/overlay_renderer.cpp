@@ -32,6 +32,14 @@
 
 #include <d2d1.h>
 #include <dwrite.h>
+// Extra DXGI / D3D11 headers required by the cross-device shim
+// path. pch.h's <d3d11.h> + <dxgi.h> only expose the base
+// interfaces; we need:
+//   - IDXGIResource1 (CreateSharedHandle)            from <dxgi1_2.h>
+//   - ID3D11Device1::OpenSharedResource1             from <d3d11_1.h>
+//   - IDXGIKeyedMutex                                from <dxgi.h>  ✓ already there
+#include <dxgi1_2.h>
+#include <d3d11_1.h>
 
 #include <array>
 #include <cmath>
