@@ -163,6 +163,37 @@ namespace openxr_api_layer::detail {
 
             ID2D1Factory* d2d() const noexcept { return m_d2dFactory.Get(); }
 
+            // Create the five solid-colour brushes used by paint() and
+            // paintHistogram(). Brushes are bound to the render target
+            // they were created against — call this once after the
+            // owning renderer creates its D2D ID2D1RenderTarget, not
+            // per frame. paint() is called at the host's frame rate
+            // (90-144 Hz), so allocating 5 COM objects per call was
+            // measurable churn for a telemetry-focused layer.
+            //
+            // If the underlying device goes lost (D2DERR_RECREATE_
+            // TARGET on EndDraw), the owner must recreate the RT
+            // AND call this again — both invalidate together.
+            bool initBrushes(ID2D1RenderTarget* rt) {
+                if (!rt) return false;
+                if (FAILED(rt->CreateSolidColorBrush(
+                        D2D1::ColorF(1.00f, 1.00f, 1.00f, 1.00f),
+                        m_textBrush.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateSolidColorBrush(
+                        D2D1::ColorF(0.40f, 0.85f, 0.40f, 0.90f),
+                        m_greenBrush.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateSolidColorBrush(
+                        D2D1::ColorF(1.00f, 0.85f, 0.30f, 0.90f),
+                        m_yellowBrush.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateSolidColorBrush(
+                        D2D1::ColorF(1.00f, 0.30f, 0.30f, 0.95f),
+                        m_redBrush.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateSolidColorBrush(
+                        D2D1::ColorF(1.00f, 1.00f, 1.00f, 0.45f),
+                        m_budgetLineBrush.GetAddressOf()))) return false;
+                return true;
+            }
+
             // Paint into a pre-created render target (one per swapchain
             // image). The render target is created by the outer class
             // from a DXGI surface obtained from the texture.
@@ -192,25 +223,15 @@ namespace openxr_api_layer::detail {
                 // game visible behind the HUD when the quad is overlaid.
                 rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.6f));
 
-                // Brushes — cheap per-frame, no need to cache.
-                ComPtr<ID2D1SolidColorBrush> textBrush;
-                ComPtr<ID2D1SolidColorBrush> greenBrush, yellowBrush, redBrush;
-                ComPtr<ID2D1SolidColorBrush> budgetLineBrush;
-                rt->CreateSolidColorBrush(
-                    D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f),
-                    textBrush.GetAddressOf());
-                rt->CreateSolidColorBrush(
-                    D2D1::ColorF(0.40f, 0.85f, 0.40f, 0.90f),
-                    greenBrush.GetAddressOf());
-                rt->CreateSolidColorBrush(
-                    D2D1::ColorF(1.00f, 0.85f, 0.30f, 0.90f),
-                    yellowBrush.GetAddressOf());
-                rt->CreateSolidColorBrush(
-                    D2D1::ColorF(1.00f, 0.30f, 0.30f, 0.95f),
-                    redBrush.GetAddressOf());
-                rt->CreateSolidColorBrush(
-                    D2D1::ColorF(1.00f, 1.00f, 1.00f, 0.45f),
-                    budgetLineBrush.GetAddressOf());
+                // Brushes were cached at init time (initBrushes called
+                // once after RT creation). Bail if a caller paints
+                // without calling initBrushes first — would be a
+                // wiring bug, not a runtime condition.
+                if (!m_textBrush || !m_greenBrush || !m_yellowBrush ||
+                    !m_redBrush || !m_budgetLineBrush) {
+                    rt->EndDraw();
+                    return false;
+                }
 
                 // Column boundaries: split the available width minus
                 // padding into two equal halves separated by kColGap.
@@ -230,6 +251,14 @@ namespace openxr_api_layer::detail {
                 const auto rows = formatOverlayRows(snap);
                 auto drawText = [&](const std::string& s, float l, float t,
                                      float r) {
+                    // ASCII-only input: formatOverlayRows uses
+                    // snprintf with %f / %d / hard-coded labels, never
+                    // emits non-ASCII bytes. The byte-by-byte
+                    // std::wstring constructor below is correct for
+                    // ASCII (each char zero-extends to a wchar_t) but
+                    // NOT a valid UTF-8 → UTF-16 decode. The day the
+                    // HUD adds °C, μs or × the right tool is
+                    // MultiByteToWideChar(CP_UTF8, ...).
                     std::wstring wide(s.begin(), s.end());
                     const D2D1_RECT_F rect = D2D1::RectF(l, t, r, t + kLineHeight);
                     rt->DrawTextW(
@@ -237,7 +266,7 @@ namespace openxr_api_layer::detail {
                         static_cast<UINT32>(wide.length()),
                         m_textFormat.Get(),
                         rect,
-                        textBrush.Get());
+                        m_textBrush.Get());
                 };
 
                 if (rows.size() >= 3) {
@@ -257,13 +286,9 @@ namespace openxr_api_layer::detail {
                 const int64_t budgetNs = snap.target_fps > 0.0f
                     ? static_cast<int64_t>(1.0e9f / snap.target_fps)
                     : 0;
-                paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
-                                redBrush.Get(), budgetLineBrush.Get(),
-                                gpuRing, budgetNs,
+                paintHistogram(rt, gpuRing, budgetNs,
                                 leftL, histoY, leftR);
-                paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
-                                redBrush.Get(), budgetLineBrush.Get(),
-                                cpuRing, budgetNs,
+                paintHistogram(rt, cpuRing, budgetNs,
                                 rightL, histoY, rightR);
 
                 // EndDraw flushes the command list. D2DERR_RECREATE_TARGET
@@ -286,10 +311,6 @@ namespace openxr_api_layer::detail {
             // turns yellow; ≥ 1× turns red and visually crosses the
             // line. Anything beyond 2× budget saturates at the top.
             void paintHistogram(ID2D1RenderTarget* rt,
-                                 ID2D1Brush* greenBrush,
-                                 ID2D1Brush* yellowBrush,
-                                 ID2D1Brush* redBrush,
-                                 ID2D1Brush* budgetLineBrush,
                                  const HistogramRing<kRingSize>& ring,
                                  int64_t budgetNs,
                                  float left, float top, float right) const {
@@ -306,7 +327,7 @@ namespace openxr_api_layer::detail {
                 const D2D1_RECT_F lineRect = D2D1::RectF(
                     left, lineY - 0.5f,
                     right, lineY + 0.5f);
-                rt->FillRectangle(lineRect, budgetLineBrush);
+                rt->FillRectangle(lineRect, m_budgetLineBrush.Get());
 
                 // Per-strip width is ~148 px with kRingSize=144 → each
                 // bar is ~1 px. Bars touch (kHistoBarGap = 0) to form
@@ -320,9 +341,9 @@ namespace openxr_api_layer::detail {
                     const auto vis = barVisualForSample(ring.at(i), budgetNs);
                     const float h = vis.heightFraction * kHistoHeight;
                     if (h <= 0.0f) continue;
-                    ID2D1Brush* brush = greenBrush;
-                    if (vis.tier == BarTier::Red)         brush = redBrush;
-                    else if (vis.tier == BarTier::Yellow) brush = yellowBrush;
+                    ID2D1Brush* brush = m_greenBrush.Get();
+                    if (vis.tier == BarTier::Red)         brush = m_redBrush.Get();
+                    else if (vis.tier == BarTier::Yellow) brush = m_yellowBrush.Get();
 
                     const float x = left +
                                     static_cast<float>(i) * (barW + kHistoBarGap);
@@ -336,6 +357,13 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1Factory>      m_d2dFactory;
             ComPtr<IDWriteFactory>    m_dwriteFactory;
             ComPtr<IDWriteTextFormat> m_textFormat;
+            // Brushes bound to the owning renderer's D2D RT. Created
+            // once via initBrushes() right after the RT is created.
+            ComPtr<ID2D1SolidColorBrush> m_textBrush;
+            ComPtr<ID2D1SolidColorBrush> m_greenBrush;
+            ComPtr<ID2D1SolidColorBrush> m_yellowBrush;
+            ComPtr<ID2D1SolidColorBrush> m_redBrush;
+            ComPtr<ID2D1SolidColorBrush> m_budgetLineBrush;
         };
 
         // -------- D3D11 native renderer --------------------------------------
@@ -420,10 +448,21 @@ namespace openxr_api_layer::detail {
                     // the app side doesn't hang the frame thread
                     // forever. 50 ms is well above any realistic copy
                     // cost on the previous frame.
-                    if (m_myShimMutex->AcquireSync(0, 50) == S_OK) {
+                    HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
+                    if (hr == S_OK) {
                         painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
                                                 m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
+                    } else if (!m_loggedMyMutexTimeout) {
+                        // One-shot log: enough to point a support
+                        // report at the symptom without spamming the
+                        // file when a recurring sync hiccup happens.
+                        m_loggedMyMutexTimeout = true;
+                        Log(fmt::format(
+                            "xr_telemetry: overlay paint mutex acquire timed "
+                            "out (HRESULT={:#x}, key=0). HUD will skip frames "
+                            "until sync recovers; subsequent timeouts silenced.\n",
+                            static_cast<unsigned int>(hr)));
                     }
                 }
 
@@ -434,10 +473,18 @@ namespace openxr_api_layer::detail {
                 //    typeless.
                 if (painted && m_appShimMutex && m_context &&
                     imageIdx < m_images.size()) {
-                    if (m_appShimMutex->AcquireSync(1, 50) == S_OK) {
+                    HRESULT hr = m_appShimMutex->AcquireSync(1, 50);
+                    if (hr == S_OK) {
                         m_context->CopyResource(m_images[imageIdx].Get(),
                                                  m_appShim.Get());
                         m_appShimMutex->ReleaseSync(0);
+                    } else if (!m_loggedAppMutexTimeout) {
+                        m_loggedAppMutexTimeout = true;
+                        Log(fmt::format(
+                            "xr_telemetry: overlay copy mutex acquire timed "
+                            "out (HRESULT={:#x}, key=1). HUD will skip frames "
+                            "until sync recovers; subsequent timeouts silenced.\n",
+                            static_cast<unsigned int>(hr)));
                     }
                 }
 
@@ -455,10 +502,17 @@ namespace openxr_api_layer::detail {
                 m_quadLayer.next = nullptr;
                 // SOURCE_ALPHA blending so the semi-transparent
                 // background composites over the game's frame instead
-                // of replacing it.
+                // of replacing it. NOT setting UNPREMULTIPLIED_ALPHA
+                // _BIT because D2D paints into our shim with
+                // D2D1_ALPHA_MODE_PREMULTIPLIED — the runtime then
+                // treats the texture as already-premultiplied (the
+                // default when UNPREMULTIPLIED_ALPHA_BIT is absent).
+                // Setting both would cause the runtime to re-
+                // premultiply already-premultiplied pixels, darkening
+                // the semi-transparent background + all coloured
+                // bars by ~10 % proportional to their alpha.
                 m_quadLayer.layerFlags =
-                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 m_quadLayer.space = viewSpace;
                 m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 m_quadLayer.subImage.swapchain = m_swapchain;
@@ -597,7 +651,9 @@ namespace openxr_api_layer::detail {
                     nullptr, 0, D3D11_SDK_VERSION,
                     m_myDevice.GetAddressOf(),
                     &outLevel,
-                    m_myContext.GetAddressOf());
+                    nullptr);   // we never invoke ID3D11DeviceContext
+                                // directly — D2D drives it through
+                                // the RT — so don't even capture it.
                 if (FAILED(hr) || !m_myDevice) {
                     Log(fmt::format(
                         "xr_telemetry: overlay disabled — D3D11CreateDevice "
@@ -697,6 +753,11 @@ namespace openxr_api_layer::detail {
                         static_cast<unsigned int>(hr)));
                     return false;
                 }
+                if (!m_core.initBrushes(m_myShimRenderTarget.Get())) {
+                    Log("xr_telemetry: overlay disabled — initBrushes (private "
+                        "device) failed\n");
+                    return false;
+                }
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
@@ -722,8 +783,10 @@ namespace openxr_api_layer::detail {
             // Our private D3D11 device — same adapter as the app's,
             // but explicitly created with D3D11_CREATE_DEVICE_BGRA
             // _SUPPORT so D2D works. Holds the shim texture we paint.
+            // The immediate context is deliberately not captured:
+            // every draw goes through D2D's RT, never through a raw
+            // ID3D11DeviceContext API we'd own.
             ComPtr<ID3D11Device>        m_myDevice;
-            ComPtr<ID3D11DeviceContext> m_myContext;
             // The shim, twice. m_myShim lives on m_myDevice and is the
             // D2D render target. m_appShim is the SAME underlying
             // GPU resource, opened on the app's device via OpenShared
@@ -746,6 +809,12 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
             bool                        m_ready = false;
+            // One-shot guards for the bounded keyed-mutex acquires —
+            // a sync glitch from the runtime / app side is logged
+            // once, then suppressed so a sustained issue doesn't
+            // flood the file. Cleared at construction.
+            bool                        m_loggedMyMutexTimeout = false;
+            bool                        m_loggedAppMutexTimeout = false;
         };
 
         // -------- D3D12 renderer (via D3D11On12 bridge) ---------------------
@@ -840,8 +909,7 @@ namespace openxr_api_layer::detail {
                 m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
                 m_quadLayer.next = nullptr;
                 m_quadLayer.layerFlags =
-                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 m_quadLayer.space = viewSpace;
                 m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 m_quadLayer.subImage.swapchain = m_swapchain;
@@ -1019,6 +1087,11 @@ namespace openxr_api_layer::detail {
                         "xr_telemetry: overlay disabled — D3D12 path Create"
                         "DxgiSurfaceRenderTarget (shim) failed (HRESULT={:#x})\n",
                         static_cast<unsigned int>(hr)));
+                    return false;
+                }
+                if (!m_core.initBrushes(m_shimRenderTarget.Get())) {
+                    Log("xr_telemetry: overlay disabled — initBrushes (D3D12 "
+                        "path) failed\n");
                     return false;
                 }
                 Log("xr_telemetry: overlay D3D12 renderer ready ("

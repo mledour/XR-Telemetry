@@ -1669,14 +1669,22 @@ namespace openxr_api_layer {
         // deque op, never blocks; the writer thread does the disk I/O).
         //
         // IMPORTANT: do NOT call Log() / fmt::format / OutputDebugStringA
-        // from this path, not even gated to every Nth frame. OutputDebugString
-        // takes the kernel-wide DBWinMutex; the Pimax OpenXR compositor (in
-        // a separate process) acquires the same mutex for its own logging
-        // and a few-hundred-µs contention spike here is enough to make the
-        // compositor drop frames — manifesting as a black HMD. Bisected on
-        // PR #1: math + ETW renders fine, math + ETW + 1 Hz Log() kills the
-        // HMD. ETW (TraceLoggingWrite) itself is lock-free and would be safe;
-        // we chose CSV instead for the UX (no wpr/tracerpt round-trip).
+        // on the PER-FRAME path (i.e. unconditionally, every xrEndFrame).
+        // OutputDebugString takes the kernel-wide DBWinMutex; the Pimax
+        // OpenXR compositor (in a separate process) acquires the same
+        // mutex for its own logging and a few-hundred-µs contention spike
+        // at every frame is enough to make the compositor drop frames —
+        // manifesting as a black HMD. Bisected on PR #1: math + ETW
+        // renders fine, math + ETW + 1 Hz Log() kills the HMD.
+        //
+        // Per-EVENT Log calls (hotkey rising-edge toggles, one-shot
+        // "we hit a config limit" warnings) ARE fine. They fire once
+        // per user action / once per session, not every frame, so the
+        // DBWinMutex contention budget stays well below the threshold.
+        //
+        // ETW (TraceLoggingWrite) itself is lock-free and would be safe
+        // even per-frame; we chose CSV instead for the UX (no
+        // wpr/tracerpt round-trip).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (m_bypassApiLayer) {
@@ -1810,6 +1818,21 @@ namespace openxr_api_layer {
                 augmentedInfo.layerCount = frameEndInfo->layerCount + 1;
                 augmentedInfo.layers = augmentedLayers;
                 effectiveInfo = &augmentedInfo;
+            } else if (overlayLayer && frameEndInfo &&
+                       frameEndInfo->layerCount > kMaxAppLayers &&
+                       !m_loggedLayerCapExceeded) {
+                // App submits more than 16 composition layers (rare
+                // sim setup: multiple cameras + mirrors + tools).
+                // We could grow kMaxAppLayers but stack arrays scale
+                // poorly, so the trade-off is: HUD silently disappears
+                // for that app, log once so a support ticket has a
+                // hint to grep.
+                m_loggedLayerCapExceeded = true;
+                Log(fmt::format(
+                    "xr_telemetry: overlay skipped — app submitted {} composition "
+                    "layers, our augment cap is {}. HUD will stay hidden for this "
+                    "session; subsequent oversize frames silenced.\n",
+                    frameEndInfo->layerCount, kMaxAppLayers));
             }
 
             const XrResult result = OpenXrApi::xrEndFrame(session, effectiveInfo);
@@ -2098,6 +2121,13 @@ namespace openxr_api_layer {
         // Session, destroyed at xrDestroySession. NULL when the layer
         // hasn't bound a session yet.
         XrSpace m_viewSpace = XR_NULL_HANDLE;
+
+        // One-shot: an app submits more composition layers than our
+        // stack-allocated augmentation array can hold (16). We can't
+        // append our quad in that case, so the HUD goes silently
+        // hidden — log once per session to leave a breadcrumb in
+        // support reports.
+        bool m_loggedLayerCapExceeded = false;
 
         // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
         // D3D12) is picked at xrCreateSession based on the binding. Null

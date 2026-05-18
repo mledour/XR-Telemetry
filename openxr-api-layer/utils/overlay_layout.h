@@ -98,19 +98,6 @@ namespace openxr_api_layer::detail {
         return rows;
     }
 
-    // Legacy flat-list view: returns the 6 strings the new
-    // formatOverlayRows produces, ordered left-then-right per row.
-    // Kept for the existing test_overlay_layout cases that already
-    // grep individual lines — saves churn on those. New code paths
-    // should prefer formatOverlayRows directly.
-    inline std::vector<std::string> formatOverlayLines(const OverlaySnapshot& snap) {
-        std::vector<std::string> out;
-        for (const auto& r : formatOverlayRows(snap)) {
-            out.push_back(r.left);
-            out.push_back(r.right);
-        }
-        return out;
-    }
 
     // The geometry of the head-locked quad. Coordinates are in OpenXR
     // view space (XR_REFERENCE_SPACE_TYPE_VIEW): +X right, +Y up,

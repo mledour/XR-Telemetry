@@ -23,7 +23,6 @@
 // =============================================================================
 // test_overlay_layout.cpp — unit tests on the pure HUD-layout helpers:
 //   - formatOverlayRows (snapshot → 3 (left, right) pairs)
-//   - formatOverlayLines (legacy flat view of the same data, 6 strings)
 //   - geometryForPosition (settings.position → quad pose/size)
 //   - normaliseBar (sample / max → [0, 1] bar height, legacy helper)
 //   - barVisualForSample (sample / budget → (heightFraction, BarTier))
@@ -36,7 +35,6 @@
 
 using openxr_api_layer::detail::OverlaySnapshot;
 using openxr_api_layer::detail::OverlayRow;
-using openxr_api_layer::detail::formatOverlayLines;
 using openxr_api_layer::detail::formatOverlayRows;
 using openxr_api_layer::detail::geometryForPosition;
 using openxr_api_layer::detail::normaliseBar;
@@ -96,31 +94,6 @@ TEST_CASE("formatOverlayRows: nominal snapshot produces 3 rows × 2 columns") {
     CHECK(rows[2].right.find("CPU")  != std::string::npos);
     CHECK(rows[2].right.find("61")   != std::string::npos);
     CHECK(rows[2].right.find("%")    != std::string::npos);
-}
-
-TEST_CASE("formatOverlayLines: legacy flat view matches formatOverlayRows order") {
-    // formatOverlayLines is the legacy flattened view used by older
-    // call sites. It MUST emit the 3 rows in left-then-right order,
-    // so a freshly-grown test using either function sees the same
-    // visual ordering of values.
-    OverlaySnapshot snap;
-    snap.valid = true;
-    snap.fps_instant = 90.0f;
-    snap.fps_avg = 89.5f;
-    snap.target_fps = 90.0f;
-    snap.cpu_frame_ms = 4.0f;
-    snap.cpu_utilisation_pct = 36.0f;
-    snap.gpu_frame_ms = 3.0f;
-    snap.gpu_utilisation_pct = 27.0f;
-
-    const auto lines = formatOverlayLines(snap);
-    REQUIRE(lines.size() == 6);
-    CHECK(lines[0].find("FPS") != std::string::npos);   // row 0 left
-    CHECK(lines[1].find("AVG") != std::string::npos);   // row 0 right
-    CHECK(lines[2].find("GPU") != std::string::npos);   // row 1 left
-    CHECK(lines[3].find("CPU") != std::string::npos);   // row 1 right
-    CHECK(lines[4].find("GPU") != std::string::npos);   // row 2 left
-    CHECK(lines[5].find("CPU") != std::string::npos);   // row 2 right
 }
 
 TEST_CASE("formatOverlayRows: zero target_fps still renders without crashing") {
