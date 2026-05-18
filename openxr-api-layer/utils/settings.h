@@ -87,6 +87,13 @@ namespace openxr_api_layer::detail {
         HotkeySpec hotkey{};
         int refresh_hz = 10;       // matches fpsvr's cadence
         std::string position = "head_top_right";
+        // Multiplier on the default 0.20 m × 0.075 m quad (at 1 m view-
+        // space distance). 1.0 = default size (~11° × 4° of FOV in the
+        // top-right corner); 0.5 → half-size; 2.0 → double. Anything
+        // outside [0.5, 2.0] is clamped so a typo can't render a quad
+        // big enough to obscure the cockpit or smaller than the font
+        // can be drawn legibly.
+        float scale = 1.0f;
     };
 
     // Top-level settings struct.
@@ -159,6 +166,16 @@ namespace openxr_api_layer::detail {
             if (it->value.IsDouble())  return static_cast<int>(it->value.GetDouble());
             return defaultVal;
         }
+        // Permissive float reader: accepts integer-typed JSON too (a user
+        // writing `"scale": 1` instead of `"scale": 1.0` is reasonable).
+        inline float getFloatOr(const rapidjson::Value& obj, const char* key,
+                                float defaultVal) noexcept {
+            const auto it = obj.FindMember(key);
+            if (it == obj.MemberEnd()) return defaultVal;
+            if (it->value.IsDouble())  return static_cast<float>(it->value.GetDouble());
+            if (it->value.IsInt())     return static_cast<float>(it->value.GetInt());
+            return defaultVal;
+        }
     } // namespace settings_parse_impl
 
     // Parse a settings.json text into a TelemetrySettings + error string.
@@ -178,6 +195,7 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.hotkey = defaultOverlayHotkey();
         result.settings.overlay.refresh_hz = 10;
         result.settings.overlay.position = "head_top_right";
+        result.settings.overlay.scale = 1.0f;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -263,12 +281,32 @@ namespace openxr_api_layer::detail {
             const int rawHz = getIntOr(ov, "refresh_hz", 10);
             result.settings.overlay.refresh_hz = std::clamp(rawHz, 1, 60);
 
-            // `position` is reserved for PR2's renderer. Currently the only
-            // meaningful value is "head_top_right"; we keep the string
-            // around so users can experiment with future values without
-            // needing a parser update.
-            result.settings.overlay.position =
-                getStringOr(ov, "position", "head_top_right");
+            // `position` selects the head-locked quad placement.
+            // Recognised values: head_top_right (default), head_top_left,
+            // head_top_center, head_center. Unknown strings still get
+            // stored verbatim — the renderer falls back to head_top_right
+            // when it can't decode them, so a typo never disables the
+            // overlay, it just lands in the default corner.
+            //
+            // Hard length cap: the recognised values are all <= 16
+            // chars; anything past 64 is either junk or a malicious /
+            // corrupted JSON trying to make us hold a multi-MB string
+            // verbatim. Clamp to the default rather than allocate.
+            // This matches the broader settings-parser philosophy
+            // (validate inputs aggressively, fall back to documented
+            // defaults rather than propagating garbage).
+            {
+                std::string rawPosition = getStringOr(ov, "position", "head_top_right");
+                if (rawPosition.size() > 64) {
+                    rawPosition = "head_top_right";
+                }
+                result.settings.overlay.position = std::move(rawPosition);
+            }
+
+            // `scale` clamped to [0.5, 2.0]. 1.0 ≙ default quad size
+            // (~0.20 m × 0.075 m at 1 m view-space distance).
+            const float rawScale = getFloatOr(ov, "scale", 1.0f);
+            result.settings.overlay.scale = std::clamp(rawScale, 0.5f, 2.0f);
         }
 
         return result;

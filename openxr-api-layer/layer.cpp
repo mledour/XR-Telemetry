@@ -53,6 +53,7 @@
 #include "utils/default_settings_template.h"
 #include "utils/name_utils.h"
 #include "utils/overlay_aggregator.h"
+#include "utils/overlay_renderer.h"
 #include "utils/settings.h"
 #include <log.h>
 #include <util.h>
@@ -1240,7 +1241,11 @@ namespace openxr_api_layer {
             // the headroom math, AND the overlay aggregator's refresh
             // deadline. 10 MHz is a sane, realistic guess that keeps the
             // numbers in the right ballpark even on a broken HAL clock.
-            // The aggregator has its own < 1000 clamp as defense in depth.
+            // The aggregator has its own < 1000 clamp as defense in
+            // depth, and it falls back to the SAME 10 MHz — so the
+            // CSV side and the overlay side stay numerically coherent
+            // even in the broken-clock case (no 100× drift between
+            // CSV.period_ns and overlay.fps_target).
             LARGE_INTEGER freq{};
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 10'000'000LL;
@@ -1457,7 +1462,7 @@ namespace openxr_api_layer {
                 if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
                     m_overlayActive = true;
                     Log(fmt::format("xr_telemetry: overlay mode=auto, refreshing snapshot "
-                                     "at {} Hz (PR1 plumbing only — rendering ships in PR2)\n",
+                                     "at {} Hz\n",
                                      m_settings.overlay.refresh_hz));
                 } else {
                     Log(fmt::format("xr_telemetry: overlay mode=hotkey, press {} to toggle "
@@ -1495,6 +1500,19 @@ namespace openxr_api_layer {
             if (m_bypassApiLayer || XR_FAILED(result) || !createInfo) {
                 return result;
             }
+            // Reset session-scoped one-shot warnings — m_loggedLayerCap
+            // Exceeded is logged at most once per session because a
+            // sustained "app submits 17+ composition layers" condition
+            // could otherwise flood the log file. A new session is the
+            // natural granularity to give the user another chance to
+            // see the warning if their composition pattern changes
+            // (e.g. they restarted the headset between sessions and
+            // the runtime's quad-layer setup differs). The flag itself
+            // lives on the OpenXrLayer instance because the layer cap
+            // applies to the augmented-layer scratch buffer in
+            // xrEndFrame, which uses stack memory not tied to any
+            // particular session handle.
+            m_loggedLayerCapExceeded = false;
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
                 auto timer = std::make_unique<D3D11GpuTimer>();
                 if (timer->init(d3d11->device)) {
@@ -1503,6 +1521,10 @@ namespace openxr_api_layer {
                 } else {
                     Log("xr_telemetry: D3D11 binding found but query creation failed; "
                         "gpu_time_ns will be 0 for this session\n");
+                }
+                if (m_settings.overlay.enabled) {
+                    m_overlayRenderer = detail::makeD3D11OverlayRenderer(
+                        this, *session, d3d11->device);
                 }
             } else if (const auto* d3d12 = findD3D12Binding(createInfo->next)) {
                 auto timer = std::make_unique<D3D12GpuTimer>();
@@ -1513,9 +1535,36 @@ namespace openxr_api_layer {
                     Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
                         "creation failed; gpu_time_ns will be 0 for this session\n");
                 }
+                if (m_settings.overlay.enabled) {
+                    m_overlayRenderer = detail::makeD3D12OverlayRenderer(
+                        this, *session, d3d12->device, d3d12->queue);
+                }
             } else {
                 Log("xr_telemetry: no D3D11 or D3D12 binding in xrCreateSession.next "
                     "(Vulkan / OpenGL / null); gpu_time_ns will be 0 for this session\n");
+                if (m_settings.overlay.enabled) {
+                    Log("xr_telemetry: overlay disabled — Vulkan / OpenGL hosts not "
+                        "supported by the renderer (CSV writing still active)\n");
+                }
+            }
+
+            // View space for the head-locked overlay quad. Created only
+            // when the renderer materialised (no point if there's no
+            // HUD to position). xrDestroySession releases it. If the
+            // base call fails, the layer keeps running but the overlay
+            // stays inactive.
+            if (m_overlayRenderer) {
+                XrReferenceSpaceCreateInfo viewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+                viewSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                viewSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+                if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                        *session, &viewSpaceInfo, &m_viewSpace))) {
+                    Log("xr_telemetry: overlay disabled — xrCreateReferenceSpace(VIEW) "
+                        "failed for this session\n");
+                    m_overlayRenderer.reset();
+                    m_viewSpace = XR_NULL_HANDLE;
+                }
             }
             return result;
         }
@@ -1539,6 +1588,15 @@ namespace openxr_api_layer {
             // don't outlive the dying session's device.
             flushPendingFramesUnresolved();
             m_gpuTimer.reset();
+            // Overlay renderer + view space are also session-scoped
+            // (they hold an XrSwapchain + an ID3D11Device wrapping the
+            // session's device). Release before the session goes away,
+            // re-create on the next xrCreateSession if one fires.
+            m_overlayRenderer.reset();
+            if (m_viewSpace != XR_NULL_HANDLE) {
+                OpenXrApi::xrDestroySpace(m_viewSpace);
+                m_viewSpace = XR_NULL_HANDLE;
+            }
             // DO NOT touch m_csv / m_recording / m_overlay / m_overlay
             // Active here. The OpenXR spec allows multiple xrCreateSession
             // / xrDestroySession cycles within a single xrInstance, and
@@ -1628,14 +1686,22 @@ namespace openxr_api_layer {
         // deque op, never blocks; the writer thread does the disk I/O).
         //
         // IMPORTANT: do NOT call Log() / fmt::format / OutputDebugStringA
-        // from this path, not even gated to every Nth frame. OutputDebugString
-        // takes the kernel-wide DBWinMutex; the Pimax OpenXR compositor (in
-        // a separate process) acquires the same mutex for its own logging
-        // and a few-hundred-µs contention spike here is enough to make the
-        // compositor drop frames — manifesting as a black HMD. Bisected on
-        // PR #1: math + ETW renders fine, math + ETW + 1 Hz Log() kills the
-        // HMD. ETW (TraceLoggingWrite) itself is lock-free and would be safe;
-        // we chose CSV instead for the UX (no wpr/tracerpt round-trip).
+        // on the PER-FRAME path (i.e. unconditionally, every xrEndFrame).
+        // OutputDebugString takes the kernel-wide DBWinMutex; the Pimax
+        // OpenXR compositor (in a separate process) acquires the same
+        // mutex for its own logging and a few-hundred-µs contention spike
+        // at every frame is enough to make the compositor drop frames —
+        // manifesting as a black HMD. Bisected on PR #1: math + ETW
+        // renders fine, math + ETW + 1 Hz Log() kills the HMD.
+        //
+        // Per-EVENT Log calls (hotkey rising-edge toggles, one-shot
+        // "we hit a config limit" warnings) ARE fine. They fire once
+        // per user action / once per session, not every frame, so the
+        // DBWinMutex contention budget stays well below the threshold.
+        //
+        // ETW (TraceLoggingWrite) itself is lock-free and would be safe
+        // even per-frame; we chose CSV instead for the UX (no
+        // wpr/tracerpt round-trip).
         // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (m_bypassApiLayer) {
@@ -1733,7 +1799,60 @@ namespace openxr_api_layer {
             const auto resolved =
                 m_gpuTimer ? m_gpuTimer->endFrameAndResolveOldest() : std::nullopt;
 
-            const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
+            // Render the overlay (if active + ready) and build a
+            // modified XrFrameEndInfo that appends our quad to the
+            // app's composition layers. The renderer's paint owns
+            // the swapchain image acquire/wait/release dance, so by
+            // the time renderAndCompose returns the image is fully
+            // committed and the returned XrCompositionLayerBaseHeader*
+            // points to a quad layer the runtime can composite.
+            //
+            // We allocate the modified layer array on the frame
+            // thread's stack (fixed cap of kMaxAppLayers + 1) to
+            // avoid touching the heap inside the hot path. Apps
+            // typically submit 1-2 projection layers; pushing the
+            // cap to 16 leaves headroom for stereoscope + tools.
+            const XrCompositionLayerBaseHeader* overlayLayer = nullptr;
+            if (m_overlayRenderer && m_overlayActive &&
+                m_viewSpace != XR_NULL_HANDLE) {
+                overlayLayer = m_overlayRenderer->renderAndCompose(
+                    m_viewSpace, m_overlay.snapshot(),
+                    m_settings.overlay.position,
+                    m_settings.overlay.scale);
+            }
+
+            constexpr uint32_t kMaxAppLayers = 16;
+            const XrCompositionLayerBaseHeader* augmentedLayers[kMaxAppLayers + 1];
+            XrFrameEndInfo augmentedInfo;
+            const XrFrameEndInfo* effectiveInfo = frameEndInfo;
+            if (overlayLayer && frameEndInfo &&
+                frameEndInfo->layerCount <= kMaxAppLayers) {
+                for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                    augmentedLayers[i] = frameEndInfo->layers[i];
+                }
+                augmentedLayers[frameEndInfo->layerCount] = overlayLayer;
+                augmentedInfo = *frameEndInfo;
+                augmentedInfo.layerCount = frameEndInfo->layerCount + 1;
+                augmentedInfo.layers = augmentedLayers;
+                effectiveInfo = &augmentedInfo;
+            } else if (overlayLayer && frameEndInfo &&
+                       frameEndInfo->layerCount > kMaxAppLayers &&
+                       !m_loggedLayerCapExceeded) {
+                // App submits more than 16 composition layers (rare
+                // sim setup: multiple cameras + mirrors + tools).
+                // We could grow kMaxAppLayers but stack arrays scale
+                // poorly, so the trade-off is: HUD silently disappears
+                // for that app, log once so a support ticket has a
+                // hint to grep.
+                m_loggedLayerCapExceeded = true;
+                Log(fmt::format(
+                    "xr_telemetry: overlay skipped — app submitted {} composition "
+                    "layers, our augment cap is {}. HUD will stay hidden for this "
+                    "session; subsequent oversize frames silenced.\n",
+                    frameEndInfo->layerCount, kMaxAppLayers));
+            }
+
+            const XrResult result = OpenXrApi::xrEndFrame(session, effectiveInfo);
             // end_frame_ns isolates the runtime + downstream layers' work
             // inside xrEndFrame (layer composition, projection correction,
             // compositor handoff). Useful for diagnosing runtime overhead —
@@ -1925,7 +2044,24 @@ namespace openxr_api_layer {
         // corresponding feature is dormant.
         void fanoutRecord(const FrameRecord& r) {
             if (m_recording)     m_csv.push(r);
-            if (m_overlayActive) m_overlay.pushFrame(r);
+            if (m_overlayActive) {
+                m_overlay.pushFrame(r);
+                if (m_overlayRenderer) {
+                    // The CPU histogram strip displays per-cycle CPU
+                    // work (frame_total − wait_block), matching the
+                    // cpu_frame_ms value drawn above the strip — that's
+                    // the same per_cycle metric OverlayAggregator uses.
+                    // Fallback to app_cpu_ns on the very first frame
+                    // (no previous tEnd to subtract from), same as
+                    // xrEndFrame's headroom math.
+                    const int64_t cpu_per_cycle_ns =
+                        (r.frame_total_ns > 0)
+                            ? (r.frame_total_ns - r.wait_block_ns)
+                            : r.app_cpu_ns;
+                    m_overlayRenderer->pushFrameSample(cpu_per_cycle_ns,
+                                                       r.gpu_time_ns);
+                }
+            }
         }
 
         void patchAndDrainPending(uint64_t resolvedFrameIndex, int64_t gpuTimeNs) {
@@ -1985,14 +2121,30 @@ namespace openxr_api_layer {
         // Overlay state. Symmetric to the log state above. The aggregator
         // is constructed late (in xrCreateInstance, once we know the
         // refresh_hz from settings and have the cached m_qpcFrequency).
-        // The renderer that will ship in PR2 reads its Snapshot via
-        // m_overlay.snapshot() once per render tick.
+        // The renderer is constructed in xrCreateSession once we know
+        // the graphics binding (D3D11 / D3D12); xrEndFrame paints with
+        // it and appends a composition layer to the runtime's layer
+        // array.
         //
         // m_overlayActive mirrors m_recording: true in auto mode, toggled
         // by press in hotkey mode.
         detail::OverlayAggregator m_overlay;
         detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
         bool m_overlayActive = false;
+        std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+
+        // View space (XR_REFERENCE_SPACE_TYPE_VIEW) — head-locked
+        // reference frame the overlay quad lives in. Created at xrCreate
+        // Session, destroyed at xrDestroySession. NULL when the layer
+        // hasn't bound a session yet.
+        XrSpace m_viewSpace = XR_NULL_HANDLE;
+
+        // One-shot: an app submits more composition layers than our
+        // stack-allocated augmentation array can hold (16). We can't
+        // append our quad in that case, so the HUD goes silently
+        // hidden — log once per session to leave a breadcrumb in
+        // support reports.
+        bool m_loggedLayerCapExceeded = false;
 
         // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
         // D3D12) is picked at xrCreateSession based on the binding. Null

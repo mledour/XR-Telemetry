@@ -696,4 +696,5 @@ TEST_CASE("template constexpr matches installer/default_settings.json (no schema
     CHECK(formatHotkey(a.overlay.hotkey) == formatHotkey(b.overlay.hotkey));
     CHECK(a.overlay.refresh_hz == b.overlay.refresh_hz);
     CHECK(a.overlay.position   == b.overlay.position);
+    CHECK(a.overlay.scale      == b.overlay.scale);
 }

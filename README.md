@@ -353,26 +353,71 @@ unit-tested in `openxr-api-layer-tests/test_name_utils.cpp`.
 | `overlay.refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsvr and is the recommended cadence — fast enough that the numbers track reality, slow enough to be readable in motion. |
 | `overlay.position` | string | `"head_top_right"` | Reserved for the future renderer (PR2). The data plumbing is in place; the head-locked quad will land in a follow-up PR. Any other string is accepted and stored verbatim. |
 
-<!-- REMOVE-WHEN-PR2-LANDS:start -->
-> **PR1 status:** the overlay block is fully parsed, the hotkey
-> toggles a runtime flag, and the moving-average aggregator is fed
-> with every fully-resolved FrameRecord at the configured cadence.
-> The actual in-headset RENDERING (DirectWrite text on a head-
-> locked OpenXR quad layer) ships in **PR2**. Until then the
-> aggregator's last snapshot is dumped to the log file at
-> `xrDestroySession` so users can confirm the data path works end-
-> to-end (`xr_telemetry: overlay final snapshot — fps=89.8 (avg
-> 90.1, target 90.0), cpu=6.78 ms (61% util), gpu=5.18 ms (47%
-> util)`).
->
-> **CPU semantic:** `cpu_frame_ms` reports the app's per-cycle CPU
-> work (frame_total − wait_block), matching fpsvr / OpenXR Toolkit
-> convention. This makes `cpu_frame_ms` × `target_fps` ≈ `cpu_
-> utilisation_pct`, so the two displayed numbers are coherent. It
-> is NOT the wait→end window (`app_cpu_ns` in the CSV) — that's a
-> sub-window of the full cycle that excludes sim / physics / input
-> polling done AFTER xrEndFrame returns.
-<!-- REMOVE-WHEN-PR2-LANDS:end -->
+**CPU semantic.** `cpu_frame_ms` reports the app's per-cycle CPU
+work (`frame_total − wait_block`), matching fpsvr / OpenXR Toolkit
+convention. This makes `cpu_frame_ms × target_fps ≈ cpu_util_pct`,
+so the two displayed numbers stay coherent. It is NOT the wait→end
+window (`app_cpu_ns` in the CSV) — that's a sub-window of the full
+cycle that excludes sim / physics / input polling done AFTER
+`xrEndFrame` returns.
+
+### Rendering
+
+The HUD is composed as an OpenXR quad layer in the `XR_REFERENCE_
+SPACE_TYPE_VIEW` head-locked space — it follows the head, sits at
+the corner of your FOV chosen by `position`, and never gets in the
+way of the cockpit.
+
+- **D3D11 hosts (DR2, ACC, LMU on D3D11, …)**: the renderer paints
+  with DirectWrite + Direct2D directly into a 256×144 BGRA8 OpenXR
+  swapchain. ~0.05 ms per paint on a 2020-era CPU.
+- **D3D12 hosts (MSFS, newer Forza, UE5 in D3D12, …)**: same
+  renderer, but the D3D12 device is wrapped via `D3D11On12Create
+  Device` so D2D (which is D3D11-only) can paint into the D3D12
+  swapchain image. The runtime composites the result the same way.
+- **Vulkan / OpenGL hosts**: not supported. The layer logs
+  `overlay disabled — Vulkan / OpenGL hosts not supported by the
+  renderer` and keeps the rest of the telemetry pipeline (CSV
+  writing, snapshot log) running.
+- **Runtime without BGRA8 swapchain support**: the layer logs
+  `overlay disabled — runtime doesn't advertise DXGI_FORMAT_
+  B8G8R8A8_UNORM` and degrades to CSV-only. Modern runtimes
+  (Pimax, SteamVR, WMR, Oculus, Varjo) all advertise BGRA8 in
+  practice.
+
+### What gets displayed
+
+Two-column fpsVR-style layout — GPU on the left, CPU on the right.
+Each column shows the metric (top), a 144-sample frametime
+histogram (middle), and the utilisation % (bottom):
+
+```
+ FPS  89.8 / 90.0          AVG  90.1
+ GPU  5.18 ms              CPU  6.78 ms
+ ▁▂▃▂▃▂▁▂▃▂▃▂▁▂▃▂▃▂▁▂▃▂   ▂▃▂▄▃▂▃▄▂▃▂▄▃▂▄▃▂▃▄▂▃▂
+ GPU  47 %                 CPU  61 %
+```
+
+(Future row, reserved: GPU/CPU temperature.)
+
+The histograms are **budget-anchored** in fpsvr / OpenXR Toolkit
+style:
+
+- Y axis spans `0..2× period` (the runtime's predicted display
+  period — 11.1 ms at 90 Hz, 8.3 ms at 120 Hz). The budget itself
+  sits at the strip's midpoint.
+- A half-transparent white line is drawn at exactly that midpoint,
+  so frames that cross it are visibly "over budget" at a glance.
+- Each bar is colour-coded: **green** under 80 % of the budget,
+  **yellow** 80–100 %, **red** at or above. Reprojected /
+  stuttered frames turn red and visually cross the line.
+- Anything beyond 2× budget saturates at the top of the strip.
+
+Unlike a max-of-window auto-normalised graph, the scale never
+shifts — a single stutter spike doesn't squash the rest of the
+bars. The cost is that on a fixed-FPS cap (e.g. menu at 60 Hz on
+a 90 Hz HMD), every bar looks red, which is the truthful answer
+("you're busting the budget every frame here").
 
 <!-- REMOVE-WHEN-PR3-LANDS:start -->
 > **Known limitation (PR3 will address):** `cpu_frame_ms` is

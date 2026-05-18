@@ -62,7 +62,8 @@ namespace openxr_api_layer::detail {
       "modifiers": ["ctrl", "shift"]
     },
     "refresh_hz": 10,
-    "position": "head_top_right"
+    "position": "head_top_right",
+    "scale": 1.0
   }
 }
 )";
