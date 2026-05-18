@@ -68,11 +68,17 @@ namespace openxr_api_layer::detail {
         // -------- Layout constants ------------------------------------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 320×96 gives a fpsVR-
+        // QUAD in 3D scales, not the resolution. 320×116 gives a fpsVR-
         // style two-column HUD: GPU on the left, CPU on the right,
-        // with histograms below each frametime line.
+        // with histograms below each frametime line, plus a 4th row
+        // for GPU temp + VRAM. The previous 320×96 layout fit 3 rows
+        // (FPS / frametimes / utilisation) plus the strip; growing to
+        // 116 px adds room for one more text row at ~kLineHeight +
+        // kRowGap = 19 px. The quad's world-space height in geometry
+        // ForPosition scales proportionally so pixel density stays
+        // visually consistent with the previous version.
         constexpr int32_t  kTexW         = 320;
-        constexpr int32_t  kTexH         = 96;
+        constexpr int32_t  kTexH         = 116;
         constexpr float    kPadX         = 8.0f;
         constexpr float    kPadTop       = 6.0f;
         constexpr float    kFontSize     = 13.0f;
@@ -243,10 +249,19 @@ namespace openxr_api_layer::detail {
                 const float rightR = texW - kPadX;
 
                 // Vertical positions, top → bottom.
+                //   row0Y  : FPS line              (data row 0)
+                //   row1Y  : frametime ms line     (data row 1)
+                //   histoY : two histograms        (between data rows 1 and 2)
+                //   row2Y  : utilisation %         (data row 2)
+                //   row3Y  : GPU temp / VRAM       (data row 3 — added in
+                //            this PR; sits below the utilisation row with
+                //            the same row gap so the vertical rhythm
+                //            stays consistent).
                 const float row0Y  = kPadTop;
                 const float row1Y  = row0Y + kLineHeight + kRowGap;
                 const float histoY = row1Y + kLineHeight + kHistoGap;
-                const float row3Y  = histoY + kHistoHeight + kHistoGap;
+                const float row2Y  = histoY + kHistoHeight + kHistoGap;
+                const float row3Y  = row2Y + kLineHeight + kRowGap;
 
                 // Re-format the row strings only when the snapshot
                 // changed. paint() runs at the host frame rate (90-
@@ -285,8 +300,17 @@ namespace openxr_api_layer::detail {
                     drawText(rows[0].right, rightL, row0Y, rightR);
                     drawText(rows[1].left,  leftL,  row1Y, leftR);
                     drawText(rows[1].right, rightL, row1Y, rightR);
-                    drawText(rows[2].left,  leftL,  row3Y, leftR);
-                    drawText(rows[2].right, rightL, row3Y, rightR);
+                    drawText(rows[2].left,  leftL,  row2Y, leftR);
+                    drawText(rows[2].right, rightL, row2Y, rightR);
+                }
+                // Row 3 is best-effort — present only when the
+                // aggregator built a 4-row layout (it always does
+                // now, but the >= 4 guard keeps the renderer
+                // resilient if a future caller swaps in a 3-row
+                // snapshot, e.g. a CPU-only debug build).
+                if (rows.size() >= 4) {
+                    drawText(rows[3].left,  leftL,  row3Y, leftR);
+                    drawText(rows[3].right, rightL, row3Y, rightR);
                 }
 
                 // Two histogram strips side-by-side. Both share the

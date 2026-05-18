@@ -46,7 +46,9 @@
 #include "../telemetry_internals.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace openxr_api_layer::detail {
 
@@ -67,6 +69,23 @@ namespace openxr_api_layer::detail {
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
+        // GPU package / hot-spot temperature in °C, sampled best-effort
+        // from NvAPI (NVIDIA-only for now; AMD ADL lands in a follow-up
+        // PR). NaN when the source is unavailable, which the renderer's
+        // isfinite() guard in formatOverlayRows turns into a "--°C"
+        // placeholder. Stored as a running mean across the refresh
+        // window — temperatures change slowly so this matches what
+        // the user perceives.
+        float gpu_temp_c = std::numeric_limits<float>::quiet_NaN();
+        // VRAM used by the host process at the end of the refresh
+        // window. Comes from DXGI_QUERY_VIDEO_MEMORY_INFO::CurrentUsage
+        // — universal across NVIDIA / AMD / Intel since Win10 RS1. 0
+        // means "DXGI didn't answer this window"; the matching
+        // gpu_temp_c value is NaN so the renderer can suppress the
+        // line. Bytes, not MB, to preserve precision in the CSV; the
+        // renderer divides for display.
+        uint64_t vram_used_bytes = 0;
+        uint64_t vram_budget_bytes = 0;
         bool  valid = false;            // false until the first refresh tick has finalised
         // Monotonic publish counter — bumped by OverlayAggregator on
         // every successful refresh tick. Lets the renderer cheaply
@@ -121,6 +140,26 @@ namespace openxr_api_layer::detail {
               // production caller hits that path (OpenXrLayer always
               // passes the cached QueryPerformanceFrequency).
               m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 10'000'000LL) {}
+
+        // Push a single GpuTelemetrySample-equivalent reading. The
+        // aggregator stores the latest valid temperature / VRAM
+        // values and weaves them into the snapshot on the next
+        // publish. Decoupled from pushFrame() because GPU telemetry
+        // refreshes at the aggregator cadence (~10 Hz), not per
+        // frame — calling NvAPI 90+ times/second would be wasted
+        // work since the driver itself only updates these counters
+        // ~once per second.
+        //
+        // NaN / 0 inputs are accepted (and re-published as NaN / 0
+        // downstream); the format helpers handle the placeholders.
+        void pushGpuTelemetry(float gpu_temp_c,
+                              uint64_t vram_used_bytes,
+                              uint64_t vram_budget_bytes) noexcept {
+            m_latestGpuTempC      = gpu_temp_c;
+            m_latestVramUsed      = vram_used_bytes;
+            m_latestVramBudget    = vram_budget_bytes;
+            m_gotGpuTelemetry     = true;
+        }
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
         // is its final value, not the in-flight 0). The aggregator
@@ -210,6 +249,18 @@ namespace openxr_api_layer::detail {
             m_snapshot.cpu_utilisation_pct = std::clamp(100.0f - headroomMean,    0.0f, 100.0f);
             m_snapshot.gpu_utilisation_pct = std::clamp(100.0f - gpuHeadroomMean, 0.0f, 100.0f);
 
+            // Latch the latest GPU telemetry reading. We deliberately
+            // do NOT average temperature across the window — drivers
+            // update these counters only ~1 Hz, so any "averaging"
+            // would just be averaging step-function holds. Show the
+            // user the latest poll instead. If pushGpuTelemetry has
+            // never been called (non-NVIDIA host with NvAPI absent),
+            // m_latestGpuTempC stays NaN and vram_used stays 0 — the
+            // renderer falls back to the "--" placeholder cleanly.
+            m_snapshot.gpu_temp_c        = m_latestGpuTempC;
+            m_snapshot.vram_used_bytes   = m_latestVramUsed;
+            m_snapshot.vram_budget_bytes = m_latestVramBudget;
+
             m_snapshot.valid = true;
             // Bump the version monotonically — starting at 1 the very
             // first time so the renderer's default-zero cache always
@@ -246,6 +297,16 @@ namespace openxr_api_layer::detail {
         // already formatted last frame" without comparing every
         // numeric field for equality.
         uint64_t m_publishCount = 0;
+        // Latest GPU telemetry reading from pushGpuTelemetry. We
+        // latch the most recent poll rather than averaging across the
+        // refresh window — see the long comment in publishAndReset.
+        // Defaults represent "no source available yet"; NaN
+        // propagates through publishAndReset and the renderer's
+        // isfinite() guard surfaces it as "--°C".
+        float    m_latestGpuTempC = std::numeric_limits<float>::quiet_NaN();
+        uint64_t m_latestVramUsed = 0;
+        uint64_t m_latestVramBudget = 0;
+        bool     m_gotGpuTelemetry = false;
         OverlaySnapshot m_snapshot;
     };
 

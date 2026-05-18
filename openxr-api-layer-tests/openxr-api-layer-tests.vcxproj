@@ -132,6 +132,7 @@
          files here — see test_example.cpp for the doctest pattern. -->
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
+    <ClCompile Include="test_gpu_telemetry.cpp" />
     <ClCompile Include="test_histogram_ring.cpp" />
     <ClCompile Include="test_hotkey.cpp" />
     <ClCompile Include="test_name_utils.cpp" />
@@ -153,6 +154,7 @@
          Add ..\openxr-api-layer\utils\*.cpp entries below as you grow
          your layer with more .cpp files. -->
     <ClCompile Include="..\openxr-api-layer\layer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\gpu_telemetry.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\overlay_renderer.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\dispatch.gen.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\log.cpp" />
