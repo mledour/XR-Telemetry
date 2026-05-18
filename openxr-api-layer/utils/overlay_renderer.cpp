@@ -368,6 +368,23 @@ namespace openxr_api_layer::detail {
 
                 m_renderTargets.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
+                    // Diagnostic: log what the runtime actually gave us
+                    // for image 0. Pimax OpenXR 0.1.0 has been seen to
+                    // hand back textures that don't match the format we
+                    // requested via xrCreateSwapchain, which then fails
+                    // D2D's pixel-format check downstream.
+                    if (i == 0) {
+                        D3D11_TEXTURE2D_DESC desc{};
+                        raw[i].texture->GetDesc(&desc);
+                        Log(fmt::format(
+                            "xr_telemetry: overlay swapchain image[0] format={}, "
+                            "bindFlags={:#x}, usage={}, sampleCount={}, mipLevels={}\n",
+                            static_cast<int>(desc.Format),
+                            static_cast<unsigned int>(desc.BindFlags),
+                            static_cast<int>(desc.Usage),
+                            static_cast<int>(desc.SampleDesc.Count),
+                            static_cast<int>(desc.MipLevels)));
+                    }
                     ComPtr<IDXGISurface> surface;
                     if (FAILED(raw[i].texture->QueryInterface(
                             __uuidof(IDXGISurface),
@@ -376,17 +393,27 @@ namespace openxr_api_layer::detail {
                             "IDXGISurface failed\n");
                         return false;
                     }
+                    // Pass DXGI_FORMAT_UNKNOWN + ALPHA_MODE_UNKNOWN so
+                    // D2D adopts whatever pixel format the texture
+                    // actually has, instead of failing when our
+                    // request mismatches the runtime's choice. Works
+                    // for any BGRA-family surface the runtime hands
+                    // back; D2D refuses non-BGRA formats internally
+                    // with a clearer HRESULT we'll log below.
                     D2D1_RENDER_TARGET_PROPERTIES props =
                         D2D1::RenderTargetProperties(
                             D2D1_RENDER_TARGET_TYPE_DEFAULT,
                             D2D1::PixelFormat(
-                                DXGI_FORMAT_B8G8R8A8_UNORM,
-                                D2D1_ALPHA_MODE_PREMULTIPLIED));
-                    if (FAILED(m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                            surface.Get(), &props,
-                            m_renderTargets[i].GetAddressOf()))) {
-                        Log("xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
-                            "Target failed for image " + std::to_string(i) + "\n");
+                                DXGI_FORMAT_UNKNOWN,
+                                D2D1_ALPHA_MODE_UNKNOWN));
+                    HRESULT hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
+                        surface.Get(), &props,
+                        m_renderTargets[i].GetAddressOf());
+                    if (FAILED(hr)) {
+                        Log(fmt::format(
+                            "xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
+                            "Target failed for image {} (HRESULT={:#x})\n",
+                            i, static_cast<unsigned int>(hr)));
                         return false;
                     }
                 }
@@ -610,18 +637,25 @@ namespace openxr_api_layer::detail {
                             "QueryInterface IDXGISurface failed\n");
                         return false;
                     }
+                    // Same auto-detect pixel format as the D3D11 path —
+                    // D2D adopts whatever format the wrapped surface
+                    // actually has (the underlying D3D12 resource's
+                    // format, which the runtime decided).
                     D2D1_RENDER_TARGET_PROPERTIES props =
                         D2D1::RenderTargetProperties(
                             D2D1_RENDER_TARGET_TYPE_DEFAULT,
                             D2D1::PixelFormat(
-                                DXGI_FORMAT_B8G8R8A8_UNORM,
-                                D2D1_ALPHA_MODE_PREMULTIPLIED));
-                    if (FAILED(m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                            surface.Get(), &props,
-                            m_renderTargets[i].GetAddressOf()))) {
-                        Log("xr_telemetry: overlay disabled — D3D12 path Create"
-                            "DxgiSurfaceRenderTarget failed for image " +
-                            std::to_string(i) + "\n");
+                                DXGI_FORMAT_UNKNOWN,
+                                D2D1_ALPHA_MODE_UNKNOWN));
+                    HRESULT hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
+                        surface.Get(), &props,
+                        m_renderTargets[i].GetAddressOf());
+                    if (FAILED(hr)) {
+                        Log(fmt::format(
+                            "xr_telemetry: overlay disabled — D3D12 path Create"
+                            "DxgiSurfaceRenderTarget failed for image {} "
+                            "(HRESULT={:#x})\n",
+                            i, static_cast<unsigned int>(hr)));
                         return false;
                     }
                 }

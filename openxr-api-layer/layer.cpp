@@ -1458,7 +1458,7 @@ namespace openxr_api_layer {
                 if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
                     m_overlayActive = true;
                     Log(fmt::format("xr_telemetry: overlay mode=auto, refreshing snapshot "
-                                     "at {} Hz (PR1 plumbing only — rendering ships in PR2)\n",
+                                     "at {} Hz\n",
                                      m_settings.overlay.refresh_hz));
                 } else {
                     Log(fmt::format("xr_telemetry: overlay mode=hotkey, press {} to toggle "
