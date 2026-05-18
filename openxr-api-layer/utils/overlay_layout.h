@@ -52,6 +52,12 @@ namespace openxr_api_layer::detail {
     //   row 1:  GPU frametime ms          |  CPU frametime ms
     //   ── histograms drawn between row 1 and row 2 ──
     //   row 2:  GPU util %                |  CPU util %
+    //   row 3:  GPU temp °C               |  VRAM used / budget GB
+    //
+    // Row 3 is filled best-effort: temperature requires NvAPI (NVIDIA-
+    // only for now); VRAM requires Win10 RS1+ DXGI. When either source
+    // is unavailable the corresponding cell renders a "--" placeholder
+    // via the std::isfinite() / != 0 guards inside the formatter.
     //
     // Empty vector if the snapshot hasn't finalised yet — the
     // caller skips text drawing in that case.
@@ -63,7 +69,7 @@ namespace openxr_api_layer::detail {
     inline std::vector<OverlayRow> formatOverlayRows(const OverlaySnapshot& snap) {
         if (!snap.valid) return {};
         std::vector<OverlayRow> rows;
-        rows.reserve(3);
+        rows.reserve(4);
 
         // Small string helpers without dragging in fmt/format.h.
         //
@@ -107,6 +113,32 @@ namespace openxr_api_layer::detail {
             return std::string(buf);
         };
 
+        // Temperature: %3.0f when finite, fixed-width "--" sentinel
+        // when NaN (NvAPI absent / AMD / Intel for now).
+        auto fmtTempC = [](float c) {
+            char buf[16];
+            if (std::isfinite(c)) {
+                std::snprintf(buf, sizeof(buf), "%3.0f", c);
+            } else {
+                std::snprintf(buf, sizeof(buf), " --");
+            }
+            return std::string(buf);
+        };
+        // VRAM in GB to 1 decimal. 0 bytes is the "no data" sentinel
+        // (the renderer's DXGI call failed); a healthy system always
+        // shows non-zero usage even at idle. Display "--" rather than
+        // "0.0 GB" so the user sees "unknown" vs "tiny".
+        auto fmtVramGb = [](uint64_t bytes) {
+            char buf[16];
+            if (bytes == 0) {
+                std::snprintf(buf, sizeof(buf), " --");
+                return std::string(buf);
+            }
+            const double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+            std::snprintf(buf, sizeof(buf), "%4.1f", gb);
+            return std::string(buf);
+        };
+
         rows.push_back({
             "FPS " + fmtFps(snap.fps_instant) + " / " + fmtFps(snap.target_fps),
             "AVG " + fmtFps(snap.fps_avg)
@@ -118,6 +150,24 @@ namespace openxr_api_layer::detail {
         rows.push_back({
             "GPU " + fmtPct(snap.gpu_utilisation_pct) + " %",
             "CPU " + fmtPct(snap.cpu_utilisation_pct) + " %"
+        });
+        // Row 3: GPU temp + VRAM. The left cell is grouped with GPU
+        // metrics (same column header pattern as the rest); the right
+        // cell shows VRAM with budget so the user can spot "I'm close
+        // to my budget". Format: "VRAM 6.3 / 8.0 GB". When the budget
+        // is unknown we still show used alone.
+        std::string vramRight;
+        if (snap.vram_used_bytes == 0) {
+            vramRight = "VRAM " + fmtVramGb(0) + " GB";
+        } else if (snap.vram_budget_bytes == 0) {
+            vramRight = "VRAM " + fmtVramGb(snap.vram_used_bytes) + " GB";
+        } else {
+            vramRight = "VRAM " + fmtVramGb(snap.vram_used_bytes) +
+                        " / " + fmtVramGb(snap.vram_budget_bytes) + " GB";
+        }
+        rows.push_back({
+            "GPU " + fmtTempC(snap.gpu_temp_c) + " C",
+            vramRight
         });
         return rows;
     }
@@ -150,9 +200,13 @@ namespace openxr_api_layer::detail {
     inline OverlayGeometry geometryForPosition(const std::string& position,
                                                 float scale) noexcept {
         // Default size at scale=1.0. Tweak in one place if fpsvr-style
-        // proves too small/big on real HMDs.
+        // proves too small/big on real HMDs. The 320×116 texture's
+        // aspect ratio is 0.20 m : 0.0725 m (rounded to 0.091 here
+        // for a small visual safety margin on edge anti-aliasing) —
+        // keeps the rendered pixel density close to the previous
+        // 320×96 / 0.20×0.075 baseline.
         constexpr float kBaseWidth  = 0.20f;
-        constexpr float kBaseHeight = 0.075f;
+        constexpr float kBaseHeight = 0.091f;
         constexpr float kZ          = -1.0f;          // 1 m forward
         constexpr float kCornerOffX = 0.16f;          // ≈ 9° off-axis at 1 m
         constexpr float kCornerOffY = 0.08f;          // ≈ 5° off-axis at 1 m

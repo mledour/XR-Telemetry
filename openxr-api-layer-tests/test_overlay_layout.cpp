@@ -57,7 +57,7 @@ TEST_CASE("formatOverlayRows: invalid snapshot → empty vector") {
     CHECK(formatOverlayRows(snap).empty());
 }
 
-TEST_CASE("formatOverlayRows: nominal snapshot produces 3 rows × 2 columns") {
+TEST_CASE("formatOverlayRows: nominal snapshot produces 4 rows × 2 columns") {
     OverlaySnapshot snap;
     snap.valid = true;
     snap.fps_instant = 89.8f;
@@ -68,8 +68,13 @@ TEST_CASE("formatOverlayRows: nominal snapshot produces 3 rows × 2 columns") {
     snap.gpu_frame_ms = 5.18f;
     snap.gpu_utilisation_pct = 47.0f;
 
+    // 4 rows since the GPU-temp/VRAM row was added; row 3's specific
+    // formatting has its own dedicated tests below. Here we just
+    // assert the row count contract — analysis: the renderer guards
+    // on `rows.size() >= 4` before drawing the new row, so the
+    // formatter must always return 4 rows from a valid snapshot.
     const auto rows = formatOverlayRows(snap);
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
 
     // Row 0: FPS (left) / AVG (right). Renderer draws the left column
     // anchored to the left half of the quad — GPU stuff goes there
@@ -107,10 +112,87 @@ TEST_CASE("formatOverlayRows: zero target_fps still renders without crashing") {
     snap.fps_instant = 60.0f;
     snap.target_fps = 0.0f;
     const auto rows = formatOverlayRows(snap);
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
     CHECK(rows[0].left.find("FPS") != std::string::npos);
     // 0.0 must appear (the "/ 0.0" component of "FPS  60.0 /  0.0").
     CHECK(rows[0].left.find("0.0") != std::string::npos);
+}
+
+TEST_CASE("formatOverlayRows: row 3 carries GPU temp + VRAM when both sources are present") {
+    // GPU temp + VRAM are populated by the aggregator from
+    // pushGpuTelemetry (NvAPI + DXGI on Windows). The layout's row 3
+    // mirrors fpsVR's per-column convention: temp under the GPU
+    // column, VRAM under the CPU column. Both cells must render with
+    // unit suffixes so the user reads them without a legend.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+    snap.fps_avg = 90.0f;
+    snap.target_fps = 90.0f;
+    snap.cpu_frame_ms = 8.0f;
+    snap.gpu_frame_ms = 9.0f;
+    snap.cpu_utilisation_pct = 70.0f;
+    snap.gpu_utilisation_pct = 75.0f;
+    snap.gpu_temp_c = 68.0f;
+    snap.vram_used_bytes   = 6'000'000'000ULL;   // ~5.6 GB
+    snap.vram_budget_bytes = 8'000'000'000ULL;   // ~7.5 GB
+
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 4);
+    // Left cell: "GPU 68 C". The temperature comes through %3.0f
+    // (no decimals — 1° resolution is below human-meaningful flicker).
+    CHECK(rows[3].left.find("GPU") != std::string::npos);
+    CHECK(rows[3].left.find("68") != std::string::npos);
+    CHECK(rows[3].left.find("C") != std::string::npos);
+    // Right cell: "VRAM 5.6 / 7.5 GB" — used / budget with 1
+    // decimal place each.
+    CHECK(rows[3].right.find("VRAM") != std::string::npos);
+    CHECK(rows[3].right.find("5.6") != std::string::npos);
+    CHECK(rows[3].right.find("7.5") != std::string::npos);
+    CHECK(rows[3].right.find("GB") != std::string::npos);
+}
+
+TEST_CASE("formatOverlayRows: row 3 placeholder when neither source is available") {
+    // Non-NVIDIA host: NvAPI absent → gpu_temp_c stays NaN, and the
+    // DXGI VRAM path may fail too on pre-RS1 Win10 → vram_used_bytes
+    // stays 0. Both cells should render the "--" placeholder; no
+    // "nan" / "inf" tokens leak through.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+    snap.fps_avg = 90.0f;
+    snap.target_fps = 90.0f;
+    // gpu_temp_c default = NaN.
+    // vram_used_bytes default = 0.
+
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[3].left.find("--") != std::string::npos);
+    CHECK(rows[3].left.find("nan") == std::string::npos);
+    CHECK(rows[3].right.find("--") != std::string::npos);
+    // No "0.0 GB" — the formatter must distinguish "unknown" from
+    // "zero usage".
+    CHECK(rows[3].right.find("0.0 GB") == std::string::npos);
+}
+
+TEST_CASE("formatOverlayRows: row 3 with VRAM used but no budget shows used alone") {
+    // Some adapters / driver versions return CurrentUsage but not a
+    // sensible Budget (e.g. headless test adapters). The formatter
+    // falls back to "VRAM x.x GB" without the slash separator.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+    snap.fps_avg = 90.0f;
+    snap.target_fps = 90.0f;
+    snap.gpu_temp_c = 65.0f;
+    snap.vram_used_bytes   = 2'000'000'000ULL;  // ~1.9 GB
+    snap.vram_budget_bytes = 0;
+
+    const auto rows = formatOverlayRows(snap);
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[3].right.find("1.9") != std::string::npos);
+    // No slash separator when budget is missing.
+    CHECK(rows[3].right.find("/") == std::string::npos);
 }
 
 TEST_CASE("formatOverlayRows: non-finite snapshot floats render as '--' placeholders") {
@@ -134,9 +216,11 @@ TEST_CASE("formatOverlayRows: non-finite snapshot floats render as '--' placehol
     snap.target_fps          = kNan;
 
     const auto rows = formatOverlayRows(snap);
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
     // No "nan" / "inf" tokens anywhere in the formatted output —
-    // the placeholder strings replace them.
+    // the placeholder strings replace them. Row 3 (GPU temp / VRAM)
+    // also gets "--" cells because gpu_temp_c stays NaN and
+    // vram_used_bytes stays 0 in this fixture.
     for (const auto& row : rows) {
         CHECK(row.left.find("nan")  == std::string::npos);
         CHECK(row.left.find("inf")  == std::string::npos);
@@ -159,9 +243,13 @@ TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
     CHECK(g.pos_z < 0.0f);      // in front
     CHECK(g.width_m > 0.0f);
     CHECK(g.height_m > 0.0f);
-    // Default dimensions documented in the header.
+    // Default dimensions documented in the header. The 0.091 m
+    // height is the proportional bump from the 96 → 116 px texture
+    // resize (added GPU temp / VRAM row 4 in this PR); pixel density
+    // is preserved so the text reads at the same apparent size in
+    // the HMD.
     CHECK(g.width_m  == doctest::Approx(0.20f).epsilon(0.001));
-    CHECK(g.height_m == doctest::Approx(0.075f).epsilon(0.001));
+    CHECK(g.height_m == doctest::Approx(0.091f).epsilon(0.001));
 }
 
 TEST_CASE("geometryForPosition: head_top_left mirrors X") {

@@ -342,6 +342,62 @@ TEST_CASE("OverlayAggregator: respects qpcFrequency when converting ticks → ns
 //   * never resets, never decreases
 // =============================================================================
 
+// =============================================================================
+// GPU telemetry — pushGpuTelemetry latches the latest reading and the next
+// publish copies it into the snapshot. NaN / 0 sentinels propagate through
+// unchanged so the renderer can treat "no source available" specially.
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: snapshot defaults to NaN temperature + 0 VRAM") {
+    // No pushGpuTelemetry calls at all — the snapshot's GPU-extras
+    // fields should signal "no data" via NaN / 0 even after a full
+    // refresh tick fires. The renderer's isfinite() / != 0 guards
+    // turn this into a "--" placeholder.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK_FALSE(std::isfinite(agg.snapshot().gpu_temp_c));
+    CHECK(agg.snapshot().vram_used_bytes == 0);
+    CHECK(agg.snapshot().vram_budget_bytes == 0);
+}
+
+TEST_CASE("OverlayAggregator: pushGpuTelemetry latches values into next publish") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushGpuTelemetry(/*temp_c=*/68.5f,
+                          /*vram_used=*/6'000'000'000ULL,
+                          /*vram_budget=*/8'000'000'000ULL);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().gpu_temp_c == doctest::Approx(68.5f).epsilon(0.001));
+    CHECK(agg.snapshot().vram_used_bytes   == 6'000'000'000ULL);
+    CHECK(agg.snapshot().vram_budget_bytes == 8'000'000'000ULL);
+}
+
+TEST_CASE("OverlayAggregator: pushGpuTelemetry uses LATEST value, not average") {
+    // Drivers update thermal counters at ~1 Hz, so averaging the
+    // values across the refresh window would just average step-
+    // function holds. The aggregator deliberately latches the
+    // latest poll; this test pins that contract.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushGpuTelemetry(60.0f, 1'000'000'000ULL, 8'000'000'000ULL);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    // Newer telemetry arrives mid-window.
+    agg.pushGpuTelemetry(72.0f, 5'000'000'000ULL, 8'000'000'000ULL);
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    // 72°C — the latest — not (60+72)/2.
+    CHECK(agg.snapshot().gpu_temp_c == doctest::Approx(72.0f).epsilon(0.001));
+    CHECK(agg.snapshot().vram_used_bytes == 5'000'000'000ULL);
+}
+
 TEST_CASE("OverlayAggregator: version is 1 after the first publish") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     CHECK(agg.snapshot().version == 0);

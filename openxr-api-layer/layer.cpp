@@ -51,10 +51,13 @@
 #include "layer.h"
 #include "telemetry_internals.h"
 #include "utils/default_settings_template.h"
+#include "utils/gpu_telemetry.h"
 #include "utils/name_utils.h"
 #include "utils/overlay_aggregator.h"
 #include "utils/overlay_renderer.h"
 #include "utils/settings.h"
+
+#include <dxgi1_4.h>  // IDXGIFactory4::EnumAdapterByLuid for the D3D12 path
 #include <log.h>
 #include <util.h>
 
@@ -128,9 +131,15 @@ namespace openxr_api_layer {
                 if (!m_file.is_open()) {
                     return false;
                 }
+                // Column order is APPEND-ONLY for backward compat — analysis
+                // notebooks reference columns by name, so adding gpu_temp_c
+                // / vram_used_bytes / vram_budget_bytes at the END never
+                // breaks existing scripts. NaN gpu_temp_c renders as "nan"
+                // in the CSV; pandas reads it as a NaN float natively.
                 m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
                           "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
-                          "headroom_pct,gpu_headroom_pct,should_render\n";
+                          "headroom_pct,gpu_headroom_pct,should_render,"
+                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -306,19 +315,27 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        m_file << fmt::format("{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{}\n",
-                                              rec.frame_index,
-                                              rec.timestamp_qpc,
-                                              rec.wait_block_ns,
-                                              rec.pre_begin_ns,
-                                              rec.app_cpu_ns,
-                                              rec.end_frame_ns,
-                                              rec.frame_total_ns,
-                                              rec.gpu_time_ns,
-                                              rec.period_ns,
-                                              rec.headroom_pct,
-                                              rec.gpu_headroom_pct,
-                                              rec.should_render ? 1 : 0);
+                        // gpu_temp_c uses %.1f; NaN renders as the platform's
+                        // canonical "nan" token (libfmt mirrors snprintf),
+                        // which pandas reads as np.nan via read_csv.
+                        m_file << fmt::format(
+                            "{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{},"
+                            "{:.1f},{},{}\n",
+                            rec.frame_index,
+                            rec.timestamp_qpc,
+                            rec.wait_block_ns,
+                            rec.pre_begin_ns,
+                            rec.app_cpu_ns,
+                            rec.end_frame_ns,
+                            rec.frame_total_ns,
+                            rec.gpu_time_ns,
+                            rec.period_ns,
+                            rec.headroom_pct,
+                            rec.gpu_headroom_pct,
+                            rec.should_render ? 1 : 0,
+                            rec.gpu_temp_c,
+                            rec.vram_used_bytes,
+                            rec.vram_budget_bytes);
                     }
 
                     // Disk-error detection: if the stream went bad mid-batch
@@ -1513,6 +1530,14 @@ namespace openxr_api_layer {
             // xrEndFrame, which uses stack memory not tied to any
             // particular session handle.
             m_loggedLayerCapExceeded = false;
+            // Stash an IDXGIAdapter for the GpuTelemetryReader. Built from
+            // whichever graphics binding the app supplied — D3D11 hands us
+            // the device directly, D3D12 forces a small EnumAdapterByLuid
+            // dance via IDXGIFactory4. ComPtr drops the refcount when this
+            // scope exits; GpuTelemetryReader::init takes its own via QI
+            // so we don't need to hold the DXGIAdapter long-term.
+            ComPtr<IDXGIAdapter> dxgiAdapter;
+
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
                 auto timer = std::make_unique<D3D11GpuTimer>();
                 if (timer->init(d3d11->device)) {
@@ -1525,6 +1550,16 @@ namespace openxr_api_layer {
                 if (m_settings.overlay.enabled) {
                     m_overlayRenderer = detail::makeD3D11OverlayRenderer(
                         this, *session, d3d11->device);
+                }
+                // D3D11 path: walk ID3D11Device → IDXGIDevice → IDXGIAdapter.
+                // Same pattern overlay_renderer.cpp uses to find the
+                // adapter for its private BGRA device.
+                ComPtr<IDXGIDevice> dxgiDevice;
+                if (d3d11->device &&
+                    SUCCEEDED(d3d11->device->QueryInterface(
+                        __uuidof(IDXGIDevice),
+                        reinterpret_cast<void**>(dxgiDevice.GetAddressOf())))) {
+                    dxgiDevice->GetAdapter(dxgiAdapter.GetAddressOf());
                 }
             } else if (const auto* d3d12 = findD3D12Binding(createInfo->next)) {
                 auto timer = std::make_unique<D3D12GpuTimer>();
@@ -1539,6 +1574,21 @@ namespace openxr_api_layer {
                     m_overlayRenderer = detail::makeD3D12OverlayRenderer(
                         this, *session, d3d12->device, d3d12->queue);
                 }
+                // D3D12 path: ID3D12Device::GetAdapterLuid → IDXGIFactory4::
+                // EnumAdapterByLuid. The factory is short-lived (released
+                // when its ComPtr drops at scope exit), DXGIAdapter held
+                // long enough for GpuTelemetryReader::init to QI from it.
+                if (d3d12->device) {
+                    const LUID luid = d3d12->device->GetAdapterLuid();
+                    ComPtr<IDXGIFactory4> factory;
+                    if (SUCCEEDED(::CreateDXGIFactory1(
+                            __uuidof(IDXGIFactory4),
+                            reinterpret_cast<void**>(factory.GetAddressOf())))) {
+                        factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter),
+                                                    reinterpret_cast<void**>(
+                                                        dxgiAdapter.GetAddressOf()));
+                    }
+                }
             } else {
                 Log("xr_telemetry: no D3D11 or D3D12 binding in xrCreateSession.next "
                     "(Vulkan / OpenGL / null); gpu_time_ns will be 0 for this session\n");
@@ -1546,6 +1596,27 @@ namespace openxr_api_layer {
                     Log("xr_telemetry: overlay disabled — Vulkan / OpenGL hosts not "
                         "supported by the renderer (CSV writing still active)\n");
                 }
+            }
+
+            // GPU telemetry reader (temp + VRAM). Best-effort: even if
+            // dxgiAdapter is null (Vulkan / OpenGL host with no D3D
+            // binding), init() still tries NvAPI for temperature. The
+            // returned bool only matters for diagnostics — we keep
+            // the unique_ptr live either way so xrEndFrame's poll()
+            // call site can stay branchless on "is the reader alive".
+            //
+            // Logged outcomes are coarse on purpose (one line, one of
+            // four states) so a support report immediately tells us
+            // whether the temp+VRAM fields will be populated for this
+            // session. fpsVR's diagnostic does roughly the same.
+            m_gpuTelemetry = std::make_unique<detail::GpuTelemetryReader>();
+            m_gpuTelemetry->init(dxgiAdapter.Get());
+            if (m_gpuTelemetry->isReady()) {
+                Log("xr_telemetry: GPU telemetry active (NvAPI / DXGI VRAM)\n");
+            } else {
+                Log("xr_telemetry: GPU telemetry unavailable (non-NVIDIA host "
+                    "and/or DXGI VRAM not supported); gpu_temp_c / vram_used_bytes "
+                    "will be NaN / 0 for this session\n");
             }
 
             // View space for the head-locked overlay quad. Created only
@@ -1588,6 +1659,16 @@ namespace openxr_api_layer {
             // don't outlive the dying session's device.
             flushPendingFramesUnresolved();
             m_gpuTimer.reset();
+            // GPU telemetry reader is also session-scoped: it holds
+            // an IDXGIAdapter3 refcount that came from the session's
+            // graphics binding device. Releasing here lets the
+            // application's IDXGIAdapter drop cleanly when the
+            // session shuts down. Reset the cached sample too so a
+            // new session doesn't briefly publish the previous
+            // session's last reading via the FrameRecord copy below.
+            m_gpuTelemetry.reset();
+            m_lastGpuTelemetry = detail::GpuTelemetrySample{};
+            m_lastGpuTelemetryPollNs = 0;
             // Overlay renderer + view space are also session-scoped
             // (they hold an XrSwapchain + an ID3D11Device wrapping the
             // session's device). Release before the session goes away,
@@ -1935,6 +2016,48 @@ namespace openxr_api_layer {
             // result lands later, patchAndDrainPending() recomputes the
             // pct against the resolved gpu_time_ns.
             const float gpuHeadroomPct = detail::computeGpuHeadroomPct(/*gpuTimeNs=*/0, periodNs);
+
+            // Refresh the cached GPU telemetry (temp + VRAM) at the
+            // aggregator's refresh cadence — drivers update these
+            // counters at ~1 Hz, so polling NvAPI / DXGI per-frame at
+            // 90+ Hz would burn CPU on values that don't change. The
+            // FrameRecord ALWAYS carries the latest cached value
+            // (NaN / 0 when no reader is alive yet), which gives the
+            // CSV a stable, per-frame column and the overlay
+            // aggregator a fresh value for its publish.
+            //
+            // The poll interval tracks the aggregator's refresh
+            // window (which itself follows settings.overlay.refresh_hz
+            // ∈ [1, 60]) so a user that bumps refresh_hz to 20 also
+            // gets twice-as-frequent thermal samples — same coherent
+            // visual rate. It's clamped at kGpuTelemetryMinPollIntervalNs
+            // (= 100 ms, i.e. 10 Hz) on the FAST end because NvAPI's
+            // underlying driver counters refresh at ~1 Hz; polling
+            // faster wastes CPU on identical values. No upper clamp:
+            // if the user picks refresh_hz=1, we still poll at 1 Hz —
+            // matches their explicit "I want slow" choice.
+            if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
+                const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
+                const int64_t pollInterval = std::max(
+                    m_overlay.refreshIntervalNs(),
+                    kGpuTelemetryMinPollIntervalNs);
+                if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
+                    m_lastGpuTelemetry = m_gpuTelemetry->poll();
+                    m_lastGpuTelemetryPollNs = nowNs;
+                    // Forward to the aggregator so the next overlay
+                    // refresh publishes the fresh reading. Pushing
+                    // every tick (rather than on every frame between
+                    // ticks) keeps the aggregator's "valid until
+                    // next publish" semantics clean.
+                    if (m_overlayActive) {
+                        m_overlay.pushGpuTelemetry(
+                            m_lastGpuTelemetry.gpu_temp_c,
+                            m_lastGpuTelemetry.vram_used_bytes,
+                            m_lastGpuTelemetry.vram_budget_bytes);
+                    }
+                }
+            }
+
             FrameRecord rec{
                 frameIndex,
                 tEnd,
@@ -1948,6 +2071,9 @@ namespace openxr_api_layer {
                 headroomPct,
                 gpuHeadroomPct,
                 shouldRender,
+                m_lastGpuTelemetry.gpu_temp_c,
+                m_lastGpuTelemetry.vram_used_bytes,
+                m_lastGpuTelemetry.vram_budget_bytes,
             };
 
             // GPU timestamps were already closed BEFORE the OpenXrApi call
@@ -2160,6 +2286,33 @@ namespace openxr_api_layer {
         // when xrDestroySession is called.
         std::unique_ptr<IGpuTimer> m_gpuTimer;
         std::deque<FrameRecord> m_pendingFrames;
+
+        // GPU package temperature + VRAM polling. Constructed in
+        // xrCreateSession once we have an IDXGIAdapter; isReady()
+        // returns false when neither source initialised (non-NVIDIA
+        // host on a pre-Win10-RS1 build, or stub adapter), in which
+        // case poll() returns a default sample and the layer keeps
+        // working with NaN / 0 in those columns.
+        //
+        // Polled on the frame thread at kGpuTelemetryPollIntervalNs
+        // cadence — every FrameRecord copies the cached value, so
+        // each CSV row has a numeric column even though the
+        // underlying driver only updates at ~1 Hz.
+        std::unique_ptr<detail::GpuTelemetryReader> m_gpuTelemetry;
+        detail::GpuTelemetrySample m_lastGpuTelemetry{};
+        int64_t m_lastGpuTelemetryPollNs = 0;
+        // 100 ms — the minimum interval between GPU telemetry polls.
+        // Caps the per-second NvAPI/DXGI call rate at 10 (vs. 90-144
+        // if we polled every frame on a typical HMD). NvAPI's
+        // thermal counters refresh at ~1 Hz on the driver side, so
+        // polling faster than 10 Hz adds no signal and just burns
+        // ~2-3 ms/s of frame-thread CPU. The effective interval is
+        // max(this, m_overlay.refreshIntervalNs()) — so a user that
+        // explicitly lowered overlay refresh_hz to 1 (or 5, etc.)
+        // gets matching telemetry pacing, while the FAST-end cap
+        // protects us from accidental hammering if a future setting
+        // ever exposes a higher refresh rate.
+        static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 100'000'000LL;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.

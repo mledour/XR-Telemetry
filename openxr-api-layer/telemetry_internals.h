@@ -90,6 +90,16 @@ namespace openxr_api_layer::detail {
         float headroom_pct;        // CPU headroom
         float gpu_headroom_pct;    // GPU headroom
         bool should_render;
+        // GPU telemetry — see gpu_telemetry.h for the per-source
+        // semantics, including the 0-byte sentinel safety argument
+        // for VRAM. Stored per-frame even though the underlying
+        // sensors update ~1 Hz: the layer caches the latest poll and
+        // every frame in the same window logs the same value, giving
+        // the offline analyser a single column to filter on (no
+        // "fill-forward" gymnastics).
+        float gpu_temp_c;          // NaN ⇒ source unavailable
+        uint64_t vram_used_bytes;  // 0   ⇒ source unavailable (no real GPU reports 0)
+        uint64_t vram_budget_bytes;
     };
 
     // --- Time conversions ---------------------------------------------------
