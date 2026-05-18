@@ -76,10 +76,15 @@ namespace openxr_api_layer::detail {
         constexpr float    kPadTop       = 6.0f;
         constexpr float    kFontSize     = 13.0f;
         constexpr float    kLineHeight   = 16.0f;
-        constexpr float    kHistoHeight  = 14.0f;
+        constexpr float    kHistoHeight  = 18.0f;
         constexpr float    kHistoGap     = 3.0f;
-        constexpr float    kHistoBarGap  = 1.0f;     // gap between bars in px
-        constexpr std::size_t kRingSize  = 50;       // ~0.5 s @ 90 Hz
+        // No gap between bars — fpsVR-style dense waveform. With
+        // kRingSize=150 over a ~240 px strip, that's ~1.6 px per
+        // bar, which renders as a near-continuous trace at HMD
+        // resolutions and lets a single overrun stand out without
+        // squashing the rest of the history.
+        constexpr float    kHistoBarGap  = 0.0f;
+        constexpr std::size_t kRingSize  = 150;      // ~1.7 s @ 90 Hz, ~1.3 s @ 120 Hz
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
