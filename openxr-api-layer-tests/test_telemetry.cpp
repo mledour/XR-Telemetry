@@ -252,12 +252,21 @@ namespace {
     constexpr int kColHeadroomPct = 9;
     constexpr int kColGpuHeadroomPct = 10;
     constexpr int kColShouldRender = 11;
-    constexpr int kColCount = 12;
+    // GPU telemetry columns appended in feat/gpu-telemetry. NaN /
+    // 0 sentinels in CI (no NvAPI driver, no real DXGI adapter on
+    // the GH Actions runner — the test fixture's mock_runtime fakes
+    // the OpenXR surface but never wires a real GPU). The columns
+    // are still emitted per-frame so the column count stays stable
+    // across all FrameRecords.
+    constexpr int kColGpuTempC = 12;
+    constexpr int kColVramUsedBytes = 13;
+    constexpr int kColVramBudgetBytes = 14;
+    constexpr int kColCount = 15;
 
     const std::string kExpectedHeader =
         "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,"
         "frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,"
-        "should_render";
+        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes";
 
 } // namespace
 
