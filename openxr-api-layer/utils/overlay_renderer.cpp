@@ -281,12 +281,31 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // 2. Paint with D2D.
+                // 2. Paint into the shim texture (typed BGRA8 we own) —
+                //    D2D refuses the typeless DXGI_FORMAT_B8G8R8A8_TYPELESS
+                //    Pimax OpenXR 0.1.0 hands back as the swapchain image
+                //    (verified empirically: D2D returns E_INVALIDARG on
+                //    CreateDxgiSurfaceRenderTarget against any typeless
+                //    surface, regardless of which PixelFormat we ask for).
+                //    The shim is created once at init in
+                //    DXGI_FORMAT_B8G8R8A8_UNORM with RENDER_TARGET bind,
+                //    painted every frame here, and copied to the OpenXR
+                //    image below via CopyResource (typeless ↔ typed of
+                //    the same byte layout is allowed).
                 const bool painted =
-                    m_core.paint(m_renderTargets[imageIdx].Get(), snap,
+                    m_core.paint(m_shimRenderTarget.Get(), snap,
                                   m_frameRing, m_gpuRing);
 
-                // 3. Release regardless of paint success — the runtime
+                // 3. Copy the painted shim into the OpenXR swapchain
+                //    image. The two textures are in the same "type
+                //    group" (B8G8R8A8 family), so D3D11 allows the copy
+                //    even though one side is typeless.
+                if (painted && m_context && imageIdx < m_images.size()) {
+                    m_context->CopyResource(m_images[imageIdx].Get(),
+                                             m_shimTexture.Get());
+                }
+
+                // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
                 //    cycling.
                 XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -366,13 +385,16 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                m_renderTargets.resize(imgCount);
+                // Stash the OpenXR swapchain images. We don't create a
+                // D2D render target on each one (Pimax hands back
+                // DXGI_FORMAT_B8G8R8A8_TYPELESS textures, which D2D
+                // refuses), instead we paint into a shim BGRA8_UNORM
+                // texture we own and CopyResource it into the OpenXR
+                // image per frame. The diagnostic log on image 0 keeps
+                // around for future format / bindFlags regressions.
+                m_images.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
-                    // Diagnostic: log what the runtime actually gave us
-                    // for image 0. Pimax OpenXR 0.1.0 has been seen to
-                    // hand back textures that don't match the format we
-                    // requested via xrCreateSwapchain, which then fails
-                    // D2D's pixel-format check downstream.
+                    m_images[i] = raw[i].texture;
                     if (i == 0) {
                         D3D11_TEXTURE2D_DESC desc{};
                         raw[i].texture->GetDesc(&desc);
@@ -385,40 +407,56 @@ namespace openxr_api_layer::detail {
                             static_cast<int>(desc.SampleDesc.Count),
                             static_cast<int>(desc.MipLevels)));
                     }
-                    ComPtr<IDXGISurface> surface;
-                    if (FAILED(raw[i].texture->QueryInterface(
-                            __uuidof(IDXGISurface),
-                            reinterpret_cast<void**>(surface.GetAddressOf())))) {
-                        Log("xr_telemetry: overlay disabled — texture QueryInterface "
-                            "IDXGISurface failed\n");
-                        return false;
-                    }
-                    // Pass DXGI_FORMAT_UNKNOWN + ALPHA_MODE_UNKNOWN so
-                    // D2D adopts whatever pixel format the texture
-                    // actually has, instead of failing when our
-                    // request mismatches the runtime's choice. Works
-                    // for any BGRA-family surface the runtime hands
-                    // back; D2D refuses non-BGRA formats internally
-                    // with a clearer HRESULT we'll log below.
-                    D2D1_RENDER_TARGET_PROPERTIES props =
-                        D2D1::RenderTargetProperties(
-                            D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                            D2D1::PixelFormat(
-                                DXGI_FORMAT_UNKNOWN,
-                                D2D1_ALPHA_MODE_UNKNOWN));
-                    HRESULT hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                        surface.Get(), &props,
-                        m_renderTargets[i].GetAddressOf());
-                    if (FAILED(hr)) {
-                        Log(fmt::format(
-                            "xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
-                            "Target failed for image {} (HRESULT={:#x})\n",
-                            i, static_cast<unsigned int>(hr)));
-                        return false;
-                    }
+                }
+
+                // Create the shim texture: typed BGRA8_UNORM, render-
+                // target-bindable, on the app's D3D11 device. D2D can
+                // wrap this surface without trouble.
+                D3D11_TEXTURE2D_DESC shimDesc{};
+                shimDesc.Width = static_cast<UINT>(kTexW);
+                shimDesc.Height = static_cast<UINT>(kTexH);
+                shimDesc.MipLevels = 1;
+                shimDesc.ArraySize = 1;
+                shimDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                shimDesc.SampleDesc.Count = 1;
+                shimDesc.SampleDesc.Quality = 0;
+                shimDesc.Usage = D3D11_USAGE_DEFAULT;
+                shimDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+                HRESULT hr = m_device->CreateTexture2D(
+                    &shimDesc, nullptr, m_shimTexture.GetAddressOf());
+                if (FAILED(hr)) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay disabled — CreateTexture2D "
+                        "(shim) failed (HRESULT={:#x})\n",
+                        static_cast<unsigned int>(hr)));
+                    return false;
+                }
+
+                ComPtr<IDXGISurface> shimSurface;
+                if (FAILED(m_shimTexture.As(&shimSurface))) {
+                    Log("xr_telemetry: overlay disabled — shim QueryInterface "
+                        "IDXGISurface failed\n");
+                    return false;
+                }
+                D2D1_RENDER_TARGET_PROPERTIES props =
+                    D2D1::RenderTargetProperties(
+                        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                        D2D1::PixelFormat(
+                            DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED));
+                hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
+                    shimSurface.Get(), &props,
+                    m_shimRenderTarget.GetAddressOf());
+                if (FAILED(hr)) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
+                        "Target (shim) failed (HRESULT={:#x})\n",
+                        static_cast<unsigned int>(hr)));
+                    return false;
                 }
                 Log("xr_telemetry: overlay D3D11 renderer ready ("
-                    + std::to_string(imgCount) + " swapchain images)\n");
+                    + std::to_string(imgCount) +
+                    " swapchain images, shim BGRA8 RT)\n");
                 return true;
             }
 
@@ -427,7 +465,15 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11Device>        m_device;
             ComPtr<ID3D11DeviceContext> m_context;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
-            std::vector<ComPtr<ID2D1RenderTarget>> m_renderTargets;
+            // OpenXR swapchain images, kept as a typeless BGRA8 texture
+            // we DON'T render to directly. The Pimax OpenXR 0.1.0
+            // runtime (and likely others) creates these as
+            // DXGI_FORMAT_B8G8R8A8_TYPELESS, which D2D refuses.
+            std::vector<ComPtr<ID3D11Texture2D>>   m_images;
+            // Shim: typed BGRA8 we own + paint into via D2D, then copy
+            // to the chosen m_images[idx] per frame.
+            ComPtr<ID3D11Texture2D>     m_shimTexture;
+            ComPtr<ID2D1RenderTarget>   m_shimRenderTarget;
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_frameRing;
             HistogramRing<kRingSize>    m_gpuRing;
@@ -497,12 +543,22 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
-                m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
+                // Paint into the typed BGRA8 shim we own (D2D refuses
+                // the typeless surface the runtime exposes via the
+                // wrapped resource). After paint, AcquireWrappedResources
+                // around the CopyResource so the underlying D3D12
+                // texture goes through the D3D11On12 state transition
+                // correctly, then ReleaseWrappedResources hands control
+                // back to the runtime's compositor.
                 const bool painted =
-                    m_core.paint(m_renderTargets[imageIdx].Get(), snap,
+                    m_core.paint(m_shimRenderTarget.Get(), snap,
                                   m_frameRing, m_gpuRing);
-                m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
+                if (painted && wrapped && m_d3d11Context) {
+                    m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
+                    m_d3d11Context->CopyResource(wrapped, m_shimTexture.Get());
+                    m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                }
                 // Flush the D3D11On12 command list into the D3D12 queue
                 // so the runtime sees the painted content when it
                 // composites this frame.
@@ -611,7 +667,6 @@ namespace openxr_api_layer::detail {
                 }
 
                 m_wrappedResources.resize(imgCount);
-                m_renderTargets.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     D3D11_RESOURCE_FLAGS flags{};
                     flags.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -631,37 +686,74 @@ namespace openxr_api_layer::detail {
                             "failed for D3D12 image " + std::to_string(i) + "\n");
                         return false;
                     }
-                    ComPtr<IDXGISurface> surface;
-                    if (FAILED(m_wrappedResources[i].As(&surface))) {
-                        Log("xr_telemetry: overlay disabled — wrapped resource "
-                            "QueryInterface IDXGISurface failed\n");
-                        return false;
+                    if (i == 0) {
+                        // Diagnostic on image 0 like the D3D11 path —
+                        // the wrapped resource's apparent format is
+                        // useful when the D3D12 swapchain ends up
+                        // typeless.
+                        ComPtr<ID3D11Texture2D> tex2d;
+                        if (SUCCEEDED(m_wrappedResources[i].As(&tex2d))) {
+                            D3D11_TEXTURE2D_DESC d{};
+                            tex2d->GetDesc(&d);
+                            Log(fmt::format(
+                                "xr_telemetry: overlay D3D12 wrapped image[0] "
+                                "format={}, bindFlags={:#x}, usage={}, sampleCount={}\n",
+                                static_cast<int>(d.Format),
+                                static_cast<unsigned int>(d.BindFlags),
+                                static_cast<int>(d.Usage),
+                                static_cast<int>(d.SampleDesc.Count)));
+                        }
                     }
-                    // Same auto-detect pixel format as the D3D11 path —
-                    // D2D adopts whatever format the wrapped surface
-                    // actually has (the underlying D3D12 resource's
-                    // format, which the runtime decided).
-                    D2D1_RENDER_TARGET_PROPERTIES props =
-                        D2D1::RenderTargetProperties(
-                            D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                            D2D1::PixelFormat(
-                                DXGI_FORMAT_UNKNOWN,
-                                D2D1_ALPHA_MODE_UNKNOWN));
-                    HRESULT hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                        surface.Get(), &props,
-                        m_renderTargets[i].GetAddressOf());
-                    if (FAILED(hr)) {
-                        Log(fmt::format(
-                            "xr_telemetry: overlay disabled — D3D12 path Create"
-                            "DxgiSurfaceRenderTarget failed for image {} "
-                            "(HRESULT={:#x})\n",
-                            i, static_cast<unsigned int>(hr)));
-                        return false;
-                    }
+                }
+
+                // Create the shim texture on the BRIDGED D3D11 device
+                // (not the app's D3D12 device — we paint with D2D, which
+                // is D3D11-only). Same approach as the D3D11 path:
+                // typed BGRA8 we own + CopyResource per frame to the
+                // wrapped D3D12 image.
+                D3D11_TEXTURE2D_DESC shimDesc{};
+                shimDesc.Width = static_cast<UINT>(kTexW);
+                shimDesc.Height = static_cast<UINT>(kTexH);
+                shimDesc.MipLevels = 1;
+                shimDesc.ArraySize = 1;
+                shimDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                shimDesc.SampleDesc.Count = 1;
+                shimDesc.Usage = D3D11_USAGE_DEFAULT;
+                shimDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+                HRESULT hr = m_d3d11Device->CreateTexture2D(
+                    &shimDesc, nullptr, m_shimTexture.GetAddressOf());
+                if (FAILED(hr)) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay disabled — D3D12 path CreateTexture2D"
+                        " (shim) failed (HRESULT={:#x})\n",
+                        static_cast<unsigned int>(hr)));
+                    return false;
+                }
+                ComPtr<IDXGISurface> shimSurface;
+                if (FAILED(m_shimTexture.As(&shimSurface))) {
+                    Log("xr_telemetry: overlay disabled — D3D12 path shim "
+                        "QueryInterface IDXGISurface failed\n");
+                    return false;
+                }
+                D2D1_RENDER_TARGET_PROPERTIES props =
+                    D2D1::RenderTargetProperties(
+                        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                        D2D1::PixelFormat(
+                            DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED));
+                hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
+                    shimSurface.Get(), &props,
+                    m_shimRenderTarget.GetAddressOf());
+                if (FAILED(hr)) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay disabled — D3D12 path Create"
+                        "DxgiSurfaceRenderTarget (shim) failed (HRESULT={:#x})\n",
+                        static_cast<unsigned int>(hr)));
+                    return false;
                 }
                 Log("xr_telemetry: overlay D3D12 renderer ready ("
                     + std::to_string(imgCount) +
-                    " swapchain images, D3D11On12 bridge)\n");
+                    " swapchain images, D3D11On12 bridge + shim BGRA8 RT)\n");
                 return true;
             }
 
@@ -674,7 +766,12 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11On12Device>              m_d3d11On12;
             XrSwapchain                           m_swapchain = XR_NULL_HANDLE;
             std::vector<ComPtr<ID3D11Resource>>   m_wrappedResources;
-            std::vector<ComPtr<ID2D1RenderTarget>> m_renderTargets;
+            // Shim — same role as in D3D11OverlayRenderer. Created on
+            // the bridged D3D11 device (not the app's D3D12 device);
+            // D2D paints into it, then CopyResource sends the result
+            // to the wrapped D3D12 swapchain image each frame.
+            ComPtr<ID3D11Texture2D>               m_shimTexture;
+            ComPtr<ID2D1RenderTarget>             m_shimRenderTarget;
             CoreRenderer                          m_core;
             HistogramRing<kRingSize>              m_frameRing;
             HistogramRing<kRingSize>              m_gpuRing;
