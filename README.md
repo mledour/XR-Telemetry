@@ -398,9 +398,24 @@ GPU  5.18 ms (47%)
 ▁▂▂▃▂▁▂▃▂▃▂▂▃▂▂▁▂▂▃▂▁▂▃▂▂  ← gpu_time over the last 50 frames
 ```
 
-The histograms re-normalise per refresh against the highest sample
-in their ring — a spike pushes the rest of the bars down so the
-shape always uses the full vertical strip.
+The histograms are **budget-anchored** in fpsvr / OpenXR Toolkit
+style:
+
+- Y axis spans `0..2× period` (the runtime's predicted display
+  period — 11.1 ms at 90 Hz, 8.3 ms at 120 Hz). The budget itself
+  sits at the strip's midpoint.
+- A half-transparent white line is drawn at exactly that midpoint,
+  so frames that cross it are visibly "over budget" at a glance.
+- Each bar is colour-coded: **green** under 80 % of the budget,
+  **yellow** 80–100 %, **red** at or above. Reprojected /
+  stuttered frames turn red and visually cross the line.
+- Anything beyond 2× budget saturates at the top of the strip.
+
+Unlike a max-of-window auto-normalised graph, the scale never
+shifts — a single stutter spike doesn't squash the rest of the
+bars. The cost is that on a fixed-FPS cap (e.g. menu at 60 Hz on
+a 90 Hz HMD), every bar looks red, which is the truthful answer
+("you're busting the budget every frame here").
 
 <!-- REMOVE-WHEN-PR3-LANDS:start -->
 > **Known limitation (PR3 will address):** `cpu_frame_ms` is

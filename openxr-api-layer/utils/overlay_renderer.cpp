@@ -164,14 +164,27 @@ namespace openxr_api_layer::detail {
                 // Brushes are cheap to create per-frame; D2D caches its
                 // own resources. Skipping the cache here keeps the
                 // renderer state-light (no resource invalidation on
-                // device-lost paths).
-                ComPtr<ID2D1SolidColorBrush> textBrush, histoBrush;
+                // device-lost paths). Four tiers for the histograms
+                // (green/yellow/red bars + a half-transparent white
+                // budget line) — matches fpsvr's colour code.
+                ComPtr<ID2D1SolidColorBrush> textBrush;
+                ComPtr<ID2D1SolidColorBrush> greenBrush, yellowBrush, redBrush;
+                ComPtr<ID2D1SolidColorBrush> budgetLineBrush;
                 rt->CreateSolidColorBrush(
                     D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f),
                     textBrush.GetAddressOf());
                 rt->CreateSolidColorBrush(
-                    D2D1::ColorF(0.4f, 0.8f, 1.0f, 0.9f),
-                    histoBrush.GetAddressOf());
+                    D2D1::ColorF(0.40f, 0.85f, 0.40f, 0.90f),
+                    greenBrush.GetAddressOf());
+                rt->CreateSolidColorBrush(
+                    D2D1::ColorF(1.00f, 0.85f, 0.30f, 0.90f),
+                    yellowBrush.GetAddressOf());
+                rt->CreateSolidColorBrush(
+                    D2D1::ColorF(1.00f, 0.30f, 0.30f, 0.95f),
+                    redBrush.GetAddressOf());
+                rt->CreateSolidColorBrush(
+                    D2D1::ColorF(1.00f, 1.00f, 1.00f, 0.45f),
+                    budgetLineBrush.GetAddressOf());
 
                 // ---- Text rows -----------------------------------------
                 const auto lines = formatOverlayLines(snap);
@@ -192,14 +205,22 @@ namespace openxr_api_layer::detail {
                 }
 
                 // ---- Histograms (frame_total + gpu_time) ---------------
-                // Two strips below the text rows. Layout (top→bottom):
-                //   [4 text rows]
-                //   [frame_total histogram] kHistoHeight
-                //   [gpu_time     histogram] kHistoHeight
+                // Two strips below the text rows. Each uses the
+                // runtime's predicted display period as the budget
+                // (target_fps → 1e9 / target_fps), so both strips share
+                // the same scale and the budget line sits at the same
+                // visual height across them.
                 const float histo1Y = kPadTop + 4.0f * kLineHeight + kHistoGap;
                 const float histo2Y = histo1Y + kHistoHeight + kHistoGap;
-                paintHistogram(rt, histoBrush.Get(), frameRing, histo1Y);
-                paintHistogram(rt, histoBrush.Get(), gpuRing,   histo2Y);
+                const int64_t budgetNs = snap.target_fps > 0.0f
+                    ? static_cast<int64_t>(1.0e9f / snap.target_fps)
+                    : 0;
+                paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
+                                redBrush.Get(), budgetLineBrush.Get(),
+                                frameRing, budgetNs, histo1Y);
+                paintHistogram(rt, greenBrush.Get(), yellowBrush.Get(),
+                                redBrush.Get(), budgetLineBrush.Get(),
+                                gpuRing, budgetNs, histo2Y);
 
                 // EndDraw flushes the command list. D2DERR_RECREATE_TARGET
                 // returned here means the underlying device went away —
@@ -208,17 +229,43 @@ namespace openxr_api_layer::detail {
             }
 
           private:
+            // fpsvr-style histogram: bars anchored to the runtime's
+            // display-period budget (not auto-normalised to the ring's
+            // max), color tier (green/yellow/red) per bar based on how
+            // close it is to busting the budget, and a half-transparent
+            // horizontal reference line drawn at exactly the budget
+            // level so the user can spot overruns at a glance.
+            //
+            // Y axis: 0 at the strip's bottom → 2× budget at the top.
+            // Budget therefore sits at the midpoint (budgetLine
+            // Fraction = 0.5). Anything between 0.8× and 1× budget
+            // turns yellow; ≥ 1× turns red and visually crosses the
+            // line. Anything beyond 2× budget saturates at the top.
             void paintHistogram(ID2D1RenderTarget* rt,
-                                 ID2D1Brush* brush,
+                                 ID2D1Brush* greenBrush,
+                                 ID2D1Brush* yellowBrush,
+                                 ID2D1Brush* redBrush,
+                                 ID2D1Brush* budgetLineBrush,
                                  const HistogramRing<kRingSize>& ring,
+                                 int64_t budgetNs,
                                  float top) const {
-                const int64_t maxNs = ring.maxValue();
-                const std::size_t n = ring.size();
-                if (n == 0 || maxNs <= 0) return;
+                if (budgetNs <= 0) return;
 
                 const float left = kPadX;
                 const float right = static_cast<float>(kTexW) - kPadX;
                 const float fullW = right - left;
+                const std::size_t n = ring.size();
+                if (n == 0) return;
+
+                // Budget reference line — drawn FIRST so bars overlap
+                // it where they protrude above (visually clear that a
+                // red bar busts the budget).
+                const float lineY = top + kHistoHeight * budgetLineFraction();
+                const D2D1_RECT_F lineRect = D2D1::RectF(
+                    left, lineY - 0.5f,
+                    right, lineY + 0.5f);
+                rt->FillRectangle(lineRect, budgetLineBrush);
+
                 // One bar per ring entry. With kRingSize=50 and a 240 px
                 // wide strip that's ~4.8 px per bar — readable, no need
                 // for sub-pixel cleverness.
@@ -228,8 +275,13 @@ namespace openxr_api_layer::detail {
                 if (barW <= 0.0f) return;
 
                 for (std::size_t i = 0; i < n; ++i) {
-                    const float h = normaliseBar(ring.at(i), maxNs) * kHistoHeight;
+                    const auto vis = barVisualForSample(ring.at(i), budgetNs);
+                    const float h = vis.heightFraction * kHistoHeight;
                     if (h <= 0.0f) continue;
+                    ID2D1Brush* brush = greenBrush;
+                    if (vis.tier == BarTier::Red)         brush = redBrush;
+                    else if (vis.tier == BarTier::Yellow) brush = yellowBrush;
+
                     const float x = left +
                                     static_cast<float>(i) * (barW + kHistoBarGap);
                     const D2D1_RECT_F bar = D2D1::RectF(

@@ -35,6 +35,9 @@ using openxr_api_layer::detail::OverlaySnapshot;
 using openxr_api_layer::detail::formatOverlayLines;
 using openxr_api_layer::detail::geometryForPosition;
 using openxr_api_layer::detail::normaliseBar;
+using openxr_api_layer::detail::BarTier;
+using openxr_api_layer::detail::barVisualForSample;
+using openxr_api_layer::detail::budgetLineFraction;
 
 // =============================================================================
 // formatOverlayLines — text formatting.
@@ -177,4 +180,70 @@ TEST_CASE("normaliseBar: negative sample (out-of-order ticks etc.) → 0") {
 
 TEST_CASE("normaliseBar: sample > max clamps to 1.0 (no overflow)") {
     CHECK(normaliseBar(200, 100) == doctest::Approx(1.0f));
+}
+
+// =============================================================================
+// barVisualForSample — budget-anchored fpsvr-style normalisation.
+//
+// Y axis spans 0..2× budget. Budget itself sits at the midpoint
+// (heightFraction = 0.5). Tier transitions are 80 % and 100 % of budget.
+// =============================================================================
+
+TEST_CASE("barVisualForSample: budget==0 returns zero-height green") {
+    const auto v = barVisualForSample(/*sample=*/5'000'000, /*budget=*/0);
+    CHECK(v.heightFraction == doctest::Approx(0.0f));
+    CHECK(v.tier == BarTier::Green);
+}
+
+TEST_CASE("barVisualForSample: negative or zero sample returns zero-height green") {
+    CHECK(barVisualForSample(0,     11'111'111).heightFraction == doctest::Approx(0.0f));
+    CHECK(barVisualForSample(-100,  11'111'111).heightFraction == doctest::Approx(0.0f));
+    CHECK(barVisualForSample(0,     11'111'111).tier           == BarTier::Green);
+}
+
+TEST_CASE("barVisualForSample: sample == budget → midpoint + red") {
+    const auto v = barVisualForSample(11'111'111, 11'111'111);
+    CHECK(v.heightFraction == doctest::Approx(0.5f).epsilon(0.001));
+    CHECK(v.tier == BarTier::Red);
+}
+
+TEST_CASE("barVisualForSample: sample at half-budget → quarter-height + green") {
+    const auto v = barVisualForSample(5'555'555, 11'111'111);
+    CHECK(v.heightFraction == doctest::Approx(0.25f).epsilon(0.001));
+    CHECK(v.tier == BarTier::Green);
+}
+
+TEST_CASE("barVisualForSample: tier thresholds are strict (80% yellow, 100% red)") {
+    // 79 % of budget → green
+    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.79), 11'111'111).tier
+          == BarTier::Green);
+    // exactly 80 % → yellow
+    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.80), 11'111'111).tier
+          == BarTier::Yellow);
+    // 99.9 % → still yellow
+    CHECK(barVisualForSample(static_cast<int64_t>(11'111'111 * 0.999), 11'111'111).tier
+          == BarTier::Yellow);
+    // exactly 100 % → red
+    CHECK(barVisualForSample(11'111'111, 11'111'111).tier == BarTier::Red);
+    // 200 % → red
+    CHECK(barVisualForSample(22'222'222, 11'111'111).tier == BarTier::Red);
+}
+
+TEST_CASE("barVisualForSample: 2× budget saturates at full height") {
+    const auto v = barVisualForSample(22'222'222, 11'111'111);
+    CHECK(v.heightFraction == doctest::Approx(1.0f));
+}
+
+TEST_CASE("barVisualForSample: 4× budget still clamped at full height") {
+    // A genuine stutter spike (e.g., loading screen on top of the
+    // running frame loop) must not overflow the strip area visually.
+    const auto v = barVisualForSample(44'444'444, 11'111'111);
+    CHECK(v.heightFraction == doctest::Approx(1.0f));
+    CHECK(v.tier == BarTier::Red);
+}
+
+TEST_CASE("budgetLineFraction: anchored at the strip midpoint") {
+    // The reference line MUST sit where a budget-equal bar would
+    // reach. Both come from the same 2× budget Y-axis convention.
+    CHECK(budgetLineFraction() == doctest::Approx(0.5f));
 }

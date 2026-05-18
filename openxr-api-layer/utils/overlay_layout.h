@@ -143,7 +143,8 @@ namespace openxr_api_layer::detail {
 
     // Convert one histogram sample (nanoseconds) into a 0..1 normalised
     // bar height, given the highest sample currently in the ring. Used
-    // by the renderer to draw mini histograms under each metric.
+    // by older fall-back paths; the current renderer uses
+    // barVisualForSample below for budget-anchored bars + colour tiers.
     //
     // Returns 0 if the ring is empty or sample is non-positive. Capped
     // at 1.0 so a single spike doesn't overflow the bar area visually.
@@ -151,6 +152,55 @@ namespace openxr_api_layer::detail {
         if (maxNs <= 0 || sampleNs <= 0) return 0.0f;
         const float ratio = static_cast<float>(sampleNs) / static_cast<float>(maxNs);
         return std::clamp(ratio, 0.0f, 1.0f);
+    }
+
+    // Colour tier for a histogram bar — fpsvr / OpenXR Toolkit
+    // convention: green when comfortably under budget, yellow when
+    // approaching the limit, red when the frame busts the period (it
+    // either dropped or got reprojected). Matches the "you can see the
+    // overruns at a glance" UX users expect.
+    enum class BarTier { Green, Yellow, Red };
+
+    struct BarVisual {
+        // Fraction of the strip height the bar should take (0..1).
+        // The renderer multiplies this by the strip's pixel height to
+        // get the actual rectangle to fill.
+        float   heightFraction;
+        BarTier tier;
+    };
+
+    // Anchored normalisation: the Y axis spans `0..2 × budgetNs`, with
+    // the budget itself at the strip midpoint. A frame at 100 % of
+    // budget shows a bar exactly to the budget line; a doubled-budget
+    // frame fills the strip; everything beyond saturates at the top.
+    // Returning a fixed Y range (instead of auto-normalising to the
+    // ring's max) is what makes the budget line visually stable —
+    // users see "am I over the line" without rescaling artefacts when
+    // a single stutter spikes the max.
+    //
+    // Budget <= 0 (no display-period info yet from the runtime) yields
+    // a green zero-height bar — the renderer skips the strip entirely
+    // in that case, but the helper stays defensive.
+    inline BarVisual barVisualForSample(int64_t sampleNs, int64_t budgetNs) noexcept {
+        if (budgetNs <= 0 || sampleNs <= 0) return {0.0f, BarTier::Green};
+        const float ratio = static_cast<float>(sampleNs) / static_cast<float>(budgetNs);
+        const float height = std::clamp(ratio * 0.5f, 0.0f, 1.0f);
+        BarTier tier = BarTier::Green;
+        if (ratio >= 1.0f) {
+            tier = BarTier::Red;
+        } else if (ratio >= 0.8f) {
+            tier = BarTier::Yellow;
+        }
+        return {height, tier};
+    }
+
+    // The Y position of the budget reference line, expressed as a
+    // fraction of the strip height (0 = top, 1 = bottom). With the
+    // 0..2× budget scale above, the line sits at 50 % of the strip's
+    // pixel height regardless of how big the strip is — keeps the
+    // budget marker visually anchored even if we resize the texture.
+    inline constexpr float budgetLineFraction() noexcept {
+        return 0.5f;
     }
 
 } // namespace openxr_api_layer::detail
