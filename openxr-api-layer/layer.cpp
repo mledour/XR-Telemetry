@@ -2025,9 +2025,23 @@ namespace openxr_api_layer {
             // (NaN / 0 when no reader is alive yet), which gives the
             // CSV a stable, per-frame column and the overlay
             // aggregator a fresh value for its publish.
+            //
+            // The poll interval tracks the aggregator's refresh
+            // window (which itself follows settings.overlay.refresh_hz
+            // ∈ [1, 60]) so a user that bumps refresh_hz to 20 also
+            // gets twice-as-frequent thermal samples — same coherent
+            // visual rate. It's clamped at kGpuTelemetryMinPollIntervalNs
+            // (= 100 ms, i.e. 10 Hz) on the FAST end because NvAPI's
+            // underlying driver counters refresh at ~1 Hz; polling
+            // faster wastes CPU on identical values. No upper clamp:
+            // if the user picks refresh_hz=1, we still poll at 1 Hz —
+            // matches their explicit "I want slow" choice.
             if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
                 const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
-                if (nowNs - m_lastGpuTelemetryPollNs >= kGpuTelemetryPollIntervalNs) {
+                const int64_t pollInterval = std::max(
+                    m_overlay.refreshIntervalNs(),
+                    kGpuTelemetryMinPollIntervalNs);
+                if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
                     m_lastGpuTelemetry = m_gpuTelemetry->poll();
                     m_lastGpuTelemetryPollNs = nowNs;
                     // Forward to the aggregator so the next overlay
@@ -2287,14 +2301,18 @@ namespace openxr_api_layer {
         std::unique_ptr<detail::GpuTelemetryReader> m_gpuTelemetry;
         detail::GpuTelemetrySample m_lastGpuTelemetry{};
         int64_t m_lastGpuTelemetryPollNs = 0;
-        // 100 ms — matches the overlay aggregator's default refresh
-        // cadence, and is well above the ~1 s update rate of NvAPI's
-        // thermal counters. Caps the per-second NvAPI call rate at
-        // 10 (vs. 90-144 if we polled every frame), saving ~2-3 ms/s
-        // of NvAPI + DXGI work that would otherwise sit on the frame
-        // thread for no observable benefit (the values don't change
-        // faster than 1 Hz).
-        static constexpr int64_t kGpuTelemetryPollIntervalNs = 100'000'000LL;
+        // 100 ms — the minimum interval between GPU telemetry polls.
+        // Caps the per-second NvAPI/DXGI call rate at 10 (vs. 90-144
+        // if we polled every frame on a typical HMD). NvAPI's
+        // thermal counters refresh at ~1 Hz on the driver side, so
+        // polling faster than 10 Hz adds no signal and just burns
+        // ~2-3 ms/s of frame-thread CPU. The effective interval is
+        // max(this, m_overlay.refreshIntervalNs()) — so a user that
+        // explicitly lowered overlay refresh_hz to 1 (or 5, etc.)
+        // gets matching telemetry pacing, while the FAST-end cap
+        // protects us from accidental hammering if a future setting
+        // ever exposes a higher refresh rate.
+        static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 100'000'000LL;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.

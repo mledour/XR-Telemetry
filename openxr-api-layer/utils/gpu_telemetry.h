@@ -75,8 +75,15 @@ struct IDXGIAdapter;
 namespace openxr_api_layer::detail {
 
     // POD result of one GpuTelemetryReader::poll() call. NaN / 0 sentinels
-    // mean "source unavailable" — distinct from "source said zero", which
-    // would set the *_valid flag to true and the field to 0.
+    // mean "source unavailable on this poll" — and downstream consumers
+    // (OverlayAggregator's snapshot, FrameRecord in the CSV) carry only
+    // those sentinel-bearing scalars, NOT the *_valid flags. The flags
+    // are an IMMEDIATE-CONSUMER convenience for code that wants to
+    // distinguish "DXGI / NvAPI returned an error this tick" from
+    // "they returned a clean 0/NaN" — but in practice no realistic GPU
+    // reports exactly 0 bytes used, and NaN is structurally
+    // unambiguous for the temperature, so the 0/NaN sentinels alone
+    // are safe to propagate.
     struct GpuTelemetrySample {
         // GPU package temperature, °C. NaN if NvAPI is absent (AMD /
         // Intel), or if NvAPI returned an error. The renderer's
@@ -86,15 +93,26 @@ namespace openxr_api_layer::detail {
         float gpu_temp_c = std::numeric_limits<float>::quiet_NaN();
 
         // Local VRAM used by THIS process (the OpenXR host). Comes from
-        // DXGI_QUERY_VIDEO_MEMORY_INFO::CurrentUsage. 0 if DXGI didn't
-        // answer; vram_valid distinguishes "0 bytes used" from "unknown".
+        // DXGI_QUERY_VIDEO_MEMORY_INFO::CurrentUsage. 0 ⇒ DXGI didn't
+        // answer (Win10 pre-RS1, stub adapter, or transient
+        // QueryVideoMemoryInfo failure). No real GPU under a live
+        // D3D11/D3D12 host reports exactly 0 bytes used — even idle
+        // OpenXR runtimes hold ≥ 1 MB for compositor swapchains — so
+        // 0 is a safe "no data" sentinel for downstream consumers.
         uint64_t vram_used_bytes = 0;
 
         // OS-allocated VRAM budget for the process. Comes from
-        // DXGI_QUERY_VIDEO_MEMORY_INFO::Budget. Useful for the "X / Y GB"
-        // display style. 0 = unknown.
+        // DXGI_QUERY_VIDEO_MEMORY_INFO::Budget. 0 ⇒ unknown (same
+        // failure modes as vram_used_bytes; same safety argument).
         uint64_t vram_budget_bytes = 0;
 
+        // Per-source validity flags — set when poll() actually got an
+        // OK status from NvAPI / DXGI on this tick. Not propagated
+        // into downstream POD structs (snapshot, FrameRecord); the
+        // 0/NaN sentinel on the scalar field is the sole signal those
+        // consumers see. Reserved here for in-process callers that
+        // care about "is this a fresh poll" vs. "still showing the
+        // last good value".
         bool temp_valid = false;
         bool vram_valid = false;
     };

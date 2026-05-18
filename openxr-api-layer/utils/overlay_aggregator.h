@@ -69,21 +69,15 @@ namespace openxr_api_layer::detail {
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
-        // GPU package / hot-spot temperature in °C, sampled best-effort
-        // from NvAPI (NVIDIA-only for now; AMD ADL lands in a follow-up
-        // PR). NaN when the source is unavailable, which the renderer's
-        // isfinite() guard in formatOverlayRows turns into a "--°C"
-        // placeholder. Stored as a running mean across the refresh
-        // window — temperatures change slowly so this matches what
-        // the user perceives.
+        // GPU telemetry, populated from GpuTelemetryReader::poll() via
+        // OverlayAggregator::pushGpuTelemetry. NaN / 0 sentinels mean
+        // "source unavailable" — see gpu_telemetry.h for the full
+        // safety argument that 0 bytes is a usable VRAM "no data"
+        // marker. The aggregator LATCHES the latest reading rather
+        // than averaging across the refresh window: drivers only
+        // update these counters at ~1 Hz, so averaging step-function
+        // holds adds smearing without any new signal.
         float gpu_temp_c = std::numeric_limits<float>::quiet_NaN();
-        // VRAM used by the host process at the end of the refresh
-        // window. Comes from DXGI_QUERY_VIDEO_MEMORY_INFO::CurrentUsage
-        // — universal across NVIDIA / AMD / Intel since Win10 RS1. 0
-        // means "DXGI didn't answer this window"; the matching
-        // gpu_temp_c value is NaN so the renderer can suppress the
-        // line. Bytes, not MB, to preserve precision in the CSV; the
-        // renderer divides for display.
         uint64_t vram_used_bytes = 0;
         uint64_t vram_budget_bytes = 0;
         bool  valid = false;            // false until the first refresh tick has finalised

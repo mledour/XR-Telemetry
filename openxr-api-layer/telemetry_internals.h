@@ -90,22 +90,15 @@ namespace openxr_api_layer::detail {
         float headroom_pct;        // CPU headroom
         float gpu_headroom_pct;    // GPU headroom
         bool should_render;
-        // GPU package / hot-spot temperature in °C — NaN when source is
-        // unavailable (NvAPI absent on AMD/Intel hosts, ADL not yet
-        // implemented). Stored per-frame even though the underlying
-        // sensor updates ~1 Hz: the layer caches the latest poll and
-        // every frame in the same window logs the same value, which
-        // gives the offline analyser a single column to filter on
-        // (no "fill-forward" gymnastics).
-        float gpu_temp_c;
-        // VRAM used by THIS process, in bytes, from DXGI_QUERY_VIDEO_
-        // MEMORY_INFO::CurrentUsage. 0 = "DXGI didn't answer" (Win10
-        // pre-RS1 or a stub adapter); the format-side guard in the
-        // overlay layer treats 0 as "no data". Kept as bytes (not MB)
-        // for precision; the renderer divides for display.
-        uint64_t vram_used_bytes;
-        // OS-provided VRAM budget (soft cap). Useful to spot the "I'm
-        // about to start swapping" condition. 0 = unknown.
+        // GPU telemetry — see gpu_telemetry.h for the per-source
+        // semantics, including the 0-byte sentinel safety argument
+        // for VRAM. Stored per-frame even though the underlying
+        // sensors update ~1 Hz: the layer caches the latest poll and
+        // every frame in the same window logs the same value, giving
+        // the offline analyser a single column to filter on (no
+        // "fill-forward" gymnastics).
+        float gpu_temp_c;          // NaN ⇒ source unavailable
+        uint64_t vram_used_bytes;  // 0   ⇒ source unavailable (no real GPU reports 0)
         uint64_t vram_budget_bytes;
     };
 
