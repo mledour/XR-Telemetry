@@ -306,16 +306,20 @@ TEST_CASE("OverlayAggregator: a frame at interval - 1 ns does NOT publish") {
 TEST_CASE("OverlayAggregator: pathological qpcFrequency falls back to a sane value") {
     // qpcFrequency < 1000 is nonsense in production (real Windows QPC
     // is always at least 1 MHz). The aggregator hardens by substituting
-    // 1 GHz so timestamps still produce meaningful refresh windows.
-    // Same shape of inputs as the "exactly at boundary" test, with
-    // qpcFreq=1 passed explicitly to exercise the clamp.
+    // 10 MHz — the typical Windows QPC frequency on modern hardware,
+    // and identical to the OpenXrLayer ctor's broken-HAL fallback so
+    // the CSV-side and overlay-side timing stay numerically coherent.
+    //
+    // Under the 10 MHz substitution (= 100 ns per tick):
+    //   - 500_000 ticks = 50 ms    → under 100 ms refresh interval
+    //   - 1_200_000 ticks = 120 ms → above the interval, triggers publish
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL, /*qpcFreq=*/1);
     agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
-    agg.pushFrame(makeRecord(50'000'000, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(500'000, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
     // 50 ms span → no publish even though freq=1 was passed.
     CHECK_FALSE(agg.snapshot().valid);
-    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
-    // 120 ms span → publish, because the clamp substituted 1 GHz.
+    agg.pushFrame(makeRecord(1'200'000, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55));
+    // 120 ms span → publish, because the clamp substituted 10 MHz.
     CHECK(agg.snapshot().valid);
 }
 
