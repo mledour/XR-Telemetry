@@ -78,8 +78,8 @@
            gets mapped into the test binary the first time you
            actually call D3D11On12CreateDevice / a D3D11 free
            function. delayimp.lib pairs with DelayLoadDLLs. -->
-      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>d3d11.dll</DelayLoadDLLs>
+      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;dxgi.dll</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -108,8 +108,8 @@
            gets mapped into the test binary the first time you
            actually call D3D11On12CreateDevice / a D3D11 free
            function. delayimp.lib pairs with DelayLoadDLLs. -->
-      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>d3d11.dll</DelayLoadDLLs>
+      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;dxgi.dll</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <!-- Order-only dependency on the layer project. We compile layer.cpp /
