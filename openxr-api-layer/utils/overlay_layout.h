@@ -24,9 +24,14 @@
 
 // =============================================================================
 // overlay_layout.h — pure helpers shared by overlay_renderer.cpp:
-//   * formatOverlayLines: snapshot → list of monospace strings to draw
+//   * formatOverlayDisplayValues: snapshot → POD of pre-formatted strings +
+//     numeric values, one entry per cell of the new fpsVR-redesign HUD
+//     (header bar with FPS/AVG/P95/P99, two frametime panels with current-
+//     value labels, bottom row with TEMP / UTIL cells per side).
 //   * geometryForPosition: settings.position string → quad pose constants
-//   * applyScale: multiply default quad dimensions by user-config scale
+//     for the 4:3 720×540 texture layout.
+//   * barVisualForSample / budgetLineFraction: per-bar colour + height
+//     decisions for the histogram panels (unchanged contract).
 //
 // Stays self-contained — no OpenXR / D3D / DirectWrite headers. Lets the
 // test binary exercise the formatting and geometry math on macOS / Linux
@@ -40,136 +45,156 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace openxr_api_layer::detail {
 
-    // One row of the side-by-side fpsVR-style HUD: a (left, right)
-    // pair the renderer draws in the two column rectangles. The
-    // current rows (top-to-bottom):
+    // Snapshot → pre-formatted strings for the new fpsVR-redesign HUD.
+    // The renderer never calls snprintf at draw time — it only paints
+    // pre-formatted cells. Numeric fields (the *_fraction members) are
+    // exposed alongside the string versions so the circular gauges can
+    // draw the arc geometry directly without re-parsing the percentage
+    // text.
     //
-    //   row 0:  FPS instant / target     |  AVG fps
-    //   row 1:  GPU frametime ms          |  CPU frametime ms
-    //   ── histograms drawn between row 1 and row 2 ──
-    //   row 2:  GPU util %                |  CPU util %
-    //   row 3:  GPU temp °C               |  VRAM used / budget GB
+    // Empty / default-constructed when the snapshot is still invalid
+    // (caller skips text drawing in that case).
     //
-    // Row 3 is filled best-effort: temperature requires NvAPI (NVIDIA-
-    // only for now); VRAM requires Win10 RS1+ DXGI. When either source
-    // is unavailable the corresponding cell renders a "--" placeholder
-    // via the std::isfinite() / != 0 guards inside the formatter.
+    // Field naming mirrors the visible cell positions:
     //
-    // Empty vector if the snapshot hasn't finalised yet — the
-    // caller skips text drawing in that case.
-    struct OverlayRow {
-        std::string left;
-        std::string right;
+    //   ── header bar (single row, 4 cells) ─────────────────────────
+    //   FPS  142    FPS AVG 138    P95 124    P99 108
+    //   fps_instant  fps_avg       fps_p95    fps_p99
+    //
+    //   ── GPU frametime panel ───────────────────────────────────────
+    //   GPU FRAMETIME MS                          6.7 ms
+    //                                     gpu_frametime_ms
+    //   <histogram >
+    //
+    //   ── CPU frametime panel ───────────────────────────────────────
+    //   CPU FRAMETIME MS                          7.4 ms
+    //                                     cpu_frametime_ms
+    //   <histogram>
+    //
+    //   ── bottom row (2 panels side-by-side) ────────────────────────
+    //   GPU TEMP & UTILISATION             CPU TEMP & UTILISATION
+    //   TEMP 67 °C   GPU UTIL [ 92% ]       TEMP -- °C   CPU UTIL [ 78% ]
+    //   gpu_temp_c     gpu_util_pct          cpu_temp_c    cpu_util_pct
+    //                  gpu_util_fraction                   cpu_util_fraction
+    //
+    // The cpu_temp_c cell always renders "--" until PawnIO support
+    // lands in a follow-up PR (no anti-cheat-safe CPU temp source for
+    // an in-process layer otherwise — see the project history for the
+    // CPU-temp / WinRing0 / PawnIO analysis).
+    struct OverlayDisplayValues {
+        // Header bar
+        std::string fps_instant      = "--";  // big white number
+        std::string fps_avg          = "--";  // cyan accent
+        std::string fps_p95          = "--";  // cyan accent
+        std::string fps_p99          = "--";  // cyan accent
+
+        // Frametime panel current-value labels (top-right of each
+        // panel — the histogram itself takes the rest of the space).
+        std::string gpu_frametime_ms = "--.-";
+        std::string cpu_frametime_ms = "--.-";
+
+        // Bottom row — temperatures (integer °C, "--" sentinel when
+        // source absent).
+        std::string gpu_temp_c       = "--";
+        std::string cpu_temp_c       = "--";   // always "--" until PawnIO
+
+        // Bottom row — utilisation percentages (drawn both as text
+        // inside the gauge AND geometrically as an arc filling 0..N%
+        // of a 270° dial).
+        std::string gpu_util_pct     = "--";
+        std::string cpu_util_pct     = "--";
+
+        // Gauge fractions (0..1) for the circular dial. Synced to the
+        // *_util_pct strings above so the dial fill matches what the
+        // text reads.
+        float       gpu_util_fraction = 0.0f;
+        float       cpu_util_fraction = 0.0f;
+
+        // True when at least the FPS field carries a real value. The
+        // renderer can skip the text/gauge passes (but still paint the
+        // frame/background) on the very first ~100 ms of a session
+        // before the aggregator publishes the first snapshot.
+        bool        valid = false;
     };
 
-    inline std::vector<OverlayRow> formatOverlayRows(const OverlaySnapshot& snap) {
-        if (!snap.valid) return {};
-        std::vector<OverlayRow> rows;
-        rows.reserve(4);
+    inline OverlayDisplayValues formatOverlayDisplayValues(const OverlaySnapshot& snap) {
+        OverlayDisplayValues v;
+        if (!snap.valid) return v;
+        v.valid = true;
 
-        // Small string helpers without dragging in fmt/format.h.
-        //
-        // Each helper checks std::isfinite() before %f-printing: the
-        // aggregator already guards against division by zero, but a
-        // momentarily-negative `frame_total_ns - wait_block_ns` (caused
-        // by a missed QPC sample or by a runtime mis-ordering the
-        // begin/wait pair) can accumulate into a NaN or ±Inf, which
-        // %5.1f renders as " nan" / " inf" / "-inf" — breaking the
-        // monospace alignment of the right-aligned columns. Rendering
-        // "  --.-" / "  --" instead keeps the grid intact and signals
-        // "no data" visually, at zero extra cost. The fix sits here
-        // rather than in the aggregator because the aggregator's job is
-        // to publish what it sees; the renderer's job is to keep the
-        // HUD readable even when the input is briefly garbage.
-        auto fmtFps = [](float fps) {
+        // The aggregator guards against div-by-zero already, but a
+        // momentarily-negative `frame_total - wait_block` can
+        // accumulate into NaN / ±Inf. Every formatter here checks
+        // std::isfinite() and substitutes "--" / "--.-" so the cells
+        // stay at their fixed widths even when the input is briefly
+        // garbage. The renderer relies on these fixed widths for
+        // pixel-alignment of the right-side accent numbers in the
+        // header bar — letting "nan" / "inf" leak through would
+        // shift the right column rightward and break the grid.
+        auto fmtFpsInt = [](float fps) {
             char buf[16];
-            if (std::isfinite(fps)) {
-                std::snprintf(buf, sizeof(buf), "%5.1f", fps);
+            if (std::isfinite(fps) && fps >= 0.0f) {
+                std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(fps)));
             } else {
-                std::snprintf(buf, sizeof(buf), " --.-");
+                std::snprintf(buf, sizeof(buf), "--");
             }
             return std::string(buf);
         };
-        auto fmtMs = [](float ms) {
+        auto fmtMsOneDecimal = [](float ms) {
             char buf[16];
-            if (std::isfinite(ms)) {
-                std::snprintf(buf, sizeof(buf), "%5.2f", ms);
+            if (std::isfinite(ms) && ms >= 0.0f) {
+                std::snprintf(buf, sizeof(buf), "%.1f", ms);
             } else {
-                std::snprintf(buf, sizeof(buf), " --.-");
+                std::snprintf(buf, sizeof(buf), "--.-");
             }
             return std::string(buf);
         };
-        auto fmtPct = [](float pct) {
-            char buf[8];
-            if (std::isfinite(pct)) {
-                std::snprintf(buf, sizeof(buf), "%3.0f", pct);
+        auto fmtTempInt = [](float c) {
+            char buf[16];
+            if (std::isfinite(c) && c >= -50.0f && c <= 200.0f) {
+                std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(c)));
             } else {
-                std::snprintf(buf, sizeof(buf), " --");
+                std::snprintf(buf, sizeof(buf), "--");
             }
             return std::string(buf);
         };
-
-        // Temperature: %3.0f when finite, fixed-width "--" sentinel
-        // when NaN (NvAPI absent / AMD / Intel for now).
-        auto fmtTempC = [](float c) {
+        auto fmtPctInt = [](float p) {
             char buf[16];
-            if (std::isfinite(c)) {
-                std::snprintf(buf, sizeof(buf), "%3.0f", c);
+            if (std::isfinite(p) && p >= 0.0f) {
+                std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(p)));
             } else {
-                std::snprintf(buf, sizeof(buf), " --");
+                std::snprintf(buf, sizeof(buf), "--");
             }
-            return std::string(buf);
-        };
-        // VRAM in GB to 1 decimal. 0 bytes is the "no data" sentinel
-        // (the renderer's DXGI call failed); a healthy system always
-        // shows non-zero usage even at idle. Display "--" rather than
-        // "0.0 GB" so the user sees "unknown" vs "tiny".
-        auto fmtVramGb = [](uint64_t bytes) {
-            char buf[16];
-            if (bytes == 0) {
-                std::snprintf(buf, sizeof(buf), " --");
-                return std::string(buf);
-            }
-            const double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
-            std::snprintf(buf, sizeof(buf), "%4.1f", gb);
             return std::string(buf);
         };
 
-        rows.push_back({
-            "FPS " + fmtFps(snap.fps_instant) + " / " + fmtFps(snap.target_fps),
-            "AVG " + fmtFps(snap.fps_avg)
-        });
-        rows.push_back({
-            "GPU " + fmtMs(snap.gpu_frame_ms) + " ms",
-            "CPU " + fmtMs(snap.cpu_frame_ms) + " ms"
-        });
-        rows.push_back({
-            "GPU " + fmtPct(snap.gpu_utilisation_pct) + " %",
-            "CPU " + fmtPct(snap.cpu_utilisation_pct) + " %"
-        });
-        // Row 3: GPU temp + VRAM. The left cell is grouped with GPU
-        // metrics (same column header pattern as the rest); the right
-        // cell shows VRAM with budget so the user can spot "I'm close
-        // to my budget". Format: "VRAM 6.3 / 8.0 GB". When the budget
-        // is unknown we still show used alone.
-        std::string vramRight;
-        if (snap.vram_used_bytes == 0) {
-            vramRight = "VRAM " + fmtVramGb(0) + " GB";
-        } else if (snap.vram_budget_bytes == 0) {
-            vramRight = "VRAM " + fmtVramGb(snap.vram_used_bytes) + " GB";
-        } else {
-            vramRight = "VRAM " + fmtVramGb(snap.vram_used_bytes) +
-                        " / " + fmtVramGb(snap.vram_budget_bytes) + " GB";
-        }
-        rows.push_back({
-            "GPU " + fmtTempC(snap.gpu_temp_c) + " C",
-            vramRight
-        });
-        return rows;
+        v.fps_instant      = fmtFpsInt(snap.fps_instant);
+        v.fps_avg          = fmtFpsInt(snap.fps_avg);
+        v.fps_p95          = fmtFpsInt(snap.fps_p95);
+        v.fps_p99          = fmtFpsInt(snap.fps_p99);
+
+        v.gpu_frametime_ms = fmtMsOneDecimal(snap.gpu_frame_ms);
+        v.cpu_frametime_ms = fmtMsOneDecimal(snap.cpu_frame_ms);
+
+        v.gpu_temp_c       = fmtTempInt(snap.gpu_temp_c);
+        // cpu_temp_c intentionally stays "--": there's no anti-cheat-
+        // safe in-process CPU temp source until PawnIO lands in a
+        // follow-up PR.
+        v.cpu_temp_c       = "--";
+
+        v.gpu_util_pct     = fmtPctInt(snap.gpu_utilisation_pct);
+        v.cpu_util_pct     = fmtPctInt(snap.cpu_utilisation_pct);
+
+        v.gpu_util_fraction = std::isfinite(snap.gpu_utilisation_pct)
+            ? std::clamp(snap.gpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
+            : 0.0f;
+        v.cpu_util_fraction = std::isfinite(snap.cpu_utilisation_pct)
+            ? std::clamp(snap.cpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
+            : 0.0f;
+        return v;
     }
 
 
@@ -184,9 +209,11 @@ namespace openxr_api_layer::detail {
         float pos_x;
         float pos_y;
         float pos_z;  // negative = in front of the user
-        // Quad dimensions in metres at the chosen distance. The 0.20 ×
-        // 0.075 m default at z = -1 m is ~11° × 4° of FOV. Matches
-        // fpsvr's discreet placement.
+        // Quad dimensions in metres at the chosen distance. The 0.28 ×
+        // 0.21 m default at z = -1 m is ~16° × 12° of FOV — bigger
+        // than the previous fpsVR-style HUD (320×116, ~11° × 4°)
+        // because the redesigned 720×540 texture packs more sections
+        // (header bar + two frametime panels + bottom temp/util row).
         float width_m;
         float height_m;
     };
@@ -199,17 +226,17 @@ namespace openxr_api_layer::detail {
     // [0.5, 2.0] by parseSettings).
     inline OverlayGeometry geometryForPosition(const std::string& position,
                                                 float scale) noexcept {
-        // Default size at scale=1.0. Tweak in one place if fpsvr-style
-        // proves too small/big on real HMDs. The 320×116 texture's
-        // aspect ratio is 0.20 m : 0.0725 m (rounded to 0.091 here
-        // for a small visual safety margin on edge anti-aliasing) —
-        // keeps the rendered pixel density close to the previous
-        // 320×96 / 0.20×0.075 baseline.
-        constexpr float kBaseWidth  = 0.20f;
-        constexpr float kBaseHeight = 0.091f;
+        // 4:3 aspect to match the 720×540 texture. 0.28 × 0.21 m at
+        // 1 m view-space distance ≈ 16° × 12° angular size — bigger
+        // than the old 0.20 × 0.091 m strip but still well under the
+        // FOV waste of a "fullscreen" HUD. Corner offsets bumped
+        // proportionally so the quad's CORNER (not centre) still
+        // lands near the previous off-axis target.
+        constexpr float kBaseWidth  = 0.28f;
+        constexpr float kBaseHeight = 0.21f;
         constexpr float kZ          = -1.0f;          // 1 m forward
-        constexpr float kCornerOffX = 0.16f;          // ≈ 9° off-axis at 1 m
-        constexpr float kCornerOffY = 0.08f;          // ≈ 5° off-axis at 1 m
+        constexpr float kCornerOffX = 0.22f;
+        constexpr float kCornerOffY = 0.14f;
 
         OverlayGeometry g;
         g.width_m  = kBaseWidth  * scale;
@@ -252,6 +279,13 @@ namespace openxr_api_layer::detail {
     // approaching the limit, red when the frame busts the period (it
     // either dropped or got reprojected). Matches the "you can see the
     // overruns at a glance" UX users expect.
+    //
+    // The new redesign uses a SINGLE accent colour per panel (teal
+    // for GPU, light blue for CPU) instead of the green/yellow/red
+    // tiering — the BarTier is still computed and the renderer
+    // optionally lightens the bar when it busts the budget, but the
+    // dominant signal is the histogram shape itself rather than a
+    // colour switch per bar.
     enum class BarTier { Green, Yellow, Red };
 
     struct BarVisual {

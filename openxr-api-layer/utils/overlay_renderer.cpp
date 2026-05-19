@@ -43,6 +43,8 @@
 
 #include <array>
 #include <cmath>
+#include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
+#include <iterator>    // std::size for the dash-style array
 #include <string>
 #include <vector>
 
@@ -65,43 +67,63 @@ namespace openxr_api_layer::detail {
 
     namespace {
 
-        // -------- Layout constants ------------------------------------------
+        // -------- Layout constants (fpsVR redesign, 720×540) ----------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 320×116 gives a fpsVR-
-        // style two-column HUD: GPU on the left, CPU on the right,
-        // with histograms below each frametime line, plus a 4th row
-        // for GPU temp + VRAM. The previous 320×96 layout fit 3 rows
-        // (FPS / frametimes / utilisation) plus the strip; growing to
-        // 116 px adds room for one more text row at ~kLineHeight +
-        // kRowGap = 19 px. The quad's world-space height in geometry
-        // ForPosition scales proportionally so pixel density stays
-        // visually consistent with the previous version.
-        constexpr int32_t  kTexW         = 320;
-        constexpr int32_t  kTexH         = 116;
-        constexpr float    kPadX         = 8.0f;
-        constexpr float    kPadTop       = 6.0f;
-        constexpr float    kFontSize     = 13.0f;
-        constexpr float    kLineHeight   = 16.0f;
-        // Vertical gap inside a column between consecutive text rows
-        // (smaller than kLineHeight; tightens the column visually).
-        constexpr float    kRowGap       = 3.0f;
-        // The histogram strip's height. Smaller than the original 18
-        // because we now place the strip BELOW the per-column frame
-        // time and ABOVE the per-column utilisation, so the strip is
-        // the visual middle of each column rather than a footer.
-        constexpr float    kHistoHeight  = 22.0f;
-        constexpr float    kHistoGap     = 2.0f;
-        // Center gap between the two columns (width-wise). Both text
-        // and histogram strips honour this — the budget reference
-        // line never crosses it.
-        constexpr float    kColGap       = 8.0f;
-        // No gap between bars within a strip — fpsVR-style dense
-        // waveform. Per-strip width is ~148 px; with kRingSize=144,
-        // each bar is ~1 px and the strip reads as a continuous
-        // trace at HMD pixel densities.
-        constexpr float    kHistoBarGap  = 0.0f;
-        constexpr std::size_t kRingSize  = 144;      // ~1.6 s @ 90 Hz, ~1.2 s @ 120 Hz
+        // QUAD in 3D scales, not the resolution. 720×540 (4:3) packs
+        // the four sections of the redesigned HUD:
+        //   - header bar (FPS / FPS AVG / P95 / P99, 4 cells)
+        //   - GPU FRAMETIME MS panel with histogram + current value
+        //   - CPU FRAMETIME MS panel with histogram + current value
+        //   - bottom row split into two panels (TEMP & UTILISATION)
+        //     each with chip + thermometer icons and a circular gauge
+        //
+        // Vertical budget (top → bottom), all in pixels at the
+        // 720×540 native texture resolution:
+        //   kOuterPad           (10) — gap between texture edge and frame
+        //   kFrameStroke         (2) — outer frame line
+        //   kSectionGap          (8) — gap between frame and header
+        //   kHeaderHeight       (66)
+        //   kSectionGap          (8)
+        //   kFrametimeHeight   (160) — GPU panel (header strip + histogram)
+        //   kSectionGap          (8)
+        //   kFrametimeHeight   (160) — CPU panel
+        //   kSectionGap          (8)
+        //   kBottomHeight      (102) — temp & util row
+        //   kSectionGap          (8)
+        //   kFrameStroke         (2)
+        //   kOuterPad           (10)
+        //   Total = 542 ≈ 540 (1px rounding tolerance per side)
+        constexpr int32_t kTexW = 720;
+        constexpr int32_t kTexH = 540;
+
+        constexpr float kOuterPad       = 10.0f;
+        constexpr float kFrameStroke    = 2.0f;
+        constexpr float kSectionGap     = 8.0f;
+        constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
+
+        constexpr float kHeaderHeight     = 66.0f;
+        constexpr float kFrametimeHeight  = 160.0f;
+        constexpr float kBottomHeight     = 102.0f;
+
+        // Histogram strip metrics — sits inside the frametime panel,
+        // below the title row.
+        constexpr float kHistoTitleH     = 24.0f;
+        constexpr float kHistoBarGap     = 1.5f;
+        // 80 bars × (~7 px each + 1.5 px gap) ≈ 680 px of strip width.
+        // Matches the visible bar density of the screenshot.
+        constexpr std::size_t kRingSize  = 80;       // ~0.9 s @ 90 Hz, ~0.7 s @ 120 Hz
+
+        // Font sizes — tuned to the 720×540 texture so the rendered
+        // result reads naturally at the new quad size (~16°×12° FOV
+        // at 1 m in the HMD).
+        constexpr float kFontTinyLabel    = 14.0f;  // "FPS", "P95", "TEMP", "GPU UTIL"
+        constexpr float kFontSectionTitle = 16.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontMs           = 22.0f;  // "6.7 ms" current value
+        constexpr float kFontBigNumber    = 42.0f;  // "142" FPS number
+        constexpr float kFontAccentNumber = 36.0f;  // "138", "124", "108"
+        constexpr float kFontTemp         = 30.0f;  // "67 °C"
+        constexpr float kFontGaugePct     = 28.0f;  // "92%" inside gauge
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -137,6 +159,7 @@ namespace openxr_api_layer::detail {
         // outer class because they bind to specific swapchain images.
         class CoreRenderer {
           public:
+            // -------- Public lifecycle --------------------------------------
             bool init() {
                 if (FAILED(::D2D1CreateFactory(
                         D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -149,224 +172,394 @@ namespace openxr_api_layer::detail {
                         reinterpret_cast<IUnknown**>(m_dwriteFactory.GetAddressOf())))) {
                     return false;
                 }
-                // Consolas ships with Windows since Vista. If it ever
-                // goes missing on a stripped-down install, the text
-                // format creation fails and the caller's isReady()
-                // returns false — graceful degrade.
-                if (FAILED(m_dwriteFactory->CreateTextFormat(
-                        L"Consolas",
-                        nullptr,
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        kFontSize,
-                        L"en-US",
-                        m_textFormat.GetAddressOf()))) {
-                    return false;
-                }
+                // The redesign packs labels, big FPS numbers, accent
+                // numbers, ms-suffix labels, temp readouts, and gauge
+                // percentages — each at a different point size and
+                // alignment. DirectWrite formats are immutable once
+                // created (you change alignment by creating a new
+                // format, NOT by mutating); we cache one format per
+                // (font, size, alignment) combination at init time so
+                // paint() never allocates a format.
+                //
+                // Font choice: Consolas for the monospace numeric cells
+                // (FPS, ms, percentages — column-aligned digits matter
+                // visually), and Segoe UI for the smaller mixed-case
+                // section labels ("GPU FRAMETIME MS", "TEMP", etc.) —
+                // Consolas is too wide for those at small sizes.
+                if (!makeFormat(L"Consolas", kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
+                if (!makeFormat(L"Consolas", kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
+                if (!makeFormat(L"Consolas", kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTemp)) return false;
+                if (!makeFormat(L"Consolas", kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
+                if (!makeFormat(L"Consolas", kFontGaugePct,     DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtGaugePct)) return false;
+                if (!makeFormat(L"Segoe UI", kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
+                if (!makeFormat(L"Segoe UI", kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTinyLabelLeft)) return false;
+                if (!makeFormat(L"Segoe UI", kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
                 return true;
             }
 
             ID2D1Factory* d2d() const noexcept { return m_d2dFactory.Get(); }
 
-            // Create the five solid-colour brushes used by paint() and
-            // paintHistogram(). Brushes are bound to the render target
-            // they were created against — call this once after the
-            // owning renderer creates its D2D ID2D1RenderTarget, not
-            // per frame. paint() is called at the host's frame rate
-            // (90-144 Hz), so allocating 5 COM objects per call was
-            // measurable churn for a telemetry-focused layer.
+            // -------- Brushes (palette) -------------------------------------
             //
-            // If the underlying device goes lost (D2DERR_RECREATE_
-            // TARGET on EndDraw), the owner must recreate the RT
-            // AND call this again — both invalidate together.
+            // Brushes are bound to the render target they were created
+            // against — call once after the owning renderer creates its
+            // D2D ID2D1RenderTarget, not per frame. The redesign uses
+            // a ~12-brush palette (background fills, panel fills,
+            // text colours, gauge colours, bar colours, icon strokes);
+            // creating them all once amortises ~5 µs of D2D allocation
+            // away from the frame thread.
             bool initBrushes(ID2D1RenderTarget* rt) {
                 if (!rt) return false;
-                if (FAILED(rt->CreateSolidColorBrush(
-                        D2D1::ColorF(1.00f, 1.00f, 1.00f, 1.00f),
-                        m_textBrush.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateSolidColorBrush(
-                        D2D1::ColorF(0.40f, 0.85f, 0.40f, 0.90f),
-                        m_greenBrush.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateSolidColorBrush(
-                        D2D1::ColorF(1.00f, 0.85f, 0.30f, 0.90f),
-                        m_yellowBrush.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateSolidColorBrush(
-                        D2D1::ColorF(1.00f, 0.30f, 0.30f, 0.95f),
-                        m_redBrush.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateSolidColorBrush(
-                        D2D1::ColorF(1.00f, 1.00f, 1.00f, 0.45f),
-                        m_budgetLineBrush.GetAddressOf()))) return false;
+                auto make = [&](D2D1::ColorF c, ComPtr<ID2D1SolidColorBrush>& out) {
+                    return SUCCEEDED(rt->CreateSolidColorBrush(c, out.GetAddressOf()));
+                };
+                // Outer frame + panel backgrounds. The double-fill
+                // (bgFill behind, then panel fills on top) gives the
+                // "raised metallic panel" feel of the reference design
+                // with no actual gradient cost.
+                if (!make(D2D1::ColorF(0.043f, 0.055f, 0.067f, 0.94f), m_brushBg)) return false;          // #0B0E11 with high alpha
+                if (!make(D2D1::ColorF(0.078f, 0.094f, 0.118f, 1.00f), m_brushPanelBg)) return false;    // #14181E
+                if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushFrameLine)) return false;  // #282E39
+                if (!make(D2D1::ColorF(0.220f, 0.247f, 0.298f, 1.00f), m_brushSeparator)) return false;  // #383F4C
+                // Text + accent.
+                if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.00f), m_brushTextWhite)) return false;
+                if (!make(D2D1::ColorF(0.690f, 0.733f, 0.792f, 1.00f), m_brushTextLabel)) return false;  // #B0BBCA
+                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushAccentCyan)) return false; // #1FD9E8
+                // Bar / gauge colours — match the screenshot.
+                if (!make(D2D1::ColorF(0.000f, 0.835f, 0.769f, 1.00f), m_brushGpuTeal)) return false;    // #00D5C4
+                if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushCpuBlue)) return false;    // #5BB8E8
+                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C
+                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushGaugeCyan)) return false;
+                if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushGaugeBg)) return false;
+                // Dashed grid lines inside the histogram panels.
+                if (!make(D2D1::ColorF(0.220f, 0.250f, 0.300f, 0.55f), m_brushGridDash)) return false;
+                // Icon stroke + thermometer fills.
+                if (!make(D2D1::ColorF(0.78f, 0.82f, 0.87f, 0.85f),   m_brushIconStroke)) return false;
+                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushThermRed)) return false;
+                if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushThermBlue)) return false;
+
+                // Stroke style for the dashed grid lines. ID2D1Strok
+                // Style is shareable; we cache the one we need.
+                D2D1_STROKE_STYLE_PROPERTIES dashProps =
+                    D2D1::StrokeStyleProperties(
+                        D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                        D2D1_LINE_JOIN_MITER, 10.0f,
+                        D2D1_DASH_STYLE_CUSTOM, 0.0f);
+                const FLOAT dashes[] = {2.0f, 4.0f};
+                if (FAILED(m_d2dFactory->CreateStrokeStyle(
+                        dashProps, dashes,
+                        static_cast<UINT32>(std::size(dashes)),
+                        m_strokeDashed.GetAddressOf()))) return false;
                 return true;
             }
 
-            // Paint into a pre-created render target (one per swapchain
-            // image). The render target is created by the outer class
-            // from a DXGI surface obtained from the texture.
+            // -------- paint() -----------------------------------------------
             //
-            // Layout (fpsVR-style two-column):
-            //   row 0: [FPS instant / target]      | [AVG fps]
-            //   row 1: [GPU XX.XX ms]              | [CPU XX.XX ms]
-            //   row 2: [GPU histogram strip]       | [CPU histogram strip]
-            //   row 3: [GPU NN %]                  | [CPU NN %]
-            // The histograms sit directly under their respective
-            // frametime label, so the visual flow inside each column
-            // is value → trace → utilisation, matching what fpsVR /
-            // OpenXR Toolkit users expect.
+            // Layout (top → bottom):
+            //   - Outer frame: dark grey 2-px stroke around a slightly
+            //     lighter dark-blue background. 10-px padding to the
+            //     texture edge so the OpenXR runtime's bilinear filter
+            //     doesn't soften the corner anti-alias.
+            //   - Header bar: 4 cells (FPS / FPS AVG / P95 / P99),
+            //     thin vertical separators. Big white FPS number,
+            //     cyan accent numbers on the right three cells.
+            //   - GPU FRAMETIME MS panel: title + current value
+            //     (top-right) + dashed grid + teal histogram.
+            //   - CPU FRAMETIME MS panel: same, light-blue bars.
+            //   - Bottom row (2 panels):
+            //       GPU TEMP & UTILISATION — chip icon, thermometer +
+            //         "TEMP 67 °C", "GPU UTIL" + red circular gauge.
+            //       CPU TEMP & UTILISATION — same, "-- °C" until
+            //         PawnIO lands, cyan gauge.
             //
-            // `m_cpuRing` carries per-cycle CPU samples (frame_total -
-            // wait_block) so the strip aligns with the cpu_frame_ms
-            // value drawn above it; `m_gpuRing` carries gpu_time_ns
-            // directly.
+            // The cached display values are re-formatted only when the
+            // snapshot's `version` changes (the aggregator publishes
+            // ~10×/s; paint() runs at the host's 90-144 Hz frame rate,
+            // so the cache saves ~13 redundant snprintf passes per
+            // frame in the steady state).
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
                        const HistogramRing<kRingSize>& cpuRing,
                        const HistogramRing<kRingSize>& gpuRing) {
                 if (!rt) return false;
+                if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
 
                 rt->BeginDraw();
-                // Semi-transparent dark background. Alpha 0.6 keeps the
-                // game visible behind the HUD when the quad is overlaid.
-                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.6f));
+                // Fully transparent clear — we paint our own opaque
+                // panel backgrounds, so the corners outside the frame
+                // composite through to the game underneath as
+                // transparent pixels.
+                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
-                // Brushes were cached at init time (initBrushes called
-                // once after RT creation). Bail if a caller paints
-                // without calling initBrushes first — would be a
-                // wiring bug, not a runtime condition.
-                if (!m_textBrush || !m_greenBrush || !m_yellowBrush ||
-                    !m_redBrush || !m_budgetLineBrush) {
-                    rt->EndDraw();
-                    return false;
-                }
-
-                // Column boundaries: split the available width minus
-                // padding into two equal halves separated by kColGap.
-                const float texW = static_cast<float>(kTexW);
-                const float midX = texW * 0.5f;
-                const float leftL  = kPadX;
-                const float leftR  = midX - kColGap * 0.5f;
-                const float rightL = midX + kColGap * 0.5f;
-                const float rightR = texW - kPadX;
-
-                // Vertical positions, top → bottom.
-                //   row0Y  : FPS line              (data row 0)
-                //   row1Y  : frametime ms line     (data row 1)
-                //   histoY : two histograms        (between data rows 1 and 2)
-                //   row2Y  : utilisation %         (data row 2)
-                //   row3Y  : GPU temp / VRAM       (data row 3 — added in
-                //            this PR; sits below the utilisation row with
-                //            the same row gap so the vertical rhythm
-                //            stays consistent).
-                const float row0Y  = kPadTop;
-                const float row1Y  = row0Y + kLineHeight + kRowGap;
-                const float histoY = row1Y + kLineHeight + kHistoGap;
-                const float row2Y  = histoY + kHistoHeight + kHistoGap;
-                const float row3Y  = row2Y + kLineHeight + kRowGap;
-
-                // Re-format the row strings only when the snapshot
-                // changed. paint() runs at the host frame rate (90-
-                // 144 Hz); snapshots refresh at the configured 10 Hz
-                // by default, so this cache skips ~10-14 redundant
-                // snprintf passes per frame in the steady state.
-                // The version comparison is a single 8-byte load —
-                // dwarfed by any single snprintf call.
+                // Re-format display values on snapshot version change.
                 if (snap.version != m_cachedSnapshotVersion) {
-                    m_cachedRows = formatOverlayRows(snap);
+                    m_cachedValues = formatOverlayDisplayValues(snap);
                     m_cachedSnapshotVersion = snap.version;
                 }
-                const auto& rows = m_cachedRows;
-                auto drawText = [&](const std::string& s, float l, float t,
-                                     float r) {
-                    // ASCII-only input: formatOverlayRows uses
-                    // snprintf with %f / %d / hard-coded labels, never
-                    // emits non-ASCII bytes. The byte-by-byte
-                    // std::wstring constructor below is correct for
-                    // ASCII (each char zero-extends to a wchar_t) but
-                    // NOT a valid UTF-8 → UTF-16 decode. The day the
-                    // HUD adds °C, μs or × the right tool is
-                    // MultiByteToWideChar(CP_UTF8, ...).
-                    std::wstring wide(s.begin(), s.end());
-                    const D2D1_RECT_F rect = D2D1::RectF(l, t, r, t + kLineHeight);
-                    rt->DrawTextW(
-                        wide.c_str(),
-                        static_cast<UINT32>(wide.length()),
-                        m_textFormat.Get(),
-                        rect,
-                        m_textBrush.Get());
-                };
+                const auto& v = m_cachedValues;
 
-                if (rows.size() >= 3) {
-                    drawText(rows[0].left,  leftL,  row0Y, leftR);
-                    drawText(rows[0].right, rightL, row0Y, rightR);
-                    drawText(rows[1].left,  leftL,  row1Y, leftR);
-                    drawText(rows[1].right, rightL, row1Y, rightR);
-                    drawText(rows[2].left,  leftL,  row2Y, leftR);
-                    drawText(rows[2].right, rightL, row2Y, rightR);
-                }
-                // Row 3 is best-effort — present only when the
-                // aggregator built a 4-row layout (it always does
-                // now, but the >= 4 guard keeps the renderer
-                // resilient if a future caller swaps in a 3-row
-                // snapshot, e.g. a CPU-only debug build).
-                if (rows.size() >= 4) {
-                    drawText(rows[3].left,  leftL,  row3Y, leftR);
-                    drawText(rows[3].right, rightL, row3Y, rightR);
-                }
+                const float texW = static_cast<float>(kTexW);
+                const float texH = static_cast<float>(kTexH);
 
-                // Two histogram strips side-by-side. Both share the
-                // same budget (runtime's predicted display period →
-                // 1e9 / target_fps), so the white reference line
-                // sits at the same Y in both — easy visual compare
-                // GPU vs CPU.
-                const int64_t budgetNs = snap.target_fps > 0.0f
-                    ? static_cast<int64_t>(1.0e9f / snap.target_fps)
-                    : 0;
-                paintHistogram(rt, gpuRing, budgetNs,
-                                leftL, histoY, leftR);
-                paintHistogram(rt, cpuRing, budgetNs,
-                                rightL, histoY, rightR);
+                // Outer frame: rounded-rect background + 2-px stroke.
+                const D2D1_ROUNDED_RECT frameRect = D2D1::RoundedRect(
+                    D2D1::RectF(kOuterPad, kOuterPad,
+                                 texW - kOuterPad, texH - kOuterPad),
+                    8.0f, 8.0f);
+                rt->FillRoundedRectangle(frameRect, m_brushBg.Get());
+                rt->DrawRoundedRectangle(frameRect, m_brushFrameLine.Get(),
+                                          kFrameStroke);
 
-                // EndDraw flushes the command list. D2DERR_RECREATE_TARGET
-                // returned here means the underlying device went away —
-                // outer class will recreate on the next attempt.
+                // Inner content rectangle (everything sits inside this).
+                const float innerL = kOuterPad + kFrameStroke + 4.0f;
+                const float innerR = texW - kOuterPad - kFrameStroke - 4.0f;
+                const float innerT = kOuterPad + kFrameStroke + 4.0f;
+                const float innerB = texH - kOuterPad - kFrameStroke - 4.0f;
+
+                // Section Y positions, top → bottom.
+                const float headerY    = innerT;
+                const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
+                const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
+                (void)innerB;  // bottomY + kBottomHeight ≤ innerB by construction
+
+                drawHeaderBar(rt, innerL, headerY, innerR,
+                               headerY + kHeaderHeight, v);
+                drawFrametimePanel(rt, innerL, gpuPanelY, innerR,
+                                    gpuPanelY + kFrametimeHeight,
+                                    L"GPU FRAMETIME MS", v.gpu_frametime_ms,
+                                    gpuRing, snap.target_fps,
+                                    m_brushGpuTeal.Get());
+                drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
+                                    cpuPanelY + kFrametimeHeight,
+                                    L"CPU FRAMETIME MS", v.cpu_frametime_ms,
+                                    cpuRing, snap.target_fps,
+                                    m_brushCpuBlue.Get());
+
+                // Bottom row: split into two equal-width panels.
+                const float bottomMidGap = kSectionGap;
+                const float bottomMid    = (innerL + innerR) * 0.5f;
+                drawBottomPanel(rt, innerL, bottomY,
+                                 bottomMid - bottomMidGap * 0.5f,
+                                 bottomY + kBottomHeight,
+                                 L"GPU TEMP & UTILISATION",
+                                 v.gpu_temp_c, v.gpu_util_pct,
+                                 v.gpu_util_fraction,
+                                 m_brushGaugeRed.Get(),
+                                 m_brushThermRed.Get());
+                drawBottomPanel(rt,
+                                 bottomMid + bottomMidGap * 0.5f, bottomY,
+                                 innerR, bottomY + kBottomHeight,
+                                 L"CPU TEMP & UTILISATION",
+                                 v.cpu_temp_c, v.cpu_util_pct,
+                                 v.cpu_util_fraction,
+                                 m_brushGaugeCyan.Get(),
+                                 m_brushThermBlue.Get());
+
                 return SUCCEEDED(rt->EndDraw());
             }
 
           private:
-            // fpsvr-style histogram: bars anchored to the runtime's
-            // display-period budget (not auto-normalised to the ring's
-            // max), color tier (green/yellow/red) per bar based on how
-            // close it is to busting the budget, and a half-transparent
-            // horizontal reference line drawn at exactly the budget
-            // level so the user can spot overruns at a glance.
+            // -------- Format / brush helpers --------------------------------
+            bool makeFormat(const wchar_t* family, float size,
+                            DWRITE_FONT_WEIGHT weight,
+                            DWRITE_TEXT_ALIGNMENT alignment,
+                            ComPtr<IDWriteTextFormat>& out) {
+                if (FAILED(m_dwriteFactory->CreateTextFormat(
+                        family, nullptr, weight,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        size, L"en-US", out.GetAddressOf()))) {
+                    return false;
+                }
+                out->SetTextAlignment(alignment);
+                out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                return true;
+            }
+
+            // ASCII-only DrawTextW shortcut. The redesign emits only
+            // ASCII digits + uppercase labels — except for the °C
+            // suffix, which we draw via the dedicated wide-literal
+            // path drawWide().
+            void drawAscii(ID2D1RenderTarget* rt, const std::string& s,
+                            IDWriteTextFormat* fmt,
+                            const D2D1_RECT_F& rect,
+                            ID2D1Brush* brush) const {
+                if (s.empty()) return;
+                std::wstring wide(s.begin(), s.end());
+                rt->DrawTextW(wide.c_str(),
+                              static_cast<UINT32>(wide.length()),
+                              fmt, rect, brush);
+            }
+
+            void drawWide(ID2D1RenderTarget* rt, const wchar_t* s,
+                           IDWriteTextFormat* fmt,
+                           const D2D1_RECT_F& rect,
+                           ID2D1Brush* brush) const {
+                if (!s) return;
+                const std::size_t len = std::wcslen(s);
+                rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
+            }
+
+            // -------- Header bar --------------------------------------------
             //
-            // Y axis: 0 at the strip's bottom → 2× budget at the top.
-            // Budget therefore sits at the midpoint (budgetLine
-            // Fraction = 0.5). Anything between 0.8× and 1× budget
-            // turns yellow; ≥ 1× turns red and visually crosses the
-            // line. Anything beyond 2× budget saturates at the top.
-            void paintHistogram(ID2D1RenderTarget* rt,
-                                 const HistogramRing<kRingSize>& ring,
-                                 int64_t budgetNs,
-                                 float left, float top, float right) const {
-                if (budgetNs <= 0) return;
-                if (right <= left) return;
-                const float fullW = right - left;
+            // Layout: 4 cells of equal width separated by 1-px vertical
+            // bars. Each cell has a small uppercase label at the top
+            // and a big number below. The FPS cell uses the white
+            // brush; the three accent cells (AVG / P95 / P99) use
+            // cyan.
+            void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
+                                float r, float b,
+                                const OverlayDisplayValues& v) const {
+                drawPanelBg(rt, l, t, r, b);
+
+                const float w = r - l;
+                const float cellW = w * 0.25f;
+
+                // Vertical separators between cells (3 of them).
+                for (int i = 1; i <= 3; ++i) {
+                    const float x = l + cellW * static_cast<float>(i);
+                    rt->DrawLine(
+                        D2D1::Point2F(x, t + 8.0f),
+                        D2D1::Point2F(x, b - 8.0f),
+                        m_brushSeparator.Get(), 1.0f);
+                }
+
+                const float labelH = 22.0f;
+                const float labelY = t + 4.0f;
+                const float valueY = labelY + labelH;
+
+                drawHeaderCell(rt,
+                                l + cellW * 0.0f, labelY, l + cellW * 1.0f, valueY,
+                                L"FPS", v.fps_instant,
+                                m_fmtBigNumber.Get(),
+                                m_brushTextWhite.Get());
+                drawHeaderCell(rt,
+                                l + cellW * 1.0f, labelY, l + cellW * 2.0f, valueY,
+                                L"FPS AVG", v.fps_avg,
+                                m_fmtAccentNumber.Get(),
+                                m_brushAccentCyan.Get());
+                drawHeaderCell(rt,
+                                l + cellW * 2.0f, labelY, l + cellW * 3.0f, valueY,
+                                L"P95", v.fps_p95,
+                                m_fmtAccentNumber.Get(),
+                                m_brushAccentCyan.Get());
+                drawHeaderCell(rt,
+                                l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
+                                L"P99", v.fps_p99,
+                                m_fmtAccentNumber.Get(),
+                                m_brushAccentCyan.Get());
+            }
+
+            void drawHeaderCell(ID2D1RenderTarget* rt, float l, float t,
+                                 float r, float valueY,
+                                 const wchar_t* label,
+                                 const std::string& value,
+                                 IDWriteTextFormat* valueFormat,
+                                 ID2D1Brush* valueBrush) const {
+                const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
+                drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
+                          labelRect, m_brushTextLabel.Get());
+                const D2D1_RECT_F valueRect = D2D1::RectF(
+                    l, valueY - 2.0f, r,
+                    valueY + kFontBigNumber + 6.0f);
+                drawAscii(rt, value, valueFormat, valueRect, valueBrush);
+            }
+
+            // -------- Frametime panel ---------------------------------------
+            //
+            // Layout:
+            //   - title "GPU FRAMETIME MS" (top-left, ~14 px line)
+            //   - current value "6.7" + cyan "ms" suffix (top-right)
+            //   - 4 horizontal dashed grid lines
+            //   - histogram bars filling the remaining vertical space
+            void drawFrametimePanel(ID2D1RenderTarget* rt, float l, float t,
+                                     float r, float b,
+                                     const wchar_t* title,
+                                     const std::string& currentValue,
+                                     const HistogramRing<kRingSize>& ring,
+                                     float targetFps,
+                                     ID2D1Brush* barBrush) const {
+                drawPanelBg(rt, l, t, r, b);
+
+                // Title bar — top inner padding.
+                const float titleT = t + 6.0f;
+                const float titleB = titleT + kHistoTitleH;
+                const D2D1_RECT_F titleRect = D2D1::RectF(
+                    l + kSectionInnerPad, titleT,
+                    r - kSectionInnerPad, titleB);
+                drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
+                          m_brushTextLabel.Get());
+
+                // Current value (top-right) — number + cyan "ms" suffix.
+                // The number is right-aligned to leave room for the
+                // "ms" suffix drawn separately.
+                const float msSuffixW = 36.0f;
+                const D2D1_RECT_F valueRect = D2D1::RectF(
+                    r - kSectionInnerPad - msSuffixW - 96.0f, titleT - 4.0f,
+                    r - kSectionInnerPad - msSuffixW - 4.0f,
+                    titleB + 6.0f);
+                drawAscii(rt, currentValue, m_fmtMsValue.Get(), valueRect,
+                           m_brushAccentCyan.Get());
+                const D2D1_RECT_F msRect = D2D1::RectF(
+                    r - kSectionInnerPad - msSuffixW, titleT + 6.0f,
+                    r - kSectionInnerPad, titleB + 6.0f);
+                drawWide(rt, L"ms", m_fmtTinyLabelLeft.Get(), msRect,
+                          m_brushAccentCyan.Get());
+
+                // Histogram region — below the title row, with inner
+                // padding on all sides.
+                const float histoL = l + kSectionInnerPad;
+                const float histoR = r - kSectionInnerPad;
+                const float histoT = titleB + 6.0f;
+                const float histoB = b - kSectionInnerPad;
+
+                drawDashedGrid(rt, histoL, histoT, histoR, histoB,
+                                /*lineCount=*/4);
+
+                const int64_t budgetNs = targetFps > 0.0f
+                    ? static_cast<int64_t>(1.0e9f / targetFps)
+                    : 0;
+                drawHistogramBars(rt, ring, budgetNs,
+                                   histoL, histoT, histoR, histoB,
+                                   barBrush);
+            }
+
+            // 4 evenly-spaced horizontal dashed lines across the
+            // histogram region. Visual purpose: give the user a sense
+            // of "vertical scale" for the bar heights, fpsVR-style.
+            void drawDashedGrid(ID2D1RenderTarget* rt, float l, float t,
+                                  float r, float b, int lineCount) const {
+                const float h = b - t;
+                for (int i = 1; i <= lineCount; ++i) {
+                    const float y = t + h * static_cast<float>(i) /
+                                          static_cast<float>(lineCount + 1);
+                    rt->DrawLine(
+                        D2D1::Point2F(l, y),
+                        D2D1::Point2F(r, y),
+                        m_brushGridDash.Get(), 1.0f,
+                        m_strokeDashed.Get());
+                }
+            }
+
+            void drawHistogramBars(ID2D1RenderTarget* rt,
+                                    const HistogramRing<kRingSize>& ring,
+                                    int64_t budgetNs,
+                                    float l, float t, float r, float b,
+                                    ID2D1Brush* barBrush) const {
+                if (r <= l || b <= t || budgetNs <= 0) return;
                 const std::size_t n = ring.size();
                 if (n == 0) return;
-
-                // Budget reference line — drawn FIRST so bars overlap
-                // it where they protrude above (visually clear that a
-                // red bar busts the budget).
-                const float lineY = top + kHistoHeight * budgetLineFraction();
-                const D2D1_RECT_F lineRect = D2D1::RectF(
-                    left, lineY - 0.5f,
-                    right, lineY + 0.5f);
-                rt->FillRectangle(lineRect, m_budgetLineBrush.Get());
-
-                // Per-strip width is ~148 px with kRingSize=144 → each
-                // bar is ~1 px. Bars touch (kHistoBarGap = 0) to form
-                // the fpsVR-style continuous waveform.
+                const float fullW = r - l;
+                const float stripH = b - t;
                 const float barW =
                     (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
                     static_cast<float>(n);
@@ -374,38 +567,293 @@ namespace openxr_api_layer::detail {
 
                 for (std::size_t i = 0; i < n; ++i) {
                     const auto vis = barVisualForSample(ring.at(i), budgetNs);
-                    const float h = vis.heightFraction * kHistoHeight;
+                    const float h = vis.heightFraction * stripH;
                     if (h <= 0.0f) continue;
-                    ID2D1Brush* brush = m_greenBrush.Get();
-                    if (vis.tier == BarTier::Red)         brush = m_redBrush.Get();
-                    else if (vis.tier == BarTier::Yellow) brush = m_yellowBrush.Get();
-
-                    const float x = left +
-                                    static_cast<float>(i) * (barW + kHistoBarGap);
+                    const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
                     const D2D1_RECT_F bar = D2D1::RectF(
-                        x, top + (kHistoHeight - h),
-                        x + barW, top + kHistoHeight);
-                    rt->FillRectangle(bar, brush);
+                        x, b - h,
+                        x + barW, b);
+                    rt->FillRectangle(bar, barBrush);
                 }
             }
 
+            // -------- Bottom panel (TEMP & UTILISATION) ---------------------
+            //
+            // Layout, left-to-right:
+            //   chip icon | TEMP block | spacer | UTIL block + gauge
+            //
+            //   ┌──┐
+            //   │██│  GPU TEMP & UTILISATION (title, full width)
+            //   └──┘
+            //   ┌─┐                              ┌──────┐
+            //   │█│  TEMP             GPU UTIL  │ 92%  │
+            //   │█│  67 °C                       │      │
+            //   └─┘                              └──────┘
+            void drawBottomPanel(ID2D1RenderTarget* rt, float l, float t,
+                                  float r, float b,
+                                  const wchar_t* title,
+                                  const std::string& tempValue,
+                                  const std::string& utilValue,
+                                  float utilFraction,
+                                  ID2D1Brush* gaugeFillBrush,
+                                  ID2D1Brush* thermFillBrush) const {
+                drawPanelBg(rt, l, t, r, b);
+
+                // Title (top-centre-left, just past the chip icon).
+                const float chipSize = 22.0f;
+                const float chipX = l + kSectionInnerPad;
+                const float chipY = t + 8.0f;
+                drawChipIcon(rt, chipX, chipY, chipSize);
+
+                const D2D1_RECT_F titleRect = D2D1::RectF(
+                    chipX + chipSize + 8.0f, t + 6.0f,
+                    r - kSectionInnerPad, t + 6.0f + kHistoTitleH);
+                drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
+                          m_brushTextLabel.Get());
+
+                // --- Temp block (left half) ---
+                const float blockY = t + 38.0f;
+                const float blockH = b - blockY - 8.0f;
+
+                const float thermW = 14.0f;
+                const float thermH = blockH - 4.0f;
+                const float thermX = l + kSectionInnerPad;
+                const float thermY = blockY + 2.0f;
+                drawThermometerIcon(rt, thermX, thermY, thermW, thermH,
+                                     thermFillBrush);
+
+                const float tempLabelX = thermX + thermW + 8.0f;
+                const D2D1_RECT_F tempLabelRect = D2D1::RectF(
+                    tempLabelX, blockY,
+                    tempLabelX + 60.0f, blockY + 18.0f);
+                drawWide(rt, L"TEMP", m_fmtTinyLabelLeft.Get(),
+                          tempLabelRect, m_brushTextLabel.Get());
+
+                // Temp value + °C suffix. Drawn separately so the
+                // numeric digits align to the same baseline regardless
+                // of digit width.
+                const D2D1_RECT_F tempValueRect = D2D1::RectF(
+                    tempLabelX, blockY + 18.0f,
+                    tempLabelX + 64.0f, b - 4.0f);
+                drawAscii(rt, tempValue, m_fmtTemp.Get(), tempValueRect,
+                           m_brushTextWhite.Get());
+                const D2D1_RECT_F tempUnitRect = D2D1::RectF(
+                    tempLabelX + 56.0f, blockY + 24.0f,
+                    tempLabelX + 96.0f, b - 4.0f);
+                drawWide(rt, L"°C", m_fmtMsValue.Get(),
+                          tempUnitRect, m_brushTextLabel.Get());
+
+                // --- Util block (right half) ---
+                const float gaugeR = 30.0f;
+                const float gaugeCx = r - kSectionInnerPad - gaugeR - 2.0f;
+                const float gaugeCy = blockY + blockH * 0.5f;
+                drawCircularGauge(rt, D2D1::Point2F(gaugeCx, gaugeCy),
+                                   gaugeR, utilFraction,
+                                   gaugeFillBrush);
+
+                // "GPU UTIL" / "CPU UTIL" label just left of the gauge.
+                const wchar_t* utilLabel =
+                    (title && title[0] == L'G') ? L"GPU UTIL" : L"CPU UTIL";
+                const D2D1_RECT_F utilLabelRect = D2D1::RectF(
+                    tempLabelX + 100.0f, blockY,
+                    gaugeCx - gaugeR - 10.0f, blockY + 22.0f);
+                drawWide(rt, utilLabel, m_fmtTinyLabelLeft.Get(),
+                          utilLabelRect, m_brushTextLabel.Get());
+
+                // Percentage text inside the gauge.
+                const D2D1_RECT_F gaugePctRect = D2D1::RectF(
+                    gaugeCx - gaugeR, gaugeCy - gaugeR * 0.6f,
+                    gaugeCx + gaugeR, gaugeCy + gaugeR * 0.6f);
+                std::string pctWithSign = utilValue + "%";
+                drawAscii(rt, pctWithSign, m_fmtGaugePct.Get(),
+                           gaugePctRect, m_brushTextWhite.Get());
+            }
+
+            // -------- Icons + gauge primitives ------------------------------
+            //
+            // Chip icon: square outline with three "legs" sticking out
+            // of each side (5-leg pattern reads as a microcontroller
+            // package at this size). All rendered with simple
+            // FillRectangle / DrawRectangle calls — no path geometry.
+            void drawChipIcon(ID2D1RenderTarget* rt, float x, float y,
+                               float size) const {
+                const float legL = 3.0f;
+                const float legW = 2.0f;
+                ID2D1Brush* stroke = m_brushIconStroke.Get();
+
+                // Main body (outline).
+                rt->DrawRectangle(
+                    D2D1::RectF(x + legL, y + legL,
+                                 x + size - legL, y + size - legL),
+                    stroke, 1.2f);
+                // Inner "die" (small filled square).
+                rt->FillRectangle(
+                    D2D1::RectF(x + size * 0.35f, y + size * 0.35f,
+                                 x + size * 0.65f, y + size * 0.65f),
+                    stroke);
+                // Legs — three on each side.
+                const float bodyT = y + legL;
+                const float bodyB = y + size - legL;
+                const float bodyL = x + legL;
+                const float bodyR = x + size - legL;
+                for (int i = 0; i < 3; ++i) {
+                    const float t01 = (static_cast<float>(i) + 1.0f) / 4.0f;
+                    const float yPos = y + size * t01;
+                    rt->FillRectangle(
+                        D2D1::RectF(x, yPos - legW * 0.5f,
+                                     bodyL, yPos + legW * 0.5f), stroke);
+                    rt->FillRectangle(
+                        D2D1::RectF(bodyR, yPos - legW * 0.5f,
+                                     x + size, yPos + legW * 0.5f), stroke);
+                    const float xPos = x + size * t01;
+                    rt->FillRectangle(
+                        D2D1::RectF(xPos - legW * 0.5f, y,
+                                     xPos + legW * 0.5f, bodyT), stroke);
+                    rt->FillRectangle(
+                        D2D1::RectF(xPos - legW * 0.5f, bodyB,
+                                     xPos + legW * 0.5f, y + size), stroke);
+                }
+            }
+
+            // Thermometer icon: rounded-rect "stem" with a circular
+            // "bulb" at the bottom. Both filled with the supplied
+            // colour (red for GPU/CPU temp variants). A thin outline
+            // outlines the stem so the icon reads against dark
+            // backgrounds.
+            void drawThermometerIcon(ID2D1RenderTarget* rt, float x, float y,
+                                       float w, float h,
+                                       ID2D1Brush* fill) const {
+                const float bulbR = w * 0.95f;
+                const float stemW = w * 0.55f;
+                const float stemX = x + (w - stemW) * 0.5f;
+                const float stemTop = y;
+                const float stemBottom = y + h - bulbR * 1.4f;
+
+                // Stem (outline + inner fill).
+                const D2D1_ROUNDED_RECT stem = D2D1::RoundedRect(
+                    D2D1::RectF(stemX, stemTop,
+                                 stemX + stemW, stemBottom + 4.0f),
+                    stemW * 0.5f, stemW * 0.5f);
+                rt->FillRoundedRectangle(stem, fill);
+                rt->DrawRoundedRectangle(stem, m_brushIconStroke.Get(), 1.0f);
+
+                // Bulb.
+                const D2D1_ELLIPSE bulb = D2D1::Ellipse(
+                    D2D1::Point2F(stemX + stemW * 0.5f, stemBottom + bulbR * 0.4f),
+                    bulbR, bulbR);
+                rt->FillEllipse(bulb, fill);
+                rt->DrawEllipse(bulb, m_brushIconStroke.Get(), 1.0f);
+            }
+
+            // Circular utilisation gauge — a "C-shape" ring drawn as
+            // a 270° arc, with the BG ring under the FILL arc to make
+            // the unfilled portion legible. The arc spans from 135°
+            // to 45° (screen coords, Y-down) going clockwise through
+            // the top.
+            void drawCircularGauge(ID2D1RenderTarget* rt,
+                                     D2D1_POINT_2F center, float radius,
+                                     float fraction,
+                                     ID2D1Brush* fillBrush) const {
+                fraction = std::clamp(fraction, 0.0f, 1.0f);
+                const float strokeWidth = 6.0f;
+                constexpr float kStartDeg  = 135.0f;
+                constexpr float kSweepFull = 270.0f;
+                drawArcPath(rt, center, radius, kStartDeg, kSweepFull,
+                             m_brushGaugeBg.Get(), strokeWidth);
+                if (fraction > 0.0f) {
+                    drawArcPath(rt, center, radius, kStartDeg,
+                                 kSweepFull * fraction,
+                                 fillBrush, strokeWidth);
+                }
+            }
+
+            void drawArcPath(ID2D1RenderTarget* rt, D2D1_POINT_2F center,
+                              float radius, float startDeg, float sweepDeg,
+                              ID2D1Brush* brush, float strokeWidth) const {
+                if (sweepDeg <= 0.0f) return;
+                constexpr float kPi = 3.14159265358979323846f;
+                const float startRad = startDeg * kPi / 180.0f;
+                const float endRad   = (startDeg + sweepDeg) * kPi / 180.0f;
+                const D2D1_POINT_2F startPt = D2D1::Point2F(
+                    center.x + radius * std::cos(startRad),
+                    center.y + radius * std::sin(startRad));
+                const D2D1_POINT_2F endPt = D2D1::Point2F(
+                    center.x + radius * std::cos(endRad),
+                    center.y + radius * std::sin(endRad));
+
+                ComPtr<ID2D1PathGeometry> path;
+                if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
+                    return;
+                }
+                ComPtr<ID2D1GeometrySink> sink;
+                if (FAILED(path->Open(sink.GetAddressOf()))) return;
+                sink->BeginFigure(startPt, D2D1_FIGURE_BEGIN_HOLLOW);
+                D2D1_ARC_SEGMENT arc{};
+                arc.point = endPt;
+                arc.size = D2D1::SizeF(radius, radius);
+                arc.rotationAngle = 0.0f;
+                arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+                arc.arcSize = (sweepDeg > 180.0f)
+                    ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+                sink->AddArc(arc);
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                sink->Close();
+                rt->DrawGeometry(path.Get(), brush, strokeWidth);
+            }
+
+            // Panel background — slightly raised dark-blue panel with
+            // a 1-px separator stroke on the inside. Used for the
+            // header, both frametime panels, and the bottom row pair.
+            void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
+                              float r, float b) const {
+                const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
+                    D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
+                rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
+                rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
+            }
+
+            // -------- Members -----------------------------------------------
             ComPtr<ID2D1Factory>      m_d2dFactory;
             ComPtr<IDWriteFactory>    m_dwriteFactory;
-            ComPtr<IDWriteTextFormat> m_textFormat;
-            // Brushes bound to the owning renderer's D2D RT. Created
-            // once via initBrushes() right after the RT is created.
-            ComPtr<ID2D1SolidColorBrush> m_textBrush;
-            ComPtr<ID2D1SolidColorBrush> m_greenBrush;
-            ComPtr<ID2D1SolidColorBrush> m_yellowBrush;
-            ComPtr<ID2D1SolidColorBrush> m_redBrush;
-            ComPtr<ID2D1SolidColorBrush> m_budgetLineBrush;
-            // Formatting cache. paint() refreshes the row strings only
+            // Text formats — one per (font, size, alignment) combo
+            // the layout uses. All immutable post-init, so paint()
+            // never allocates a format.
+            ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
+            ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
+            ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67"
+            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7", "°C", "ms"
+            ComPtr<IDWriteTextFormat> m_fmtGaugePct;         // "92%"
+            ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "P95"
+            ComPtr<IDWriteTextFormat> m_fmtTinyLabelLeft;    // "TEMP", "GPU UTIL"
+            ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
+
+            // Brushes — the 12-colour palette.
+            ComPtr<ID2D1SolidColorBrush> m_brushBg;
+            ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
+            ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
+            ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
+            ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
+            ComPtr<ID2D1SolidColorBrush> m_brushTextLabel;
+            ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
+            ComPtr<ID2D1SolidColorBrush> m_brushGpuTeal;
+            ComPtr<ID2D1SolidColorBrush> m_brushCpuBlue;
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeCyan;
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeBg;
+            ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
+            ComPtr<ID2D1SolidColorBrush> m_brushIconStroke;
+            ComPtr<ID2D1SolidColorBrush> m_brushThermRed;
+            ComPtr<ID2D1SolidColorBrush> m_brushThermBlue;
+            // Dashed stroke style for the grid lines.
+            ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
+
+            // Formatting cache. paint() refreshes the strings only
             // when m_cachedSnapshotVersion != snap.version — typically
             // ~10× per second on a 144 Hz HMD, not 144×. Not `mutable`
             // because paint() is already non-const (it mutates this
             // cache by design).
-            std::vector<OverlayRow> m_cachedRows;
-            uint64_t                m_cachedSnapshotVersion = 0;
+            OverlayDisplayValues m_cachedValues;
+            uint64_t             m_cachedSnapshotVersion = 0;
         };
 
         // -------- D3D11 native renderer --------------------------------------

@@ -343,6 +343,131 @@ TEST_CASE("OverlayAggregator: respects qpcFrequency when converting ticks → ns
 // =============================================================================
 
 // =============================================================================
+// FPS percentiles (P95 / P99) — computed from a 5s sliding ring of
+// frame_total_ns samples, sorted on each publish. The contract:
+//
+//   fps_p95 = FPS such that 95% of frames hit AT LEAST this value
+//             (the slow 5% drop below)
+//   fps_p99 = FPS such that 99% of frames hit AT LEAST this value
+//             (the worst 1% drop below)
+//
+// Frametime is sorted ASCENDING; fps_p95 = 1e9 / frametime[at ascending
+// index 95%]. Smaller percentile-FPS = worse N% of frames.
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: P95 / P99 default to 0 before any publish") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(0.0f));
+    CHECK(agg.snapshot().fps_p99 == doctest::Approx(0.0f));
+}
+
+TEST_CASE("OverlayAggregator: P95/P99 reflect frame_total_ns distribution") {
+    // Push 100 frames, all at exactly 11.111 ms (= 90 FPS). Every
+    // frame is the same, so P95 and P99 of FPS are both exactly 90.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    constexpr int64_t kFrameNs = 11'111'111;
+    for (int i = 0; i < 100; ++i) {
+        agg.pushFrame(makeRecord(int64_t(i) * kFrameNs,
+                                   4'000'000, 5'000'000,
+                                   kFrameNs, kFrameNs, 64, 55));
+    }
+    // Span = 100 × 11.1 ms ≈ 1.1 s — multiple refresh ticks have fired.
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(90.0f).epsilon(0.01));
+    CHECK(agg.snapshot().fps_p99 == doctest::Approx(90.0f).epsilon(0.01));
+}
+
+TEST_CASE("OverlayAggregator: P99 < P95 < FPS_AVG when stutters present") {
+    // 95 frames at 11.111 ms (90 FPS) + 5 frames at 33.333 ms (30 FPS).
+    // The 5 slow frames are the worst 5%, so:
+    //   fps_avg ≈ (95 × 90 + 5 × 30) / 100 = (8550 + 150) / 100 = 87 FPS
+    //     But this is the harmonic mean equivalent because fps_avg
+    //     uses mean(frametime), not mean(fps). Mean frametime =
+    //     (95 × 11.111 + 5 × 33.333) / 100 ≈ 12.222 ms → 81.8 FPS.
+    //   fps_p95 = the slowest 5% boundary → exactly at the 30 FPS
+    //     transition. sorted_ascending[at 95%] indexes the first slow
+    //     frame → 1e9 / 33.333ms = 30 FPS.
+    //   fps_p99 = the worst 1% → also 30 FPS in this dataset (since
+    //     all 5 slow frames are equally slow).
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    constexpr int64_t kFastNs = 11'111'111;   // 90 FPS
+    constexpr int64_t kSlowNs = 33'333'333;   // 30 FPS
+    int64_t cumQpc = 0;
+    for (int i = 0; i < 95; ++i) {
+        cumQpc += kFastNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kFastNs, kFastNs, 64, 55));
+    }
+    for (int i = 0; i < 5; ++i) {
+        cumQpc += kSlowNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kSlowNs, kSlowNs, 64, 55));
+    }
+    REQUIRE(agg.snapshot().valid);
+    const float p95 = agg.snapshot().fps_p95;
+    const float p99 = agg.snapshot().fps_p99;
+    const float avg = agg.snapshot().fps_avg;
+    // The 5 slow frames sit at the END of the ascending-frametime
+    // sort, so P95 / P99 land in the slow region. Both should read
+    // ~30 FPS (the slow boundary), well below the 81.8 FPS average.
+    CHECK(p95 < avg);
+    CHECK(p99 <= p95);
+    CHECK(p95 == doctest::Approx(30.0f).epsilon(0.05));
+    CHECK(p99 == doctest::Approx(30.0f).epsilon(0.05));
+}
+
+TEST_CASE("OverlayAggregator: P95/P99 ignore frame_total_ns=0 first-frame sentinels") {
+    // First-frame sentinels (frame_total=0) would map to infinite FPS
+    // and corrupt the percentile estimate. The aggregator drops them
+    // from the ring.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    // 50 sentinel frames (frame_total=0) — must not enter the ring.
+    for (int i = 0; i < 50; ++i) {
+        agg.pushFrame(makeRecord(int64_t(i) * 11'111'111LL,
+                                   4'000'000, 5'000'000,
+                                   /*frame_total=*/0, 11'111'111, 64, 55));
+    }
+    // 50 real frames at 11.111 ms.
+    for (int i = 0; i < 50; ++i) {
+        agg.pushFrame(makeRecord(int64_t(50 + i) * 11'111'111LL,
+                                   4'000'000, 5'000'000,
+                                   11'111'111, 11'111'111, 64, 55));
+    }
+    REQUIRE(agg.snapshot().valid);
+    // P95 must be 90 FPS — if the sentinels had entered the ring at
+    // their "infinite FPS" interpretation, the slow 5% boundary would
+    // shift wildly.
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(90.0f).epsilon(0.01));
+}
+
+TEST_CASE("OverlayAggregator: P95/P99 window cap at 720 samples") {
+    // The percentile ring is 5 s @ 144 Hz = 720 samples. After 1000
+    // frames at varied rates, only the latest 720 should influence
+    // the percentiles. Push 300 slow frames, then 720 fast frames —
+    // the slow ones must have rotated out of the ring entirely.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    int64_t cumQpc = 0;
+    constexpr int64_t kSlowNs = 33'333'333;
+    constexpr int64_t kFastNs = 6'944'444;   // 144 FPS
+    for (int i = 0; i < 300; ++i) {
+        cumQpc += kSlowNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kSlowNs, kSlowNs, 64, 55));
+    }
+    for (int i = 0; i < 720; ++i) {
+        cumQpc += kFastNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kFastNs, kFastNs, 64, 55));
+    }
+    REQUIRE(agg.snapshot().valid);
+    // Slow frames flushed — P95 / P99 reflect only the recent fast
+    // frames. With the 720-sample ring fully populated by the last
+    // 720 fast frames, all samples are 144 FPS.
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(144.0f).epsilon(0.05));
+    CHECK(agg.snapshot().fps_p99 == doctest::Approx(144.0f).epsilon(0.05));
+}
+
+// =============================================================================
 // GPU telemetry — pushGpuTelemetry latches the latest reading and the next
 // publish copies it into the snapshot. NaN / 0 sentinels propagate through
 // unchanged so the renderer can treat "no source available" specially.
