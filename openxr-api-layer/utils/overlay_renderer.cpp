@@ -67,10 +67,10 @@ namespace openxr_api_layer::detail {
 
     namespace {
 
-        // -------- Layout constants (fpsVR redesign, 720×540) ----------------
+        // -------- Layout constants (fpsVR redesign, 720×480) ----------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 720×540 (4:3) packs
+        // QUAD in 3D scales, not the resolution. 720×480 (3:2) packs
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99, 4 cells)
         //   - GPU FRAMETIME MS panel with histogram + current value
@@ -78,24 +78,32 @@ namespace openxr_api_layer::detail {
         //   - bottom row split into two panels (TEMP & UTILISATION)
         //     each with chip + thermometer icons and a circular gauge
         //
-        // Vertical budget (top → bottom), all in pixels at the
-        // 720×540 native texture resolution:
-        //   kOuterPad           (10) — gap between texture edge and frame
-        //   kFrameStroke         (2) — outer frame line
-        //   kSectionGap          (8) — gap between frame and header
+        // The texture is shorter than the previous 720×540 (4:3) layout
+        // because the frametime panels are now 90 px each (was 160→120
+        // in earlier revisions). With less vertical real estate, the
+        // histogram strip is ~54 px after the title row — short
+        // enough that a normal frame at ~50 % budget fills most of
+        // the strip visually, no empty top region.
+        //
+        // Vertical budget (top → bottom), all in pixels at native
+        // texture resolution:
+        //   kOuterPad           (10)
+        //   kFrameStroke         (2)
+        //   inner padding        (4)
         //   kHeaderHeight       (66)
-        //   kSectionGap          (8)
-        //   kFrametimeHeight   (160) — GPU panel (header strip + histogram)
-        //   kSectionGap          (8)
-        //   kFrametimeHeight   (160) — CPU panel
-        //   kSectionGap          (8)
-        //   kBottomHeight      (102) — temp & util row
-        //   kSectionGap          (8)
+        //   kSectionGap         (14)
+        //   kFrametimeHeight    (90) — GPU panel
+        //   kSectionGap         (14)
+        //   kFrametimeHeight    (90) — CPU panel
+        //   kSectionGap         (14)
+        //   kBottomHeight      (130)
+        //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 542 ≈ 540 (1px rounding tolerance per side)
+        //   Total = 450, with ~30 px of breathing-room slack against
+        //   the 480-px texture height.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 540;
+        constexpr int32_t kTexH = 480;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
@@ -103,10 +111,12 @@ namespace openxr_api_layer::detail {
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
         constexpr float kHeaderHeight     = 66.0f;
-        constexpr float kFrametimeHeight  = 120.0f;  // shorter than before — bar strip
-                                                      // height ≈ 84 px after the title
-                                                      // row, matches the visual density
-                                                      // of the reference design
+        constexpr float kFrametimeHeight  = 90.0f;   // strip height ≈ 54 px after the
+                                                      // title row. Sized so that a normal
+                                                      // frame at ~50 % budget fills most
+                                                      // of the strip — eliminates the
+                                                      // empty top-half users observed
+                                                      // in light-load scenarios.
         constexpr float kBottomHeight     = 130.0f;  // tall enough for the chip + thermo
                                                       // + 22-px gauge font + label row
 

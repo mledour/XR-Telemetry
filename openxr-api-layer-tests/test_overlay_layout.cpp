@@ -229,15 +229,19 @@ TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
     CHECK(g.pos_z < 0.0f);      // in front
     CHECK(g.width_m > 0.0f);
     CHECK(g.height_m > 0.0f);
-    // 4:3 base dimensions tuned for the new 720×540 redesign.
+    // 3:2 base dimensions tuned for the 720×480 redesign — frametime
+    // panels were shrunk from 120 → 90 px to eliminate the empty top
+    // half of the histogram strip under light load; texture height
+    // came down proportionally (540 → 480), aspect ratio shifted
+    // from 4:3 to 3:2.
     CHECK(g.width_m  == doctest::Approx(0.28f).epsilon(0.001));
-    CHECK(g.height_m == doctest::Approx(0.21f).epsilon(0.001));
+    CHECK(g.height_m == doctest::Approx(0.187f).epsilon(0.001));
 }
 
-TEST_CASE("geometryForPosition: aspect ratio is 4:3 (texture's native)") {
+TEST_CASE("geometryForPosition: aspect ratio is 3:2 (texture's native)") {
     const auto g = geometryForPosition("head_top_right", 1.0f);
     const float aspect = g.width_m / g.height_m;
-    CHECK(aspect == doctest::Approx(720.0f / 540.0f).epsilon(0.01));
+    CHECK(aspect == doctest::Approx(720.0f / 480.0f).epsilon(0.01));
 }
 
 TEST_CASE("geometryForPosition: head_top_left mirrors X") {

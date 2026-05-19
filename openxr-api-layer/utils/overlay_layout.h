@@ -210,10 +210,9 @@ namespace openxr_api_layer::detail {
         float pos_y;
         float pos_z;  // negative = in front of the user
         // Quad dimensions in metres at the chosen distance. The 0.28 ×
-        // 0.21 m default at z = -1 m is ~16° × 12° of FOV — bigger
-        // than the previous fpsVR-style HUD (320×116, ~11° × 4°)
-        // because the redesigned 720×540 texture packs more sections
-        // (header bar + two frametime panels + bottom temp/util row).
+        // 0.187 m default at z = -1 m is ~16° × 11° of FOV. Matches
+        // the 720×480 (3:2) texture's native aspect so pixels stay
+        // square in the HMD with no anisotropic stretching.
         float width_m;
         float height_m;
     };
@@ -226,14 +225,13 @@ namespace openxr_api_layer::detail {
     // [0.5, 2.0] by parseSettings).
     inline OverlayGeometry geometryForPosition(const std::string& position,
                                                 float scale) noexcept {
-        // 4:3 aspect to match the 720×540 texture. 0.28 × 0.21 m at
-        // 1 m view-space distance ≈ 16° × 12° angular size — bigger
-        // than the old 0.20 × 0.091 m strip but still well under the
-        // FOV waste of a "fullscreen" HUD. Corner offsets bumped
-        // proportionally so the quad's CORNER (not centre) still
-        // lands near the previous off-axis target.
+        // 3:2 aspect to match the 720×480 texture. 0.28 × 0.187 m at
+        // 1 m view-space distance ≈ 16° × 11° angular size. Pixel
+        // density stays square (720/480 = 0.28/0.187 = 1.5). Corner
+        // offsets bumped proportionally so the quad's CORNER (not
+        // centre) still lands near the previous off-axis target.
         constexpr float kBaseWidth  = 0.28f;
-        constexpr float kBaseHeight = 0.21f;
+        constexpr float kBaseHeight = 0.187f;
         constexpr float kZ          = -1.0f;          // 1 m forward
         constexpr float kCornerOffX = 0.22f;
         constexpr float kCornerOffY = 0.14f;
