@@ -378,38 +378,49 @@ TEST_CASE("OverlayAggregator: P95/P99 reflect frame_total_ns distribution") {
 }
 
 TEST_CASE("OverlayAggregator: P99 < P95 < FPS_AVG when stutters present") {
-    // 95 frames at 11.111 ms (90 FPS) + 5 frames at 33.333 ms (30 FPS).
-    // The 5 slow frames are the worst 5%, so:
-    //   fps_avg ≈ (95 × 90 + 5 × 30) / 100 = (8550 + 150) / 100 = 87 FPS
-    //     But this is the harmonic mean equivalent because fps_avg
-    //     uses mean(frametime), not mean(fps). Mean frametime =
-    //     (95 × 11.111 + 5 × 33.333) / 100 ≈ 12.222 ms → 81.8 FPS.
-    //   fps_p95 = the slowest 5% boundary → exactly at the 30 FPS
-    //     transition. sorted_ascending[at 95%] indexes the first slow
-    //     frame → 1e9 / 33.333ms = 30 FPS.
-    //   fps_p99 = the worst 1% → also 30 FPS in this dataset (since
-    //     all 5 slow frames are equally slow).
+    // 90 frames at 11.111 ms (90 FPS) + 10 frames at 33.333 ms (30 FPS).
+    // 10 % stutter rate — slightly above the 5 % P95 threshold so the
+    // boundary index lands ROBUSTLY in the slow region regardless of
+    // tiny off-by-one swings in N (the kind of swing you get when a
+    // forced-publish push at the end adds one more sample to the
+    // ring).
+    //
+    // Why force a final publish: the aggregator publishes when the
+    // delta since last refresh crosses 100 ms. With 11.111-ms /
+    // 33.333-ms inputs, the LAST publish naturally lands a few frames
+    // before the final push (delta = 99,999,999 ns just shy of the
+    // threshold on the very last frame). To make the snapshot
+    // reflect the FULL distribution we explicitly push one extra
+    // frame with a 200-ms QPC gap — way over the refresh interval —
+    // which guarantees a publish whose ring state has all 100 + 1
+    // samples.
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     constexpr int64_t kFastNs = 11'111'111;   // 90 FPS
     constexpr int64_t kSlowNs = 33'333'333;   // 30 FPS
     int64_t cumQpc = 0;
-    for (int i = 0; i < 95; ++i) {
+    for (int i = 0; i < 90; ++i) {
         cumQpc += kFastNs;
         agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
                                    kFastNs, kFastNs, 64, 55));
     }
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 10; ++i) {
         cumQpc += kSlowNs;
         agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
                                    kSlowNs, kSlowNs, 64, 55));
     }
+    // Forced-publish push — kicks the aggregator to publish with the
+    // ring carrying 91 fast + 10 slow = 101 samples.
+    cumQpc += 200'000'000;
+    agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                               kFastNs, kFastNs, 64, 55));
+
     REQUIRE(agg.snapshot().valid);
     const float p95 = agg.snapshot().fps_p95;
     const float p99 = agg.snapshot().fps_p99;
     const float avg = agg.snapshot().fps_avg;
-    // The 5 slow frames sit at the END of the ascending-frametime
-    // sort, so P95 / P99 land in the slow region. Both should read
-    // ~30 FPS (the slow boundary), well below the 81.8 FPS average.
+    // sorted_ascending(frametime) has 91 fast at idx 0..90, 10 slow
+    // at idx 91..100. integer index 950*101/1000 = 95 → slow region.
+    // 990*101/1000 = 99 → slow region. Both percentiles read 30 FPS.
     CHECK(p95 < avg);
     CHECK(p99 <= p95);
     CHECK(p95 == doctest::Approx(30.0f).epsilon(0.05));
