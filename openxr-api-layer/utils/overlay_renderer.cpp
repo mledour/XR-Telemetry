@@ -140,13 +140,11 @@ namespace openxr_api_layer::detail {
         constexpr float kFontMs           = 22.0f;  // "6.7 ms" current value
         constexpr float kFontBigNumber    = 42.0f;  // "142" FPS number
         constexpr float kFontAccentNumber = 36.0f;  // "138", "124", "108"
-        constexpr float kFontTemp         = 30.0f;  // "67 °C"
-        // Gauge percentage. 22-px keeps "100%" (4 glyphs) inside the
-        // 30-px-radius ring — at 28 px Consolas Bold the "100%" string
-        // measured ~68 px wide and overflowed the 60-px-wide inner
-        // text rect, clipping the trailing digit / `%` against the
-        // ring stroke.
-        constexpr float kFontGaugePct     = 22.0f;
+        constexpr float kFontTemp         = 30.0f;  // "67 °C" / "92 %" in the
+                                                     // bottom panel TEMP / LOAD
+                                                     // columns. The gauge font
+                                                     // was retired alongside the
+                                                     // circular gauge.
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -213,16 +211,16 @@ namespace openxr_api_layer::detail {
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
                 if (!makeFormat(L"Consolas", kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
+                // m_fmtTemp is now CENTER-aligned: the bottom panel
+                // stacks each value (TEMP / LOAD) centred under its
+                // column label, no longer pinned to the left of a
+                // thermometer icon.
                 if (!makeFormat(L"Consolas", kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
-                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTemp)) return false;
+                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
                 if (!makeFormat(L"Consolas", kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(L"Consolas", kFontGaugePct,     DWRITE_FONT_WEIGHT_BOLD,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtGaugePct)) return false;
                 if (!makeFormat(L"Segoe UI", kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(L"Segoe UI", kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTinyLabelLeft)) return false;
                 if (!makeFormat(L"Segoe UI", kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
                 return true;
@@ -261,13 +259,13 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushCpuBlue)) return false;    // #5BB8E8
                 // Warning-tier colours used by BOTH the histogram bars
                 // (per-bar tier from barVisualForSample) and the
-                // circular gauge fill (overall utilisation tier from
+                // bottom panel LOAD value text (overall tier from
                 // gaugeTierForUtilisation). Same palette = coherent
-                // "X% headroom remaining" signal across the panel.
+                // "X% headroom remaining" signal across the HUD. The
+                // healthy-tier load colour reuses m_brushAccentCyan
+                // (same #1FD9E8 as the header accent numbers).
                 if (!make(D2D1::ColorF(1.000f, 0.553f, 0.000f, 1.00f), m_brushOrange)) return false;     // #FF8D00 — warning
                 if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C — critical
-                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushGaugeCyan)) return false;  // healthy default
-                if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushGaugeBg)) return false;
                 // Dashed grid lines inside the histogram panels.
                 if (!make(D2D1::ColorF(0.220f, 0.250f, 0.300f, 0.55f), m_brushGridDash)) return false;
                 // Budget reference line — brighter than the grid so
@@ -275,10 +273,6 @@ namespace openxr_api_layer::detail {
                 // with moderate alpha; bars crossing it on a stutter
                 // render visibly over it (intentional overlap).
                 if (!make(D2D1::ColorF(0.90f, 0.92f, 0.95f, 0.45f), m_brushBudgetLine)) return false;
-                // Icon stroke. Thermometer fill is the same brush as
-                // the gauge — picked dynamically from the util tier
-                // in drawBottomPanel (no separate brushes needed).
-                if (!make(D2D1::ColorF(0.78f, 0.82f, 0.87f, 0.85f), m_brushIconStroke)) return false;
 
                 // Stroke style for the dashed grid lines. ID2D1Strok
                 // Style is shareable; we cache the one we need.
@@ -390,13 +384,13 @@ namespace openxr_api_layer::detail {
                 drawBottomPanel(rt, innerL, bottomY,
                                  bottomMid - bottomMidGap * 0.5f,
                                  bottomY + kBottomHeight,
-                                 L"GPU TEMP & UTILISATION",
+                                 L"GPU",
                                  v.gpu_temp_c, v.gpu_util_pct,
                                  v.gpu_util_fraction);
                 drawBottomPanel(rt,
                                  bottomMid + bottomMidGap * 0.5f, bottomY,
                                  innerR, bottomY + kBottomHeight,
-                                 L"CPU TEMP & UTILISATION",
+                                 L"CPU",
                                  v.cpu_temp_c, v.cpu_util_pct,
                                  v.cpu_util_fraction);
 
@@ -535,21 +529,20 @@ namespace openxr_api_layer::detail {
                 drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
                           m_brushTextLabel.Get());
 
-                // Current value (top-right) — number + cyan "ms" suffix.
-                // The number is right-aligned to leave room for the
-                // "ms" suffix drawn separately.
-                const float msSuffixW = 36.0f;
+                // Current value (top-right) — "X.X ms" rendered as a
+                // single right-aligned string in one font / one rect.
+                // Drawing the "ms" suffix in a separate rect with a
+                // different font caused visible misalignment between
+                // the GPU and CPU panels (different paragraph centres
+                // at different sizes); merging into one string makes
+                // the right edges and baselines automatically
+                // identical across both panels.
+                const std::string valueWithMs = currentValue + " ms";
                 const D2D1_RECT_F valueRect = D2D1::RectF(
-                    r - kSectionInnerPad - msSuffixW - 96.0f, titleT - 4.0f,
-                    r - kSectionInnerPad - msSuffixW - 4.0f,
-                    titleB + 6.0f);
-                drawAscii(rt, currentValue, m_fmtMsValue.Get(), valueRect,
+                    r - kSectionInnerPad - 140.0f, titleT - 4.0f,
+                    r - kSectionInnerPad,           titleB + 6.0f);
+                drawAscii(rt, valueWithMs, m_fmtMsValue.Get(), valueRect,
                            m_brushAccentCyan.Get());
-                const D2D1_RECT_F msRect = D2D1::RectF(
-                    r - kSectionInnerPad - msSuffixW, titleT + 6.0f,
-                    r - kSectionInnerPad, titleB + 6.0f);
-                drawWide(rt, L"ms", m_fmtTinyLabelLeft.Get(), msRect,
-                          m_brushAccentCyan.Get());
 
                 // Histogram region — below the title row, with inner
                 // padding on all sides.
@@ -646,249 +639,99 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // -------- Bottom panel (TEMP & UTILISATION) ---------------------
+            // -------- Bottom panel (TEMP / LOAD, text-only) -----------------
             //
-            // Layout, left-to-right:
-            //   chip icon | TEMP block | spacer | UTIL block + gauge
+            // Two equally-sized columns, no icons, no gauge. Each
+            // column carries a small uppercase label at the top and
+            // a big numeric value below. The LOAD column's value is
+            // tier-coloured (cyan / orange / red) so the user gets
+            // the headroom signal without needing a graphical
+            // indicator — same colour palette as the histogram bars.
             //
-            //   ┌──┐
-            //   │██│  GPU TEMP & UTILISATION (title, full width)
-            //   └──┘
-            //   ┌─┐                              ┌──────┐
-            //   │█│  TEMP             GPU UTIL  │ 92%  │
-            //   │█│  67 °C                       │      │
-            //   └─┘                              └──────┘
+            //   ┌──────────────────────────────────────────────────┐
+            //   │                                                  │
+            //   │   GPU TEMP              GPU LOAD                 │
+            //   │   67 °C                  92 %                    │
+            //   │                                                  │
+            //   └──────────────────────────────────────────────────┘
+            //
+            // `prefix` is L"GPU" or L"CPU"; the labels are built by
+            // appending L" TEMP" / L" LOAD".
             void drawBottomPanel(ID2D1RenderTarget* rt, float l, float t,
                                   float r, float b,
-                                  const wchar_t* title,
+                                  const wchar_t* prefix,
                                   const std::string& tempValue,
                                   const std::string& utilValue,
                                   float utilFraction) const {
                 drawPanelBg(rt, l, t, r, b);
 
-                // Dynamic colour from the utilisation tier. Same
-                // palette as the histogram bars so an orange bar
-                // and an orange gauge tell the same story. The
-                // thermometer icon's fill follows the gauge — both
-                // visual elements turning red signals "this side is
-                // pinned and hot".
+                // Tier colour for the LOAD value (text only — the
+                // gauge was retired). Same palette + thresholds as
+                // the histogram bars: < 80 % = cyan default, 80–89 %
+                // orange warning, ≥ 90 % red critical. The TEMP value
+                // stays white because we don't have a thermal-tier
+                // contract yet (would require knowing TjMax per SKU).
                 const BarTier tier = gaugeTierForUtilisation(utilFraction);
-                ID2D1Brush* gaugeFillBrush = m_brushGaugeCyan.Get();
-                if (tier == BarTier::Red)         gaugeFillBrush = m_brushGaugeRed.Get();
-                else if (tier == BarTier::Orange) gaugeFillBrush = m_brushOrange.Get();
-                ID2D1Brush* thermFillBrush = gaugeFillBrush;
+                ID2D1Brush* loadBrush = m_brushAccentCyan.Get();
+                if (tier == BarTier::Red)         loadBrush = m_brushGaugeRed.Get();
+                else if (tier == BarTier::Orange) loadBrush = m_brushOrange.Get();
 
-                // Title (top-centre-left, just past the chip icon).
-                const float chipSize = 22.0f;
-                const float chipX = l + kSectionInnerPad;
-                const float chipY = t + 8.0f;
-                drawChipIcon(rt, chipX, chipY, chipSize);
+                const float midX = (l + r) * 0.5f;
+                // Vertical separator between the two columns. Same
+                // brush as the panel inner stroke so it reads as a
+                // subtle column divider, not a hard divider.
+                rt->DrawLine(
+                    D2D1::Point2F(midX, t + 14.0f),
+                    D2D1::Point2F(midX, b - 14.0f),
+                    m_brushSeparator.Get(), 1.0f);
 
-                const D2D1_RECT_F titleRect = D2D1::RectF(
-                    chipX + chipSize + 8.0f, t + 6.0f,
-                    r - kSectionInnerPad, t + 6.0f + kHistoTitleH);
-                drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
+                // Build the column labels by concatenating the
+                // prefix. wstring is mandatory because the panel
+                // labels stay ASCII (no degree sign), but the
+                // approach mirrors the temp-value path below.
+                std::wstring tempLabel = std::wstring(prefix) + L" TEMP";
+                std::wstring loadLabel = std::wstring(prefix) + L" LOAD";
+
+                // Vertical positions inside the panel:
+                //   labelY : ~25 % from top  — the small label sits
+                //            here in m_fmtTinyLabelCenter (14 px)
+                //   valueY : ~50 % from top  — the value rect
+                //            extends down to the panel bottom and
+                //            paragraph-centres in m_fmtTemp (30 px)
+                //   The value font's intrinsic ascent + the
+                //   paragraph-centre placement gives the visual
+                //   "label on top, value below" stack the design
+                //   asks for, with the value visually anchored to
+                //   the panel's vertical centre-of-mass.
+                const float labelY = t + (b - t) * 0.18f;
+                const float valueY = t + (b - t) * 0.40f;
+
+                // --- Left column: <prefix> TEMP / "67 °C" ---
+                drawWide(rt, tempLabel.c_str(), m_fmtTinyLabelCenter.Get(),
+                          D2D1::RectF(l, labelY, midX, labelY + 22.0f),
                           m_brushTextLabel.Get());
-
-                // --- Temp block (left half) ---
-                const float blockY = t + 38.0f;
-                const float blockH = b - blockY - 8.0f;
-
-                const float thermW = 14.0f;
-                const float thermH = blockH - 4.0f;
-                const float thermX = l + kSectionInnerPad;
-                const float thermY = blockY + 2.0f;
-                drawThermometerIcon(rt, thermX, thermY, thermW, thermH,
-                                     thermFillBrush);
-
-                const float tempLabelX = thermX + thermW + 8.0f;
-                const D2D1_RECT_F tempLabelRect = D2D1::RectF(
-                    tempLabelX, blockY,
-                    tempLabelX + 60.0f, blockY + 18.0f);
-                drawWide(rt, L"TEMP", m_fmtTinyLabelLeft.Get(),
-                          tempLabelRect, m_brushTextLabel.Get());
-
-                // Temp value + °C suffix. Drawn separately so the
-                // numeric digits align to the same baseline regardless
-                // of digit width.
-                const D2D1_RECT_F tempValueRect = D2D1::RectF(
-                    tempLabelX, blockY + 18.0f,
-                    tempLabelX + 64.0f, b - 4.0f);
-                drawAscii(rt, tempValue, m_fmtTemp.Get(), tempValueRect,
-                           m_brushTextWhite.Get());
-                const D2D1_RECT_F tempUnitRect = D2D1::RectF(
-                    tempLabelX + 56.0f, blockY + 24.0f,
-                    tempLabelX + 96.0f, b - 4.0f);
-                drawWide(rt, L"°C", m_fmtMsValue.Get(),
-                          tempUnitRect, m_brushTextLabel.Get());
-
-                // --- Util block (right half) ---
-                // Gauge radius bumped from 30 → 38 now that the
-                // bottom panel is 130-px tall (was 102). The 76-px
-                // diameter sits comfortably inside the panel with
-                // breathing room for the "GPU UTIL" / "CPU UTIL"
-                // label on the left.
-                const float gaugeR = 38.0f;
-                const float gaugeCx = r - kSectionInnerPad - gaugeR - 2.0f;
-                const float gaugeCy = blockY + blockH * 0.5f;
-                drawCircularGauge(rt, D2D1::Point2F(gaugeCx, gaugeCy),
-                                   gaugeR, utilFraction,
-                                   gaugeFillBrush);
-
-                // "GPU UTIL" / "CPU UTIL" label just left of the gauge.
-                const wchar_t* utilLabel =
-                    (title && title[0] == L'G') ? L"GPU UTIL" : L"CPU UTIL";
-                const D2D1_RECT_F utilLabelRect = D2D1::RectF(
-                    tempLabelX + 100.0f, blockY,
-                    gaugeCx - gaugeR - 10.0f, blockY + 22.0f);
-                drawWide(rt, utilLabel, m_fmtTinyLabelLeft.Get(),
-                          utilLabelRect, m_brushTextLabel.Get());
-
-                // Percentage text inside the gauge. The rect is
-                // INTENTIONALLY wider than the gauge diameter so the
-                // 4-glyph "100%" string fits without the trailing `%`
-                // clipping against the ring stroke. DirectWrite
-                // centres the text inside this rect, so visual
-                // centring is preserved — only the maximum width is
-                // increased.
-                const D2D1_RECT_F gaugePctRect = D2D1::RectF(
-                    gaugeCx - gaugeR * 1.3f, gaugeCy - gaugeR * 0.6f,
-                    gaugeCx + gaugeR * 1.3f, gaugeCy + gaugeR * 0.6f);
-                std::string pctWithSign = utilValue + "%";
-                drawAscii(rt, pctWithSign, m_fmtGaugePct.Get(),
-                           gaugePctRect, m_brushTextWhite.Get());
-            }
-
-            // -------- Icons + gauge primitives ------------------------------
-            //
-            // Chip icon: square outline with three "legs" sticking out
-            // of each side (5-leg pattern reads as a microcontroller
-            // package at this size). All rendered with simple
-            // FillRectangle / DrawRectangle calls — no path geometry.
-            void drawChipIcon(ID2D1RenderTarget* rt, float x, float y,
-                               float size) const {
-                const float legL = 3.0f;
-                const float legW = 2.0f;
-                ID2D1Brush* stroke = m_brushIconStroke.Get();
-
-                // Main body (outline).
-                rt->DrawRectangle(
-                    D2D1::RectF(x + legL, y + legL,
-                                 x + size - legL, y + size - legL),
-                    stroke, 1.2f);
-                // Inner "die" (small filled square).
-                rt->FillRectangle(
-                    D2D1::RectF(x + size * 0.35f, y + size * 0.35f,
-                                 x + size * 0.65f, y + size * 0.65f),
-                    stroke);
-                // Legs — three on each side.
-                const float bodyT = y + legL;
-                const float bodyB = y + size - legL;
-                const float bodyL = x + legL;
-                const float bodyR = x + size - legL;
-                for (int i = 0; i < 3; ++i) {
-                    const float t01 = (static_cast<float>(i) + 1.0f) / 4.0f;
-                    const float yPos = y + size * t01;
-                    rt->FillRectangle(
-                        D2D1::RectF(x, yPos - legW * 0.5f,
-                                     bodyL, yPos + legW * 0.5f), stroke);
-                    rt->FillRectangle(
-                        D2D1::RectF(bodyR, yPos - legW * 0.5f,
-                                     x + size, yPos + legW * 0.5f), stroke);
-                    const float xPos = x + size * t01;
-                    rt->FillRectangle(
-                        D2D1::RectF(xPos - legW * 0.5f, y,
-                                     xPos + legW * 0.5f, bodyT), stroke);
-                    rt->FillRectangle(
-                        D2D1::RectF(xPos - legW * 0.5f, bodyB,
-                                     xPos + legW * 0.5f, y + size), stroke);
+                {
+                    // Temp value uses a wide string so the degree
+                    // sign (U+00B0) is encoded correctly. tempValue
+                    // is ASCII (digits or "--"), so byte-by-byte
+                    // widening + concatenation works.
+                    std::wstring tempWide(tempValue.begin(), tempValue.end());
+                    tempWide += L" °C";
+                    drawWide(rt, tempWide.c_str(), m_fmtTemp.Get(),
+                              D2D1::RectF(l, valueY, midX, b - 8.0f),
+                              m_brushTextWhite.Get());
                 }
-            }
 
-            // Thermometer icon: rounded-rect "stem" with a circular
-            // "bulb" at the bottom. Both filled with the supplied
-            // colour (red for GPU/CPU temp variants). A thin outline
-            // outlines the stem so the icon reads against dark
-            // backgrounds.
-            void drawThermometerIcon(ID2D1RenderTarget* rt, float x, float y,
-                                       float w, float h,
-                                       ID2D1Brush* fill) const {
-                const float bulbR = w * 0.95f;
-                const float stemW = w * 0.55f;
-                const float stemX = x + (w - stemW) * 0.5f;
-                const float stemTop = y;
-                const float stemBottom = y + h - bulbR * 1.4f;
-
-                // Stem (outline + inner fill).
-                const D2D1_ROUNDED_RECT stem = D2D1::RoundedRect(
-                    D2D1::RectF(stemX, stemTop,
-                                 stemX + stemW, stemBottom + 4.0f),
-                    stemW * 0.5f, stemW * 0.5f);
-                rt->FillRoundedRectangle(stem, fill);
-                rt->DrawRoundedRectangle(stem, m_brushIconStroke.Get(), 1.0f);
-
-                // Bulb.
-                const D2D1_ELLIPSE bulb = D2D1::Ellipse(
-                    D2D1::Point2F(stemX + stemW * 0.5f, stemBottom + bulbR * 0.4f),
-                    bulbR, bulbR);
-                rt->FillEllipse(bulb, fill);
-                rt->DrawEllipse(bulb, m_brushIconStroke.Get(), 1.0f);
-            }
-
-            // Circular utilisation gauge — a "C-shape" ring drawn as
-            // a 270° arc, with the BG ring under the FILL arc to make
-            // the unfilled portion legible. The arc spans from 135°
-            // to 45° (screen coords, Y-down) going clockwise through
-            // the top.
-            void drawCircularGauge(ID2D1RenderTarget* rt,
-                                     D2D1_POINT_2F center, float radius,
-                                     float fraction,
-                                     ID2D1Brush* fillBrush) const {
-                fraction = std::clamp(fraction, 0.0f, 1.0f);
-                const float strokeWidth = 6.0f;
-                constexpr float kStartDeg  = 135.0f;
-                constexpr float kSweepFull = 270.0f;
-                drawArcPath(rt, center, radius, kStartDeg, kSweepFull,
-                             m_brushGaugeBg.Get(), strokeWidth);
-                if (fraction > 0.0f) {
-                    drawArcPath(rt, center, radius, kStartDeg,
-                                 kSweepFull * fraction,
-                                 fillBrush, strokeWidth);
+                // --- Right column: <prefix> LOAD / "92 %" ---
+                drawWide(rt, loadLabel.c_str(), m_fmtTinyLabelCenter.Get(),
+                          D2D1::RectF(midX, labelY, r, labelY + 22.0f),
+                          m_brushTextLabel.Get());
+                {
+                    const std::string loadStr = utilValue + " %";
+                    drawAscii(rt, loadStr, m_fmtTemp.Get(),
+                               D2D1::RectF(midX, valueY, r, b - 8.0f),
+                               loadBrush);
                 }
-            }
-
-            void drawArcPath(ID2D1RenderTarget* rt, D2D1_POINT_2F center,
-                              float radius, float startDeg, float sweepDeg,
-                              ID2D1Brush* brush, float strokeWidth) const {
-                if (sweepDeg <= 0.0f) return;
-                constexpr float kPi = 3.14159265358979323846f;
-                const float startRad = startDeg * kPi / 180.0f;
-                const float endRad   = (startDeg + sweepDeg) * kPi / 180.0f;
-                const D2D1_POINT_2F startPt = D2D1::Point2F(
-                    center.x + radius * std::cos(startRad),
-                    center.y + radius * std::sin(startRad));
-                const D2D1_POINT_2F endPt = D2D1::Point2F(
-                    center.x + radius * std::cos(endRad),
-                    center.y + radius * std::sin(endRad));
-
-                ComPtr<ID2D1PathGeometry> path;
-                if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
-                    return;
-                }
-                ComPtr<ID2D1GeometrySink> sink;
-                if (FAILED(path->Open(sink.GetAddressOf()))) return;
-                sink->BeginFigure(startPt, D2D1_FIGURE_BEGIN_HOLLOW);
-                D2D1_ARC_SEGMENT arc{};
-                arc.point = endPt;
-                arc.size = D2D1::SizeF(radius, radius);
-                arc.rotationAngle = 0.0f;
-                arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
-                arc.arcSize = (sweepDeg > 180.0f)
-                    ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
-                sink->AddArc(arc);
-                sink->EndFigure(D2D1_FIGURE_END_OPEN);
-                sink->Close();
-                rt->DrawGeometry(path.Get(), brush, strokeWidth);
             }
 
             // Panel background — slightly raised dark-blue panel with
@@ -910,11 +753,9 @@ namespace openxr_api_layer::detail {
             // never allocates a format.
             ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
-            ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67"
-            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7", "°C", "ms"
-            ComPtr<IDWriteTextFormat> m_fmtGaugePct;         // "92%"
-            ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "P95"
-            ComPtr<IDWriteTextFormat> m_fmtTinyLabelLeft;    // "TEMP", "GPU UTIL"
+            ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
+            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms"
+            ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
             // Brushes — the 12-colour palette.
@@ -927,13 +768,10 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             ComPtr<ID2D1SolidColorBrush> m_brushGpuTeal;
             ComPtr<ID2D1SolidColorBrush> m_brushCpuBlue;
-            ComPtr<ID2D1SolidColorBrush> m_brushOrange;      // warning tier
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;    // critical tier
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeCyan;   // healthy tier (default)
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeBg;
+            ComPtr<ID2D1SolidColorBrush> m_brushOrange;      // warning tier (≥ 80 % load)
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;    // critical tier (≥ 90 % load)
             ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
             ComPtr<ID2D1SolidColorBrush> m_brushBudgetLine;
-            ComPtr<ID2D1SolidColorBrush> m_brushIconStroke;
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 
