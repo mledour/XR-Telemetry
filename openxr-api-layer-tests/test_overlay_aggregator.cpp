@@ -441,10 +441,18 @@ TEST_CASE("OverlayAggregator: P95/P99 ignore frame_total_ns=0 first-frame sentin
 }
 
 TEST_CASE("OverlayAggregator: P95/P99 window cap at 720 samples") {
-    // The percentile ring is 5 s @ 144 Hz = 720 samples. After 1000
-    // frames at varied rates, only the latest 720 should influence
-    // the percentiles. Push 300 slow frames, then 720 fast frames —
-    // the slow ones must have rotated out of the ring entirely.
+    // The percentile ring is 5 s @ 144 Hz = 720 samples. We push
+    // 300 slow frames + many fast frames; the slow ones must rotate
+    // out of the ring entirely by the time the LAST publish fires.
+    //
+    // Sizing: publishes fire every ~15 fast frames (100 ms refresh /
+    // 6.94 ms per fast frame ≈ 14.4 → 15). To guarantee the LAST
+    // publish sees an all-fast ring, the ring must be fully
+    // overwritten with fast frames BEFORE that publish. Frame 1020
+    // is when the 300th fast push overwrites the last slow position;
+    // the next publish lands at frame ~1025. Push 900 fast frames
+    // total — that gives several publishes after the all-fast point,
+    // any of which is the "latest" snapshot the test reads.
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     int64_t cumQpc = 0;
     constexpr int64_t kSlowNs = 33'333'333;
@@ -454,15 +462,15 @@ TEST_CASE("OverlayAggregator: P95/P99 window cap at 720 samples") {
         agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
                                    kSlowNs, kSlowNs, 64, 55));
     }
-    for (int i = 0; i < 720; ++i) {
+    for (int i = 0; i < 900; ++i) {
         cumQpc += kFastNs;
         agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
                                    kFastNs, kFastNs, 64, 55));
     }
     REQUIRE(agg.snapshot().valid);
     // Slow frames flushed — P95 / P99 reflect only the recent fast
-    // frames. With the 720-sample ring fully populated by the last
-    // 720 fast frames, all samples are 144 FPS.
+    // frames. With the 720-sample ring fully populated by fast
+    // samples, all entries are 144 FPS.
     CHECK(agg.snapshot().fps_p95 == doctest::Approx(144.0f).epsilon(0.05));
     CHECK(agg.snapshot().fps_p99 == doctest::Approx(144.0f).epsilon(0.05));
 }
