@@ -288,20 +288,25 @@ namespace openxr_api_layer::detail {
                 //   N=720, p=0.95 → idx 684 (36 frames at idx 684..719)
                 //   N=720, p=0.99 → idx 712 (8 frames at idx 712..719)
                 //
-                // Equivalent to `N - ceil((1-p) * N)` for clean p*N;
-                // floor is the simpler form and matches percentile
-                // libraries like NumPy (linear interpolation method)
-                // when the index is whole.
-                auto frametimeAtPct = [&](double p) -> int64_t {
+                // Critically, we use INTEGER arithmetic via permille
+                // (per-thousand) rather than `floor(p * N)` with a
+                // float p — `0.95 * 100` in IEEE-754 double evaluates
+                // to 94.99999... (because 0.95 has no exact binary
+                // representation), and floor() returns 94 instead of
+                // the intended 95. The boundary off-by-one drops P95
+                // into the fast tail, which is the OPPOSITE of what
+                // the user expects. Integer arithmetic
+                // (permille × N / 1000) keeps the index exact at
+                // every clean percentile value.
+                auto frametimeAtPermille = [&](int permille) -> int64_t {
                     const std::size_t n = sorted.size();
                     if (n == 0) return 0;
-                    std::size_t idx = static_cast<std::size_t>(
-                        std::floor(p * static_cast<double>(n)));
+                    std::size_t idx = (static_cast<std::size_t>(permille) * n) / 1000;
                     if (idx >= n) idx = n - 1;
                     return sorted[idx];
                 };
-                const int64_t ft_p95 = frametimeAtPct(0.95);
-                const int64_t ft_p99 = frametimeAtPct(0.99);
+                const int64_t ft_p95 = frametimeAtPermille(950);
+                const int64_t ft_p99 = frametimeAtPermille(990);
                 m_snapshot.fps_p95 = ft_p95 > 0 ? 1.0e9f / static_cast<float>(ft_p95) : 0.0f;
                 m_snapshot.fps_p99 = ft_p99 > 0 ? 1.0e9f / static_cast<float>(ft_p99) : 0.0f;
             } else {
