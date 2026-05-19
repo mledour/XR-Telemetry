@@ -297,14 +297,28 @@ namespace openxr_api_layer::detail {
         BarTier tier;
     };
 
-    // Anchored normalisation: the Y axis spans `0..2 × budgetNs`, with
-    // the budget itself at the strip midpoint. A frame at 100 % of
-    // budget shows a bar exactly to the budget line; a doubled-budget
-    // frame fills the strip; everything beyond saturates at the top.
-    // Returning a fixed Y range (instead of auto-normalising to the
-    // ring's max) is what makes the budget line visually stable —
-    // users see "am I over the line" without rescaling artefacts when
-    // a single stutter spikes the max.
+    // Anchored normalisation: the Y axis spans `0..1.2 × budgetNs`,
+    // so a frame at 100 % of budget fills ~83 % of the strip height
+    // (= 1/1.2) — the budget reference line sits at that same 83 %.
+    // Bars that exceed 120 % of budget saturate at the strip's top.
+    //
+    // Why 1.2× and not 2×: the previous 0..2× range reserved the
+    // entire UPPER half of the strip for overruns, which meant
+    // typical light-load frames (40–70 % of budget) only filled
+    // 20–35 % of the strip — leaving the top half empty under normal
+    // operation. fpsVR uses 0..2× too, but with much taller strips,
+    // so the absolute pixel space below "budget" stays visually
+    // satisfying. At our 54-px strip height the trade-off flips —
+    // fuller bars under normal load + clipped overruns reads
+    // better than half-empty bars + visible overruns.
+    //
+    // Trade-off: a frame at 130 % budget (= -30 % headroom)
+    // saturates visually at the top, indistinguishable from 200 %.
+    // The TIER colour still tells the user "this frame is in red
+    // (≥ 90 % budget)" — the SHAPE of the bar tells "how often",
+    // the COLOUR tells "how bad". Most users care about the
+    // first-derivative (am I getting overruns?) more than the
+    // exact magnitude.
     //
     // Budget <= 0 (no display-period info yet from the runtime) yields
     // a green zero-height bar — the renderer skips the strip entirely
@@ -312,7 +326,11 @@ namespace openxr_api_layer::detail {
     inline BarVisual barVisualForSample(int64_t sampleNs, int64_t budgetNs) noexcept {
         if (budgetNs <= 0 || sampleNs <= 0) return {0.0f, BarTier::Green};
         const float ratio = static_cast<float>(sampleNs) / static_cast<float>(budgetNs);
-        const float height = std::clamp(ratio * 0.5f, 0.0f, 1.0f);
+        // ratio / 1.2 == ratio * (5/6). Direct multiply chosen for
+        // numerical stability (1.2f isn't exactly representable in
+        // IEEE-754 but the division is well-conditioned for the
+        // [0, 4] input range we'll see in practice).
+        const float height = std::clamp(ratio / 1.2f, 0.0f, 1.0f);
         BarTier tier = BarTier::Green;
         if (ratio >= 0.9f) {
             tier = BarTier::Red;
@@ -337,11 +355,13 @@ namespace openxr_api_layer::detail {
 
     // The Y position of the budget reference line, expressed as a
     // fraction of the strip height (0 = top, 1 = bottom). With the
-    // 0..2× budget scale above, the line sits at 50 % of the strip's
-    // pixel height regardless of how big the strip is — keeps the
-    // budget marker visually anchored even if we resize the texture.
+    // 0..1.2× budget scale above, the line sits at 1/6 of the strip
+    // (≈ 16.7 % from the top) — that's where the BAR TIP lands when
+    // ratio = 1.0 (since heightFraction = 1/1.2 = 5/6, and the bar
+    // grows upward from the bottom, so the tip is 5/6 from the
+    // bottom = 1/6 from the top).
     inline constexpr float budgetLineFraction() noexcept {
-        return 0.5f;
+        return 1.0f / 6.0f;
     }
 
 } // namespace openxr_api_layer::detail

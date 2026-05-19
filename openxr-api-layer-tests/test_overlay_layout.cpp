@@ -316,10 +316,14 @@ TEST_CASE("normaliseBar: sample > max clamps to 1.0 (no overflow)") {
 }
 
 // =============================================================================
-// barVisualForSample — budget-anchored fpsvr-style normalisation.
+// barVisualForSample — budget-anchored fpsVR-style normalisation.
 //
-// Y axis spans 0..2× budget. Budget itself sits at the midpoint
-// (heightFraction = 0.5). Tier transitions are 80 % and 100 % of budget.
+// Y axis spans 0..1.2× budget. A frame at exactly 100 % of budget fills
+// 5/6 ≈ 0.833 of the strip height (= ratio / 1.2); the budget reference
+// line sits at that same Y position (= 1/6 from the top). Frames above
+// 120 % budget saturate at the strip's top — the visible TIER (orange /
+// red) tells the user "how bad", the bar's SHAPE tells "how often".
+// Tier transitions remain at 80 % (orange) and 90 % (red).
 // =============================================================================
 
 TEST_CASE("barVisualForSample: budget==0 returns zero-height green") {
@@ -334,15 +338,17 @@ TEST_CASE("barVisualForSample: negative or zero sample returns zero-height green
     CHECK(barVisualForSample(0,     11'111'111).tier           == BarTier::Green);
 }
 
-TEST_CASE("barVisualForSample: sample == budget → midpoint + red") {
+TEST_CASE("barVisualForSample: sample == budget → ~83% strip + red") {
+    // ratio = 1.0; heightFraction = 1.0/1.2 = 5/6 ≈ 0.833.
     const auto v = barVisualForSample(11'111'111, 11'111'111);
-    CHECK(v.heightFraction == doctest::Approx(0.5f).epsilon(0.001));
+    CHECK(v.heightFraction == doctest::Approx(1.0f / 1.2f).epsilon(0.001));
     CHECK(v.tier == BarTier::Red);
 }
 
-TEST_CASE("barVisualForSample: sample at half-budget → quarter-height + green") {
+TEST_CASE("barVisualForSample: sample at half-budget → ~42% strip + green") {
+    // ratio = 0.5; heightFraction = 0.5 / 1.2 ≈ 0.417.
     const auto v = barVisualForSample(5'555'555, 11'111'111);
-    CHECK(v.heightFraction == doctest::Approx(0.25f).epsilon(0.001));
+    CHECK(v.heightFraction == doctest::Approx(0.5f / 1.2f).epsilon(0.001));
     CHECK(v.tier == BarTier::Green);
 }
 
@@ -360,9 +366,20 @@ TEST_CASE("barVisualForSample: tier thresholds are 80% orange / 90% red (headroo
     CHECK(barVisualForSample(2 * budget, budget).tier == BarTier::Red);
 }
 
-TEST_CASE("barVisualForSample: 2× budget saturates at full height") {
+TEST_CASE("barVisualForSample: 1.2× budget saturates at full height (Y-axis cap)") {
+    const auto v = barVisualForSample(13'333'333, 11'111'111);
+    CHECK(v.heightFraction == doctest::Approx(1.0f).epsilon(0.001));
+}
+
+TEST_CASE("barVisualForSample: 2× budget still clamped at full height") {
+    // The 0..1.2× Y-axis trade-off: any frame above 1.2× budget
+    // saturates visually at the strip's top, indistinguishable from
+    // each other (2× looks the same as 4×). The TIER colour stays
+    // Red regardless; the user reads "how bad" from the colour, not
+    // from the bar height beyond 100 % budget.
     const auto v = barVisualForSample(22'222'222, 11'111'111);
     CHECK(v.heightFraction == doctest::Approx(1.0f));
+    CHECK(v.tier == BarTier::Red);
 }
 
 TEST_CASE("barVisualForSample: 4× budget still clamped at full height") {
@@ -371,8 +388,14 @@ TEST_CASE("barVisualForSample: 4× budget still clamped at full height") {
     CHECK(v.tier == BarTier::Red);
 }
 
-TEST_CASE("budgetLineFraction: anchored at the strip midpoint") {
-    CHECK(budgetLineFraction() == doctest::Approx(0.5f));
+TEST_CASE("budgetLineFraction: at the bar-tip position for ratio=1.0 (1/6 from top)") {
+    // The reference line MUST sit where a budget-equal bar's tip
+    // lands. With heightFraction = 1/1.2 = 5/6 (= fraction of strip
+    // height the bar occupies, growing from bottom), the tip Y is
+    // at strip_top + (1 - 5/6) * stripH = strip_top + (1/6) *
+    // stripH. Same math here keeps the marker visually aligned to
+    // the bar tip at budget.
+    CHECK(budgetLineFraction() == doctest::Approx(1.0f / 6.0f).epsilon(0.001));
 }
 
 // =============================================================================

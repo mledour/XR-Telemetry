@@ -270,6 +270,11 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushGaugeBg)) return false;
                 // Dashed grid lines inside the histogram panels.
                 if (!make(D2D1::ColorF(0.220f, 0.250f, 0.300f, 0.55f), m_brushGridDash)) return false;
+                // Budget reference line — brighter than the grid so
+                // it reads as THE marker for 100 % budget. Soft white
+                // with moderate alpha; bars crossing it on a stutter
+                // render visibly over it (intentional overlap).
+                if (!make(D2D1::ColorF(0.90f, 0.92f, 0.95f, 0.45f), m_brushBudgetLine)) return false;
                 // Icon stroke. Thermometer fill is the same brush as
                 // the gauge — picked dynamically from the util tier
                 // in drawBottomPanel (no separate brushes needed).
@@ -562,6 +567,30 @@ namespace openxr_api_layer::detail {
                 drawHistogramBars(rt, ring, budgetNs,
                                    histoL, histoT, histoR, histoB,
                                    barBrush);
+
+                // Budget reference line — drawn AFTER the bars so
+                // bars that cross it (overruns ≥ budget) visually
+                // overlap the line and the user sees the breach.
+                // Position from the top: budgetLineFraction (= 1/6).
+                // Brighter than the dashed grid so it reads as the
+                // "this is your budget" marker rather than just one
+                // more grid line.
+                drawBudgetLine(rt, histoL, histoT, histoR, histoB);
+            }
+
+            // Budget reference line — fine solid line at the Y
+            // position where a bar at exactly 100 % budget tops out
+            // (= budgetLineFraction from the strip top). Drawn with
+            // the dedicated m_brushBudgetLine (brighter than the
+            // dashed grid). 1 px stroke, slight horizontal inset so
+            // it doesn't touch the panel's inner border.
+            void drawBudgetLine(ID2D1RenderTarget* rt, float l, float t,
+                                  float r, float b) const {
+                const float y = t + (b - t) * budgetLineFraction();
+                rt->DrawLine(
+                    D2D1::Point2F(l, y),
+                    D2D1::Point2F(r, y),
+                    m_brushBudgetLine.Get(), 1.0f);
             }
 
             // 4 evenly-spaced horizontal dashed lines across the
@@ -903,6 +932,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushGaugeCyan;   // healthy tier (default)
             ComPtr<ID2D1SolidColorBrush> m_brushGaugeBg;
             ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
+            ComPtr<ID2D1SolidColorBrush> m_brushBudgetLine;
             ComPtr<ID2D1SolidColorBrush> m_brushIconStroke;
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
