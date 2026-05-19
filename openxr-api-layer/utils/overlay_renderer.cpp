@@ -99,20 +99,28 @@ namespace openxr_api_layer::detail {
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
-        constexpr float kSectionGap     = 8.0f;
+        constexpr float kSectionGap     = 14.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
         constexpr float kHeaderHeight     = 66.0f;
-        constexpr float kFrametimeHeight  = 160.0f;
-        constexpr float kBottomHeight     = 102.0f;
+        constexpr float kFrametimeHeight  = 120.0f;  // shorter than before — bar strip
+                                                      // height ≈ 84 px after the title
+                                                      // row, matches the visual density
+                                                      // of the reference design
+        constexpr float kBottomHeight     = 130.0f;  // tall enough for the chip + thermo
+                                                      // + 22-px gauge font + label row
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
         constexpr float kHistoTitleH     = 24.0f;
-        constexpr float kHistoBarGap     = 1.5f;
-        // 80 bars × (~7 px each + 1.5 px gap) ≈ 680 px of strip width.
-        // Matches the visible bar density of the screenshot.
-        constexpr std::size_t kRingSize  = 80;       // ~0.9 s @ 90 Hz, ~0.7 s @ 120 Hz
+        constexpr float kHistoBarGap     = 2.0f;
+        // 120 bars × (~3.6 px each + 2 px gap) ≈ 670 px of strip width.
+        // Roughly half the bar width of the previous version (~7 px) —
+        // matches the denser, thinner-bar visual of the reference
+        // design. Window covered = 120 samples ≈ 1.3 s @ 90 Hz / 1 s @
+        // 120 Hz, still long enough to catch a stutter spike but short
+        // enough that the histogram reacts within the same second.
+        constexpr std::size_t kRingSize  = 120;
 
         // Font sizes — tuned to the 720×540 texture so the rendered
         // result reads naturally at the new quad size (~16°×12° FOV
@@ -123,7 +131,12 @@ namespace openxr_api_layer::detail {
         constexpr float kFontBigNumber    = 42.0f;  // "142" FPS number
         constexpr float kFontAccentNumber = 36.0f;  // "138", "124", "108"
         constexpr float kFontTemp         = 30.0f;  // "67 °C"
-        constexpr float kFontGaugePct     = 28.0f;  // "92%" inside gauge
+        // Gauge percentage. 22-px keeps "100%" (4 glyphs) inside the
+        // 30-px-radius ring — at 28 px Consolas Bold the "100%" string
+        // measured ~68 px wide and overflowed the 60-px-wide inner
+        // text rect, clipping the trailing digit / `%` against the
+        // ring stroke.
+        constexpr float kFontGaugePct     = 22.0f;
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -236,15 +249,21 @@ namespace openxr_api_layer::detail {
                 // Bar / gauge colours — match the screenshot.
                 if (!make(D2D1::ColorF(0.000f, 0.835f, 0.769f, 1.00f), m_brushGpuTeal)) return false;    // #00D5C4
                 if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushCpuBlue)) return false;    // #5BB8E8
-                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C
-                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushGaugeCyan)) return false;
+                // Warning-tier colours used by BOTH the histogram bars
+                // (per-bar tier from barVisualForSample) and the
+                // circular gauge fill (overall utilisation tier from
+                // gaugeTierForUtilisation). Same palette = coherent
+                // "X% headroom remaining" signal across the panel.
+                if (!make(D2D1::ColorF(1.000f, 0.553f, 0.000f, 1.00f), m_brushOrange)) return false;     // #FF8D00 — warning
+                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C — critical
+                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushGaugeCyan)) return false;  // healthy default
                 if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushGaugeBg)) return false;
                 // Dashed grid lines inside the histogram panels.
                 if (!make(D2D1::ColorF(0.220f, 0.250f, 0.300f, 0.55f), m_brushGridDash)) return false;
-                // Icon stroke + thermometer fills.
-                if (!make(D2D1::ColorF(0.78f, 0.82f, 0.87f, 0.85f),   m_brushIconStroke)) return false;
-                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushThermRed)) return false;
-                if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushThermBlue)) return false;
+                // Icon stroke. Thermometer fill is the same brush as
+                // the gauge — picked dynamically from the util tier
+                // in drawBottomPanel (no separate brushes needed).
+                if (!make(D2D1::ColorF(0.78f, 0.82f, 0.87f, 0.85f), m_brushIconStroke)) return false;
 
                 // Stroke style for the dashed grid lines. ID2D1Strok
                 // Style is shareable; we cache the one we need.
@@ -344,7 +363,13 @@ namespace openxr_api_layer::detail {
                                     cpuRing, snap.target_fps,
                                     m_brushCpuBlue.Get());
 
-                // Bottom row: split into two equal-width panels.
+                // Bottom row: split into two equal-width panels. The
+                // gauge colour is NO LONGER fixed per panel — it's
+                // dynamic based on utilisation tier (cyan when <80 %,
+                // orange when 80–89 %, red when ≥90 %). Same tiering
+                // as the histogram bars. The thermometer icon's fill
+                // colour mirrors the gauge tier so the panel reads
+                // as a coherent "this side is hot" signal.
                 const float bottomMidGap = kSectionGap;
                 const float bottomMid    = (innerL + innerR) * 0.5f;
                 drawBottomPanel(rt, innerL, bottomY,
@@ -352,17 +377,13 @@ namespace openxr_api_layer::detail {
                                  bottomY + kBottomHeight,
                                  L"GPU TEMP & UTILISATION",
                                  v.gpu_temp_c, v.gpu_util_pct,
-                                 v.gpu_util_fraction,
-                                 m_brushGaugeRed.Get(),
-                                 m_brushThermRed.Get());
+                                 v.gpu_util_fraction);
                 drawBottomPanel(rt,
                                  bottomMid + bottomMidGap * 0.5f, bottomY,
                                  innerR, bottomY + kBottomHeight,
                                  L"CPU TEMP & UTILISATION",
                                  v.cpu_temp_c, v.cpu_util_pct,
-                                 v.cpu_util_fraction,
-                                 m_brushGaugeCyan.Get(),
-                                 m_brushThermBlue.Get());
+                                 v.cpu_util_fraction);
 
                 return SUCCEEDED(rt->EndDraw());
             }
@@ -554,7 +575,7 @@ namespace openxr_api_layer::detail {
                                     const HistogramRing<kRingSize>& ring,
                                     int64_t budgetNs,
                                     float l, float t, float r, float b,
-                                    ID2D1Brush* barBrush) const {
+                                    ID2D1Brush* accentBrush) const {
                 if (r <= l || b <= t || budgetNs <= 0) return;
                 const std::size_t n = ring.size();
                 if (n == 0) return;
@@ -569,11 +590,20 @@ namespace openxr_api_layer::detail {
                     const auto vis = barVisualForSample(ring.at(i), budgetNs);
                     const float h = vis.heightFraction * stripH;
                     if (h <= 0.0f) continue;
+                    // Per-bar tier colour: healthy bars use the
+                    // panel's accent (teal for GPU, blue for CPU),
+                    // warning tier goes ORANGE, critical goes RED.
+                    // Same palette as the gauge — keeps the visual
+                    // language consistent ("orange/red anywhere ⇒
+                    // headroom problem").
+                    ID2D1Brush* brush = accentBrush;
+                    if (vis.tier == BarTier::Red)         brush = m_brushGaugeRed.Get();
+                    else if (vis.tier == BarTier::Orange) brush = m_brushOrange.Get();
                     const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
                     const D2D1_RECT_F bar = D2D1::RectF(
                         x, b - h,
                         x + barW, b);
-                    rt->FillRectangle(bar, barBrush);
+                    rt->FillRectangle(bar, brush);
                 }
             }
 
@@ -594,10 +624,20 @@ namespace openxr_api_layer::detail {
                                   const wchar_t* title,
                                   const std::string& tempValue,
                                   const std::string& utilValue,
-                                  float utilFraction,
-                                  ID2D1Brush* gaugeFillBrush,
-                                  ID2D1Brush* thermFillBrush) const {
+                                  float utilFraction) const {
                 drawPanelBg(rt, l, t, r, b);
+
+                // Dynamic colour from the utilisation tier. Same
+                // palette as the histogram bars so an orange bar
+                // and an orange gauge tell the same story. The
+                // thermometer icon's fill follows the gauge — both
+                // visual elements turning red signals "this side is
+                // pinned and hot".
+                const BarTier tier = gaugeTierForUtilisation(utilFraction);
+                ID2D1Brush* gaugeFillBrush = m_brushGaugeCyan.Get();
+                if (tier == BarTier::Red)         gaugeFillBrush = m_brushGaugeRed.Get();
+                else if (tier == BarTier::Orange) gaugeFillBrush = m_brushOrange.Get();
+                ID2D1Brush* thermFillBrush = gaugeFillBrush;
 
                 // Title (top-centre-left, just past the chip icon).
                 const float chipSize = 22.0f;
@@ -644,7 +684,12 @@ namespace openxr_api_layer::detail {
                           tempUnitRect, m_brushTextLabel.Get());
 
                 // --- Util block (right half) ---
-                const float gaugeR = 30.0f;
+                // Gauge radius bumped from 30 → 38 now that the
+                // bottom panel is 130-px tall (was 102). The 76-px
+                // diameter sits comfortably inside the panel with
+                // breathing room for the "GPU UTIL" / "CPU UTIL"
+                // label on the left.
+                const float gaugeR = 38.0f;
                 const float gaugeCx = r - kSectionInnerPad - gaugeR - 2.0f;
                 const float gaugeCy = blockY + blockH * 0.5f;
                 drawCircularGauge(rt, D2D1::Point2F(gaugeCx, gaugeCy),
@@ -660,10 +705,16 @@ namespace openxr_api_layer::detail {
                 drawWide(rt, utilLabel, m_fmtTinyLabelLeft.Get(),
                           utilLabelRect, m_brushTextLabel.Get());
 
-                // Percentage text inside the gauge.
+                // Percentage text inside the gauge. The rect is
+                // INTENTIONALLY wider than the gauge diameter so the
+                // 4-glyph "100%" string fits without the trailing `%`
+                // clipping against the ring stroke. DirectWrite
+                // centres the text inside this rect, so visual
+                // centring is preserved — only the maximum width is
+                // increased.
                 const D2D1_RECT_F gaugePctRect = D2D1::RectF(
-                    gaugeCx - gaugeR, gaugeCy - gaugeR * 0.6f,
-                    gaugeCx + gaugeR, gaugeCy + gaugeR * 0.6f);
+                    gaugeCx - gaugeR * 1.3f, gaugeCy - gaugeR * 0.6f,
+                    gaugeCx + gaugeR * 1.3f, gaugeCy + gaugeR * 0.6f);
                 std::string pctWithSign = utilValue + "%";
                 drawAscii(rt, pctWithSign, m_fmtGaugePct.Get(),
                            gaugePctRect, m_brushTextWhite.Get());
@@ -837,13 +888,12 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             ComPtr<ID2D1SolidColorBrush> m_brushGpuTeal;
             ComPtr<ID2D1SolidColorBrush> m_brushCpuBlue;
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeCyan;
+            ComPtr<ID2D1SolidColorBrush> m_brushOrange;      // warning tier
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;    // critical tier
+            ComPtr<ID2D1SolidColorBrush> m_brushGaugeCyan;   // healthy tier (default)
             ComPtr<ID2D1SolidColorBrush> m_brushGaugeBg;
             ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
             ComPtr<ID2D1SolidColorBrush> m_brushIconStroke;
-            ComPtr<ID2D1SolidColorBrush> m_brushThermRed;
-            ComPtr<ID2D1SolidColorBrush> m_brushThermBlue;
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 

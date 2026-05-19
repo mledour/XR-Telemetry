@@ -274,19 +274,22 @@ namespace openxr_api_layer::detail {
         return std::clamp(ratio, 0.0f, 1.0f);
     }
 
-    // Colour tier for a histogram bar — fpsvr / OpenXR Toolkit
-    // convention: green when comfortably under budget, yellow when
-    // approaching the limit, red when the frame busts the period (it
-    // either dropped or got reprojected). Matches the "you can see the
-    // overruns at a glance" UX users expect.
+    // Colour tier for a histogram bar — fpsVR-style "headroom
+    // warning" tiering: the bar stays at the panel's accent colour
+    // when there's healthy headroom (>20 % below the budget), turns
+    // ORANGE as a warning when headroom falls under 20 %, and RED
+    // when headroom is under 10 % (i.e. the frame is on the verge of
+    // overruns / reprojection).
     //
-    // The new redesign uses a SINGLE accent colour per panel (teal
-    // for GPU, light blue for CPU) instead of the green/yellow/red
-    // tiering — the BarTier is still computed and the renderer
-    // optionally lightens the bar when it busts the budget, but the
-    // dominant signal is the histogram shape itself rather than a
-    // colour switch per bar.
-    enum class BarTier { Green, Yellow, Red };
+    //   ratio = frametime / budget
+    //   ratio < 0.80 → Green   (≥ 20 % headroom — fine)
+    //   ratio < 0.90 → Orange  (10–20 % headroom — warning)
+    //   ratio ≥ 0.90 → Red     ( < 10 % headroom — critical)
+    //
+    // The same tiering drives the circular utilisation gauge's fill
+    // colour in the bottom panels — see drawCircularGauge in the
+    // renderer.
+    enum class BarTier { Green, Orange, Red };
 
     struct BarVisual {
         // Fraction of the strip height the bar should take (0..1).
@@ -313,12 +316,25 @@ namespace openxr_api_layer::detail {
         const float ratio = static_cast<float>(sampleNs) / static_cast<float>(budgetNs);
         const float height = std::clamp(ratio * 0.5f, 0.0f, 1.0f);
         BarTier tier = BarTier::Green;
-        if (ratio >= 1.0f) {
+        if (ratio >= 0.9f) {
             tier = BarTier::Red;
         } else if (ratio >= 0.8f) {
-            tier = BarTier::Yellow;
+            tier = BarTier::Orange;
         }
         return {height, tier};
+    }
+
+    // Reuse the same tiering for the circular utilisation gauge in
+    // the bottom panels — keeps the visual language coherent (a bar
+    // turning orange next to a gauge turning red reads as "GPU was
+    // borderline last second, now it's pinned"). The input here is
+    // a 0..1 utilisation FRACTION (not a frametime ratio), but the
+    // semantics are the same: 0.80–0.89 = orange, 0.90+ = red.
+    inline BarTier gaugeTierForUtilisation(float fraction) noexcept {
+        if (!(fraction >= 0.0f)) return BarTier::Green;  // NaN → green default
+        if (fraction >= 0.90f) return BarTier::Red;
+        if (fraction >= 0.80f) return BarTier::Orange;
+        return BarTier::Green;
     }
 
     // The Y position of the budget reference line, expressed as a

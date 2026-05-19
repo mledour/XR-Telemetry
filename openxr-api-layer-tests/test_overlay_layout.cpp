@@ -342,11 +342,16 @@ TEST_CASE("barVisualForSample: sample at half-budget → quarter-height + green"
     CHECK(v.tier == BarTier::Green);
 }
 
-TEST_CASE("barVisualForSample: tier thresholds are strict (80% yellow, 100% red)") {
+TEST_CASE("barVisualForSample: tier thresholds are 80% orange / 90% red (headroom-based)") {
+    // The "headroom warning" tiering:
+    //   ratio < 0.80 → Green   (≥ 20 % headroom — fine)
+    //   ratio < 0.90 → Orange  (10–20 % headroom — warning)
+    //   ratio ≥ 0.90 → Red     ( < 10 % headroom — critical)
     constexpr int64_t budget = 10'000'000;  // 10 ms — clean tenths
     CHECK(barVisualForSample(7'900'000, budget).tier == BarTier::Green);
-    CHECK(barVisualForSample(8'000'000, budget).tier == BarTier::Yellow);
-    CHECK(barVisualForSample(9'900'000, budget).tier == BarTier::Yellow);
+    CHECK(barVisualForSample(8'000'000, budget).tier == BarTier::Orange);
+    CHECK(barVisualForSample(8'900'000, budget).tier == BarTier::Orange);
+    CHECK(barVisualForSample(9'000'000, budget).tier == BarTier::Red);
     CHECK(barVisualForSample(budget,    budget).tier == BarTier::Red);
     CHECK(barVisualForSample(2 * budget, budget).tier == BarTier::Red);
 }
@@ -364,4 +369,38 @@ TEST_CASE("barVisualForSample: 4× budget still clamped at full height") {
 
 TEST_CASE("budgetLineFraction: anchored at the strip midpoint") {
     CHECK(budgetLineFraction() == doctest::Approx(0.5f));
+}
+
+// =============================================================================
+// gaugeTierForUtilisation — drives the circular gauge's fill colour.
+// Same threshold semantics as barVisualForSample's bar tier, but the input is
+// a utilisation FRACTION (0..1) rather than a frametime/budget ratio. Same
+// boundaries: 0.80 = warning (Orange), 0.90 = critical (Red).
+// =============================================================================
+
+using openxr_api_layer::detail::gaugeTierForUtilisation;
+
+TEST_CASE("gaugeTierForUtilisation: <80 % → green (default healthy state)") {
+    CHECK(gaugeTierForUtilisation(0.0f)  == BarTier::Green);
+    CHECK(gaugeTierForUtilisation(0.5f)  == BarTier::Green);
+    CHECK(gaugeTierForUtilisation(0.79f) == BarTier::Green);
+}
+
+TEST_CASE("gaugeTierForUtilisation: 80–89 % → orange (warning)") {
+    CHECK(gaugeTierForUtilisation(0.80f) == BarTier::Orange);
+    CHECK(gaugeTierForUtilisation(0.85f) == BarTier::Orange);
+    CHECK(gaugeTierForUtilisation(0.89f) == BarTier::Orange);
+}
+
+TEST_CASE("gaugeTierForUtilisation: ≥ 90 % → red (critical)") {
+    CHECK(gaugeTierForUtilisation(0.90f) == BarTier::Red);
+    CHECK(gaugeTierForUtilisation(0.95f) == BarTier::Red);
+    CHECK(gaugeTierForUtilisation(1.00f) == BarTier::Red);
+    // Even out-of-range values stay clamped to the worst tier.
+    CHECK(gaugeTierForUtilisation(2.50f) == BarTier::Red);
+}
+
+TEST_CASE("gaugeTierForUtilisation: NaN defaults to green (safe default)") {
+    const float kNan = std::numeric_limits<float>::quiet_NaN();
+    CHECK(gaugeTierForUtilisation(kNan) == BarTier::Green);
 }
