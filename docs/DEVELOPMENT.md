@@ -274,11 +274,10 @@ Checklist for adding a new bundled resource:
    `<ResourceCompile>` entry that pulls in the `.rc` is already
    there — no new entry needed.
 7. **Re-render and refresh the golden**: the snapshot will now use
-   your new resource. Regenerate `screenshots/overlay_snapshot.png`
-   (currently by copying the fresh CI render manually; a manual
-   `workflow_dispatch` workflow to automate this is on the roadmap),
-   commit it, push. The diff in the PR will show the rendering
-   change.
+   your new resource. See "Regenerating the golden" below — either
+   the `Update overlay snapshot golden` workflow does the work, or
+   you copy the failing CI run's fresh render into `screenshots/`
+   by hand.
 
 ### When the diff fails
 
@@ -292,19 +291,64 @@ fresh render kept at overlay_snapshot.png
 
 Workflow to handle a failure:
 
-1. **Pull the branch locally**, build, run the test. The freshly-rendered
-   PNG ends up at `bin\x64\<cfg>\overlay_snapshot.png` (the test EXE's
-   working directory).
-2. **Open both PNGs side-by-side**. Any image viewer that supports
-   tabs / pixel-zoom works; ImageMagick `compare` produces a diff
-   image (`compare -metric AE golden.png fresh.png diff.png`).
-3. **Decide**: is the diff a real regression (revert / fix the
-   offending code) or an intentional design change (update the
-   golden)?
-4. **To update the golden**: copy the fresh PNG over
-   `screenshots/overlay_snapshot.png`, commit, push. The PR diff
-   will visualise the change. Reviewer can compare base vs head
-   in GitHub's image-diff view.
+1. **Decide first whether the change is intentional.** Pull the branch
+   locally and look at what's in `overlay_renderer.cpp` /
+   `overlay_layout.cpp`. If your last commit touched the renderer
+   (layout, palette, fonts, …), the diff is expected. If it didn't,
+   the diff is a real regression — revert and investigate.
+2. **For a real regression**: open both PNGs side-by-side. Any image
+   viewer that supports tabs / pixel-zoom works; ImageMagick
+   `compare -metric AE golden.png fresh.png diff.png` produces a
+   per-pixel difference map.
+3. **For an intentional change**: regenerate the golden — see below.
+
+### Regenerating the golden
+
+Two ways to do this, both safe:
+
+**Option A — `Update overlay snapshot golden` workflow (recommended)**
+
+The `.github/workflows/update-overlay-snapshot.yml` workflow runs
+the test on CI, captures the fresh render, and either uploads it as
+an artifact for review (dry-run, the default) or commits it directly
+to the source branch.
+
+1. GitHub → Actions tab → "Update overlay snapshot golden" →
+   "Run workflow".
+2. Pick your feature branch in the ref dropdown.
+3. Leave the **`commit`** checkbox unchecked → "Run workflow". This
+   is the dry-run: builds, runs the test, and uploads an artifact
+   `overlay-snapshot-regen-<branch>/` containing both `new/overlay_snapshot.png`
+   (the fresh render) and `old/overlay_snapshot.png` (the current
+   golden).
+4. Download the artifact, eyeball both PNGs in your image viewer.
+5. Happy with the change? Re-run the workflow with the
+   **`commit`** checkbox ticked. The bot now overwrites
+   `screenshots/overlay_snapshot.png` on your branch and pushes
+   a commit; the normal CI then re-runs and the snapshot test
+   passes against the new baseline.
+
+Why two steps: the golden is the visual contract for the whole HUD.
+A single-click "regenerate" workflow makes it too easy for a layout
+regression to sneak in unnoticed. The dry-run forces a deliberate
+30-second eyeball check before the file actually changes.
+
+The workflow refuses to push to branches with branch-protection
+that disallow GITHUB_TOKEN — main is usually protected this way,
+so golden updates on main MUST go through a PR. That's a feature.
+
+**Option B — manual fallback**
+
+If CI is down or you want full local control:
+
+1. Locally: build + run the test (`bin\x64\Release\openxr-api-layer-tests.exe`).
+   The test fails the snapshot CHECK but writes
+   `overlay_snapshot.png` to the test EXE's working directory.
+2. Copy the fresh PNG over `screenshots/overlay_snapshot.png`.
+3. `git commit` + push.
+
+The PR diff in GitHub's image-diff view shows the rendering change
+side-by-side for reviewers.
 
 ### Why the test doesn't tolerate any pixel diff
 
