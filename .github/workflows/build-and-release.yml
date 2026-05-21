@@ -241,6 +241,61 @@ jobs:
             throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
           }
 
+      # ---- Snapshot diff artifact (on test failure, Release only) -------
+      #
+      # When the snapshot test fails ("snapshot diverges from golden: N
+      # pixels differ; first at (x, y)"), the test runner exits non-
+      # zero and the step above throws — but the PNG was written to
+      # disk BEFORE the comparison check, so it's still available on
+      # the runner.
+      #
+      # This step grabs both the freshly-rendered PNG and the
+      # committed golden, stages them under new/ and old/ so a
+      # reviewer can download the artifact and diff them in any
+      # image viewer, exactly the same UX as the
+      # update-overlay-snapshot.yml workflow but for the
+      # automatic-CI failure case. Without this, the only way to see
+      # the diff is to either pull the branch + build locally on
+      # Windows or trigger the manual regen workflow — both are too
+      # much friction for "I want to see the 5 pixels that changed."
+      #
+      # `if: failure()` runs when ANY earlier step in the job failed.
+      # Release-only to avoid duplicate uploads (Debug and Release
+      # render bit-identically because the entire pipeline is
+      # software WIC + D2D).
+      - name: Stage snapshot diff (on test failure)
+        if: failure() && matrix.configuration == 'Release'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact/snapshot-diff/new | Out-Null
+          New-Item -ItemType Directory -Force -Path artifact/snapshot-diff/old | Out-Null
+          # The fresh render is written to the runner's workspace
+          # root (CWD when the test EXE runs). Absent only if the
+          # test bailed at an earlier REQUIRE before the encoder ran
+          # — in that case the upload still happens but contains
+          # only the golden, which is enough to confirm the issue is
+          # pre-encode and not a pixel diff.
+          if (Test-Path overlay_snapshot.png) {
+            Copy-Item overlay_snapshot.png artifact/snapshot-diff/new/overlay_snapshot.png
+            Write-Host "Staged fresh render: $((Get-Item overlay_snapshot.png).Length) bytes"
+          } else {
+            Write-Host "::warning::overlay_snapshot.png not found — test likely bailed before the PNG encoder ran"
+          }
+          if (Test-Path screenshots/overlay_snapshot.png) {
+            Copy-Item screenshots/overlay_snapshot.png artifact/snapshot-diff/old/overlay_snapshot.png
+            Write-Host "Staged current golden: $((Get-Item screenshots/overlay_snapshot.png).Length) bytes"
+          }
+
+      - name: Upload snapshot diff (on test failure)
+        if: failure() && matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          # Branch / SHA in the name so several failing PRs don't
+          # collide if someone downloads them in parallel.
+          name: overlay-snapshot-diff-${{ github.ref_name }}-${{ github.run_attempt }}
+          path: artifact/snapshot-diff/
+          if-no-files-found: warn
+
       # ---- Inno Setup installer (Release only) --------------------------
       # Produces a single Setup.exe that installs the DLL + JSON manifest
       # to Program Files (correct ACLs for sandboxed identities), registers

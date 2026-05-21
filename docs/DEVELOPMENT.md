@@ -289,18 +289,29 @@ snapshot diverges from golden: 482 pixels differ; first at (x=178, y=24);
 fresh render kept at overlay_snapshot.png
 ```
 
-Workflow to handle a failure:
+The PR's Actions tab then carries an automatic artifact
+`overlay-snapshot-diff-<branch>-<attempt>/` with:
 
-1. **Decide first whether the change is intentional.** Pull the branch
-   locally and look at what's in `overlay_renderer.cpp` /
-   `overlay_layout.cpp`. If your last commit touched the renderer
-   (layout, palette, fonts, …), the diff is expected. If it didn't,
-   the diff is a real regression — revert and investigate.
-2. **For a real regression**: open both PNGs side-by-side. Any image
-   viewer that supports tabs / pixel-zoom works; ImageMagick
-   `compare -metric AE golden.png fresh.png diff.png` produces a
-   per-pixel difference map.
+- `new/overlay_snapshot.png` — the freshly-rendered output
+- `old/overlay_snapshot.png` — the committed golden
+
+Download the artifact, open both PNGs in any image viewer (or run
+`compare -metric AE old.png new.png diff.png` from ImageMagick for a
+per-pixel difference map). Workflow to handle the failure:
+
+1. **Decide first whether the change is intentional.** If your last
+   commit touched the renderer (layout, palette, fonts, …), the diff
+   is expected. If it didn't, the diff is a real regression — revert
+   and investigate.
+2. **For a real regression**: the diff artifact + the `(x, y)` of the
+   first differing pixel from the test log usually localises the
+   problem in seconds.
 3. **For an intentional change**: regenerate the golden — see below.
+
+The automatic artifact is only uploaded when the test fails (so
+green-CI runs stay clean) and only on the Release matrix entry
+(Debug renders bit-identically because the entire pipeline is
+software WIC + D2D — no point uploading the same image twice).
 
 ### Regenerating the golden
 
