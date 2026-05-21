@@ -672,8 +672,27 @@ namespace openxr_api_layer::detail {
                     static_cast<float>(n);
                 if (barW <= 0.0f) return;
 
+                constexpr float kDashPlaceholderH = 2.0f;
                 for (std::size_t i = 0; i < n; ++i) {
-                    const auto vis = barVisualForSample(ring.at(i), budgetNs);
+                    const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
+                    const int64_t sample = ring.at(i);
+                    if (sample <= 0) {
+                        // Empty slot — render a 2-px dash at the
+                        // strip bottom as a placeholder. Tells the
+                        // user "this position exists, just no
+                        // signal yet" (typical during the first
+                        // second of a session while the ring fills,
+                        // or during a transient where a GPU query
+                        // result wasn't ready). Same brush as the
+                        // dashed grid lines so the placeholders
+                        // read as chart chrome rather than as data.
+                        const D2D1_RECT_F dash = D2D1::RectF(
+                            x, b - kDashPlaceholderH,
+                            x + barW, b);
+                        rt->FillRectangle(dash, m_brushGridDash.Get());
+                        continue;
+                    }
+                    const auto vis = barVisualForSample(sample, budgetNs);
                     const float h = vis.heightFraction * stripH;
                     if (h <= 0.0f) continue;
                     // Per-bar tier colour: healthy bars use the
@@ -685,7 +704,6 @@ namespace openxr_api_layer::detail {
                     ID2D1Brush* brush = accentBrush;
                     if (vis.tier == BarTier::Red)         brush = m_brushGaugeRed.Get();
                     else if (vis.tier == BarTier::Orange) brush = m_brushOrange.Get();
-                    const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
                     const D2D1_RECT_F bar = D2D1::RectF(
                         x, b - h,
                         x + barW, b);
