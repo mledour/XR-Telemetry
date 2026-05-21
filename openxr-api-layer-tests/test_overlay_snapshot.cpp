@@ -269,30 +269,42 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     INFO("renderOverlayToTarget step: " << err);
     REQUIRE(ok);
 
-    // Encode to PNG. Filename relative to the test EXE's CWD — the
-    // CI step picks it up by glob.
+    // Encode to PNG. Filename relative to the test EXE's CWD.
+    //
+    // The encoder + stream are scoped inside a { } block so they
+    // release their refcounts (and the underlying file handle) on
+    // exit. WIC's IWICStream wraps a Windows HANDLE opened with
+    // GENERIC_WRITE — the next decoder we'll create against the
+    // same path needs GENERIC_READ + FILE_SHARE_READ. Without the
+    // scope, CreateDecoderFromFilename returns 0x80070020 (sharing
+    // violation) and decodePngToBgra fails — which is exactly what
+    // the first golden-comparison CI run hit.
     constexpr const wchar_t* kOut = L"overlay_snapshot.png";
-    ComPtr<IWICStream> stream;
-    REQUIRE(SUCCEEDED(wic->CreateStream(stream.GetAddressOf())));
-    REQUIRE(SUCCEEDED(stream->InitializeFromFilename(kOut, GENERIC_WRITE)));
+    {
+        ComPtr<IWICStream> stream;
+        REQUIRE(SUCCEEDED(wic->CreateStream(stream.GetAddressOf())));
+        REQUIRE(SUCCEEDED(stream->InitializeFromFilename(kOut, GENERIC_WRITE)));
 
-    ComPtr<IWICBitmapEncoder> encoder;
-    REQUIRE(SUCCEEDED(wic->CreateEncoder(
-        GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf())));
-    REQUIRE(SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)));
+        ComPtr<IWICBitmapEncoder> encoder;
+        REQUIRE(SUCCEEDED(wic->CreateEncoder(
+            GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf())));
+        REQUIRE(SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)));
 
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2>         encoderOptions;
-    REQUIRE(SUCCEEDED(encoder->CreateNewFrame(
-        frame.GetAddressOf(), encoderOptions.GetAddressOf())));
-    REQUIRE(SUCCEEDED(frame->Initialize(encoderOptions.Get())));
-    REQUIRE(SUCCEEDED(frame->SetSize(W, H)));
+        ComPtr<IWICBitmapFrameEncode> frame;
+        ComPtr<IPropertyBag2>         encoderOptions;
+        REQUIRE(SUCCEEDED(encoder->CreateNewFrame(
+            frame.GetAddressOf(), encoderOptions.GetAddressOf())));
+        REQUIRE(SUCCEEDED(frame->Initialize(encoderOptions.Get())));
+        REQUIRE(SUCCEEDED(frame->SetSize(W, H)));
 
-    WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppPBGRA;
-    REQUIRE(SUCCEEDED(frame->SetPixelFormat(&pixelFormat)));
-    REQUIRE(SUCCEEDED(frame->WriteSource(bitmap.Get(), nullptr)));
-    REQUIRE(SUCCEEDED(frame->Commit()));
-    REQUIRE(SUCCEEDED(encoder->Commit()));
+        WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppPBGRA;
+        REQUIRE(SUCCEEDED(frame->SetPixelFormat(&pixelFormat)));
+        REQUIRE(SUCCEEDED(frame->WriteSource(bitmap.Get(), nullptr)));
+        REQUIRE(SUCCEEDED(frame->Commit()));
+        REQUIRE(SUCCEEDED(encoder->Commit()));
+    }
+    // Stream, encoder, frame, options all released here — the file
+    // handle is closed and the PNG is now safe to re-open for read.
 
     // -------- Visual-regression check vs golden ---------------------------
     //
