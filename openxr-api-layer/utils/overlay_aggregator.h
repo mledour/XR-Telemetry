@@ -296,9 +296,22 @@ namespace openxr_api_layer::detail {
             // local timing harness). Done once per publish (~10 Hz),
             // so the cost amortises trivially.
             if (m_percentileCount > 0) {
-                std::vector<int64_t> sorted(m_percentileRing.begin(),
-                                             m_percentileRing.begin() + m_percentileCount);
-                std::sort(sorted.begin(), sorted.end());
+                // Copy into the pre-allocated scratch member and sort
+                // in place — avoids the per-publish std::vector
+                // allocation that would otherwise burn ~340 KB/s of
+                // allocator churn (kPercentileWindowSize × sizeof(int64_t)
+                // × 10 Hz) inside the host process.
+                std::copy(m_percentileRing.begin(),
+                          m_percentileRing.begin() + m_percentileCount,
+                          m_percentileSortScratch.begin());
+                const auto sortedBegin = m_percentileSortScratch.begin();
+                const auto sortedEnd   = sortedBegin + m_percentileCount;
+                std::sort(sortedBegin, sortedEnd);
+                // The valid range is [sortedBegin, sortedBegin +
+                // m_percentileCount). The rest of the 4320-element
+                // scratch array is stale data from previous publishes,
+                // so the percentile lookup must use m_percentileCount
+                // as the bound, NOT m_percentileSortScratch.size().
                 // P95 of FPS in the fpsVR convention reads as:
                 // "95 % of frames hit AT LEAST this FPS — the slowest
                 //  5 % drop below". We sort frametimes ASCENDING, so
@@ -320,11 +333,11 @@ namespace openxr_api_layer::detail {
                 // (permille × N / 1000) keeps the index exact at
                 // every clean percentile value.
                 auto frametimeAtPermille = [&](int permille) -> int64_t {
-                    const std::size_t n = sorted.size();
+                    const std::size_t n = m_percentileCount;
                     if (n == 0) return 0;
                     std::size_t idx = (static_cast<std::size_t>(permille) * n) / 1000;
                     if (idx >= n) idx = n - 1;
-                    return sorted[idx];
+                    return m_percentileSortScratch[idx];
                 };
                 const int64_t ft_p95   = frametimeAtPermille(950);
                 const int64_t ft_p99   = frametimeAtPermille(990);
@@ -422,6 +435,14 @@ namespace openxr_api_layer::detail {
         // imperceptible against the frame thread's 11 ms budget).
         static constexpr std::size_t kPercentileWindowSize = 4320;
         std::array<int64_t, kPercentileWindowSize> m_percentileRing{};
+        // Scratch buffer for the per-publish sort. Reused across
+        // publishes so we don't churn 34 KB / 10 Hz = 340 KB/s through
+        // the host's allocator. Layers run inside third-party games and
+        // the project policy is "zero alloc in the hot path where
+        // possible" — see CLAUDE.md's notes on anti-cheat / I/O
+        // surprise risk. Same fixed-size array shape as
+        // m_percentileRing so we can copy + sort in place.
+        std::array<int64_t, kPercentileWindowSize> m_percentileSortScratch{};
         std::size_t m_percentileHead = 0;
         std::size_t m_percentileCount = 0;
 

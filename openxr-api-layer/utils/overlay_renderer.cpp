@@ -547,16 +547,21 @@ namespace openxr_api_layer::detail {
                 const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
                 const float cpuPanelL   = gpuPanelR + kSectionGap;
                 const float cpuPanelR   = innerR;
+                // Labels are passed as full wide string literals
+                // ("GPU TEMP", "CPU LOAD", …) rather than a prefix +
+                // concat at draw time. Saves 4 std::wstring
+                // allocations per frame × 144 Hz = ~576 useless
+                // allocs/s in the host's hot path.
                 drawBottomPanel(rt, gpuPanelL, bottomY,
                                  gpuPanelR, bottomY + kBottomHeight,
-                                 L"GPU",
+                                 L"GPU TEMP", L"GPU LOAD",
                                  v.gpu_temp_c, v.gpu_util_pct,
                                  v.gpu_util_fraction,
                                  /*vramValue=*/v.vram_pct,
                                  /*vramFraction=*/v.vram_fraction);
                 drawBottomPanel(rt, cpuPanelL, bottomY,
                                  cpuPanelR, bottomY + kBottomHeight,
-                                 L"CPU",
+                                 L"CPU TEMP", L"CPU LOAD",
                                  v.cpu_temp_c, v.cpu_util_pct,
                                  v.cpu_util_fraction,
                                  /*vramValue=*/std::string{},
@@ -839,7 +844,7 @@ namespace openxr_api_layer::detail {
                                      const std::string& secondaryValue,
                                      const HistogramRing<kRingSize>& ring,
                                      float targetFps,
-                                     ID2D1Brush* barBrush) const {
+                                     ID2D1LinearGradientBrush* barBrush) const {
                 drawPanelBg(rt, l, t, r, b);
 
                 // Title bar — top inner padding.
@@ -961,7 +966,7 @@ namespace openxr_api_layer::detail {
                                     const HistogramRing<kRingSize>& ring,
                                     int64_t budgetNs,
                                     float l, float t, float r, float b,
-                                    ID2D1Brush* accentBrush) const {
+                                    ID2D1LinearGradientBrush* accentBrush) const {
                 if (r <= l || b <= t || budgetNs <= 0) return;
                 const std::size_t n = ring.size();
                 if (n == 0) return;
@@ -972,23 +977,18 @@ namespace openxr_api_layer::detail {
                     static_cast<float>(n);
                 if (barW <= 0.0f) return;
 
-                // If the caller passed a linear-gradient brush
-                // (m_brushGpuTealGrad / m_brushCpuBlueGrad), update
-                // its endpoints to span the strip's vertical range
-                // before drawing. Each bar then samples the gradient
+                // Update the gradient endpoints to span the strip's
+                // vertical range. Each bar then samples the gradient
                 // from its own position within the strip — a bar
                 // that only reaches halfway up gets only the bottom
                 // half of the gradient, matching how the spec's
-                // mock-up renders.
-                {
-                    ComPtr<ID2D1LinearGradientBrush> grad;
-                    if (SUCCEEDED(accentBrush->QueryInterface(
-                            __uuidof(ID2D1LinearGradientBrush),
-                            reinterpret_cast<void**>(grad.GetAddressOf())))) {
-                        grad->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
-                        grad->SetEndPoint(D2D1::Point2F((l + r) * 0.5f, b));
-                    }
-                }
+                // mock-up renders. accentBrush is typed as
+                // ID2D1LinearGradientBrush* so the previous per-
+                // frame QueryInterface (288 QIs/s at 144 Hz × 2
+                // strips) is gone — we already know the type at
+                // brush-creation time in initBrushes().
+                accentBrush->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
+                accentBrush->SetEndPoint  (D2D1::Point2F((l + r) * 0.5f, b));
 
                 constexpr float kDashPlaceholderH = 2.0f;
                 for (std::size_t i = 0; i < n; ++i) {
@@ -1053,7 +1053,8 @@ namespace openxr_api_layer::detail {
             // entirely — same code path, fewer columns).
             void drawBottomPanel(ID2D1RenderTarget* rt, float l, float t,
                                   float r, float b,
-                                  const wchar_t* prefix,
+                                  const wchar_t* tempLabel,
+                                  const wchar_t* loadLabel,
                                   const std::string& tempValue,
                                   const std::string& utilValue,
                                   float utilFraction,
@@ -1088,14 +1089,13 @@ namespace openxr_api_layer::detail {
                         m_brushSeparator.Get(), 1.0f);
                 }
 
-                // Build the per-column labels. TEMP and LOAD include
-                // the panel prefix ("GPU TEMP" / "CPU LOAD"); VRAM is
-                // a singleton label ("VRAM") because it's
-                // implicitly GPU-side — no "GPU VRAM" because that
-                // would be redundant and use a full extra word of
-                // horizontal space.
-                std::wstring tempLabel = std::wstring(prefix) + L" TEMP";
-                std::wstring loadLabel = std::wstring(prefix) + L" LOAD";
+                // tempLabel / loadLabel arrive pre-built as wide
+                // string literals (L"GPU TEMP", L"CPU LOAD", …) — see
+                // the comment at the drawBottomPanel call site in
+                // paint(). VRAM stays a singleton label ("VRAM")
+                // because it's implicitly GPU-side — no "GPU VRAM"
+                // because that would be redundant and use a full
+                // extra word of horizontal space.
 
                 // Vertical positions inside the panel:
                 //   labelY : small label (m_fmtTinyLabelCenter,
@@ -1157,11 +1157,11 @@ namespace openxr_api_layer::detail {
                 // regardless of how MSVC parses the surrounding
                 // bytes.
                 drawCell(l, l + colW,
-                          tempLabel.c_str(), tempValue, L" \u00B0C",
+                          tempLabel, tempValue, L" \u00B0C",
                           m_brushTextWhite.Get(), /*useWideValue=*/true);
                 // Cell 1 — <prefix> LOAD / "92 %"
                 drawCell(l + colW, l + colW * 2.0f,
-                          loadLabel.c_str(), utilValue, L" %",
+                          loadLabel, utilValue, L" %",
                           tierBrush(utilFraction), /*useWideValue=*/false);
                 // Cell 2 — VRAM / "76 %" (GPU panel only)
                 if (hasVram) {
