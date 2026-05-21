@@ -262,6 +262,17 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.043f, 0.051f, 0.051f, 1.00f), m_brushPanelBg)) return false;    // #0B0D0D graphite
                 if (!make(D2D1::ColorF(0.165f, 0.176f, 0.180f, 1.00f), m_brushFrameLine)) return false;  // #2A2D2E metal-line
                 if (!make(D2D1::ColorF(0.227f, 0.239f, 0.243f, 1.00f), m_brushSeparator)) return false;  // #3A3D3E
+                // Bevel highlight (lighter, top edge of each panel)
+                // and shadow (darker, bottom edge). 1-px lines at
+                // these colours give the "raised metal" impression
+                // around every panel rim — see drawPanelBg.
+                if (!make(D2D1::ColorF(0.357f, 0.380f, 0.388f, 1.00f), m_brushBevelHighlight)) return false; // #5B6163
+                if (!make(D2D1::ColorF(0.110f, 0.122f, 0.125f, 1.00f), m_brushBevelShadow)) return false;    // #1C1F20
+                // Carbon-fibre hatch — drawn as low-alpha diagonal
+                // lines across the panel backgrounds. ~6 % white so
+                // the texture is just visible without becoming
+                // visible stripes.
+                if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
                 // Text — softly off-white (not pure #FFFFFF) is less
                 // harsh on OLED HMD panels under low ambient light,
                 // and matches the spec's #F2F4F5 / #B8BFC1.
@@ -272,11 +283,40 @@ namespace openxr_api_layer::detail {
                 // (FPS AVG / P95 / P99 / P99.9) AND healthy-tier
                 // LOAD / VRAM text in the bottom row.
                 if (!make(D2D1::ColorF(0.125f, 0.847f, 0.863f, 1.00f), m_brushAccentCyan)) return false; // #20D8DC
-                // Histogram bar colours — match the spec's brand
-                // hues. Slightly lighter teal and a more saturated
-                // electric blue so the two channels read at a glance.
-                if (!make(D2D1::ColorF(0.157f, 0.878f, 0.898f, 1.00f), m_brushGpuTeal)) return false;    // #28E0E5
-                if (!make(D2D1::ColorF(0.157f, 0.686f, 1.000f, 1.00f), m_brushCpuBlue)) return false;    // #28AFFF
+                // Histogram bar GRADIENT brushes — top→bottom
+                // linear gradient inside each bar gives the bars
+                // the "lit from above" look from the design spec.
+                // The brushes are created here with placeholder
+                // endpoints (0,0)→(0,1); drawHistogramBars sets the
+                // actual strip-top / strip-bottom per frame via
+                // SetStartPoint / SetEndPoint. That avoids
+                // re-creating the brush every frame while still
+                // letting it sample the gradient across whichever
+                // strip is being painted.
+                D2D1_GRADIENT_STOP gpuStops[2] = {
+                    {0.0f, D2D1::ColorF(0.157f, 0.878f, 0.898f, 1.00f)},  // #28E0E5 (top, lighter)
+                    {1.0f, D2D1::ColorF(0.075f, 0.682f, 0.710f, 1.00f)},  // #13AEB5 (bottom, darker)
+                };
+                D2D1_GRADIENT_STOP cpuStops[2] = {
+                    {0.0f, D2D1::ColorF(0.157f, 0.686f, 1.000f, 1.00f)},  // #28AFFF (top, lighter)
+                    {1.0f, D2D1::ColorF(0.047f, 0.561f, 0.847f, 1.00f)},  // #0C8FD8 (bottom, darker)
+                };
+                if (FAILED(rt->CreateGradientStopCollection(
+                        gpuStops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                        m_gpuTealStops.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateGradientStopCollection(
+                        cpuStops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                        m_cpuBlueStops.GetAddressOf()))) return false;
+                const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES gradProps = {
+                    /* startPoint */ {0.0f, 0.0f},
+                    /* endPoint   */ {0.0f, 1.0f},
+                };
+                if (FAILED(rt->CreateLinearGradientBrush(
+                        gradProps, m_gpuTealStops.Get(),
+                        m_brushGpuTealGrad.GetAddressOf()))) return false;
+                if (FAILED(rt->CreateLinearGradientBrush(
+                        gradProps, m_cpuBlueStops.Get(),
+                        m_brushCpuBlueGrad.GetAddressOf()))) return false;
                 // Warning / critical tiers — kept from the previous
                 // palette. Apply to both histogram bars (per-sample)
                 // and LOAD / VRAM text (overall).
@@ -351,14 +391,20 @@ namespace openxr_api_layer::detail {
                 const float texW = static_cast<float>(kTexW);
                 const float texH = static_cast<float>(kTexH);
 
-                // Outer frame: rounded-rect background + 2-px stroke.
-                const D2D1_ROUNDED_RECT frameRect = D2D1::RoundedRect(
-                    D2D1::RectF(kOuterPad, kOuterPad,
-                                 texW - kOuterPad, texH - kOuterPad),
-                    8.0f, 8.0f);
-                rt->FillRoundedRectangle(frameRect, m_brushBg.Get());
-                rt->DrawRoundedRectangle(frameRect, m_brushFrameLine.Get(),
-                                          kFrameStroke);
+                // Outer frame: octagonal-ish shape with chamfered
+                // corners — matches the design spec's "cut corners"
+                // industrial-HUD look. 12-px diagonal cut at each
+                // corner; the 4 sides connect with straight edges.
+                // Built once per paint via ID2D1PathGeometry (8
+                // line segments). The geometry is closed so a single
+                // FillGeometry / DrawGeometry pair handles both the
+                // background fill and the metal-line stroke.
+                const D2D1_RECT_F frameOuter = D2D1::RectF(
+                    kOuterPad, kOuterPad,
+                    texW - kOuterPad, texH - kOuterPad);
+                drawChamferedRect(rt, frameOuter, 12.0f,
+                                   m_brushBg.Get(),
+                                   m_brushFrameLine.Get(), kFrameStroke);
 
                 // Inner content rectangle (everything sits inside this).
                 const float innerL = kOuterPad + kFrameStroke + 4.0f;
@@ -389,14 +435,14 @@ namespace openxr_api_layer::detail {
                                     v.gpu_frametime_ms,
                                     /*secondaryValue=*/std::string{},
                                     gpuRing, snap.target_fps,
-                                    m_brushGpuTeal.Get());
+                                    m_brushGpuTealGrad.Get());
                 drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
                                     cpuPanelY + kFrametimeHeight,
                                     L"CPU FRAMETIME MS",
                                     v.cpu_frametime_ms,
                                     v.cpu_app_ms,
                                     cpuRing, snap.target_fps,
-                                    m_brushCpuBlue.Get());
+                                    m_brushCpuBlueGrad.Get());
 
                 // Bottom row: 60/40 split between the GPU and CPU
                 // panels — GPU gets 3 cells (TEMP / LOAD / VRAM),
@@ -686,6 +732,24 @@ namespace openxr_api_layer::detail {
                     static_cast<float>(n);
                 if (barW <= 0.0f) return;
 
+                // If the caller passed a linear-gradient brush
+                // (m_brushGpuTealGrad / m_brushCpuBlueGrad), update
+                // its endpoints to span the strip's vertical range
+                // before drawing. Each bar then samples the gradient
+                // from its own position within the strip — a bar
+                // that only reaches halfway up gets only the bottom
+                // half of the gradient, matching how the spec's
+                // mock-up renders.
+                {
+                    ComPtr<ID2D1LinearGradientBrush> grad;
+                    if (SUCCEEDED(accentBrush->QueryInterface(
+                            __uuidof(ID2D1LinearGradientBrush),
+                            reinterpret_cast<void**>(grad.GetAddressOf())))) {
+                        grad->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
+                        grad->SetEndPoint(D2D1::Point2F((l + r) * 0.5f, b));
+                    }
+                }
+
                 constexpr float kDashPlaceholderH = 2.0f;
                 for (std::size_t i = 0; i < n; ++i) {
                     const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
@@ -856,12 +920,127 @@ namespace openxr_api_layer::detail {
             // Panel background — slightly raised dark-blue panel with
             // a 1-px separator stroke on the inside. Used for the
             // header, both frametime panels, and the bottom row pair.
+            // Adds a top-edge bevel highlight (lighter) and a
+            // bottom-edge bevel shadow (darker) so each panel reads
+            // as a slightly raised metal surface, matching the
+            // design spec's industrial-HUD look. The corner-radius
+            // strokes are subtle enough that a straight horizontal
+            // line crossing the panel doesn't break visually.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
                 const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
+
+                // Subtle carbon-fibre-ish diagonal hatch: thin
+                // diagonal lines at ~6 % alpha across the panel
+                // body. Spaced 6 px apart; at the design's
+                // resolution they read as a very faint texture
+                // hint, never as actual stripes. Drawn BEFORE the
+                // panel separator stroke so the stroke covers the
+                // line ends at the panel edge.
+                drawCarbonHatch(rt, l, t, r, b);
+
                 rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
+                // Bevel highlight (top edge) and shadow (bottom
+                // edge). Inset by 1.5 px from the panel border so
+                // the bevel lines sit JUST inside the separator
+                // stroke without overlapping it.
+                const float bevelInset = 1.5f;
+                rt->DrawLine(
+                    D2D1::Point2F(l + 6.0f, t + bevelInset),
+                    D2D1::Point2F(r - 6.0f, t + bevelInset),
+                    m_brushBevelHighlight.Get(), 1.0f);
+                rt->DrawLine(
+                    D2D1::Point2F(l + 6.0f, b - bevelInset),
+                    D2D1::Point2F(r - 6.0f, b - bevelInset),
+                    m_brushBevelShadow.Get(), 1.0f);
+            }
+
+            // Carbon-fibre hatch — diagonal 45° lines spanning the
+            // panel, at very low alpha so they read as a subtle
+            // texture rather than as visible stripes. The lines are
+            // clipped to the panel's rounded-rect bounds by axis-
+            // aligned clipping — close enough for the visual intent
+            // at this opacity.
+            //
+            // Cost: ~(w + h) / spacing DrawLine calls per panel.
+            // For a 280-px-wide × 90-px-tall frametime panel at
+            // 6 px spacing that's ~62 lines. At 4-5 panels per
+            // frame and 144 Hz that's ~45k DrawLine/s — well within
+            // D2D's budget for a 720×480 target. Could be cached to
+            // an offscreen bitmap brush later if it ever shows up
+            // in a profile.
+            void drawCarbonHatch(ID2D1RenderTarget* rt, float l, float t,
+                                   float r, float b) const {
+                constexpr float kSpacing = 6.0f;
+                // Clip rect: panel inner area. Slight inset so the
+                // hatch doesn't bleed into the rounded corners.
+                D2D1_RECT_F clip = D2D1::RectF(l + 1.0f, t + 1.0f,
+                                                r - 1.0f, b - 1.0f);
+                rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                // Diagonal lines going down-right. We need to cover
+                // the panel from its top-right corner to its bottom-
+                // left corner, so the start positions range from
+                // (l - panel_h, t) to (r, t). The diagonal length is
+                // bounded by the panel diagonal.
+                const float panelH = b - t;
+                const float startX0 = l - panelH;
+                const float endX0   = r;
+                for (float x = startX0; x < endX0; x += kSpacing) {
+                    rt->DrawLine(
+                        D2D1::Point2F(x, t),
+                        D2D1::Point2F(x + panelH, b),
+                        m_brushCarbonHatch.Get(), 0.6f);
+                }
+                rt->PopAxisAlignedClip();
+            }
+
+            // Outer frame with chamfered (cut) corners. Builds an
+            // octagonal-ish closed path: 4 straight edges joined by
+            // 4 diagonal cuts at the corners. `chamfer` is the
+            // diagonal cut length in pixels (12 px matches the
+            // design's industrial-HUD look). Single fill + stroke
+            // pair, no per-corner arc geometry needed.
+            void drawChamferedRect(ID2D1RenderTarget* rt,
+                                     const D2D1_RECT_F& rect,
+                                     float chamfer,
+                                     ID2D1Brush* fillBrush,
+                                     ID2D1Brush* strokeBrush,
+                                     float strokeWidth) const {
+                ComPtr<ID2D1PathGeometry> path;
+                if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
+                    // Fallback to a plain rounded-rect if path
+                    // creation fails for any reason (shouldn't
+                    // happen in practice — D2D factory is always
+                    // alive at paint time).
+                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+                        rect, 8.0f, 8.0f);
+                    rt->FillRoundedRectangle(rr, fillBrush);
+                    rt->DrawRoundedRectangle(rr, strokeBrush, strokeWidth);
+                    return;
+                }
+                ComPtr<ID2D1GeometrySink> sink;
+                if (FAILED(path->Open(sink.GetAddressOf()))) return;
+                const float L = rect.left;
+                const float Rg = rect.right;
+                const float T = rect.top;
+                const float B = rect.bottom;
+                const float c = chamfer;
+                sink->BeginFigure(D2D1::Point2F(L + c, T),
+                                   D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(Rg - c, T));        // top edge
+                sink->AddLine(D2D1::Point2F(Rg, T + c));        // top-right cut
+                sink->AddLine(D2D1::Point2F(Rg, B - c));        // right edge
+                sink->AddLine(D2D1::Point2F(Rg - c, B));        // bottom-right cut
+                sink->AddLine(D2D1::Point2F(L + c, B));         // bottom edge
+                sink->AddLine(D2D1::Point2F(L, B - c));         // bottom-left cut
+                sink->AddLine(D2D1::Point2F(L, T + c));         // left edge
+                sink->AddLine(D2D1::Point2F(L + c, T));         // top-left cut (close)
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                rt->FillGeometry(path.Get(), fillBrush);
+                rt->DrawGeometry(path.Get(), strokeBrush, strokeWidth);
             }
 
             // -------- Members -----------------------------------------------
@@ -882,11 +1061,21 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
             ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
             ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
+            ComPtr<ID2D1SolidColorBrush> m_brushBevelHighlight;
+            ComPtr<ID2D1SolidColorBrush> m_brushBevelShadow;
+            ComPtr<ID2D1SolidColorBrush> m_brushCarbonHatch;
             ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
             ComPtr<ID2D1SolidColorBrush> m_brushTextLabel;
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
-            ComPtr<ID2D1SolidColorBrush> m_brushGpuTeal;
-            ComPtr<ID2D1SolidColorBrush> m_brushCpuBlue;
+            // Histogram bar brushes use linear gradients (top→
+            // bottom) rather than solid colours, matching the design
+            // spec's "lit from above" look. Stop collections cached
+            // once at init, brushes are reused with per-strip
+            // endpoint updates in drawHistogramBars.
+            ComPtr<ID2D1GradientStopCollection> m_gpuTealStops;
+            ComPtr<ID2D1GradientStopCollection> m_cpuBlueStops;
+            ComPtr<ID2D1LinearGradientBrush>    m_brushGpuTealGrad;
+            ComPtr<ID2D1LinearGradientBrush>    m_brushCpuBlueGrad;
             ComPtr<ID2D1SolidColorBrush> m_brushOrange;      // warning tier (≥ 80 % load)
             ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;    // critical tier (≥ 90 % load)
             ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
