@@ -73,11 +73,12 @@ namespace openxr_api_layer::detail {
         // Texture stays at this fixed size regardless of `scale` — the
         // QUAD in 3D scales, not the resolution. 720×480 (3:2) packs
         // the four sections of the redesigned HUD:
-        //   - header bar (FPS / FPS AVG / P95 / P99, 4 cells)
+        //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
         //   - GPU FRAMETIME MS panel with histogram + current value
-        //   - CPU FRAMETIME MS panel with histogram + current value
-        //   - bottom row split into two panels (TEMP & UTILISATION)
-        //     each with chip + thermometer icons and a circular gauge
+        //   - CPU FRAMETIME MS panel with histogram + App / Render split
+        //   - bottom row split into two panels (60 / 40):
+        //       GPU panel = TEMP / LOAD / VRAM (3 cells)
+        //       CPU panel = TEMP / LOAD       (2 cells)
         //
         // The texture is shorter than the previous 720×540 (4:3) layout
         // because the frametime panels are now 90 px each (was 160→120
@@ -87,11 +88,12 @@ namespace openxr_api_layer::detail {
         // the strip visually, no empty top region.
         //
         // Vertical budget (top → bottom), all in pixels at native
-        // texture resolution:
+        // texture resolution. The actual sum is documented as a check
+        // for whoever tweaks the constants next:
         //   kOuterPad           (10)
         //   kFrameStroke         (2)
-        //   inner padding        (4)
-        //   kHeaderHeight       (66)
+        //   inner padding        (4)   ← see innerT in paint()
+        //   kHeaderHeight       (90)
         //   kSectionGap         (14)
         //   kFrametimeHeight    (90) — GPU panel
         //   kSectionGap         (14)
@@ -101,8 +103,12 @@ namespace openxr_api_layer::detail {
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 450, with ~30 px of breathing-room slack against
-        //   the 480-px texture height.
+        //   Total = 474, leaving 6 px of bottom slack against the
+        //   480-px texture height. The slack is intentionally small —
+        //   each panel is sized to its content, and `bottomY + kBottomHeight
+        //   ≤ innerB` by construction (asserted via the (void)innerB
+        //   line in paint()). Bumping any of the heights past this
+        //   budget will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
         constexpr int32_t kTexH = 480;
 
@@ -421,21 +427,25 @@ namespace openxr_api_layer::detail {
             // -------- paint() -----------------------------------------------
             //
             // Layout (top → bottom):
-            //   - Outer frame: dark grey 2-px stroke around a slightly
-            //     lighter dark-blue background. 10-px padding to the
-            //     texture edge so the OpenXR runtime's bilinear filter
-            //     doesn't soften the corner anti-alias.
-            //   - Header bar: 4 cells (FPS / FPS AVG / P95 / P99),
-            //     thin vertical separators. Big white FPS number,
-            //     cyan accent numbers on the right three cells.
-            //   - GPU FRAMETIME MS panel: title + current value
-            //     (top-right) + dashed grid + teal histogram.
-            //   - CPU FRAMETIME MS panel: same, light-blue bars.
-            //   - Bottom row (2 panels):
-            //       GPU TEMP & UTILISATION — chip icon, thermometer +
-            //         "TEMP 67 °C", "GPU UTIL" + red circular gauge.
-            //       CPU TEMP & UTILISATION — same, "-- °C" until
-            //         PawnIO lands, cyan gauge.
+            //   - Outer frame: dark grey 2-px stroke around a deep-
+            //     carbon background, chamfered corners (12-px diagonal
+            //     cuts), 10-px padding to the texture edge so the
+            //     OpenXR runtime's bilinear filter doesn't soften the
+            //     corner anti-alias.
+            //   - Header bar: 5 cells (FPS / FPS AVG / P95 / P99 /
+            //     P99.9) with thin vertical separators. Big white FPS
+            //     number, cyan accent numbers on the right four cells.
+            //   - GPU FRAMETIME MS panel: title + "X.X ms" value
+            //     (top-right) + dashed grid + teal-gradient histogram.
+            //   - CPU FRAMETIME MS panel: title + compound
+            //     "App ms X / Render ms Y" (top-right) + blue-gradient
+            //     histogram.
+            //   - Bottom row (60 / 40 split between two panels):
+            //       GPU panel = TEMP / LOAD / VRAM (3 cells). LOAD &
+            //         VRAM are tier-coloured (cyan / orange / red
+            //         per gaugeTierForUtilisation).
+            //       CPU panel = TEMP / LOAD (2 cells). TEMP shows
+            //         "-- °C" until PawnIO support lands.
             //
             // The cached display values are re-formatted only when the
             // snapshot's `version` changes (the aggregator publishes
@@ -745,11 +755,13 @@ namespace openxr_api_layer::detail {
             // brush; the four accent cells (AVG / P95 / P99 / P99.9)
             // use cyan.
             //
-            // Cell width = 688 / 5 ≈ 137 px on the 720-wide texture.
-            // Bahnschrift Bold 42 px on "142" measures ~70 px (the
-            // font is condensed so 3-digit numbers stay narrow);
-            // labels at 14 px SemiBold stay well under 50 px even
-            // for "P99.9". Comfortable margins.
+            // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
+            // (innerR - innerL). Rajdhani Bold kFontBigNumber=52 px on
+            // "142" measures ~78 px (the font is condensed so 3-digit
+            // numbers stay narrow); kFontTinyLabel=17 px SemiBold labels
+            // stay well under 50 px even for "P99.9". Comfortable
+            // margins. On systems without the bundled font we fall
+            // back to Bahnschrift — slightly wider but still fits.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -1086,11 +1098,13 @@ namespace openxr_api_layer::detail {
                 std::wstring loadLabel = std::wstring(prefix) + L" LOAD";
 
                 // Vertical positions inside the panel:
-                //   labelY : small label (m_fmtTinyLabelCenter, 14 px)
-                //   valueY : big value (m_fmtTemp, 30 px) — extends
-                //            down to the panel bottom and paragraph-
-                //            centres for the "label above / value
-                //            below" stack the design asks for.
+                //   labelY : small label (m_fmtTinyLabelCenter,
+                //            kFontTinyLabel = 17 px SemiBold)
+                //   valueY : big value (m_fmtTemp, kFontTemp = 43 px
+                //            Bold) — extends down to the panel bottom
+                //            and paragraph-centres for the "label
+                //            above / value below" stack the design
+                //            asks for.
                 const float labelY = t + (b - t) * 0.18f;
                 const float valueY = t + (b - t) * 0.40f;
 
