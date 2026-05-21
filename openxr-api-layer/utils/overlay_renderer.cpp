@@ -135,7 +135,10 @@ namespace openxr_api_layer::detail {
         // design. Window covered = 120 samples ≈ 1.3 s @ 90 Hz / 1 s @
         // 120 Hz, still long enough to catch a stutter spike but short
         // enough that the histogram reacts within the same second.
-        constexpr std::size_t kRingSize  = 120;
+        constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
+        static_assert(kRingSize == 120,
+                       "kOverlayHistoRingSize must match the in-engine ring size; "
+                       "bump both in lockstep if tuning the histogram length");
 
         // Font sizes — calibrated against the design spec's
         // hierarchy. Sizes in pixels at the 720×480 native texture
@@ -2155,6 +2158,35 @@ namespace openxr_api_layer::detail {
         auto r = std::make_unique<D3D12OverlayRenderer>(api, session, device, queue);
         return r->isReady() ? std::unique_ptr<OverlayRenderer>(std::move(r))
                             : nullptr;
+    }
+
+    // -------- Snapshot entry point ----------------------------------------
+    //
+    // One-shot render to an externally-owned ID2D1RenderTarget. Used by
+    // the visual-regression snapshot tool — caller provides a WIC bitmap
+    // render target, this function paints the HUD into it, caller saves
+    // the bitmap to PNG. Reuses the same CoreRenderer as the in-engine
+    // path, so the snapshot reflects EXACTLY what the user sees in the
+    // headset (modulo font availability — see the bundled-Rajdhani
+    // fallback in init()).
+    //
+    // Not suitable for per-frame use: every call allocates a fresh
+    // CoreRenderer + its brushes / fonts. The cost (~5 ms of D2D/
+    // DirectWrite init) is fine for a once-per-CI-run snapshot tool
+    // but would be wasteful in production.
+    bool renderOverlayToTarget(
+        ID2D1RenderTarget* rt,
+        const OverlaySnapshot& snap,
+        const HistogramRing<kOverlayHistoRingSize>& cpuRing,
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing) {
+        if (!rt) return false;
+        // CoreRenderer is in this TU's anonymous namespace (nested in
+        // openxr_api_layer::detail), so the unqualified name resolves
+        // here from the enclosing detail namespace.
+        CoreRenderer core;
+        if (!core.init())            return false;
+        if (!core.initBrushes(rt))   return false;
+        return core.paint(rt, snap, cpuRing, gpuRing);
     }
 
 } // namespace openxr_api_layer::detail

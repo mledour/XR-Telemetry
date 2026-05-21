@@ -42,6 +42,7 @@
 
 #include "pch.h"
 
+#include "histogram_ring.h"
 #include "overlay_aggregator.h"
 
 #include <memory>
@@ -118,5 +119,31 @@ namespace openxr_api_layer::detail {
     std::unique_ptr<OverlayRenderer> makeD3D12OverlayRenderer(
         OpenXrApi* api, XrSession session,
         ID3D12Device* device, ID3D12CommandQueue* queue);
+
+    // -------- Snapshot / test entry point ---------------------------------
+    //
+    // Renders the overlay HUD to an arbitrary ID2D1RenderTarget — useful
+    // for visual-regression tests (a WIC bitmap RT in a CI tool produces
+    // a PNG that can be diffed against a golden image) and for offline
+    // preview generation.
+    //
+    // Same paint pipeline as the in-game renderers, just decoupled from
+    // OpenXR swapchain plumbing. Caller is responsible for the render
+    // target's lifecycle (Begin/EndDraw not required — this function
+    // handles them internally), but the brushes / text formats are
+    // allocated fresh on every call so the function is suitable only
+    // for one-shot rendering (NOT per-frame). Returns true on success.
+    //
+    // The histogram ring template parameter must match the in-engine
+    // kRingSize. We expose that as kOverlayHistoRingSize here so test
+    // code can declare matching rings without hard-coding the value
+    // (and the cpp's static_assert below guards against drift).
+    constexpr std::size_t kOverlayHistoRingSize = 120;
+
+    bool renderOverlayToTarget(
+        ID2D1RenderTarget* rt,
+        const OverlaySnapshot& snap,
+        const HistogramRing<kOverlayHistoRingSize>& cpuRing,
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing);
 
 } // namespace openxr_api_layer::detail

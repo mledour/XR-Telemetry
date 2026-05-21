@@ -241,6 +241,22 @@ jobs:
             throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
           }
 
+      # ---- Overlay snapshot artifact (Release only) ----------------------
+      # test_overlay_snapshot.cpp renders the HUD with mock data to a
+      # WIC bitmap and writes overlay_snapshot.png in the test runner's
+      # working directory. Uploaded as an artifact so visual changes
+      # are reviewable from the PR's Actions tab without needing a
+      # HMD. Runs even when other tests failed (`if: always()`) so a
+      # broken assertion elsewhere doesn't hide the snapshot from a
+      # reviewer.
+      - name: Upload overlay snapshot
+        if: always() && matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-snapshot
+          path: overlay_snapshot.png
+          if-no-files-found: warn
+
       # ---- Inno Setup installer (Release only) --------------------------
       # Produces a single Setup.exe that installs the DLL + JSON manifest
       # to Program Files (correct ACLs for sandboxed identities), registers
