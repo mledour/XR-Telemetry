@@ -286,13 +286,28 @@ jobs:
             Write-Host "Staged current golden: $((Get-Item screenshots/overlay_snapshot.png).Length) bytes"
           }
 
+          # actions/upload-artifact@v4 rejects names containing any of
+          # / \ : * ? " < > | (NTFS path-illegal chars). github.ref_name
+          # on a pull_request event is "<PR_number>/merge" — the slash
+          # makes the upload fail. On a regular push it's the branch
+          # name, which CAN also contain slashes (`feat/foo`, `ci-test/
+          # bar`, …). Sanitise by replacing any non-[A-Za-z0-9-_.] with
+          # a dash, then publish the result as an env var the upload
+          # step below consumes.
+          $rawRef = '${{ github.ref_name }}'
+          $safeRef = $rawRef -replace '[^a-zA-Z0-9\-_.]', '-'
+          Write-Host "ref_name raw='$rawRef' sanitised='$safeRef'"
+          "ARTIFACT_REF_TAG=$safeRef" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Upload snapshot diff (on test failure)
         if: failure() && matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          # Branch / SHA in the name so several failing PRs don't
-          # collide if someone downloads them in parallel.
-          name: overlay-snapshot-diff-${{ github.ref_name }}-${{ github.run_attempt }}
+          # ARTIFACT_REF_TAG comes from the staging step above — it's
+          # the github.ref_name sanitised against actions/upload-artifact
+          # @v4's naming rules. run_attempt distinguishes re-runs so two
+          # downloads of the same failing PR don't collide.
+          name: overlay-snapshot-diff-${{ env.ARTIFACT_REF_TAG }}-${{ github.run_attempt }}
           path: artifact/snapshot-diff/
           if-no-files-found: warn
 
