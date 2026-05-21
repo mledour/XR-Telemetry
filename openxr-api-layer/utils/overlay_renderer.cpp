@@ -627,8 +627,16 @@ namespace openxr_api_layer::detail {
                 if (!addResourceFont(200)) return false;
                 if (!addResourceFont(201)) return false;
 
-                // Build the font set from the loaded files.
-                ComPtr<IDWriteFontSetBuilder> setBuilder;
+                // Build the font set from the loaded files. We use
+                // IDWriteFontSetBuilder1 (the extended interface)
+                // because AddFontFile lives there — the base
+                // IDWriteFontSetBuilder only exposes
+                // AddFontFaceReference, which would require us to
+                // create a face reference per file via the factory
+                // (more boilerplate). IDWriteFactory5::CreateFontSet
+                // Builder returns the v1 builder directly (the
+                // override hides the inherited v0 signature).
+                ComPtr<IDWriteFontSetBuilder1> setBuilder;
                 if (FAILED(factory5->CreateFontSetBuilder(setBuilder.GetAddressOf()))) {
                     return false;
                 }
