@@ -73,11 +73,20 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
     // Mock OverlaySnapshot matching the design mockup numbers.
+    //
+    // [ci-test] Intentional one-digit tweak (142 → 143) to validate
+    // the snapshot CI: the change should cause the FPS big-number
+    // glyph to differ vs the committed golden, the test's CHECK
+    // should fail with a clear "snapshot diverges from golden: N
+    // pixels differ; first at (x=…, y=…)" message, and the workflow
+    // update-overlay-snapshot.yml should be able to regenerate the
+    // golden via dry-run + commit. NOT FOR MERGE — revert this line
+    // before closing the PR.
     openxr_api_layer::detail::OverlaySnapshot makeMockSnapshot() {
         openxr_api_layer::detail::OverlaySnapshot s;
         s.valid       = true;
         s.version     = 1;
-        s.fps_instant = 142.0f;
+        s.fps_instant = 143.0f;
         s.fps_avg     = 138.0f;
         s.fps_p95     = 124.0f;
         s.fps_p99     = 108.0f;
