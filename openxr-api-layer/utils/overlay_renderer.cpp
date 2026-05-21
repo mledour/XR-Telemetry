@@ -361,14 +361,26 @@ namespace openxr_api_layer::detail {
 
                 drawHeaderBar(rt, innerL, headerY, innerR,
                                headerY + kHeaderHeight, v);
+                // GPU panel: single value top-right ("6.7 ms").
+                // CPU panel: dual value "App ms X.X ms / Render ms Y.Y
+                // ms" — the App / Render split is the diagnostic
+                // value of the design (see comment in
+                // overlay_aggregator.h for what each metric covers).
+                // An empty secondary string suppresses the App / Render
+                // composition and falls back to the single-value
+                // rendering — same code path as the GPU panel.
                 drawFrametimePanel(rt, innerL, gpuPanelY, innerR,
                                     gpuPanelY + kFrametimeHeight,
-                                    L"GPU FRAMETIME MS", v.gpu_frametime_ms,
+                                    L"GPU FRAMETIME MS",
+                                    v.gpu_frametime_ms,
+                                    /*secondaryValue=*/std::string{},
                                     gpuRing, snap.target_fps,
                                     m_brushGpuTeal.Get());
                 drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
                                     cpuPanelY + kFrametimeHeight,
-                                    L"CPU FRAMETIME MS", v.cpu_frametime_ms,
+                                    L"CPU FRAMETIME MS",
+                                    v.cpu_frametime_ms,
+                                    v.cpu_app_ms,
                                     cpuRing, snap.target_fps,
                                     m_brushCpuBlue.Get());
 
@@ -527,6 +539,7 @@ namespace openxr_api_layer::detail {
                                      float r, float b,
                                      const wchar_t* title,
                                      const std::string& currentValue,
+                                     const std::string& secondaryValue,
                                      const HistogramRing<kRingSize>& ring,
                                      float targetFps,
                                      ID2D1Brush* barBrush) const {
@@ -541,19 +554,37 @@ namespace openxr_api_layer::detail {
                 drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
                           m_brushTextLabel.Get());
 
-                // Current value (top-right) — "X.X ms" rendered as a
-                // single right-aligned string in one font / one rect.
-                // Drawing the "ms" suffix in a separate rect with a
-                // different font caused visible misalignment between
-                // the GPU and CPU panels (different paragraph centres
-                // at different sizes); merging into one string makes
-                // the right edges and baselines automatically
-                // identical across both panels.
-                const std::string valueWithMs = currentValue + " ms";
+                // Current value (top-right). Two shapes depending on
+                // whether `secondaryValue` is empty:
+                //
+                //   GPU panel (secondaryValue == "")   : "6.7 ms"
+                //   CPU panel (secondaryValue == "4.3"): "App ms 4.3 ms / Render ms 7.4 ms"
+                //
+                // Both render as a SINGLE right-aligned trailing-
+                // aligned string in m_fmtMsValue (Consolas Bold 22 px).
+                // Drawing the labels and values in separate rects /
+                // colours was tried in an earlier revision and caused
+                // visible baseline mismatch between the two panels —
+                // the single-string approach keeps right edges and
+                // baselines identical across GPU / CPU and across
+                // resize events. The colour split between "labels"
+                // and "values" is sacrificed for layout robustness;
+                // can be revisited via IDWriteTextLayout if the
+                // visual hierarchy needs more separation.
+                std::string topRightStr;
+                float valueRectWidth;
+                if (secondaryValue.empty()) {
+                    topRightStr = currentValue + " ms";
+                    valueRectWidth = 140.0f;
+                } else {
+                    topRightStr = "App ms " + secondaryValue +
+                                   " ms / Render ms " + currentValue + " ms";
+                    valueRectWidth = 420.0f;
+                }
                 const D2D1_RECT_F valueRect = D2D1::RectF(
-                    r - kSectionInnerPad - 140.0f, titleT - 4.0f,
-                    r - kSectionInnerPad,           titleB + 6.0f);
-                drawAscii(rt, valueWithMs, m_fmtMsValue.Get(), valueRect,
+                    r - kSectionInnerPad - valueRectWidth, titleT - 4.0f,
+                    r - kSectionInnerPad,                  titleB + 6.0f);
+                drawAscii(rt, topRightStr, m_fmtMsValue.Get(), valueRect,
                            m_brushAccentCyan.Get());
 
                 // Histogram region — below the title row, with inner

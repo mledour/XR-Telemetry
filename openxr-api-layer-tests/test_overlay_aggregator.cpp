@@ -124,6 +124,15 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
     REQUIRE(agg.snapshot().valid);
     const auto& s = agg.snapshot();
     CHECK(s.cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
+    // cpu_app_ms = rec.app_cpu_ns averaged across the window. With
+    // app_cpu_ns = 4'000'000 on every frame, the App ms reads 4.0 —
+    // matches the per-cycle 4ms in this fixture because we set
+    // wait_block such that the two metrics happen to align. In real
+    // workloads, app_cpu_ns (= wait→end) is typically SMALLER than
+    // per-cycle (= frame_total − wait_block), because per-cycle
+    // includes the endframe call + pre-begin housekeeping on top of
+    // the wait→end window.
+    CHECK(s.cpu_app_ms   == doctest::Approx(4.0f).epsilon(0.001));
     CHECK(s.gpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
     // 1e9 / 11.111e6 ≈ 90 fps.
     CHECK(s.fps_avg     == doctest::Approx(90.0f).epsilon(0.05));
@@ -137,6 +146,34 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
 // =============================================================================
 // Moving average — values are averaged across the window, not the latest.
 // =============================================================================
+
+TEST_CASE("OverlayAggregator: cpu_app_ms is independent of cpu_frame_ms") {
+    // App ms = rec.app_cpu_ns (wait→end window).
+    // Render ms (= cpu_frame_ms) = frame_total - wait_block (per-cycle).
+    //
+    // The two diverge whenever endframe / pre-begin overhead is
+    // non-trivial. This test fixes BOTH values explicitly and
+    // verifies the aggregator publishes them independently.
+    //
+    //   frame_total = 11.111 ms
+    //   wait_block  = 6.111 ms  → per_cycle (Render) = 5.000 ms
+    //   app_cpu     = 3.500 ms
+    //   → overhead  = Render - App = 1.500 ms (endframe + pre_begin)
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0,
+                              /*app_cpu=*/3'500'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/6'111'111));
+    agg.pushFrame(makeRecord(120'000'000,
+                              /*app_cpu=*/3'500'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/6'111'111));
+    REQUIRE(agg.snapshot().valid);
+    const auto& s = agg.snapshot();
+    CHECK(s.cpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
+    CHECK(s.cpu_app_ms   == doctest::Approx(3.5f).epsilon(0.001));
+    CHECK(s.cpu_app_ms < s.cpu_frame_ms);  // ordering contract
+}
 
 TEST_CASE("OverlayAggregator: first frame with frame_total_ns=0 falls back to app_cpu_ns") {
     // On the very first frame of a session, frame_total_ns is 0 (no

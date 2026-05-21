@@ -66,6 +66,7 @@ TEST_CASE("formatOverlayDisplayValues: invalid snapshot → valid=false POD") {
     CHECK(v.fps_p99_9   == "--");
     CHECK(v.gpu_frametime_ms == "--.-");
     CHECK(v.cpu_frametime_ms == "--.-");
+    CHECK(v.cpu_app_ms       == "--.-");
     CHECK(v.gpu_temp_c  == "--");
     CHECK(v.cpu_temp_c  == "--");
     CHECK(v.gpu_util_pct == "--");
@@ -84,7 +85,8 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     snap.fps_p99_9           = 98.0f;
     snap.target_fps          = 144.0f;
     snap.gpu_frame_ms        = 6.7f;
-    snap.cpu_frame_ms        = 7.4f;
+    snap.cpu_frame_ms        = 7.4f;   // Render ms (per-cycle)
+    snap.cpu_app_ms          = 4.3f;   // App ms (wait→end window)
     snap.gpu_temp_c          = 67.0f;
     snap.gpu_utilisation_pct = 92.0f;
     snap.cpu_utilisation_pct = 78.0f;
@@ -102,6 +104,7 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     // Frametime panels — one decimal.
     CHECK(v.gpu_frametime_ms == "6.7");
     CHECK(v.cpu_frametime_ms == "7.4");
+    CHECK(v.cpu_app_ms       == "4.3");
 
     // Bottom row temps — integer °C.
     CHECK(v.gpu_temp_c == "67");

@@ -70,8 +70,8 @@ namespace openxr_api_layer::detail {
     //   <histogram >
     //
     //   ── CPU frametime panel ───────────────────────────────────────
-    //   CPU FRAMETIME MS                          7.4 ms
-    //                                     cpu_frametime_ms
+    //   CPU FRAMETIME MS        App ms 4.3 ms / Render ms 7.4 ms
+    //                            cpu_app_ms_str   cpu_frametime_ms
     //   <histogram>
     //
     //   ── bottom row (2 panels side-by-side) ────────────────────────
@@ -98,8 +98,13 @@ namespace openxr_api_layer::detail {
 
         // Frametime panel current-value labels (top-right of each
         // panel — the histogram itself takes the rest of the space).
+        // GPU panel only shows the per-cycle GPU time. CPU panel
+        // shows BOTH the per-cycle CPU (= "Render ms") AND the
+        // app-only window (= "App ms"); the difference is the OpenXR
+        // overhead, which is the diagnostic value the design surfaces.
         std::string gpu_frametime_ms = "--.-";
-        std::string cpu_frametime_ms = "--.-";
+        std::string cpu_frametime_ms = "--.-";  // Render ms
+        std::string cpu_app_ms       = "--.-";  // App ms (wait→end)
 
         // Bottom row — temperatures (integer °C, "--" sentinel when
         // source absent).
@@ -184,6 +189,7 @@ namespace openxr_api_layer::detail {
 
         v.gpu_frametime_ms = fmtMsOneDecimal(snap.gpu_frame_ms);
         v.cpu_frametime_ms = fmtMsOneDecimal(snap.cpu_frame_ms);
+        v.cpu_app_ms       = fmtMsOneDecimal(snap.cpu_app_ms);
 
         v.gpu_temp_c       = fmtTempInt(snap.gpu_temp_c);
         // cpu_temp_c intentionally stays "--": there's no anti-cheat-
