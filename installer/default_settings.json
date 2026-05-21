@@ -21,6 +21,8 @@
     },
     "refresh_hz": 10,
     "position": "head_top_right",
-    "scale": 1.0
+    "scale": 1.0,
+    "_comment_renderer_path": "How the D3D11 overlay renderer composites the HUD onto the OpenXR swapchain image. 'auto' (default): try the direct path, fall back to the shim if the app's D3D11 device lacks D3D11_CREATE_DEVICE_BGRA_SUPPORT or the swapchain image isn't D2D-compatible. 'shim': always paint into a private BGRA texture and CopyResource into the swapchain image (the conservative path that worked in every previous version of this layer — keep this if you see HUD glitches or anti-cheat warnings). 'direct': always paint straight into the swapchain image; logs a warning + falls back to shim if unsupported. D3D12 hosts ignore this — they always use the D3D11On12 bridge.",
+    "renderer_path": "auto"
   }
 }

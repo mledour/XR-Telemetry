@@ -146,6 +146,151 @@ If a D3D11On12 path is overkill for your layer, drop the `d3d12.h`
 and `d3d11on12.h` includes from `pch.h` — they're optional weight on
 build time only.
 
+## Overlay renderer paths (D3D11): direct vs shim
+
+The D3D11 overlay renderer has two ways to put a D2D-painted HUD onto
+the OpenXR swapchain image. Which one runs in a given session depends
+on `overlay.renderer_path` in `settings.json` AND on the app's D3D11
+device flags. The setting itself is documented in
+`installer/default_settings.json`; this section explains what's behind
+each choice.
+
+### Shim path (default + guaranteed-to-work fallback)
+
+```
+Layer DLL                                  App
+─────────                                  ──────────
+m_myDevice (D3D11 + BGRA_SUPPORT)          m_device (the app's D3D11)
+m_myShim (BGRA texture, shared NT handle)
+m_myShimRenderTarget (D2D RT on shim) ┐
+                                       │
+        ┌── keyed-mutex pair (key 0/1)─┤
+        │                              │
+        │                              m_appShim (same texture, opened on app device)
+        │                              m_appShimMutex
+        │                              m_context->CopyResource(swapchainImage, m_appShim)
+        ▼
+   D2D paint goes here every frame
+```
+
+Per frame:
+1. `m_myShimMutex.AcquireSync(0, 50)` — wait for app side to finish
+   the previous copy (50 ms ceiling guards against host-side deadlock).
+2. `m_core.paint(m_myShimRenderTarget, snap, ...)` — D2D paints.
+3. `m_myShimMutex.ReleaseSync(1)` — hand the key over to the copy side.
+4. `m_appShimMutex.AcquireSync(1, 50)` — copy side claims the key.
+5. `m_context->CopyResource(m_images[idx], m_appShim)` — copy on the
+   app's device.
+6. `m_appShimMutex.ReleaseSync(0)` — restore key=0 for the next frame.
+
+Why this exists: D2D requires the underlying D3D11 device to have been
+created with `D3D11_CREATE_DEVICE_BGRA_SUPPORT`. Almost no VR game
+sets that flag (Unity / Unreal RHIs don't, neither do iRacing / DCS /
+MSFS / DR2 / etc.) so paint-on-the-app-device fails with
+`E_INVALIDARG` on `CreateDxgiSurfaceRenderTarget`. The shim is the
+defensive workaround: we own a private D3D11 device with BGRA, paint
+there, then copy via a shared NT handle.
+
+Cost per frame: ~100–300 µs (2 keyed-mutex acquire/release pairs +
+one cross-device `CopyResource` of a 720×480 BGRA texture).
+Memory cost: one 1.4 MB shim texture + one D3D11 device + one
+kernel NT handle, all for the session's lifetime.
+
+### Direct path (opt-in fast path)
+
+```
+Layer DLL                                  App
+─────────                                  ──────────
+m_directRTs[N]  (one ID2D1RenderTarget    m_device (the app's D3D11)
+                 per swapchain image, on  m_images[N] (OpenXR swapchain)
+                 the app's device)
+       │
+       └── D2D paint goes straight into m_directRTs[idx] every frame
+           (NO mutex, NO copy, NO shim)
+```
+
+Per frame:
+1. `m_core.paint(m_directRTs[idx], snap, ...)` — D2D paints directly
+   into the swapchain image via the app's D3D11 device.
+
+That's it. No mutex, no copy. D2D's `BeginDraw`/`EndDraw` saves and
+restores the app's D3D11 state, so the app's `ImmediateContext` is
+clean afterwards.
+
+### Detection logic
+
+In `D3D11OverlayRenderer::init()`, after the swapchain + images are
+populated:
+
+```cpp
+if (m_pathSetting != OverlayRendererPath::Shim &&
+    tryInitDirectPath()) {
+    m_useDirectPath = true;
+    // log + return
+}
+// else fall through to shim init
+```
+
+`tryInitDirectPath()` succeeds only when:
+1. `m_device->GetCreationFlags() & D3D11_CREATE_DEVICE_BGRA_SUPPORT`
+2. `m_core.d2d()->CreateDxgiSurfaceRenderTarget()` succeeds on every
+   `m_images[i]` (handles the case where the runtime stores BGRA
+   swapchain images as TYPELESS — Pimax has been observed doing this,
+   and D2D refuses TYPELESS surfaces).
+
+`renderer_path` semantics:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Try direct. If `tryInitDirectPath()` returns false, silently fall back to shim. The probe failures are not logged in this mode. |
+| `direct` | Try direct. If the probe fails, log the *specific* reason (missing BGRA_SUPPORT, `IDXGISurface` query fail, or `CreateDxgiSurfaceRenderTarget` failure with HRESULT) and fall back to shim anyway — never refuse to load the HUD. |
+| `shim` | Skip the probe entirely, go straight to shim init. Forces the conservative path; useful for opting out if a future D2D / driver change breaks the direct path on a specific machine. |
+
+### Which path will my session pick?
+
+| App / engine | Direct works? | Default (Auto) chooses |
+|---|---|---|
+| Unity (URP / HDRP) VR | No (no `BGRA_SUPPORT`) | Shim |
+| Unreal Engine 4 / 5 VR | No | Shim |
+| iRacing, DCS, MSFS, DR2, LMU, AC | No | Shim |
+| Custom D3D11 app that uses D2D itself | Likely yes | Direct |
+| Test app built with `D3D11_CREATE_DEVICE_BGRA_SUPPORT` for layer testing | Yes | Direct |
+
+In practice the direct path benefits well under 5 % of VR titles. The
+setting exists primarily so that future apps that DO request
+`BGRA_SUPPORT` (e.g. unified D2D-based HUD pipelines) get the fast
+path automatically, and so that anyone debugging a shim glitch can
+force the conservative path.
+
+### Why the snapshot test doesn't cover either path
+
+`test_overlay_snapshot.cpp` uses `renderOverlayToTarget` with a WIC
+bitmap RT — it doesn't go through `D3D11OverlayRenderer` at all, so
+neither the shim nor the direct path is exercised. Both paths produce
+visually identical D2D output (same `m_core.paint()` invoked the same
+way), so a passing snapshot test does NOT prove that a session-level
+regression hasn't crept in.
+
+Real-runtime validation requires running the layer in a HMD with a
+game. That's why the `OverlayRendererPath::Direct` log line includes
+"DIRECT path — N swapchain RTs on app device" — a user reporting a
+HUD issue can grep their session log for that line to confirm which
+path was selected.
+
+### Adding a new path
+
+If a future runtime introduces a third compositing model (e.g.
+SwapChainPanel for Windows MR Cliff House, or DComp surfaces for
+spatial overlays), follow the same pattern:
+
+1. Add a value to `OverlayRendererPath` in `settings.h`.
+2. Add a probe helper (`tryInitFooPath()`) that returns false on any
+   incompatibility, releasing partial state.
+3. Branch `init()` to attempt the new path BEFORE the shim, falling
+   through to shim on any failure.
+4. Branch `renderAndCompose()` to handle the new path's per-frame work.
+5. Document the trade-offs here.
+
 ## Snapshot (visual-regression) tests
 
 ### What it does and why

@@ -44,6 +44,7 @@
 
 #include "histogram_ring.h"
 #include "overlay_aggregator.h"
+#include "settings.h"
 
 #include <memory>
 #include <string>
@@ -117,8 +118,18 @@ namespace openxr_api_layer::detail {
     // binding device received via XrGraphicsBindingD3D11KHR in
     // xrCreateSession. Returns nullptr if anything in the init path
     // fails (the caller logs and degrades).
+    //
+    // `path` controls whether the renderer paints DIRECTLY into the
+    // OpenXR swapchain image (skips a per-frame cross-device copy + 2
+    // keyed-mutex acquires) or through a SHIM texture on a private
+    // D3D11 device (the conservative default that works on every app).
+    // Default Auto behaviour: try Direct, silently fall back to Shim if
+    // the app's device is missing D3D11_CREATE_DEVICE_BGRA_SUPPORT or
+    // the swapchain image isn't D2D-compatible. See settings.h
+    // OverlayRendererPath for the full semantics.
     std::unique_ptr<OverlayRenderer> makeD3D11OverlayRenderer(
-        OpenXrApi* api, XrSession session, ID3D11Device* device);
+        OpenXrApi* api, XrSession session, ID3D11Device* device,
+        OverlayRendererPath path = OverlayRendererPath::Auto);
 
     // Factory: app uses D3D12. We bridge via D3D11On12 (the wrapper that
     // exposes the D3D12 device as an ID3D11Device so D2D can paint into

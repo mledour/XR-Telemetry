@@ -1389,8 +1389,10 @@ namespace openxr_api_layer::detail {
         class D3D11OverlayRenderer final : public OverlayRenderer {
           public:
             D3D11OverlayRenderer(OpenXrApi* api, XrSession session,
-                                  ID3D11Device* device)
-                : m_api(api), m_session(session), m_device(device) {
+                                  ID3D11Device* device,
+                                  OverlayRendererPath pathSetting)
+                : m_api(api), m_session(session), m_device(device),
+                  m_pathSetting(pathSetting) {
                 if (m_device) m_device->GetImmediateContext(m_context.GetAddressOf());
                 m_ready = init();
             }
@@ -1451,6 +1453,33 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
+                // -------- Direct path -------------------------------
+                //
+                // The "good citizen" branch: paint straight into the
+                // OpenXR swapchain image via the app's D3D11 device.
+                // No shim texture, no shared NT handle, no keyed
+                // mutex, no CopyResource — D2D's BeginDraw/EndDraw
+                // saves/restores the app's D3D11 state so the
+                // immediate context is clean afterwards.
+                if (m_useDirectPath) {
+                    bool painted = false;
+                    if (imageIdx < m_directRTs.size() && m_directRTs[imageIdx]) {
+                        painted = m_core.paint(m_directRTs[imageIdx].Get(),
+                                                snap, m_cpuRing, m_gpuRing);
+                    }
+                    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                    m_api->xrReleaseSwapchainImage(m_swapchain, &releaseInfo);
+                    if (!painted) return nullptr;
+
+                    const auto geo = geometryForPosition(position, scale);
+                    m_quadLayer.space = viewSpace;
+                    m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
+                    m_quadLayer.size = {geo.width_m, geo.height_m};
+                    return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
+                }
+
+                // -------- Shim path (default + fallback) -----------
+                //
                 // 2. Paint into the shim texture (typed BGRA8 we own)
                 //    on OUR private D3D11 device. The app's device may
                 //    not have been created with D3D11_CREATE_DEVICE_
@@ -1648,13 +1677,13 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Stash the OpenXR swapchain images. We don't create a
-                // D2D render target on each one (Pimax hands back
+                // Stash the OpenXR swapchain images. Whether we paint
+                // directly into these or via a shim depends on the
+                // direct-path probe below: in the shim path we never
+                // touch these via D2D (Pimax hands back
                 // DXGI_FORMAT_B8G8R8A8_TYPELESS textures, which D2D
-                // refuses), instead we paint into a shim BGRA8_UNORM
-                // texture we own and CopyResource it into the OpenXR
-                // image per frame. The diagnostic log on image 0 keeps
-                // around for future format / bindFlags regressions.
+                // refuses); in the direct path each image gets its
+                // own cached ID2D1RenderTarget.
                 m_images.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     m_images[i] = raw[i].texture;
@@ -1670,6 +1699,40 @@ namespace openxr_api_layer::detail {
                             static_cast<int>(desc.SampleDesc.Count),
                             static_cast<int>(desc.MipLevels)));
                     }
+                }
+
+                // -------- Direct path probe ---------------------------------
+                //
+                // If the user hasn't forced the shim and the app's
+                // D3D11 device + the swapchain images are D2D-
+                // compatible, paint directly into the swapchain
+                // image via the app's device. Skips ~100-300 µs per
+                // frame of mutex/copy work and removes one D3D11
+                // device + one shared NT handle + one BGRA texture
+                // from the host process.
+                //
+                // On failure (BGRA_SUPPORT missing, typeless format
+                // rejected by D2D, etc.) we fall through to the
+                // shim init below. The two paths are mutually
+                // exclusive — m_useDirectPath gates renderAndCompose.
+                if (m_pathSetting != OverlayRendererPath::Shim &&
+                    tryInitDirectPath()) {
+                    m_useDirectPath = true;
+                    initQuadLayerConstants();
+                    Log(fmt::format(
+                        "xr_telemetry: overlay D3D11 renderer ready "
+                        "(DIRECT path — {} swapchain RTs on app device, "
+                        "no shim/mutex/copy)\n",
+                        m_images.size()));
+                    return true;
+                }
+                if (m_pathSetting == OverlayRendererPath::Direct) {
+                    // User explicitly asked for direct — log the
+                    // demotion so they know why they're paying the
+                    // shim cost. Auto mode falls back silently.
+                    Log("xr_telemetry: overlay renderer_path='direct' "
+                        "requested but unavailable on this app/runtime "
+                        "combination; using shim path\n");
                 }
 
                 // Diagnostic for the app's D3D11 device — D2D requires
@@ -1846,6 +1909,92 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
+            // -------- Direct path init -----------------------------------
+            //
+            // Tries to set up the renderer for direct painting into
+            // the OpenXR swapchain images via the app's D3D11 device.
+            // Returns true ONLY when EVERY swapchain image got a D2D
+            // RT — partial success is treated as failure and the
+            // caller falls through to the shim path. Releases any
+            // partially-filled m_directRTs on failure.
+            //
+            // Two prerequisites must hold for success:
+            //   1. The app's D3D11 device has D3D11_CREATE_DEVICE_BGRA
+            //      _SUPPORT (D2D refuses to bind any RT to a device
+            //      missing this flag — verified empirically against
+            //      common VR titles, almost none set it).
+            //   2. Each swapchain image is a D2D-compatible DXGI
+            //      surface — the runtime advertised BGRA8 in our
+            //      pickSwapchainFormat probe AND the image's
+            //      BindFlags include RENDER_TARGET. Pimax can hand
+            //      back TYPELESS, which CreateDxgiSurfaceRenderTarget
+            //      rejects.
+            bool tryInitDirectPath() {
+                const UINT appFlags = m_device->GetCreationFlags();
+                if ((appFlags & D3D11_CREATE_DEVICE_BGRA_SUPPORT) == 0) {
+                    if (m_pathSetting == OverlayRendererPath::Direct) {
+                        Log(fmt::format(
+                            "xr_telemetry: direct-path probe — app D3D11 device "
+                            "lacks BGRA_SUPPORT (flags={:#x}); cannot create D2D "
+                            "render targets on its textures\n",
+                            static_cast<unsigned int>(appFlags)));
+                    }
+                    return false;
+                }
+
+                const D2D1_RENDER_TARGET_PROPERTIES props =
+                    D2D1::RenderTargetProperties(
+                        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                        D2D1::PixelFormat(
+                            DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+                m_directRTs.clear();
+                m_directRTs.reserve(m_images.size());
+                for (std::size_t i = 0; i < m_images.size(); ++i) {
+                    ComPtr<IDXGISurface> surface;
+                    if (FAILED(m_images[i].As(&surface))) {
+                        if (m_pathSetting == OverlayRendererPath::Direct) {
+                            Log(fmt::format(
+                                "xr_telemetry: direct-path probe — swapchain "
+                                "image[{}] QueryInterface IDXGISurface failed\n",
+                                i));
+                        }
+                        m_directRTs.clear();
+                        return false;
+                    }
+                    ComPtr<ID2D1RenderTarget> rt;
+                    HRESULT hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
+                        surface.Get(), &props, rt.GetAddressOf());
+                    if (FAILED(hr)) {
+                        if (m_pathSetting == OverlayRendererPath::Direct) {
+                            Log(fmt::format(
+                                "xr_telemetry: direct-path probe — "
+                                "CreateDxgiSurfaceRenderTarget on swapchain "
+                                "image[{}] failed (HRESULT={:#x})\n",
+                                i, static_cast<unsigned int>(hr)));
+                        }
+                        m_directRTs.clear();
+                        return false;
+                    }
+                    m_directRTs.push_back(std::move(rt));
+                }
+
+                // Brushes are factory-scoped, not RT-scoped — we
+                // create them once against image[0]'s RT and reuse
+                // them across every m_directRTs[i] in paint(). The
+                // RTs all share the same D2D factory (m_core.d2d())
+                // and the same underlying D3D11 device (the app's),
+                // so brush sharing is well-defined.
+                if (!m_core.initBrushes(m_directRTs[0].Get())) {
+                    Log("xr_telemetry: direct-path probe — initBrushes failed "
+                        "on swapchain image[0] D2D RT\n");
+                    m_directRTs.clear();
+                    return false;
+                }
+                return true;
+            }
+
             // One-time fill of the XrCompositionLayerQuad fields that
             // never change frame-to-frame. SOURCE_ALPHA without
             // UNPREMULTIPLIED_ALPHA_BIT matches the D2D RT's
@@ -1901,8 +2050,29 @@ namespace openxr_api_layer::detail {
             ComPtr<IDXGIKeyedMutex>     m_myShimMutex;
             ComPtr<IDXGIKeyedMutex>     m_appShimMutex;
             HANDLE                      m_sharedHandle = nullptr;
-            // D2D render target on m_myShim — the actual paint surface.
+            // D2D render target on m_myShim — the actual paint surface
+            // in the shim path. Null in direct-path mode (see
+            // m_useDirectPath below).
             ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
+
+            // -------- Direct path state ------------------------------------
+            //
+            // Set to true if tryInitDirectPath() succeeded — the
+            // shim members (m_myDevice, m_myShim, m_appShim,
+            // m_myShimMutex, m_appShimMutex, m_sharedHandle,
+            // m_myShimRenderTarget) all stay null and renderAndCompose
+            // takes the direct branch. The setting that drove this
+            // choice is captured in m_pathSetting so a log line can
+            // show "auto chose direct" vs "user forced direct".
+            OverlayRendererPath         m_pathSetting = OverlayRendererPath::Auto;
+            bool                        m_useDirectPath = false;
+            // One D2D RT per swapchain image. Index matches the
+            // imageIdx returned by xrAcquireSwapchainImage. RTs are
+            // created once at init and live for the renderer's
+            // lifetime — D2D RTs are device-bound, swapchain images
+            // are device-bound, both share the app's device, so the
+            // RTs stay valid until the swapchain is destroyed.
+            std::vector<ComPtr<ID2D1RenderTarget>> m_directRTs;
 
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_cpuRing;
@@ -2248,8 +2418,10 @@ namespace openxr_api_layer::detail {
     // -------- Factory functions ----------------------------------------------
 
     std::unique_ptr<OverlayRenderer> makeD3D11OverlayRenderer(
-        OpenXrApi* api, XrSession session, ID3D11Device* device) {
-        auto r = std::make_unique<D3D11OverlayRenderer>(api, session, device);
+        OpenXrApi* api, XrSession session, ID3D11Device* device,
+        OverlayRendererPath path) {
+        auto r = std::make_unique<D3D11OverlayRenderer>(
+            api, session, device, path);
         return r->isReady() ? std::unique_ptr<OverlayRenderer>(std::move(r))
                             : nullptr;
     }

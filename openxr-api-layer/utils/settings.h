@@ -64,6 +64,30 @@ namespace openxr_api_layer::detail {
     enum class LogMode { Auto, Hotkey };
     enum class OverlayMode { Auto, Hotkey };
 
+    // How the D3D11 overlay renderer composites the HUD onto the OpenXR
+    // swapchain image:
+    //   - Auto   (default): try Direct, fall back to Shim if D2D can't
+    //                       paint into the swapchain image (app device
+    //                       missing D3D11_CREATE_DEVICE_BGRA_SUPPORT
+    //                       or the image format isn't D2D-compatible).
+    //   - Shim   : always use the cross-device shim path — paint into a
+    //              private BGRA texture on our own D3D11 device, copy
+    //              to the swapchain image via the app device with a
+    //              keyed-mutex pair. Conservative; works on every app
+    //              regardless of its device creation flags.
+    //   - Direct : always use the direct path — D2D paints straight
+    //              into the swapchain image via the app's D3D11 device.
+    //              Skips the per-frame CopyResource + 2 keyed-mutex
+    //              acquires. If the app device lacks BGRA_SUPPORT the
+    //              renderer logs a warning at session init and silently
+    //              falls back to Shim (the choice between Direct and
+    //              Auto only matters as an explicit override / debug
+    //              opt-in — see DEVELOPMENT.md).
+    //
+    // D3D12 hosts always use the D3D11On12 bridge path; this setting
+    // doesn't apply to them.
+    enum class OverlayRendererPath { Auto, Shim, Direct };
+
     // Parsed "log" block. `hotkey` is only consulted when mode == Hotkey, but
     // it's always populated from the JSON (or the default) so logs can show
     // the bound combo regardless of mode.
@@ -87,6 +111,9 @@ namespace openxr_api_layer::detail {
         HotkeySpec hotkey{};
         int refresh_hz = 10;       // matches fpsvr's cadence
         std::string position = "head_top_right";
+        // D3D11 renderer path. See OverlayRendererPath comment above.
+        // D3D12 hosts ignore this — they always use D3D11On12 bridge.
+        OverlayRendererPath renderer_path = OverlayRendererPath::Auto;
         // Multiplier on the default 0.20 m × 0.075 m quad (at 1 m view-
         // space distance). 1.0 = default size (~11° × 4° of FOV in the
         // top-right corner); 0.5 → half-size; 2.0 → double. Anything
@@ -196,6 +223,7 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.refresh_hz = 10;
         result.settings.overlay.position = "head_top_right";
         result.settings.overlay.scale = 1.0f;
+        result.settings.overlay.renderer_path = OverlayRendererPath::Auto;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -307,6 +335,27 @@ namespace openxr_api_layer::detail {
             // (~0.20 m × 0.075 m at 1 m view-space distance).
             const float rawScale = getFloatOr(ov, "scale", 1.0f);
             result.settings.overlay.scale = std::clamp(rawScale, 0.5f, 2.0f);
+
+            // `renderer_path`: "auto" (default) / "shim" / "direct".
+            // Unknown / typo values silently fall back to "auto" so a
+            // user can't pin themselves into a broken state with a
+            // malformed JSON edit. Case-insensitive comparison so
+            // `Auto`, `AUTO`, etc all work — same convention as the
+            // mode parsing above.
+            {
+                const std::string rawPath =
+                    getStringOr(ov, "renderer_path", "auto");
+                if (iequalsAscii(rawPath, "shim")) {
+                    result.settings.overlay.renderer_path =
+                        OverlayRendererPath::Shim;
+                } else if (iequalsAscii(rawPath, "direct")) {
+                    result.settings.overlay.renderer_path =
+                        OverlayRendererPath::Direct;
+                } else {
+                    result.settings.overlay.renderer_path =
+                        OverlayRendererPath::Auto;
+                }
+            }
         }
 
         return result;

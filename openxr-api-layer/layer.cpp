@@ -1549,7 +1549,8 @@ namespace openxr_api_layer {
                 }
                 if (m_settings.overlay.enabled) {
                     m_overlayRenderer = detail::makeD3D11OverlayRenderer(
-                        this, *session, d3d11->device);
+                        this, *session, d3d11->device,
+                        m_settings.overlay.renderer_path);
                 }
                 // D3D11 path: walk ID3D11Device → IDXGIDevice → IDXGIAdapter.
                 // Same pattern overlay_renderer.cpp uses to find the

@@ -56,6 +56,8 @@ namespace {
         CHECK(p.settings.overlay.refresh_hz == 10);
         CHECK(p.settings.overlay.position == "head_top_right");
         CHECK(p.settings.overlay.scale == 1.0f);
+        CHECK(p.settings.overlay.renderer_path
+              == openxr_api_layer::detail::OverlayRendererPath::Auto);
     }
 }
 
@@ -275,6 +277,49 @@ TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {
     // A user pasting from another tool's config might write 10.0 instead
     // of 10 — the parser should still accept it.
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":12.0}})").settings.overlay.refresh_hz == 12);
+}
+
+// =============================================================================
+// overlay.renderer_path — D3D11 path selection (auto / shim / direct)
+// =============================================================================
+
+TEST_CASE("parseSettings: overlay.renderer_path defaults to Auto") {
+    // Nothing set → Auto (try direct, fall back to shim). The Auto
+    // default keeps the layer behaviour unchanged for users who don't
+    // know or care about the renderer path knob.
+    CHECK(parseSettings("{}").settings.overlay.renderer_path
+          == openxr_api_layer::detail::OverlayRendererPath::Auto);
+    CHECK(parseSettings(R"({"overlay":{}})").settings.overlay.renderer_path
+          == openxr_api_layer::detail::OverlayRendererPath::Auto);
+}
+
+TEST_CASE("parseSettings: overlay.renderer_path accepts auto/shim/direct (case-insensitive)") {
+    using openxr_api_layer::detail::OverlayRendererPath;
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"auto"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Auto);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"shim"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Shim);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"direct"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Direct);
+    // Case-insensitive — same convention as mode parsing.
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"SHIM"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Shim);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"Direct"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Direct);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"AuTo"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Auto);
+}
+
+TEST_CASE("parseSettings: overlay.renderer_path unknown values fall back to Auto") {
+    using openxr_api_layer::detail::OverlayRendererPath;
+    // Typo / future-value / outright garbage all fall back to Auto so
+    // a malformed JSON edit can never pin the user into a broken state.
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"sham"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Auto);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":""}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Auto);
+    CHECK(parseSettings(R"({"overlay":{"renderer_path":"on-screen-keyboard"}})")
+              .settings.overlay.renderer_path == OverlayRendererPath::Auto);
 }
 
 TEST_CASE("parseSettings: overlay mode strings are case-insensitive") {
