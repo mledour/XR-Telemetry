@@ -165,6 +165,18 @@ namespace openxr_api_layer::detail {
         constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
                                                      // VRAM values
 
+        // Vertical insets for the 1-px column separator lines.
+        // Header bar uses a tighter inset (the cells are 90 px tall);
+        // bottom panel inset is larger because the panel is 130 px
+        // and the design's airier separator visual asks for more
+        // breathing room above and below.
+        constexpr float kHeaderSepInsetY      =  8.0f;
+        constexpr float kBottomSepInsetY      = 14.0f;
+        // Bottom margin for the big value text inside each bottom-
+        // panel cell (drawCell's text rect). Keeps the descender of
+        // glyphs like the "9" tail in "99" clear of the panel edge.
+        constexpr float kBottomCellTextBottomPad = 8.0f;
+
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
         constexpr int64_t kFormatBGRA = static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
@@ -779,8 +791,8 @@ namespace openxr_api_layer::detail {
                 for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
                     rt->DrawLine(
-                        D2D1::Point2F(x, t + 8.0f),
-                        D2D1::Point2F(x, b - 8.0f),
+                        D2D1::Point2F(x, t + kHeaderSepInsetY),
+                        D2D1::Point2F(x, b - kHeaderSepInsetY),
                         m_brushSeparator.Get(), 1.0f);
                 }
 
@@ -1084,8 +1096,8 @@ namespace openxr_api_layer::detail {
                 for (int i = 1; i < numCols; ++i) {
                     const float x = l + colW * static_cast<float>(i);
                     rt->DrawLine(
-                        D2D1::Point2F(x, t + 14.0f),
-                        D2D1::Point2F(x, b - 14.0f),
+                        D2D1::Point2F(x, t + kBottomSepInsetY),
+                        D2D1::Point2F(x, b - kBottomSepInsetY),
                         m_brushSeparator.Get(), 1.0f);
                 }
 
@@ -1126,19 +1138,30 @@ namespace openxr_api_layer::detail {
                                            asciiValue.end());
                         wide += unitSuffix;
                         drawWide(rt, wide.c_str(), m_fmtTemp.Get(),
-                                  D2D1::RectF(cellL, valueY, cellR, b - 8.0f),
+                                  D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
                                   valueBrush);
                     } else {
                         // % and other ASCII-safe suffixes — single
                         // ASCII drawAscii call, no wide conversion.
                         std::string full = asciiValue;
-                        // Append the suffix as narrow chars (we
-                        // already know it's ASCII by contract here).
+                        // Append the suffix as narrow chars. Caller
+                        // contract: !useWideValue means unitSuffix is
+                        // ASCII-only (`%`, ` ms`, ` x`, …). The assert
+                        // guards against future drift — if someone
+                        // passes ` °C` through this branch (the byte
+                        // 0xB0 alone, without the wide-conversion
+                        // path), the narrow cast silently produces
+                        // mojibake. Same family of bug as the
+                        // CP1252-source mishap we caught with the
+                        // first snapshot artifact.
                         for (const wchar_t* p = unitSuffix; *p; ++p) {
+                            assert(static_cast<unsigned>(*p) < 0x80 &&
+                                   "ASCII-only suffix expected on the "
+                                   "!useWideValue path");
                             full.push_back(static_cast<char>(*p));
                         }
                         drawAscii(rt, full, m_fmtTemp.Get(),
-                                   D2D1::RectF(cellL, valueY, cellR, b - 8.0f),
+                                   D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
                                    valueBrush);
                     }
                 };
