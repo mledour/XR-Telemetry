@@ -1396,6 +1396,20 @@ namespace openxr_api_layer::detail {
             }
 
             ~D3D11OverlayRenderer() override {
+                // Session summary for the keyed-mutex timeouts. The
+                // per-occurrence log throttles to first + every
+                // kMutexTimeoutLogStride-th, so a user reporting a
+                // glitchy HUD may have only one or two log lines
+                // even after hours of timeouts. Always emit a
+                // session-end total when non-zero — support reads
+                // this to triage "intermittent sync issue" vs
+                // "isolated startup hiccup".
+                if (m_myMutexTimeouts || m_appMutexTimeouts) {
+                    Log(fmt::format(
+                        "xr_telemetry: session ended with {} paint-mutex + "
+                        "{} copy-mutex acquire timeouts.\n",
+                        m_myMutexTimeouts, m_appMutexTimeouts));
+                }
                 if (m_swapchain != XR_NULL_HANDLE && m_api) {
                     m_api->xrDestroySwapchain(m_swapchain);
                 }
@@ -1482,16 +1496,22 @@ namespace openxr_api_layer::detail {
                                                 m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
                         weHaveKey1 = true;
-                    } else if (!m_loggedMyMutexTimeout) {
-                        // One-shot log: enough to point a support
-                        // report at the symptom without spamming the
-                        // file when a recurring sync hiccup happens.
-                        m_loggedMyMutexTimeout = true;
-                        Log(fmt::format(
-                            "xr_telemetry: overlay paint mutex acquire timed "
-                            "out (HRESULT={:#x}, key=0). HUD will skip frames "
-                            "until sync recovers; subsequent timeouts silenced.\n",
-                            static_cast<unsigned int>(hr)));
+                    } else {
+                        // Periodic log: first occurrence + every
+                        // kMutexTimeoutLogStride-th after that. A
+                        // recurring hiccup at e.g. 1 % of frames at
+                        // 144 Hz produces one log line every ~12 s,
+                        // visible enough to triage but not flooding.
+                        ++m_myMutexTimeouts;
+                        if (m_myMutexTimeouts == 1 ||
+                            m_myMutexTimeouts % kMutexTimeoutLogStride == 0) {
+                            Log(fmt::format(
+                                "xr_telemetry: overlay paint mutex acquire timed "
+                                "out (HRESULT={:#x}, key=0, total={}). HUD will "
+                                "skip frames until sync recovers.\n",
+                                static_cast<unsigned int>(hr),
+                                m_myMutexTimeouts));
+                        }
                     }
                 }
 
@@ -1518,13 +1538,17 @@ namespace openxr_api_layer::detail {
                             }
                             m_appShimMutex->ReleaseSync(0);
                             handedBack = true;
-                        } else if (!m_loggedAppMutexTimeout) {
-                            m_loggedAppMutexTimeout = true;
-                            Log(fmt::format(
-                                "xr_telemetry: overlay copy mutex acquire timed "
-                                "out (HRESULT={:#x}, key=1). HUD will skip frames "
-                                "until sync recovers; subsequent timeouts silenced.\n",
-                                static_cast<unsigned int>(hr)));
+                        } else {
+                            ++m_appMutexTimeouts;
+                            if (m_appMutexTimeouts == 1 ||
+                                m_appMutexTimeouts % kMutexTimeoutLogStride == 0) {
+                                Log(fmt::format(
+                                    "xr_telemetry: overlay copy mutex acquire timed "
+                                    "out (HRESULT={:#x}, key=1, total={}). HUD will "
+                                    "skip frames until sync recovers.\n",
+                                    static_cast<unsigned int>(hr),
+                                    m_appMutexTimeouts));
+                            }
                         }
                     }
                     if (!handedBack) {
@@ -1885,12 +1909,20 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
             bool                        m_ready = false;
-            // One-shot guards for the bounded keyed-mutex acquires —
-            // a sync glitch from the runtime / app side is logged
-            // once, then suppressed so a sustained issue doesn't
-            // flood the file. Cleared at construction.
-            bool                        m_loggedMyMutexTimeout = false;
-            bool                        m_loggedAppMutexTimeout = false;
+            // Periodic-log counters for the bounded keyed-mutex
+            // acquires. A sync glitch from the runtime / app side
+            // is logged on first occurrence and then every Nth
+            // recurrence (kMutexTimeoutLogStride) so a sustained
+            // issue doesn't silently freeze the HUD for the rest
+            // of the session — support can see "the timeouts kept
+            // happening" instead of "1 timeout 4 hours ago".
+            //
+            // Also rolled up at destructor time so the session
+            // summary records the total — useful when a user
+            // submits a bug report after closing the game.
+            static constexpr uint64_t   kMutexTimeoutLogStride = 1000;
+            uint64_t                    m_myMutexTimeouts  = 0;
+            uint64_t                    m_appMutexTimeouts = 0;
         };
 
         // -------- D3D12 renderer (via D3D11On12 bridge) ---------------------
