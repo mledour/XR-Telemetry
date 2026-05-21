@@ -32,6 +32,7 @@
 
 #include <d2d1.h>
 #include <dwrite.h>
+#include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
 // Extra DXGI / D3D11 headers required by the cross-device shim
 // path. pch.h's <d3d11.h> + <dxgi.h> only expose the base
 // interfaces; we need:
@@ -181,6 +182,20 @@ namespace openxr_api_layer::detail {
         class CoreRenderer {
           public:
             // -------- Public lifecycle --------------------------------------
+            //
+            // Destructor unregisters the bundled-font loader before the
+            // ComPtr drops the last reference, so the shared
+            // IDWriteFactory's internal loader table never holds a
+            // dangling pointer across sessions. Order of destruction:
+            // m_customFontCollection → m_bundledFontFiles → loader
+            // (here, explicit unregister) → m_dwriteFactory → m_d2dFactory.
+            ~CoreRenderer() {
+                if (m_inMemoryFontLoader && m_dwriteFactory) {
+                    m_dwriteFactory->UnregisterFontFileLoader(
+                        m_inMemoryFontLoader.Get());
+                }
+            }
+
             bool init() {
                 if (FAILED(::D2D1CreateFactory(
                         D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -193,44 +208,64 @@ namespace openxr_api_layer::detail {
                         reinterpret_cast<IUnknown**>(m_dwriteFactory.GetAddressOf())))) {
                     return false;
                 }
+
+                // Load the BUNDLED Rajdhani font (subset to ASCII +
+                // °/µ/× glyphs). The TTF files live as RT_BUNDLED_FONT
+                // resources in the DLL (see openxr-api-layer.rc.in);
+                // we feed their bytes into an IDWriteInMemoryFontFile
+                // Loader and build a custom IDWriteFontCollection
+                // around them. The collection is then referenced by
+                // family name ("Rajdhani") in every CreateTextFormat
+                // call below — DirectWrite resolves through the
+                // custom collection, never falling back to system
+                // fonts.
+                //
+                // Why bundled: the design spec specifies Rajdhani,
+                // and shipping the font as a 22 KB total resource
+                // guarantees the HUD looks identical on every machine
+                // (vs. relying on whatever condensed sans the system
+                // happens to ship — Bahnschrift on Win10+, but a
+                // different glyph shape on older versions).
+                //
+                // On failure (resource missing, factory QI fails,
+                // collection creation fails), we proceed without the
+                // custom collection and let CreateTextFormat fall
+                // back to system default. Graceful degrade — never
+                // crash the host process for a cosmetic font.
+                const wchar_t* kFontFamily = L"Rajdhani";
+                IDWriteFontCollection* customCollection = nullptr;
+                if (!loadBundledFontCollection(m_dwriteFactory.Get(),
+                                                 m_customFontCollection)) {
+                    // Fallback: leave m_customFontCollection null and
+                    // let DirectWrite use system fonts. Bahnschrift
+                    // is the next-best match where available.
+                    kFontFamily = L"Bahnschrift";
+                } else {
+                    customCollection = m_customFontCollection.Get();
+                }
+
                 // The redesign packs labels, big FPS numbers, accent
                 // numbers, ms-suffix labels, temp readouts, and gauge
                 // percentages — each at a different point size and
                 // alignment. DirectWrite formats are immutable once
-                // created (you change alignment by creating a new
-                // format, NOT by mutating); we cache one format per
-                // (font, size, alignment) combination at init time so
-                // paint() never allocates a format.
-                //
-                // Font family: Bahnschrift (Microsoft's DIN-inspired
-                // condensed sans, shipped with Windows 10 1709+).
-                // Closest native match to the design spec's
-                // recommended Rajdhani / DIN Condensed / Saira
-                // Condensed family — same condensed-techno feel,
-                // same weight axis. Falls back to the system
-                // default if Bahnschrift is somehow absent (older
-                // Win10 builds without the optional font feature
-                // pack); DirectWrite handles that automatically.
-                //
-                // We use the SAME family across labels AND values
-                // — visual cohesion + simpler init. Weights are
-                // varied (SemiBold for labels, Bold for values) to
-                // give the design's hierarchy.
-                constexpr const wchar_t* kFontFamily = L"Bahnschrift";
-                if (!makeFormat(kFontFamily, kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
+                // created (alignment changes require a new format);
+                // we cache one format per (font, size, alignment)
+                // combination at init time so paint() never allocates
+                // a format.
+                if (!makeFormat(kFontFamily, customCollection, kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
-                if (!makeFormat(kFontFamily, kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
                 // under its column label.
-                if (!makeFormat(kFontFamily, kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(kFontFamily, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(kFontFamily, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(kFontFamily, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
                 return true;
             }
@@ -482,12 +517,20 @@ namespace openxr_api_layer::detail {
 
           private:
             // -------- Format / brush helpers --------------------------------
-            bool makeFormat(const wchar_t* family, float size,
+            //
+            // makeFormat takes an optional IDWriteFontCollection — non-null
+            // when the renderer loaded the bundled Rajdhani fonts, null when
+            // we fell back to system fonts. CreateTextFormat resolves the
+            // family name through the supplied collection (or the system
+            // collection on null).
+            bool makeFormat(const wchar_t* family,
+                            IDWriteFontCollection* collection,
+                            float size,
                             DWRITE_FONT_WEIGHT weight,
                             DWRITE_TEXT_ALIGNMENT alignment,
                             ComPtr<IDWriteTextFormat>& out) {
                 if (FAILED(m_dwriteFactory->CreateTextFormat(
-                        family, nullptr, weight,
+                        family, collection, weight,
                         DWRITE_FONT_STYLE_NORMAL,
                         DWRITE_FONT_STRETCH_NORMAL,
                         size, L"en-US", out.GetAddressOf()))) {
@@ -495,6 +538,130 @@ namespace openxr_api_layer::detail {
                 }
                 out->SetTextAlignment(alignment);
                 out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                return true;
+            }
+
+            // Loads the bundled Rajdhani font resources (RT_BUNDLED_FONT,
+            // IDs 200 + 201 in openxr-api-layer.rc.in) into a custom
+            // IDWriteFontCollection. Uses IDWriteFactory5's in-memory
+            // font-file-loader API (Windows 10 1703+) to avoid the
+            // boilerplate of implementing IDWriteFontFileLoader /
+            // IDWriteFontFileStream / IDWriteFontCollectionLoader by hand.
+            //
+            // Returns true on success and writes the collection into
+            // `outCollection`. False = caller falls back to system fonts.
+            // Never throws. Never crashes the host process if any DirectWrite
+            // call fails — the layer is loaded into VR games and the renderer
+            // is best-effort.
+            bool loadBundledFontCollection(IDWriteFactory* dwriteFactory,
+                                             ComPtr<IDWriteFontCollection>& outCollection) {
+                if (!dwriteFactory) return false;
+
+                // IDWriteFactory5 was added in the Windows 10 Creators
+                // Update (1703). The QueryInterface returns S_OK on
+                // Win10 1703+ and E_NOINTERFACE on older platforms.
+                ComPtr<IDWriteFactory5> factory5;
+                if (FAILED(dwriteFactory->QueryInterface(
+                        __uuidof(IDWriteFactory5),
+                        reinterpret_cast<void**>(factory5.GetAddressOf())))) {
+                    return false;
+                }
+
+                // Find both font resources in the DLL. The trick
+                // is using GetModuleHandleEx with the ADDRESS of a
+                // function INSIDE our own DLL — that resolves to
+                // our DLL's HMODULE (not the host EXE's). Without
+                // this we'd accidentally look for resources in the
+                // game's executable. pickSwapchainFormat is a free
+                // function in this TU's anonymous namespace; taking
+                // its address gives us a guaranteed in-DLL pointer.
+                HMODULE hMod = nullptr;
+                if (!::GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(&pickSwapchainFormat),
+                        &hMod)) {
+                    return false;
+                }
+
+                // Create an in-memory font file loader and register it.
+                ComPtr<IDWriteInMemoryFontFileLoader> inMemoryLoader;
+                if (FAILED(factory5->CreateInMemoryFontFileLoader(
+                        inMemoryLoader.GetAddressOf()))) {
+                    return false;
+                }
+                if (FAILED(factory5->RegisterFontFileLoader(inMemoryLoader.Get()))) {
+                    return false;
+                }
+                // Cache the loader so we can unregister it at
+                // destruction (avoids a process-wide leak across
+                // many overlay-renderer create/destroy cycles).
+                m_inMemoryFontLoader = inMemoryLoader;
+
+                // Helper: pull a single RT_BUNDLED_FONT resource into the loader.
+                constexpr WORD RT_BUNDLED_FONT_W = 256;
+                auto addResourceFont = [&](WORD resourceId) -> bool {
+                    HRSRC res = ::FindResourceW(
+                        hMod, MAKEINTRESOURCEW(resourceId),
+                        MAKEINTRESOURCEW(RT_BUNDLED_FONT_W));
+                    if (!res) return false;
+                    HGLOBAL global = ::LoadResource(hMod, res);
+                    if (!global) return false;
+                    const void* data = ::LockResource(global);
+                    const DWORD size = ::SizeofResource(hMod, res);
+                    if (!data || size == 0) return false;
+
+                    ComPtr<IDWriteFontFile> fontFile;
+                    if (FAILED(inMemoryLoader->CreateInMemoryFontFileReference(
+                            factory5.Get(), data, size,
+                            /*ownerObject=*/nullptr,
+                            fontFile.GetAddressOf()))) {
+                        return false;
+                    }
+                    m_bundledFontFiles.push_back(std::move(fontFile));
+                    return true;
+                };
+
+                // 200 = SemiBold, 201 = Bold (matches the IDs in the
+                // .rc.in template).
+                if (!addResourceFont(200)) return false;
+                if (!addResourceFont(201)) return false;
+
+                // Build the font set from the loaded files.
+                ComPtr<IDWriteFontSetBuilder> setBuilder;
+                if (FAILED(factory5->CreateFontSetBuilder(setBuilder.GetAddressOf()))) {
+                    return false;
+                }
+                for (auto& f : m_bundledFontFiles) {
+                    // Analyze validates the file is a recognised
+                    // font format before we add it to the set;
+                    // AddFontFile internally handles all faces in
+                    // the file (single face per file for our
+                    // Rajdhani subsets, but the API is robust
+                    // either way).
+                    BOOL supported = FALSE;
+                    DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
+                    DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
+                    UINT32 numFaces = 0;
+                    if (SUCCEEDED(f->Analyze(&supported, &fileType, &faceType, &numFaces)) &&
+                        supported && numFaces > 0) {
+                        setBuilder->AddFontFile(f.Get());
+                    }
+                }
+                ComPtr<IDWriteFontSet> fontSet;
+                if (FAILED(setBuilder->CreateFontSet(fontSet.GetAddressOf()))) {
+                    return false;
+                }
+                ComPtr<IDWriteFontCollection1> collection1;
+                if (FAILED(factory5->CreateFontCollectionFromFontSet(
+                        fontSet.Get(), collection1.GetAddressOf()))) {
+                    return false;
+                }
+                // QI down to IDWriteFontCollection — that's the type
+                // CreateTextFormat accepts.
+                if (FAILED(collection1.As(&outCollection))) {
+                    return false;
+                }
                 return true;
             }
 
@@ -1046,6 +1213,17 @@ namespace openxr_api_layer::detail {
             // -------- Members -----------------------------------------------
             ComPtr<ID2D1Factory>      m_d2dFactory;
             ComPtr<IDWriteFactory>    m_dwriteFactory;
+            // Bundled-font state. Held for the lifetime of the
+            // CoreRenderer so the IDWriteInMemoryFontFileLoader stays
+            // registered with the factory and the font files stay
+            // valid for as long as text formats reference them.
+            // m_inMemoryFontLoader is the registered loader (we
+            // unregister it in the destructor to keep the factory
+            // clean across many overlay-renderer create/destroy
+            // cycles).
+            ComPtr<IDWriteInMemoryFontFileLoader> m_inMemoryFontLoader;
+            std::vector<ComPtr<IDWriteFontFile>>  m_bundledFontFiles;
+            ComPtr<IDWriteFontCollection>         m_customFontCollection;
             // Text formats — one per (font, size, alignment) combo
             // the layout uses. All immutable post-init, so paint()
             // never allocates a format.
