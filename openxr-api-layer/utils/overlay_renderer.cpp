@@ -297,6 +297,27 @@ namespace openxr_api_layer::detail {
             // away from the frame thread.
             bool initBrushes(ID2D1RenderTarget* rt) {
                 if (!rt) return false;
+                // Adopt the RT's owning factory unconditionally. D2D
+                // resources (path geometries, stroke styles) are
+                // factory-bound — using one created from factory A
+                // against an RT from factory B causes a deferred
+                // error that surfaces at EndDraw time as a silent
+                // failure (no doctest assert hit, just `false`
+                // returned from paint()).
+                //
+                // Production path (D3D11/D3D12 renderers): rt was
+                // created via m_core.d2d()->CreateDxgiSurfaceRender
+                // Target(...), so rt->GetFactory == m_d2dFactory
+                // already; this is a refcount-only no-op.
+                //
+                // Snapshot path (renderOverlayToTarget): the test
+                // owns its own ID2D1Factory and creates a WIC bitmap
+                // RT from it. The factory init() created is now
+                // dropped (no D2D resources reference it yet — text
+                // formats only reference m_dwriteFactory), and the
+                // geometries later created in paint() use rt's
+                // factory. EndDraw then succeeds.
+                rt->GetFactory(m_d2dFactory.ReleaseAndGetAddressOf());
                 auto make = [&](D2D1::ColorF c, ComPtr<ID2D1SolidColorBrush>& out) {
                     return SUCCEEDED(rt->CreateSolidColorBrush(c, out.GetAddressOf()));
                 };
@@ -2178,15 +2199,29 @@ namespace openxr_api_layer::detail {
         ID2D1RenderTarget* rt,
         const OverlaySnapshot& snap,
         const HistogramRing<kOverlayHistoRingSize>& cpuRing,
-        const HistogramRing<kOverlayHistoRingSize>& gpuRing) {
-        if (!rt) return false;
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing,
+        std::string* errOut) {
         // CoreRenderer is in this TU's anonymous namespace (nested in
         // openxr_api_layer::detail), so the unqualified name resolves
         // here from the enclosing detail namespace.
+        //
+        // errOut is an optional diagnostic outparam used by the
+        // snapshot test — when a step fails it captures which one,
+        // since paint()'s EndDraw return value collapses every
+        // possible draw-time queued error into a single bool. The
+        // production callers leave it null.
+        auto fail = [&](const char* msg) {
+            if (errOut) *errOut = msg;
+            return false;
+        };
+        if (!rt)                     return fail("rt is null");
         CoreRenderer core;
-        if (!core.init())            return false;
-        if (!core.initBrushes(rt))   return false;
-        return core.paint(rt, snap, cpuRing, gpuRing);
+        if (!core.init())            return fail("core.init() failed (D2D / DWrite factory or text format creation)");
+        if (!core.initBrushes(rt))   return fail("core.initBrushes(rt) failed (brush / gradient / stroke style creation)");
+        if (!core.paint(rt, snap, cpuRing, gpuRing)) {
+            return fail("core.paint(rt, ...) failed (EndDraw returned an HRESULT — usually a cross-factory or queued-draw error)");
+        }
+        return true;
     }
 
 } // namespace openxr_api_layer::detail

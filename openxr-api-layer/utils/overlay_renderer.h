@@ -148,10 +148,15 @@ namespace openxr_api_layer::detail {
     // (and the cpp's static_assert below guards against drift).
     constexpr std::size_t kOverlayHistoRingSize = 120;
 
+    // errOut: optional. On false return, populated with a short string
+    // identifying which step failed (init / initBrushes / paint). Used
+    // by the snapshot test to surface a useful failure message via
+    // doctest INFO(); production callers leave it null.
     bool renderOverlayToTarget(
         ID2D1RenderTarget* rt,
         const OverlaySnapshot& snap,
         const HistogramRing<kOverlayHistoRingSize>& cpuRing,
-        const HistogramRing<kOverlayHistoRingSize>& gpuRing);
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing,
+        std::string* errOut = nullptr);
 
 } // namespace openxr_api_layer::detail

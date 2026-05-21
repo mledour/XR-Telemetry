@@ -172,7 +172,16 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
                        /*stutter=*/11.0f, /*spike_a=*/55, /*spike_b=*/90);
 
     // Render through the same CoreRenderer the in-engine path uses.
-    REQUIRE(renderOverlayToTarget(rt.Get(), snap, cpuRing, gpuRing));
+    // errOut captures which step failed (init / initBrushes / paint /
+    // null rt) — without it the bool return collapses every possible
+    // D2D failure into a single false, which makes CI debugging a
+    // game of guesswork. INFO() attaches the message to the next
+    // REQUIRE so doctest prints it on failure.
+    std::string err;
+    const bool ok = openxr_api_layer::detail::renderOverlayToTarget(
+        rt.Get(), snap, cpuRing, gpuRing, &err);
+    INFO("renderOverlayToTarget step: " << err);
+    REQUIRE(ok);
 
     // Encode to PNG. Filename relative to the test EXE's CWD — the
     // CI step picks it up by glob.
