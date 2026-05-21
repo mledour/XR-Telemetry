@@ -1,0 +1,61 @@
+// MIT License
+//
+// Copyright (c) 2026 Michael Ledour
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// openxr-api-layer-tests.rc — bundled Rajdhani fonts for the test binary.
+//
+// The test EXE statically links overlay_renderer.cpp, which loads the
+// bundled Rajdhani font via:
+//
+//     GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+//                        &pickSwapchainFormat, &hMod);
+//     FindResource(hMod, MAKEINTRESOURCE(200), MAKEINTRESOURCE(256));
+//
+// pickSwapchainFormat lives in overlay_renderer.cpp, which is compiled
+// into BOTH the layer DLL and this test EXE — so the HMODULE that
+// GetModuleHandleEx returns when called from the test binary is the
+// test EXE itself, not the layer DLL. Without these resources baked
+// into the EXE, FindResource returns null, loadBundledFontCollection
+// fails, and the renderer falls back to system Bahnschrift — which
+// is what made the first snapshot artifact look "wrong" (system
+// condensed sans instead of Rajdhani).
+//
+// IDs / custom resource type match the layer's openxr-api-layer.rc.in
+// exactly (200 / 201, RT_BUNDLED_FONT == 256). loadBundledFontCollection
+// is therefore identical in both binaries — no test-specific code path.
+//
+// Why not VERSIONINFO too? The test EXE is never redistributed (it
+// runs in CI only), so the Windows-shell version metadata adds no
+// value. The fonts are the ONLY resource the test actually needs
+// from the .rc — keep this file minimal.
+// =============================================================================
+
+#define IDR_FONT_RAJDHANI_SEMIBOLD 200
+#define IDR_FONT_RAJDHANI_BOLD     201
+#define RT_BUNDLED_FONT            256
+
+// Paths are relative to THIS .rc file's directory (rc.exe's default
+// search root). The TTFs live under the layer project's fonts\ folder
+// — referenced rather than copied so a future re-subset only has to
+// be done in one place.
+IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\Rajdhani-SemiBold.ttf"
+IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\Rajdhani-Bold.ttf"
