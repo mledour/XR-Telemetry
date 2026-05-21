@@ -74,11 +74,15 @@ namespace openxr_api_layer::detail {
     //                            cpu_app_ms_str   cpu_frametime_ms
     //   <histogram>
     //
-    //   ── bottom row (2 panels side-by-side) ────────────────────────
-    //   GPU TEMP & UTILISATION             CPU TEMP & UTILISATION
-    //   TEMP 67 °C   GPU UTIL [ 92% ]       TEMP -- °C   CPU UTIL [ 78% ]
-    //   gpu_temp_c     gpu_util_pct          cpu_temp_c    cpu_util_pct
-    //                  gpu_util_fraction                   cpu_util_fraction
+    //   ── bottom row (2 panels, 60/40 split, 5 cells total) ────────
+    //   ┌──────────────────────────────────────┬───────────────────┐
+    //   │ GPU TEMP │ GPU LOAD │ VRAM           │ CPU TEMP │ CPU LOAD│
+    //   │ 67 °C    │ 92 %     │ 76 %           │ -- °C    │ 78 %    │
+    //   └──────────────────────────────────────┴───────────────────┘
+    //   GPU panel (3 cells)                    CPU panel (2 cells)
+    //   gpu_temp_c   gpu_util_pct    vram_pct  cpu_temp_c  cpu_util_pct
+    //                gpu_util_fraction          (no CPU temp     cpu_util_fraction
+    //                                            source yet)
     //
     // The cpu_temp_c cell always renders "--" until PawnIO support
     // lands in a follow-up PR (no anti-cheat-safe CPU temp source for
@@ -117,11 +121,20 @@ namespace openxr_api_layer::detail {
         std::string gpu_util_pct     = "--";
         std::string cpu_util_pct     = "--";
 
-        // Gauge fractions (0..1) for the circular dial. Synced to the
-        // *_util_pct strings above so the dial fill matches what the
-        // text reads.
+        // VRAM percentage of budget (= vram_used / vram_budget). Lives
+        // in the GPU panel of the bottom row as a third cell next to
+        // GPU TEMP / GPU LOAD. "--" when DXGI didn't answer (no
+        // adapter, Win10 pre-RS1) — distinct from "0 %" which would
+        // be impossible in practice (any live D3D session holds at
+        // least a few MB of compositor swapchain).
+        std::string vram_pct         = "--";
+        // Tier fractions (0..1) drive the warning-tier text colour
+        // for LOAD and VRAM in the bottom panels — same cyan / orange
+        // / red palette as the histogram bars, same thresholds via
+        // gaugeTierForUtilisation (0.80 / 0.90).
         float       gpu_util_fraction = 0.0f;
         float       cpu_util_fraction = 0.0f;
+        float       vram_fraction     = 0.0f;
 
         // True when at least the FPS field carries a real value. The
         // renderer can skip the text/gauge passes (but still paint the
@@ -206,6 +219,22 @@ namespace openxr_api_layer::detail {
         v.cpu_util_fraction = std::isfinite(snap.cpu_utilisation_pct)
             ? std::clamp(snap.cpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
             : 0.0f;
+
+        // VRAM percentage of budget. Both bytes values come from
+        // DXGI_QUERY_VIDEO_MEMORY_INFO. Guard: both must be non-zero
+        // (a 0 budget would div-by-zero and a 0 used means DXGI
+        // returned nothing — see gpu_telemetry.h for the sentinel
+        // contract).
+        if (snap.vram_used_bytes > 0 && snap.vram_budget_bytes > 0) {
+            const double frac =
+                static_cast<double>(snap.vram_used_bytes) /
+                static_cast<double>(snap.vram_budget_bytes);
+            v.vram_fraction = static_cast<float>(std::clamp(frac, 0.0, 1.0));
+            v.vram_pct = fmtPctInt(v.vram_fraction * 100.0f);
+        } else {
+            v.vram_fraction = 0.0f;
+            v.vram_pct = "--";
+        }
         return v;
     }
 

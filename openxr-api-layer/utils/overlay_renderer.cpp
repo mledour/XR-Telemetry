@@ -384,27 +384,38 @@ namespace openxr_api_layer::detail {
                                     cpuRing, snap.target_fps,
                                     m_brushCpuBlue.Get());
 
-                // Bottom row: split into two equal-width panels. The
-                // gauge colour is NO LONGER fixed per panel — it's
-                // dynamic based on utilisation tier (cyan when <80 %,
-                // orange when 80–89 %, red when ≥90 %). Same tiering
-                // as the histogram bars. The thermometer icon's fill
-                // colour mirrors the gauge tier so the panel reads
-                // as a coherent "this side is hot" signal.
-                const float bottomMidGap = kSectionGap;
-                const float bottomMid    = (innerL + innerR) * 0.5f;
-                drawBottomPanel(rt, innerL, bottomY,
-                                 bottomMid - bottomMidGap * 0.5f,
-                                 bottomY + kBottomHeight,
+                // Bottom row: 60/40 split between the GPU and CPU
+                // panels — GPU gets 3 cells (TEMP / LOAD / VRAM),
+                // CPU gets 2 cells (TEMP / LOAD). With 5 equal cells
+                // across the row this gives every cell the same
+                // pixel width (≈ 135 px), so the labels and values
+                // align perfectly across both panels.
+                //
+                // VRAM-cell tier-colour (cyan / orange / red) follows
+                // the same gaugeTierForUtilisation thresholds as
+                // GPU LOAD / CPU LOAD: < 80 % = cyan default, 80–89 %
+                // = orange, ≥ 90 % = red. Coherent palette = the
+                // user reads "anything orange / red = headroom
+                // problem" without per-cell legends.
+                const float bottomCellW = (innerR - innerL - kSectionGap) / 5.0f;
+                const float gpuPanelL   = innerL;
+                const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
+                const float cpuPanelL   = gpuPanelR + kSectionGap;
+                const float cpuPanelR   = innerR;
+                drawBottomPanel(rt, gpuPanelL, bottomY,
+                                 gpuPanelR, bottomY + kBottomHeight,
                                  L"GPU",
                                  v.gpu_temp_c, v.gpu_util_pct,
-                                 v.gpu_util_fraction);
-                drawBottomPanel(rt,
-                                 bottomMid + bottomMidGap * 0.5f, bottomY,
-                                 innerR, bottomY + kBottomHeight,
+                                 v.gpu_util_fraction,
+                                 /*vramValue=*/v.vram_pct,
+                                 /*vramFraction=*/v.vram_fraction);
+                drawBottomPanel(rt, cpuPanelL, bottomY,
+                                 cpuPanelR, bottomY + kBottomHeight,
                                  L"CPU",
                                  v.cpu_temp_c, v.cpu_util_pct,
-                                 v.cpu_util_fraction);
+                                 v.cpu_util_fraction,
+                                 /*vramValue=*/std::string{},
+                                 /*vramFraction=*/0.0f);
 
                 return SUCCEEDED(rt->EndDraw());
             }
@@ -682,98 +693,131 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // -------- Bottom panel (TEMP / LOAD, text-only) -----------------
+            // -------- Bottom panel (TEMP / LOAD [/ VRAM], text-only) --------
             //
-            // Two equally-sized columns, no icons, no gauge. Each
-            // column carries a small uppercase label at the top and
-            // a big numeric value below. The LOAD column's value is
-            // tier-coloured (cyan / orange / red) so the user gets
-            // the headroom signal without needing a graphical
-            // indicator — same colour palette as the histogram bars.
+            // 2 or 3 equally-sized columns (CPU = 2, GPU = 3 because
+            // VRAM lives on the GPU side). Each column carries a
+            // small uppercase label at the top and a big numeric
+            // value below. The LOAD and VRAM values are tier-
+            // coloured (cyan / orange / red) so the user gets the
+            // headroom signal at a glance — same palette and same
+            // gaugeTierForUtilisation thresholds as the histogram
+            // bars.
             //
-            //   ┌──────────────────────────────────────────────────┐
-            //   │                                                  │
-            //   │   GPU TEMP              GPU LOAD                 │
-            //   │   67 °C                  92 %                    │
-            //   │                                                  │
-            //   └──────────────────────────────────────────────────┘
+            //   GPU panel (3 cells):                CPU panel (2 cells):
+            //   ┌─────────┬──────────┬──────┐      ┌──────────┬──────────┐
+            //   │GPU TEMP │GPU LOAD  │VRAM  │      │CPU TEMP  │CPU LOAD  │
+            //   │ 67 °C   │ 92 %     │ 76 % │      │ -- °C    │ 78 %     │
+            //   └─────────┴──────────┴──────┘      └──────────┴──────────┘
             //
-            // `prefix` is L"GPU" or L"CPU"; the labels are built by
-            // appending L" TEMP" / L" LOAD".
+            // `prefix` is L"GPU" or L"CPU"; TEMP / LOAD labels are
+            // built by appending L" TEMP" / L" LOAD". The VRAM cell
+            // is only rendered when `vramValue` is non-empty (the
+            // CPU panel passes "" and skips the third column
+            // entirely — same code path, fewer columns).
             void drawBottomPanel(ID2D1RenderTarget* rt, float l, float t,
                                   float r, float b,
                                   const wchar_t* prefix,
                                   const std::string& tempValue,
                                   const std::string& utilValue,
-                                  float utilFraction) const {
+                                  float utilFraction,
+                                  const std::string& vramValue,
+                                  float vramFraction) const {
                 drawPanelBg(rt, l, t, r, b);
 
-                // Tier colour for the LOAD value (text only — the
-                // gauge was retired). Same palette + thresholds as
-                // the histogram bars: < 80 % = cyan default, 80–89 %
-                // orange warning, ≥ 90 % red critical. The TEMP value
-                // stays white because we don't have a thermal-tier
-                // contract yet (would require knowing TjMax per SKU).
-                const BarTier tier = gaugeTierForUtilisation(utilFraction);
-                ID2D1Brush* loadBrush = m_brushAccentCyan.Get();
-                if (tier == BarTier::Red)         loadBrush = m_brushGaugeRed.Get();
-                else if (tier == BarTier::Orange) loadBrush = m_brushOrange.Get();
+                // Tier-brush helper: same logic for LOAD and VRAM.
+                // < 80 % = cyan default, 80–89 % = orange warning,
+                // ≥ 90 % = red critical. The TEMP value stays white
+                // (no thermal-tier contract yet — would require
+                // knowing TjMax per SKU).
+                auto tierBrush = [&](float fraction) -> ID2D1Brush* {
+                    const BarTier tier = gaugeTierForUtilisation(fraction);
+                    if (tier == BarTier::Red)    return m_brushGaugeRed.Get();
+                    if (tier == BarTier::Orange) return m_brushOrange.Get();
+                    return m_brushAccentCyan.Get();
+                };
 
-                const float midX = (l + r) * 0.5f;
-                // Vertical separator between the two columns. Same
-                // brush as the panel inner stroke so it reads as a
-                // subtle column divider, not a hard divider.
-                rt->DrawLine(
-                    D2D1::Point2F(midX, t + 14.0f),
-                    D2D1::Point2F(midX, b - 14.0f),
-                    m_brushSeparator.Get(), 1.0f);
+                const bool hasVram = !vramValue.empty();
+                const int  numCols = hasVram ? 3 : 2;
+                const float colW   = (r - l) / static_cast<float>(numCols);
 
-                // Build the column labels by concatenating the
-                // prefix. wstring is mandatory because the panel
-                // labels stay ASCII (no degree sign), but the
-                // approach mirrors the temp-value path below.
+                // Vertical separators between cells. Same brush as
+                // the panel inner stroke so they read as subtle
+                // column dividers, not hard borders.
+                for (int i = 1; i < numCols; ++i) {
+                    const float x = l + colW * static_cast<float>(i);
+                    rt->DrawLine(
+                        D2D1::Point2F(x, t + 14.0f),
+                        D2D1::Point2F(x, b - 14.0f),
+                        m_brushSeparator.Get(), 1.0f);
+                }
+
+                // Build the per-column labels. TEMP and LOAD include
+                // the panel prefix ("GPU TEMP" / "CPU LOAD"); VRAM is
+                // a singleton label ("VRAM") because it's
+                // implicitly GPU-side — no "GPU VRAM" because that
+                // would be redundant and use a full extra word of
+                // horizontal space.
                 std::wstring tempLabel = std::wstring(prefix) + L" TEMP";
                 std::wstring loadLabel = std::wstring(prefix) + L" LOAD";
 
                 // Vertical positions inside the panel:
-                //   labelY : ~25 % from top  — the small label sits
-                //            here in m_fmtTinyLabelCenter (14 px)
-                //   valueY : ~50 % from top  — the value rect
-                //            extends down to the panel bottom and
-                //            paragraph-centres in m_fmtTemp (30 px)
-                //   The value font's intrinsic ascent + the
-                //   paragraph-centre placement gives the visual
-                //   "label on top, value below" stack the design
-                //   asks for, with the value visually anchored to
-                //   the panel's vertical centre-of-mass.
+                //   labelY : small label (m_fmtTinyLabelCenter, 14 px)
+                //   valueY : big value (m_fmtTemp, 30 px) — extends
+                //            down to the panel bottom and paragraph-
+                //            centres for the "label above / value
+                //            below" stack the design asks for.
                 const float labelY = t + (b - t) * 0.18f;
                 const float valueY = t + (b - t) * 0.40f;
 
-                // --- Left column: <prefix> TEMP / "67 °C" ---
-                drawWide(rt, tempLabel.c_str(), m_fmtTinyLabelCenter.Get(),
-                          D2D1::RectF(l, labelY, midX, labelY + 22.0f),
-                          m_brushTextLabel.Get());
-                {
-                    // Temp value uses a wide string so the degree
-                    // sign (U+00B0) is encoded correctly. tempValue
-                    // is ASCII (digits or "--"), so byte-by-byte
-                    // widening + concatenation works.
-                    std::wstring tempWide(tempValue.begin(), tempValue.end());
-                    tempWide += L" °C";
-                    drawWide(rt, tempWide.c_str(), m_fmtTemp.Get(),
-                              D2D1::RectF(l, valueY, midX, b - 8.0f),
-                              m_brushTextWhite.Get());
-                }
+                auto drawCell = [&](float cellL, float cellR,
+                                      const wchar_t* label,
+                                      const std::string& asciiValue,
+                                      const wchar_t* unitSuffix,
+                                      ID2D1Brush* valueBrush,
+                                      bool useWideValue) {
+                    drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
+                              D2D1::RectF(cellL, labelY, cellR,
+                                           labelY + 22.0f),
+                              m_brushTextLabel.Get());
+                    if (useWideValue) {
+                        // For the °C suffix the whole string must be
+                        // wide. tempValue is ASCII, so byte-widening
+                        // it and concatenating L" °C" works.
+                        std::wstring wide(asciiValue.begin(),
+                                           asciiValue.end());
+                        wide += unitSuffix;
+                        drawWide(rt, wide.c_str(), m_fmtTemp.Get(),
+                                  D2D1::RectF(cellL, valueY, cellR, b - 8.0f),
+                                  valueBrush);
+                    } else {
+                        // % and other ASCII-safe suffixes — single
+                        // ASCII drawAscii call, no wide conversion.
+                        std::string full = asciiValue;
+                        // Append the suffix as narrow chars (we
+                        // already know it's ASCII by contract here).
+                        for (const wchar_t* p = unitSuffix; *p; ++p) {
+                            full.push_back(static_cast<char>(*p));
+                        }
+                        drawAscii(rt, full, m_fmtTemp.Get(),
+                                   D2D1::RectF(cellL, valueY, cellR, b - 8.0f),
+                                   valueBrush);
+                    }
+                };
 
-                // --- Right column: <prefix> LOAD / "92 %" ---
-                drawWide(rt, loadLabel.c_str(), m_fmtTinyLabelCenter.Get(),
-                          D2D1::RectF(midX, labelY, r, labelY + 22.0f),
-                          m_brushTextLabel.Get());
-                {
-                    const std::string loadStr = utilValue + " %";
-                    drawAscii(rt, loadStr, m_fmtTemp.Get(),
-                               D2D1::RectF(midX, valueY, r, b - 8.0f),
-                               loadBrush);
+                // Cell 0 — <prefix> TEMP / "67 °C"
+                drawCell(l, l + colW,
+                          tempLabel.c_str(), tempValue, L" °C",
+                          m_brushTextWhite.Get(), /*useWideValue=*/true);
+                // Cell 1 — <prefix> LOAD / "92 %"
+                drawCell(l + colW, l + colW * 2.0f,
+                          loadLabel.c_str(), utilValue, L" %",
+                          tierBrush(utilFraction), /*useWideValue=*/false);
+                // Cell 2 — VRAM / "76 %" (GPU panel only)
+                if (hasVram) {
+                    drawCell(l + colW * 2.0f, r,
+                              L"VRAM", vramValue, L" %",
+                              tierBrush(vramFraction), /*useWideValue=*/false);
                 }
             }
 

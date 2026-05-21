@@ -71,8 +71,10 @@ TEST_CASE("formatOverlayDisplayValues: invalid snapshot → valid=false POD") {
     CHECK(v.cpu_temp_c  == "--");
     CHECK(v.gpu_util_pct == "--");
     CHECK(v.cpu_util_pct == "--");
+    CHECK(v.vram_pct     == "--");
     CHECK(v.gpu_util_fraction == 0.0f);
     CHECK(v.cpu_util_fraction == 0.0f);
+    CHECK(v.vram_fraction     == 0.0f);
 }
 
 TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
@@ -116,6 +118,47 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     CHECK(v.cpu_util_pct == "78");
     CHECK(v.gpu_util_fraction == doctest::Approx(0.92f).epsilon(0.001));
     CHECK(v.cpu_util_fraction == doctest::Approx(0.78f).epsilon(0.001));
+}
+
+TEST_CASE("formatOverlayDisplayValues: vram percentage from used/budget bytes") {
+    // 6 GB used out of 8 GB budget → 75 %.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant         = 144.0f;
+    snap.vram_used_bytes     = 6'000'000'000ULL;
+    snap.vram_budget_bytes   = 8'000'000'000ULL;
+    const auto v = formatOverlayDisplayValues(snap);
+    CHECK(v.vram_pct == "75");
+    CHECK(v.vram_fraction == doctest::Approx(0.75f).epsilon(0.001));
+}
+
+TEST_CASE("formatOverlayDisplayValues: vram pct = '--' when DXGI didn't answer") {
+    // No VRAM data → both bytes fields are 0 (the gpu_telemetry.h
+    // sentinel contract). Formatter must NOT divide by zero — sets
+    // vram_pct to "--" and vram_fraction to 0.0.
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant       = 90.0f;
+    snap.vram_used_bytes   = 0;
+    snap.vram_budget_bytes = 0;
+    const auto v = formatOverlayDisplayValues(snap);
+    CHECK(v.vram_pct == "--");
+    CHECK(v.vram_fraction == doctest::Approx(0.0f).epsilon(0.001));
+}
+
+TEST_CASE("formatOverlayDisplayValues: vram clamps at 100 % even with used > budget") {
+    // Rare but possible — driver returns CurrentUsage briefly above
+    // Budget (the budget recalibrates ~1 Hz, usage can spike). The
+    // formatter clamps to keep tier semantics sane (no "121 %"
+    // displayed).
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant       = 90.0f;
+    snap.vram_used_bytes   = 9'000'000'000ULL;
+    snap.vram_budget_bytes = 8'000'000'000ULL;
+    const auto v = formatOverlayDisplayValues(snap);
+    CHECK(v.vram_fraction == doctest::Approx(1.0f).epsilon(0.001));
+    CHECK(v.vram_pct == "100");
 }
 
 TEST_CASE("formatOverlayDisplayValues: rounding goes to nearest integer for FPS / temps / pct") {
