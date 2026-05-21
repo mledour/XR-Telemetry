@@ -124,6 +124,15 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
     REQUIRE(agg.snapshot().valid);
     const auto& s = agg.snapshot();
     CHECK(s.cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
+    // cpu_app_ms = rec.app_cpu_ns averaged across the window. With
+    // app_cpu_ns = 4'000'000 on every frame, the App ms reads 4.0 —
+    // matches the per-cycle 4ms in this fixture because we set
+    // wait_block such that the two metrics happen to align. In real
+    // workloads, app_cpu_ns (= wait→end) is typically SMALLER than
+    // per-cycle (= frame_total − wait_block), because per-cycle
+    // includes the endframe call + pre-begin housekeeping on top of
+    // the wait→end window.
+    CHECK(s.cpu_app_ms   == doctest::Approx(4.0f).epsilon(0.001));
     CHECK(s.gpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
     // 1e9 / 11.111e6 ≈ 90 fps.
     CHECK(s.fps_avg     == doctest::Approx(90.0f).epsilon(0.05));
@@ -137,6 +146,34 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
 // =============================================================================
 // Moving average — values are averaged across the window, not the latest.
 // =============================================================================
+
+TEST_CASE("OverlayAggregator: cpu_app_ms is independent of cpu_frame_ms") {
+    // App ms = rec.app_cpu_ns (wait→end window).
+    // Render ms (= cpu_frame_ms) = frame_total - wait_block (per-cycle).
+    //
+    // The two diverge whenever endframe / pre-begin overhead is
+    // non-trivial. This test fixes BOTH values explicitly and
+    // verifies the aggregator publishes them independently.
+    //
+    //   frame_total = 11.111 ms
+    //   wait_block  = 6.111 ms  → per_cycle (Render) = 5.000 ms
+    //   app_cpu     = 3.500 ms
+    //   → overhead  = Render - App = 1.500 ms (endframe + pre_begin)
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0,
+                              /*app_cpu=*/3'500'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/6'111'111));
+    agg.pushFrame(makeRecord(120'000'000,
+                              /*app_cpu=*/3'500'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/6'111'111));
+    REQUIRE(agg.snapshot().valid);
+    const auto& s = agg.snapshot();
+    CHECK(s.cpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
+    CHECK(s.cpu_app_ms   == doctest::Approx(3.5f).epsilon(0.001));
+    CHECK(s.cpu_app_ms < s.cpu_frame_ms);  // ordering contract
+}
 
 TEST_CASE("OverlayAggregator: first frame with frame_total_ns=0 falls back to app_cpu_ns") {
     // On the very first frame of a session, frame_total_ns is 0 (no
@@ -341,6 +378,214 @@ TEST_CASE("OverlayAggregator: respects qpcFrequency when converting ticks → ns
 //   * first publish bumps to 1, second to 2, etc.
 //   * never resets, never decreases
 // =============================================================================
+
+// =============================================================================
+// FPS percentiles (P95 / P99 / P99.9) — computed from a 30s sliding ring of
+// frame_total_ns samples (4320 entries @ 144 Hz), sorted on each publish.
+// The contract:
+//
+//   fps_p95   = FPS such that 95 % of frames hit AT LEAST this value
+//               (the slow 5 % drop below)
+//   fps_p99   = FPS such that 99 % of frames hit AT LEAST this value
+//               (the worst 1 % drop below)
+//   fps_p99_9 = FPS such that 99.9 % of frames hit AT LEAST this value
+//               (the single worst ~0.1 %, ≈ 4 frames in 4320)
+//
+// Frametime is sorted ASCENDING; fps_pXX = 1e9 / frametime[at ascending
+// index XX %]. Smaller percentile-FPS = worse N % of frames.
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: P95 / P99 / P99.9 default to 0 before any publish") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    CHECK(agg.snapshot().fps_p95   == doctest::Approx(0.0f));
+    CHECK(agg.snapshot().fps_p99   == doctest::Approx(0.0f));
+    CHECK(agg.snapshot().fps_p99_9 == doctest::Approx(0.0f));
+}
+
+TEST_CASE("OverlayAggregator: P95/P99/P99.9 reflect frame_total_ns distribution") {
+    // Push 100 frames, all at exactly 11.111 ms (= 90 FPS). Every
+    // frame is the same, so all three percentiles read exactly 90.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    constexpr int64_t kFrameNs = 11'111'111;
+    for (int i = 0; i < 100; ++i) {
+        agg.pushFrame(makeRecord(int64_t(i) * kFrameNs,
+                                   4'000'000, 5'000'000,
+                                   kFrameNs, kFrameNs, 64, 55));
+    }
+    // Span = 100 × 11.1 ms ≈ 1.1 s — multiple refresh ticks have fired.
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().fps_p95   == doctest::Approx(90.0f).epsilon(0.01));
+    CHECK(agg.snapshot().fps_p99   == doctest::Approx(90.0f).epsilon(0.01));
+    CHECK(agg.snapshot().fps_p99_9 == doctest::Approx(90.0f).epsilon(0.01));
+}
+
+TEST_CASE("OverlayAggregator: P99.9 ≤ P99 ≤ P95 ordering contract") {
+    // P99.9 looks at the worst 0.1 % of frames in the sort, P99 the
+    // worst 1 %, P95 the worst 5 %. Since each successive percentile
+    // is a strict superset of the next, the FPS values must be
+    // monotonically non-decreasing as the percentile gets wider:
+    //   fps_p99_9 ≤ fps_p99 ≤ fps_p95.
+    //
+    // Synthetic distribution: 994 fast (90 FPS) + 1 slow (30 FPS) +
+    // 5 stutter (60 FPS) = 1000 samples. After the forced final
+    // publish:
+    //   sorted ascending by frametime → 994 fast at idx 0..993, then
+    //   5 stutter at idx 994..998, then 1 slow at idx 999.
+    //   integer index 950 * 1001 / 1000 = 950 → fast = 90 FPS
+    //   integer index 990 * 1001 / 1000 = 990 → fast = 90 FPS
+    //   integer index 999 * 1001 / 1000 = 999 → stutter = 60 FPS
+    //   (the single slow frame at idx 1000 is just beyond the
+    //    percentile boundary in our integer math).
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    constexpr int64_t kFastNs    = 11'111'111;   // 90 FPS
+    constexpr int64_t kStutterNs = 16'666'666;   // 60 FPS
+    constexpr int64_t kSlowNs    = 33'333'333;   // 30 FPS
+    int64_t cumQpc = 0;
+    for (int i = 0; i < 994; ++i) {
+        cumQpc += kFastNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kFastNs, kFastNs, 64, 55));
+    }
+    for (int i = 0; i < 5; ++i) {
+        cumQpc += kStutterNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kStutterNs, kStutterNs, 64, 55));
+    }
+    cumQpc += kSlowNs;
+    agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                               kSlowNs, kSlowNs, 64, 55));
+    // Forced-publish push so the snapshot reflects all 1000 samples.
+    cumQpc += 200'000'000;
+    agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                               kFastNs, kFastNs, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    const float p95   = agg.snapshot().fps_p95;
+    const float p99   = agg.snapshot().fps_p99;
+    const float p99_9 = agg.snapshot().fps_p99_9;
+    // Monotonic ordering (narrower percentile ≤ wider).
+    CHECK(p99_9 <= p99);
+    CHECK(p99   <= p95);
+    // P95 and P99 land in the all-fast region.
+    CHECK(p95 == doctest::Approx(90.0f).epsilon(0.05));
+    CHECK(p99 == doctest::Approx(90.0f).epsilon(0.05));
+    // P99.9 lands in the stutter region (60 FPS).
+    CHECK(p99_9 == doctest::Approx(60.0f).epsilon(0.05));
+}
+
+TEST_CASE("OverlayAggregator: P99 < P95 < FPS_AVG when stutters present") {
+    // 90 frames at 11.111 ms (90 FPS) + 10 frames at 33.333 ms (30 FPS).
+    // 10 % stutter rate — slightly above the 5 % P95 threshold so the
+    // boundary index lands ROBUSTLY in the slow region regardless of
+    // tiny off-by-one swings in N (the kind of swing you get when a
+    // forced-publish push at the end adds one more sample to the
+    // ring).
+    //
+    // Why force a final publish: the aggregator publishes when the
+    // delta since last refresh crosses 100 ms. With 11.111-ms /
+    // 33.333-ms inputs, the LAST publish naturally lands a few frames
+    // before the final push (delta = 99,999,999 ns just shy of the
+    // threshold on the very last frame). To make the snapshot
+    // reflect the FULL distribution we explicitly push one extra
+    // frame with a 200-ms QPC gap — way over the refresh interval —
+    // which guarantees a publish whose ring state has all 100 + 1
+    // samples.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    constexpr int64_t kFastNs = 11'111'111;   // 90 FPS
+    constexpr int64_t kSlowNs = 33'333'333;   // 30 FPS
+    int64_t cumQpc = 0;
+    for (int i = 0; i < 90; ++i) {
+        cumQpc += kFastNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kFastNs, kFastNs, 64, 55));
+    }
+    for (int i = 0; i < 10; ++i) {
+        cumQpc += kSlowNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kSlowNs, kSlowNs, 64, 55));
+    }
+    // Forced-publish push — kicks the aggregator to publish with the
+    // ring carrying 91 fast + 10 slow = 101 samples.
+    cumQpc += 200'000'000;
+    agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                               kFastNs, kFastNs, 64, 55));
+
+    REQUIRE(agg.snapshot().valid);
+    const float p95 = agg.snapshot().fps_p95;
+    const float p99 = agg.snapshot().fps_p99;
+    const float avg = agg.snapshot().fps_avg;
+    // sorted_ascending(frametime) has 91 fast at idx 0..90, 10 slow
+    // at idx 91..100. integer index 950*101/1000 = 95 → slow region.
+    // 990*101/1000 = 99 → slow region. Both percentiles read 30 FPS.
+    CHECK(p95 < avg);
+    CHECK(p99 <= p95);
+    CHECK(p95 == doctest::Approx(30.0f).epsilon(0.05));
+    CHECK(p99 == doctest::Approx(30.0f).epsilon(0.05));
+}
+
+TEST_CASE("OverlayAggregator: P95/P99 ignore frame_total_ns=0 first-frame sentinels") {
+    // First-frame sentinels (frame_total=0) would map to infinite FPS
+    // and corrupt the percentile estimate. The aggregator drops them
+    // from the ring.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    // 50 sentinel frames (frame_total=0) — must not enter the ring.
+    for (int i = 0; i < 50; ++i) {
+        agg.pushFrame(makeRecord(int64_t(i) * 11'111'111LL,
+                                   4'000'000, 5'000'000,
+                                   /*frame_total=*/0, 11'111'111, 64, 55));
+    }
+    // 50 real frames at 11.111 ms.
+    for (int i = 0; i < 50; ++i) {
+        agg.pushFrame(makeRecord(int64_t(50 + i) * 11'111'111LL,
+                                   4'000'000, 5'000'000,
+                                   11'111'111, 11'111'111, 64, 55));
+    }
+    REQUIRE(agg.snapshot().valid);
+    // P95 must be 90 FPS — if the sentinels had entered the ring at
+    // their "infinite FPS" interpretation, the slow 5% boundary would
+    // shift wildly.
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(90.0f).epsilon(0.01));
+}
+
+TEST_CASE("OverlayAggregator: percentile window caps at 4320 samples") {
+    // The percentile ring is 30 s @ 144 Hz = 4320 samples. To make
+    // the test prove rollover, we push more samples than the ring
+    // capacity: 300 slow then ~4500 fast. Every slow frame must
+    // have been overwritten by a fast one by the time the LAST
+    // publish fires (which happens periodically throughout the
+    // fast phase — the test reads whichever publish was last).
+    //
+    // Sizing: publishes fire every ~15 fast frames at the 6.944 ms /
+    // 100 ms-interval rate. The 300th fast push overwrites the LAST
+    // slow position at total push count = 300 + 4320 = 4620. After
+    // that the ring is fully fast. We push 4500 fast (well past the
+    // capacity but stopping short of 4620) — the LAST publish will
+    // land at frame ~4790 (= 4800-ish), well past the all-fast
+    // point so the snapshot reflects an all-fast ring.
+    //
+    // Sort cost: 4320 ints at ~50 µs/sort × ~50 publishes in the
+    // test ≈ 2.5 ms total. Imperceptible vs the test binary's
+    // total runtime.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    int64_t cumQpc = 0;
+    constexpr int64_t kSlowNs = 33'333'333;
+    constexpr int64_t kFastNs = 6'944'444;   // 144 FPS
+    for (int i = 0; i < 300; ++i) {
+        cumQpc += kSlowNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kSlowNs, kSlowNs, 64, 55));
+    }
+    for (int i = 0; i < 4500; ++i) {
+        cumQpc += kFastNs;
+        agg.pushFrame(makeRecord(cumQpc, 4'000'000, 5'000'000,
+                                   kFastNs, kFastNs, 64, 55));
+    }
+    REQUIRE(agg.snapshot().valid);
+    // Slow frames flushed — P95 / P99 / P99.9 all reflect the
+    // all-fast ring at the latest publish.
+    CHECK(agg.snapshot().fps_p95   == doctest::Approx(144.0f).epsilon(0.05));
+    CHECK(agg.snapshot().fps_p99   == doctest::Approx(144.0f).epsilon(0.05));
+    CHECK(agg.snapshot().fps_p99_9 == doctest::Approx(144.0f).epsilon(0.05));
+}
 
 // =============================================================================
 // GPU telemetry — pushGpuTelemetry latches the latest reading and the next

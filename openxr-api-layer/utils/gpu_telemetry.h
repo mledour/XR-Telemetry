@@ -47,8 +47,8 @@
 //
 // AMD coverage (ADL) and Intel Arc (IGCL) will land in a follow-up PR;
 // today the temp field reads NaN on non-NVIDIA systems and the renderer
-// already substitutes "--°C" via the isfinite() guard in
-// formatOverlayRows.
+// already substitutes "--" via the isfinite() guard in
+// formatOverlayDisplayValues.
 //
 // Anti-cheat note: NvAPI is a stock NVIDIA DLL signed by NVIDIA and
 // loaded by virtually every game and benchmark tool — its presence in
@@ -87,9 +87,9 @@ namespace openxr_api_layer::detail {
     struct GpuTelemetrySample {
         // GPU package temperature, °C. NaN if NvAPI is absent (AMD /
         // Intel), or if NvAPI returned an error. The renderer's
-        // isfinite() guard in formatOverlayRows handles this by
-        // substituting "--°C", keeping the monospace column width
-        // stable.
+        // isfinite() guard in formatOverlayDisplayValues handles this
+        // by substituting "--", keeping the bottom-row temp cell at
+        // its fixed width.
         float gpu_temp_c = std::numeric_limits<float>::quiet_NaN();
 
         // Local VRAM used by THIS process (the OpenXR host). Comes from

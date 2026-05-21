@@ -46,9 +46,11 @@
 #include "../telemetry_internals.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace openxr_api_layer::detail {
 
@@ -63,12 +65,47 @@ namespace openxr_api_layer::detail {
         // CSV's `headroom_pct` column, so the displayed time and util%
         // are coherent. Falls back to app_cpu_ns on the first frame
         // (no previous cycle yet), same as xrEndFrame does for
-        // headroom computation.
+        // headroom computation. Surfaced in the HUD as "Render ms" —
+        // it's the full per-cycle CPU cost (app work + endframe call +
+        // pre-begin housekeeping).
         float cpu_frame_ms = 0;
+        // App-only CPU time — the wait→end window (rec.app_cpu_ns).
+        // Surfaced as "App ms" alongside Render ms in the CPU
+        // frametime panel. The difference (Render − App) tells the
+        // user how much of the per-cycle CPU is OpenXR overhead vs
+        // their own game logic / submission code, which is the
+        // diagnostic value the design asks for.
+        float cpu_app_ms = 0;
         float gpu_frame_ms = 0;         // mean(gpu_time_ns) / 1e6
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
+        // FPS percentiles over a sliding window (kPercentileWindowSize
+        // samples — 30 s @ 144 Hz). Computed by sorting the recent
+        // frame_total_ns ring and indexing at the 95th / 99th /
+        // 99.9th percentile of the ASCENDING-sorted frametimes —
+        // the FPS value reported is `1e9 / frametime_at_that_index`,
+        // so smaller percentile-FPS means "worse N% of frames".
+        //
+        //   fps_p95   = 95 % of frames hit at least this FPS
+        //               (the slow 5 % drop below)
+        //   fps_p99   = 99 % of frames hit at least this FPS
+        //               (the worst 1 % drop below)
+        //   fps_p99_9 = 99.9 % of frames hit at least this FPS
+        //               (the single worst ~0.1 % — typically a few
+        //               specific spike frames in a 30 s window)
+        //
+        // 30 s window vs the previous 5 s was specifically chosen so
+        // P99.9 has statistical meaning: at 144 Hz, 0.1 % of 4320 ≈
+        // 4 frames, enough samples to be stable against a single
+        // random background-process hiccup. At 90 Hz the window
+        // covers ~48 s = ~4 frames in P99.9 too.
+        //
+        // Same convention as fpsVR / SteamVR "Frame Timing".
+        // 0 until the percentile window has at least one sample.
+        float fps_p95   = 0;
+        float fps_p99   = 0;
+        float fps_p99_9 = 0;
         // GPU telemetry, populated from GpuTelemetryReader::poll() via
         // OverlayAggregator::pushGpuTelemetry. NaN / 0 sentinels mean
         // "source unavailable" — see gpu_telemetry.h for the full
@@ -176,6 +213,7 @@ namespace openxr_api_layer::detail {
                 ? (rec.frame_total_ns - rec.wait_block_ns)
                 : rec.app_cpu_ns;
             m_sumCpuNs        += perCycleCpuNs;
+            m_sumAppCpuNs     += rec.app_cpu_ns;
             m_sumGpuNs        += rec.gpu_time_ns;
             m_sumFrameTotalNs += rec.frame_total_ns;
             m_sumPeriodNs     += rec.period_ns;
@@ -183,6 +221,21 @@ namespace openxr_api_layer::detail {
             m_sumGpuHeadroomPct   += rec.gpu_headroom_pct;
             m_lastFrameTotalNs = rec.frame_total_ns;
             ++m_count;
+
+            // Push the frame_total_ns into the percentile ring. Drops
+            // the oldest sample once the ring is full (~5 s at 144 Hz
+            // = 720 samples). Only positive frametimes are accepted —
+            // first-frame sentinels (frame_total=0 when there's no
+            // prior tEnd) would otherwise rank as "infinitely fast"
+            // (= INT64_MAX FPS after the inversion) and corrupt the
+            // P99 estimate.
+            if (rec.frame_total_ns > 0) {
+                m_percentileRing[m_percentileHead] = rec.frame_total_ns;
+                m_percentileHead = (m_percentileHead + 1) % kPercentileWindowSize;
+                if (m_percentileCount < kPercentileWindowSize) {
+                    ++m_percentileCount;
+                }
+            }
 
             const int64_t nowNs = qpcToNs(rec.timestamp_qpc, m_qpcFrequency);
             if (!m_armed) {
@@ -228,11 +281,75 @@ namespace openxr_api_layer::detail {
             const float avgFrameTotal = static_cast<float>(m_sumFrameTotalNs) / countF;
             m_snapshot.fps_avg = avgFrameTotal > 0.0f ? 1.0e9f / avgFrameTotal : 0.0f;
 
-            m_snapshot.cpu_frame_ms = (static_cast<float>(m_sumCpuNs) / countF) / 1.0e6f;
-            m_snapshot.gpu_frame_ms = (static_cast<float>(m_sumGpuNs) / countF) / 1.0e6f;
+            m_snapshot.cpu_frame_ms = (static_cast<float>(m_sumCpuNs)    / countF) / 1.0e6f;
+            m_snapshot.cpu_app_ms   = (static_cast<float>(m_sumAppCpuNs) / countF) / 1.0e6f;
+            m_snapshot.gpu_frame_ms = (static_cast<float>(m_sumGpuNs)    / countF) / 1.0e6f;
 
             const float avgPeriod = static_cast<float>(m_sumPeriodNs) / countF;
             m_snapshot.target_fps = avgPeriod > 0.0f ? 1.0e9f / avgPeriod : 0.0f;
+
+            // Percentiles — sort a copy of the (up to 720) ring entries
+            // and pick at index ceil(p * (N-1)). std::nth_element would
+            // be O(N) vs sort's O(N log N), but we need both 95% AND
+            // 99% so we'd nth_element twice anyway, and 720 ints sort
+            // in well under 100 µs even debug-build (verified via the
+            // local timing harness). Done once per publish (~10 Hz),
+            // so the cost amortises trivially.
+            if (m_percentileCount > 0) {
+                // Copy into the pre-allocated scratch member and sort
+                // in place — avoids the per-publish std::vector
+                // allocation that would otherwise burn ~340 KB/s of
+                // allocator churn (kPercentileWindowSize × sizeof(int64_t)
+                // × 10 Hz) inside the host process.
+                std::copy(m_percentileRing.begin(),
+                          m_percentileRing.begin() + m_percentileCount,
+                          m_percentileSortScratch.begin());
+                const auto sortedBegin = m_percentileSortScratch.begin();
+                const auto sortedEnd   = sortedBegin + m_percentileCount;
+                std::sort(sortedBegin, sortedEnd);
+                // The valid range is [sortedBegin, sortedBegin +
+                // m_percentileCount). The rest of the 4320-element
+                // scratch array is stale data from previous publishes,
+                // so the percentile lookup must use m_percentileCount
+                // as the bound, NOT m_percentileSortScratch.size().
+                // P95 of FPS in the fpsVR convention reads as:
+                // "95 % of frames hit AT LEAST this FPS — the slowest
+                //  5 % drop below". We sort frametimes ASCENDING, so
+                // the slow 5 % are at the high-index end. The boundary
+                // value sits at `floor(p * N)` in zero-indexed terms:
+                //
+                //   N=100, p=0.95 → idx 95  (5 frames at idx 95..99)
+                //   N=720, p=0.95 → idx 684 (36 frames at idx 684..719)
+                //   N=720, p=0.99 → idx 712 (8 frames at idx 712..719)
+                //
+                // Critically, we use INTEGER arithmetic via permille
+                // (per-thousand) rather than `floor(p * N)` with a
+                // float p — `0.95 * 100` in IEEE-754 double evaluates
+                // to 94.99999... (because 0.95 has no exact binary
+                // representation), and floor() returns 94 instead of
+                // the intended 95. The boundary off-by-one drops P95
+                // into the fast tail, which is the OPPOSITE of what
+                // the user expects. Integer arithmetic
+                // (permille × N / 1000) keeps the index exact at
+                // every clean percentile value.
+                auto frametimeAtPermille = [&](int permille) -> int64_t {
+                    const std::size_t n = m_percentileCount;
+                    if (n == 0) return 0;
+                    std::size_t idx = (static_cast<std::size_t>(permille) * n) / 1000;
+                    if (idx >= n) idx = n - 1;
+                    return m_percentileSortScratch[idx];
+                };
+                const int64_t ft_p95   = frametimeAtPermille(950);
+                const int64_t ft_p99   = frametimeAtPermille(990);
+                const int64_t ft_p99_9 = frametimeAtPermille(999);
+                m_snapshot.fps_p95   = ft_p95   > 0 ? 1.0e9f / static_cast<float>(ft_p95)   : 0.0f;
+                m_snapshot.fps_p99   = ft_p99   > 0 ? 1.0e9f / static_cast<float>(ft_p99)   : 0.0f;
+                m_snapshot.fps_p99_9 = ft_p99_9 > 0 ? 1.0e9f / static_cast<float>(ft_p99_9) : 0.0f;
+            } else {
+                m_snapshot.fps_p95   = 0.0f;
+                m_snapshot.fps_p99   = 0.0f;
+                m_snapshot.fps_p99_9 = 0.0f;
+            }
 
             // utilisation = 100 - headroom. Clamp to [0, 100] so a single
             // CPU-bound frame's negative headroom doesn't spike the
@@ -267,7 +384,7 @@ namespace openxr_api_layer::detail {
             // than `lastRefreshNs + intervalNs` to avoid catch-up bursts
             // after a stall (a few hundred ms of GPU work would otherwise
             // queue several pending refreshes back-to-back).
-            m_sumCpuNs = m_sumGpuNs = m_sumFrameTotalNs = m_sumPeriodNs = 0;
+            m_sumCpuNs = m_sumAppCpuNs = m_sumGpuNs = m_sumFrameTotalNs = m_sumPeriodNs = 0;
             m_sumHeadroomPct = m_sumGpuHeadroomPct = 0.0;
             m_count = 0;
             m_lastRefreshNs = nowNs;
@@ -277,7 +394,8 @@ namespace openxr_api_layer::detail {
         int64_t m_qpcFrequency;
         int64_t m_lastRefreshNs = 0;
         bool    m_armed = false;
-        int64_t m_sumCpuNs = 0;
+        int64_t m_sumCpuNs = 0;     // per-cycle (frame_total - wait_block) — Render ms
+        int64_t m_sumAppCpuNs = 0;  // wait→end window (rec.app_cpu_ns) — App ms
         int64_t m_sumGpuNs = 0;
         int64_t m_sumFrameTotalNs = 0;
         int64_t m_sumPeriodNs = 0;
@@ -301,6 +419,33 @@ namespace openxr_api_layer::detail {
         uint64_t m_latestVramUsed = 0;
         uint64_t m_latestVramBudget = 0;
         bool     m_gotGpuTelemetry = false;
+
+        // Sliding window of frame_total_ns samples for P95 / P99 /
+        // P99.9 computation. 4320 samples = 30 s @ 144 Hz / 48 s @
+        // 90 Hz. Width chosen so P99.9 has statistical meaning
+        // (0.1 % × 4320 ≈ 4 samples — robust against a single
+        // background hiccup). The percentiles still respond to
+        // sustained changes within ~3 s because P95 ignores the
+        // newest spike until it accumulates a fair share of the
+        // window. Storage: 4320 × 8 B ≈ 34 KB per aggregator —
+        // trivial vs the OpenXR-side per-frame surface.
+        //
+        // Sort cost at publish: 4320 ints in well under 100 µs on
+        // a modern CPU (we sort ~10×/s, totalling ~1 ms/s of CPU —
+        // imperceptible against the frame thread's 11 ms budget).
+        static constexpr std::size_t kPercentileWindowSize = 4320;
+        std::array<int64_t, kPercentileWindowSize> m_percentileRing{};
+        // Scratch buffer for the per-publish sort. Reused across
+        // publishes so we don't churn 34 KB / 10 Hz = 340 KB/s through
+        // the host's allocator. Layers run inside third-party games and
+        // the project policy is "zero alloc in the hot path where
+        // possible" — see CLAUDE.md's notes on anti-cheat / I/O
+        // surprise risk. Same fixed-size array shape as
+        // m_percentileRing so we can copy + sort in place.
+        std::array<int64_t, kPercentileWindowSize> m_percentileSortScratch{};
+        std::size_t m_percentileHead = 0;
+        std::size_t m_percentileCount = 0;
+
         OverlaySnapshot m_snapshot;
     };
 

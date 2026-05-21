@@ -45,3 +45,18 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
+
+// -----------------------------------------------------------------------------
+// Bundled fonts — Rajdhani (SIL Open Font License, see fonts/OFL.txt).
+// Subsetted to ASCII + °/µ/× glyphs (~11 KB each) so the DLL doesn't pay the
+// full multi-script weight (~400 KB original).
+//
+// IDs 200/201 are used at runtime via FindResource(...) +
+// IDWriteFactory5::CreateInMemoryFontFileLoader — see overlay_renderer.cpp.
+// -----------------------------------------------------------------------------
+#define IDR_FONT_RAJDHANI_SEMIBOLD 200
+#define IDR_FONT_RAJDHANI_BOLD     201
+#define RT_BUNDLED_FONT            256
+
+IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "fonts\\Rajdhani-SemiBold.ttf"
+IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "fonts\\Rajdhani-Bold.ttf"
