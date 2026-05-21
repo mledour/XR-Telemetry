@@ -111,7 +111,11 @@ namespace openxr_api_layer::detail {
         constexpr float kSectionGap     = 14.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
-        constexpr float kHeaderHeight     = 66.0f;
+        // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
+        // FPS value AND the kFontTinyLabel (17 px) label above it,
+        // plus paragraph-centring margins on both. Without the bump,
+        // the FPS glyph's descender clipped at the panel bottom.
+        constexpr float kHeaderHeight     = 90.0f;
         constexpr float kFrametimeHeight  = 90.0f;   // strip height ≈ 54 px after the
                                                       // title row. Sized so that a normal
                                                       // frame at ~50 % budget fills most
@@ -133,19 +137,24 @@ namespace openxr_api_layer::detail {
         // enough that the histogram reacts within the same second.
         constexpr std::size_t kRingSize  = 120;
 
-        // Font sizes — tuned to the 720×540 texture so the rendered
-        // result reads naturally at the new quad size (~16°×12° FOV
-        // at 1 m in the HMD).
-        constexpr float kFontTinyLabel    = 14.0f;  // "FPS", "P95", "TEMP", "GPU UTIL"
-        constexpr float kFontSectionTitle = 16.0f;  // "GPU FRAMETIME MS"
-        constexpr float kFontMs           = 22.0f;  // "6.7 ms" current value
-        constexpr float kFontBigNumber    = 42.0f;  // "142" FPS number
-        constexpr float kFontAccentNumber = 36.0f;  // "138", "124", "108"
-        constexpr float kFontTemp         = 30.0f;  // "67 °C" / "92 %" in the
-                                                     // bottom panel TEMP / LOAD
-                                                     // columns. The gauge font
-                                                     // was retired alongside the
-                                                     // circular gauge.
+        // Font sizes — calibrated against the design spec's
+        // hierarchy. Sizes in pixels at the 720×480 native texture
+        // resolution; rendered to the head-locked quad they read at
+        // their natural visual weight in the HMD.
+        constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
+        constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
+        constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
+                                                     // ("App ms X / Render ms Y") —
+                                                     // smaller so the longer
+                                                     // string still fits in the
+                                                     // top-right region.
+        constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
+                                                     // single biggest text on
+                                                     // the HUD, primary anchor.
+        constexpr float kFontAccentNumber = 32.0f;  // "138", "124", "108", "98"
+        constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
+                                                     // VRAM values
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -263,6 +272,8 @@ namespace openxr_api_layer::detail {
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
                 if (!makeFormat(kFontFamily, customCollection, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
+                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   DWRITE_FONT_WEIGHT_BOLD,
+                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
                 if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
                 if (!makeFormat(kFontFamily, customCollection, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
@@ -293,31 +304,36 @@ namespace openxr_api_layer::detail {
                 // from the design spec; alpha 0.94 on the outer bg
                 // composites the HUD over the game with a subtle
                 // window into the world behind it.
-                if (!make(D2D1::ColorF(0.008f, 0.012f, 0.012f, 0.94f), m_brushBg)) return false;          // #020303 carbon
-                if (!make(D2D1::ColorF(0.043f, 0.051f, 0.051f, 1.00f), m_brushPanelBg)) return false;    // #0B0D0D graphite
-                if (!make(D2D1::ColorF(0.165f, 0.176f, 0.180f, 1.00f), m_brushFrameLine)) return false;  // #2A2D2E metal-line
-                if (!make(D2D1::ColorF(0.227f, 0.239f, 0.243f, 1.00f), m_brushSeparator)) return false;  // #3A3D3E
+                // Refined palette from the design spec — slightly
+                // lighter background, deeper panel fill, more
+                // muted cyan for text accents (vs. saturated
+                // cyan-bright reserved for the bar gradient top).
+                if (!make(D2D1::ColorF(0.020f, 0.024f, 0.024f, 0.94f), m_brushBg)) return false;          // #050606
+                if (!make(D2D1::ColorF(0.035f, 0.039f, 0.039f, 1.00f), m_brushPanelBg)) return false;    // #090A0A
+                if (!make(D2D1::ColorF(0.122f, 0.133f, 0.133f, 1.00f), m_brushFrameLine)) return false;  // #1F2222 darker frame
+                if (!make(D2D1::ColorF(0.184f, 0.200f, 0.204f, 1.00f), m_brushSeparator)) return false;  // #2F3334
                 // Bevel highlight (lighter, top edge of each panel)
                 // and shadow (darker, bottom edge). 1-px lines at
                 // these colours give the "raised metal" impression
                 // around every panel rim — see drawPanelBg.
-                if (!make(D2D1::ColorF(0.357f, 0.380f, 0.388f, 1.00f), m_brushBevelHighlight)) return false; // #5B6163
+                if (!make(D2D1::ColorF(0.322f, 0.349f, 0.361f, 1.00f), m_brushBevelHighlight)) return false; // #52595C
                 if (!make(D2D1::ColorF(0.110f, 0.122f, 0.125f, 1.00f), m_brushBevelShadow)) return false;    // #1C1F20
                 // Carbon-fibre hatch — drawn as low-alpha diagonal
                 // lines across the panel backgrounds. ~6 % white so
                 // the texture is just visible without becoming
                 // visible stripes.
                 if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
-                // Text — softly off-white (not pure #FFFFFF) is less
-                // harsh on OLED HMD panels under low ambient light,
-                // and matches the spec's #F2F4F5 / #B8BFC1.
-                if (!make(D2D1::ColorF(0.949f, 0.957f, 0.961f, 1.00f), m_brushTextWhite)) return false;  // #F2F4F5
-                if (!make(D2D1::ColorF(0.722f, 0.749f, 0.757f, 1.00f), m_brushTextLabel)) return false;  // #B8BFC1
-                // Cyan accent — more saturated than the previous
-                // #1FD9E8. One brush, two roles: header bar values
-                // (FPS AVG / P95 / P99 / P99.9) AND healthy-tier
-                // LOAD / VRAM text in the bottom row.
-                if (!make(D2D1::ColorF(0.125f, 0.847f, 0.863f, 1.00f), m_brushAccentCyan)) return false; // #20D8DC
+                // Text — slightly cooler white than before. Matches
+                // the spec's #EBF0F2 (was #F2F4F5).
+                if (!make(D2D1::ColorF(0.922f, 0.941f, 0.949f, 1.00f), m_brushTextWhite)) return false;  // #EBF0F2
+                if (!make(D2D1::ColorF(0.620f, 0.659f, 0.671f, 1.00f), m_brushTextLabel)) return false;  // #9EA8AB
+                // Cyan accent — the "duller" cyan from the spec
+                // (#19D1D9), reserved for TEXT accents (FPS AVG /
+                // P95 / P99 / P99.9 + healthy LOAD / VRAM). The
+                // brighter #28E0E5 lives in the bar gradient TOP
+                // (see m_gpuTealStops below) — different role,
+                // different colour.
+                if (!make(D2D1::ColorF(0.098f, 0.820f, 0.851f, 1.00f), m_brushAccentCyan)) return false; // #19D1D9
                 // Histogram bar GRADIENT brushes — top→bottom
                 // linear gradient inside each bar gives the bars
                 // the "lit from above" look from the design spec.
@@ -819,18 +835,31 @@ namespace openxr_api_layer::detail {
                 // visual hierarchy needs more separation.
                 std::string topRightStr;
                 float valueRectWidth;
+                IDWriteTextFormat* topRightFmt;
                 if (secondaryValue.empty()) {
+                    // GPU panel: short "6.7 ms" at the larger
+                    // kFontMs (26 px) — primary frametime read-out.
                     topRightStr = currentValue + " ms";
-                    valueRectWidth = 140.0f;
+                    valueRectWidth = 160.0f;
+                    topRightFmt = m_fmtMsValue.Get();
                 } else {
+                    // CPU panel: compound "App ms X / Render ms Y"
+                    // at the smaller kFontMsCompound (18 px). The
+                    // string is ~32 chars so the size drop keeps
+                    // it inside the panel without crowding the
+                    // section title on the left. Both labels and
+                    // values render in cyan accent — colour-coded
+                    // sub-grouping deferred (would need multi-run
+                    // text layout, see earlier commit's caveat).
                     topRightStr = "App ms " + secondaryValue +
                                    " ms / Render ms " + currentValue + " ms";
-                    valueRectWidth = 420.0f;
+                    valueRectWidth = 360.0f;
+                    topRightFmt = m_fmtMsCompound.Get();
                 }
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     r - kSectionInnerPad - valueRectWidth, titleT - 4.0f,
                     r - kSectionInnerPad,                  titleB + 6.0f);
-                drawAscii(rt, topRightStr, m_fmtMsValue.Get(), valueRect,
+                drawAscii(rt, topRightStr, topRightFmt, valueRect,
                            m_brushAccentCyan.Get());
 
                 // Histogram region — below the title row, with inner
@@ -1238,7 +1267,8 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
             ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
-            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms"
+            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU, 26 px)
+            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ms ... / Render ms ..." (CPU, 18 px)
             ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
