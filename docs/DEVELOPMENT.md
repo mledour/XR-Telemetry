@@ -26,8 +26,15 @@ openxr-api-layer/
     dispatch.gen.{h,cpp}              ← regenerated from layer_apis.py
     entry.cpp                         ← DLL entry point + loader negotiation
     log.{h,cpp}                       ← file + ETW logging helpers
+  utils/
+    overlay_renderer.{h,cpp}        ← in-headset HUD (D2D/DirectWrite)
+    overlay_aggregator.{h,cpp}      ← per-frame metric accumulator
+    histogram_ring.h                ← ring buffer for frametime samples
+    gpu_telemetry.{h,cpp}           ← NvAPI / DXGI VRAM polling
+  fonts/                            ← bundled Rajdhani (subset to ASCII + °)
   layer.cpp / layer.h               ← YOUR layer logic
   pch.h                             ← D3D11 + D3D12 includes (delay-loaded)
+  openxr-api-layer.rc.in            ← VERSIONINFO + RT_BUNDLED_FONT template
   module.def                        ← DLL export list
   *.json                            ← OpenXR loader manifests
 
@@ -36,6 +43,12 @@ openxr-api-layer-tests/
   mock_runtime.{h,cpp}              ← in-process OpenXR fake
   test_stubs.cpp                    ← entry.cpp substitutes for the test build
   test_*.cpp                        ← YOUR tests
+  test_overlay_snapshot.cpp         ← visual-regression vs screenshots/
+  openxr-api-layer-tests.rc         ← duplicate RT_BUNDLED_FONT for the test
+                                       EXE (see "Snapshot tests" below)
+
+screenshots/
+  overlay_snapshot.png              ← golden image diffed by the snapshot test
 
 scripts/
   Init-Template.ps1                 ← post-clone placeholder substitution
@@ -132,6 +145,177 @@ if (d3d12Binding) {
 If a D3D11On12 path is overkill for your layer, drop the `d3d12.h`
 and `d3d11on12.h` includes from `pch.h` — they're optional weight on
 build time only.
+
+## Snapshot (visual-regression) tests
+
+### What it does and why
+
+`test_overlay_snapshot.cpp` renders the in-headset HUD with hard-coded
+mock telemetry into an offscreen WIC bitmap via the exact same
+`CoreRenderer` the production renderers use, encodes the bitmap to
+PNG, and diffs the result pixel-for-pixel against the golden image
+checked in at `screenshots/overlay_snapshot.png`.
+
+This catches things that ordinary unit tests can't: layout shifts of
+a few pixels, palette regressions, font substitution, mojibake (a
+literal `°` byte gets corrupted to `Â°` when MSVC reads a UTF-8
+source file as CP1252), accidental edits to gradients or stroke
+widths, off-by-one in any of the dozens of `DrawLine` /
+`FillGeometry` / `DrawText` calls inside the renderer. A passing CI
+run is a per-commit guarantee that the HUD still looks exactly the
+way the golden looks.
+
+The rendering is deterministic across CI runners because:
+
+- WIC's bitmap render target is a **software** D2D context (no GPU,
+  no driver differences).
+- The mock snapshot in `makeMockSnapshot()` is a hard-coded `OverlaySnapshot`
+  struct — no clock reads, no system queries.
+- The bundled Rajdhani font (subsetted to ASCII + `°`/`µ`/`×`, ~11 KB
+  each weight) is embedded in the test EXE so DirectWrite never falls
+  back to whatever system font happens to be installed.
+- Both halves of the comparison go through the same PNG
+  encode + un-premultiply + decode pipeline (the fresh PNG is written
+  to disk, then re-decoded), so PBGRA→BGRA precision noise cancels out.
+
+### How a CI run plays out
+
+1. MSBuild compiles `openxr-api-layer-tests.rc` into the test EXE
+   alongside the C++ TUs. rc.exe bakes the Rajdhani TTF bytes into
+   the EXE's resource table (custom type `RT_BUNDLED_FONT` == 256,
+   IDs 200 + 201).
+2. The PowerShell test step runs `openxr-api-layer-tests.exe`. The
+   snapshot test creates a 720×480 WIC bitmap RT, calls
+   `renderOverlayToTarget(...)`, encodes to `overlay_snapshot.png`
+   in the runner's CWD.
+3. The test then decodes both the golden (`screenshots/overlay_snapshot.png`,
+   path resolved from `__FILE__` so it's CWD-independent) and the
+   fresh PNG, and compares the BGRA byte buffers.
+4. `CHECK(diff.differingPixels == 0)` — pass or fail.
+
+There is no artifact upload step: the golden is the source of
+truth in the repo, and a passing test is the confirmation it still
+matches. If the test fails locally, the fresh PNG is on disk for
+inspection; if it fails in CI, the assertion message includes the
+count of differing pixels and the `(x, y)` of the first one.
+
+### What lives where
+
+| File | Role |
+|---|---|
+| `openxr-api-layer-tests/test_overlay_snapshot.cpp` | The TEST_CASE, mock data, WIC encode + decode + diff helpers |
+| `openxr-api-layer-tests/openxr-api-layer-tests.rc` | Resource script that embeds the Rajdhani TTFs into the test EXE |
+| `openxr-api-layer/openxr-api-layer.rc.in` | Production-DLL counterpart — same TTFs, same IDs, same custom type |
+| `openxr-api-layer/fonts/Rajdhani-{SemiBold,Bold}.ttf` | The bundled fonts — referenced from both `.rc` files |
+| `screenshots/overlay_snapshot.png` | The golden, 720×480 RGBA, ~68 KB |
+| `openxr-api-layer/utils/overlay_renderer.cpp` | `renderOverlayToTarget()` — the shared entry point used by both the in-headset path and the snapshot test |
+
+### Adding a new resource (font, image, …) used by the renderer
+
+The renderer loads resources via:
+
+```cpp
+HMODULE hMod = nullptr;
+GetModuleHandleExW(
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    reinterpret_cast<LPCWSTR>(&pickSwapchainFormat),  // any in-DLL function
+    &hMod);
+HRSRC hRes = FindResourceW(hMod, MAKEINTRESOURCEW(200),
+                            MAKEINTRESOURCEW(/*RT_BUNDLED_FONT*/256));
+```
+
+`pickSwapchainFormat` is defined in `overlay_renderer.cpp`. When the
+production DLL is loaded, that function lives in the DLL, so
+`GetModuleHandleEx` returns the DLL's `HMODULE` and `FindResource`
+hits the DLL's resource table. **When the test EXE runs**, the same
+`overlay_renderer.cpp` is statically linked into the EXE — so the
+same `GetModuleHandleEx` call returns the **test EXE's** `HMODULE`
+and `FindResource` hits the **test EXE's** resource table.
+
+Net consequence: any resource the renderer wants to read at runtime
+must be declared in BOTH `.rc` files, with identical custom type
+and IDs. Skip the test `.rc` entry and `FindResource` returns null
+in the test EXE — the renderer falls back to its degraded path
+(e.g. system Bahnschrift instead of bundled Rajdhani for fonts),
+which makes the snapshot diverge from the in-headset rendering and
+defeats the regression-test value.
+
+Checklist for adding a new bundled resource:
+
+1. **Place the file** under `openxr-api-layer/<some-folder>/` (e.g.
+   `openxr-api-layer/fonts/` for fonts, `openxr-api-layer/images/`
+   for PNGs). Pick a stable folder so both `.rc` files can reference
+   the same path.
+2. **Pick a custom resource type** if you don't already have one.
+   Numeric IDs ≥ 256 are safe (Windows reserves 1–255 for the
+   predefined types like `RT_BITMAP`, `RT_ICON`, etc.). Reuse
+   `RT_BUNDLED_FONT (256)` if it's another font.
+3. **Pick a resource ID** ≥ 200 (this codebase's convention; under
+   200 is reserved for IDs the DLL's `.rc.in` template might add for
+   icons, dialogs, etc.).
+4. **Declare in `openxr-api-layer/openxr-api-layer.rc.in`**:
+   ```rc
+   #define IDR_MY_NEW_RESOURCE   202
+   #define RT_BUNDLED_FONT       256   // reuse if existing
+   IDR_MY_NEW_RESOURCE RT_BUNDLED_FONT "fonts\\MyFile.ttf"
+   ```
+5. **Declare in `openxr-api-layer-tests/openxr-api-layer-tests.rc`**
+   with the SAME ID and type — path is relative to the test project
+   so it'll be `..\openxr-api-layer\fonts\MyFile.ttf` (the file lives
+   in the layer project, the .rc only references it):
+   ```rc
+   #define IDR_MY_NEW_RESOURCE   202
+   #define RT_BUNDLED_FONT       256
+   IDR_MY_NEW_RESOURCE RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\MyFile.ttf"
+   ```
+6. **Add the file to both vcxprojs as `<None Include>`** so Solution
+   Explorer shows it and the build triggers when it changes. The
+   `<ResourceCompile>` entry that pulls in the `.rc` is already
+   there — no new entry needed.
+7. **Re-render and refresh the golden**: the snapshot will now use
+   your new resource. Regenerate `screenshots/overlay_snapshot.png`
+   (currently by copying the fresh CI render manually; a manual
+   `workflow_dispatch` workflow to automate this is on the roadmap),
+   commit it, push. The diff in the PR will show the rendering
+   change.
+
+### When the diff fails
+
+`overlay snapshot — render mock to PNG (visual-regression artifact)`
+prints:
+
+```
+snapshot diverges from golden: 482 pixels differ; first at (x=178, y=24);
+fresh render kept at overlay_snapshot.png
+```
+
+Workflow to handle a failure:
+
+1. **Pull the branch locally**, build, run the test. The freshly-rendered
+   PNG ends up at `bin\x64\<cfg>\overlay_snapshot.png` (the test EXE's
+   working directory).
+2. **Open both PNGs side-by-side**. Any image viewer that supports
+   tabs / pixel-zoom works; ImageMagick `compare` produces a diff
+   image (`compare -metric AE golden.png fresh.png diff.png`).
+3. **Decide**: is the diff a real regression (revert / fix the
+   offending code) or an intentional design change (update the
+   golden)?
+4. **To update the golden**: copy the fresh PNG over
+   `screenshots/overlay_snapshot.png`, commit, push. The PR diff
+   will visualise the change. Reviewer can compare base vs head
+   in GitHub's image-diff view.
+
+### Why the test doesn't tolerate any pixel diff
+
+Tempting to allow "small differences" with a perceptual diff library
+(SSIM, pHash, …) — but on a deterministic software pipeline like
+this one, any pixel diff IS a real change, never noise. Tolerance
+turns a strict regression test into a flaky one. If the test ever
+becomes flaky despite the software path, the right fix is to find
+the source of nondeterminism (system time leaking into a string?
+locale-sensitive number format? font fallback?), not to widen the
+tolerance.
 
 ## Releases
 
