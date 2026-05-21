@@ -60,6 +60,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 #include "utils/histogram_ring.h"
 #include "utils/overlay_aggregator.h"
@@ -125,6 +128,89 @@ namespace {
         HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ~ComScope() { if (SUCCEEDED(hr)) ::CoUninitialize(); }
     };
+
+    // Resolve the golden snapshot path relative to THIS .cpp file's
+    // build-time location. Using __FILE__ rather than the test EXE's
+    // CWD makes the test robust to whichever working directory the
+    // test runner picks (CI runs from the workspace root, VS Test
+    // Explorer from bin\x64\<cfg>\, manual local from anywhere).
+    //
+    // The repo layout is:
+    //   <repo>/
+    //     openxr-api-layer-tests/test_overlay_snapshot.cpp  ← __FILE__
+    //     screenshots/overlay_snapshot.png                  ← golden
+    //
+    // So the golden lives at __FILE__/../../screenshots/...
+    std::filesystem::path goldenPngPath() {
+        namespace fs = std::filesystem;
+        return fs::path(__FILE__).parent_path().parent_path()
+            / "screenshots" / "overlay_snapshot.png";
+    }
+
+    // Decode a PNG (any pixel format) into a 32bpp BGRA byte buffer.
+    // BGRA — not PBGRA — to dodge the alpha-premultiplied-vs-straight
+    // mismatch that WIC's PNG decoder produces depending on whether
+    // the encoder side wrote a tRNS chunk. PBGRA == BGRA when alpha
+    // is 0xFF (which our HUD is for the opaque pixels), so this
+    // matches the test's render-side PBGRA byte-for-byte; the
+    // transparent corners outside the chamfered frame have alpha 0
+    // in both buffers and zero RGB, also matching.
+    bool decodePngToBgra(IWICImagingFactory* wic, const wchar_t* path,
+                         std::vector<BYTE>& outPixels,
+                         UINT& outW, UINT& outH) {
+        ComPtr<IWICBitmapDecoder> decoder;
+        if (FAILED(wic->CreateDecoderFromFilename(
+                path, nullptr, GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+                decoder.GetAddressOf()))) {
+            return false;
+        }
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) return false;
+        ComPtr<IWICFormatConverter> conv;
+        if (FAILED(wic->CreateFormatConverter(conv.GetAddressOf()))) return false;
+        if (FAILED(conv->Initialize(
+                frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0,
+                WICBitmapPaletteTypeMedianCut))) {
+            return false;
+        }
+        if (FAILED(conv->GetSize(&outW, &outH))) return false;
+        const UINT stride = outW * 4;
+        outPixels.assign(static_cast<std::size_t>(stride) * outH, 0);
+        return SUCCEEDED(conv->CopyPixels(
+            nullptr, stride,
+            static_cast<UINT>(outPixels.size()), outPixels.data()));
+    }
+
+    // Pixel-diff report. Counts pixels (NOT bytes) where any of B/G/R/A
+    // differ, and records the first such pixel for the failure message.
+    struct PixelDiff {
+        std::size_t differingPixels = 0;
+        int firstX = -1;
+        int firstY = -1;
+    };
+
+    PixelDiff comparePixels(const std::vector<BYTE>& a,
+                             const std::vector<BYTE>& b,
+                             UINT w, UINT h) {
+        PixelDiff d{};
+        const std::size_t pixelCount = static_cast<std::size_t>(w) * h;
+        for (std::size_t i = 0; i < pixelCount; ++i) {
+            const std::size_t off = i * 4;
+            if (a[off]   != b[off]   ||
+                a[off+1] != b[off+1] ||
+                a[off+2] != b[off+2] ||
+                a[off+3] != b[off+3]) {
+                if (d.differingPixels == 0) {
+                    d.firstX = static_cast<int>(i % w);
+                    d.firstY = static_cast<int>(i / w);
+                }
+                ++d.differingPixels;
+            }
+        }
+        return d;
+    }
 
 } // namespace
 
@@ -208,14 +294,51 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     REQUIRE(SUCCEEDED(frame->Commit()));
     REQUIRE(SUCCEEDED(encoder->Commit()));
 
-    // Sanity check: file exists and has plausible size. A 720×480
-    // PNG of a populated HUD lands around 30-80 KB; we just verify
-    // it's non-trivial.
+    // -------- Visual-regression check vs golden ---------------------------
+    //
+    // The freshly-rendered HUD MUST match the committed golden at
+    // screenshots/overlay_snapshot.png pixel-for-pixel. WIC software
+    // rendering is deterministic, the bundled font is identical
+    // across runners, and the mock snapshot is hard-coded — so any
+    // diff is a real regression in the renderer.
+    //
+    // Both halves are decoded from PNG on disk: the golden directly,
+    // the fresh from the overlay_snapshot.png we just wrote above.
+    // That way both buffers go through the SAME PNG encode +
+    // un-premultiply + decode pipeline, so the comparison only
+    // surfaces real rendering differences — not encode-precision
+    // noise from PBGRA→BGRA conversion paths.
+    //
+    // On mismatch, doctest prints how many pixels differ and the
+    // (x,y) of the first one. The freshly-rendered PNG is left on
+    // disk at overlay_snapshot.png for local-dev inspection. To
+    // accept an intentional change, regenerate the golden via the
+    // (forthcoming) manual workflow.
     {
-        WIN32_FILE_ATTRIBUTE_DATA attrs{};
-        REQUIRE(::GetFileAttributesExW(kOut, GetFileExInfoStandard, &attrs));
-        const DWORD bytes = attrs.nFileSizeLow;
-        CHECK(bytes > 5'000);
-        CHECK(bytes < 5'000'000);  // sanity upper bound
+        const std::filesystem::path goldenPath = goldenPngPath();
+        INFO("golden expected at: " << goldenPath.string());
+        REQUIRE_MESSAGE(std::filesystem::exists(goldenPath),
+                         "golden snapshot missing — run the update-snapshot "
+                         "workflow to seed screenshots/overlay_snapshot.png");
+
+        std::vector<BYTE> goldenPx, freshPx;
+        UINT gw = 0, gh = 0, fw = 0, fh = 0;
+        REQUIRE(decodePngToBgra(wic.Get(), goldenPath.wstring().c_str(),
+                                 goldenPx, gw, gh));
+        REQUIRE(decodePngToBgra(wic.Get(), kOut, freshPx, fw, fh));
+
+        CAPTURE(gw); CAPTURE(gh); CAPTURE(fw); CAPTURE(fh);
+        REQUIRE(gw == fw);
+        REQUIRE(gh == fh);
+        REQUIRE(goldenPx.size() == freshPx.size());
+
+        const PixelDiff diff = comparePixels(goldenPx, freshPx, fw, fh);
+        if (diff.differingPixels != 0) {
+            MESSAGE("snapshot diverges from golden: "
+                    << diff.differingPixels << " pixels differ; first at "
+                    << "(x=" << diff.firstX << ", y=" << diff.firstY << "); "
+                    << "fresh render kept at overlay_snapshot.png");
+        }
+        CHECK(diff.differingPixels == 0);
     }
 }
