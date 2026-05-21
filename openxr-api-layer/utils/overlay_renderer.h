@@ -52,6 +52,14 @@ namespace openxr_api_layer {
     class OpenXrApi;
 }
 
+// Forward declaration so consumers of this header (layer.cpp etc.) don't
+// have to drag in <d2d1.h> just because the test entry point below takes
+// an ID2D1RenderTarget*. pch.h pulls D3D11/D3D12 but not D2D — D2D only
+// lives in overlay_renderer.cpp and the test TU. A bare struct fwd decl
+// is enough for the pointer-parameter signature; the implementation in
+// the .cpp sees the real definition via <d2d1.h>.
+struct ID2D1RenderTarget;
+
 namespace openxr_api_layer::detail {
 
     // Abstract renderer interface. Holds the lifecycle the layer drives:
