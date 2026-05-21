@@ -202,26 +202,35 @@ namespace openxr_api_layer::detail {
                 // (font, size, alignment) combination at init time so
                 // paint() never allocates a format.
                 //
-                // Font choice: Consolas for the monospace numeric cells
-                // (FPS, ms, percentages — column-aligned digits matter
-                // visually), and Segoe UI for the smaller mixed-case
-                // section labels ("GPU FRAMETIME MS", "TEMP", etc.) —
-                // Consolas is too wide for those at small sizes.
-                if (!makeFormat(L"Consolas", kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
+                // Font family: Bahnschrift (Microsoft's DIN-inspired
+                // condensed sans, shipped with Windows 10 1709+).
+                // Closest native match to the design spec's
+                // recommended Rajdhani / DIN Condensed / Saira
+                // Condensed family — same condensed-techno feel,
+                // same weight axis. Falls back to the system
+                // default if Bahnschrift is somehow absent (older
+                // Win10 builds without the optional font feature
+                // pack); DirectWrite handles that automatically.
+                //
+                // We use the SAME family across labels AND values
+                // — visual cohesion + simpler init. Weights are
+                // varied (SemiBold for labels, Bold for values) to
+                // give the design's hierarchy.
+                constexpr const wchar_t* kFontFamily = L"Bahnschrift";
+                if (!makeFormat(kFontFamily, kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
-                if (!makeFormat(L"Consolas", kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
-                // m_fmtTemp is now CENTER-aligned: the bottom panel
-                // stacks each value (TEMP / LOAD) centred under its
-                // column label, no longer pinned to the left of a
-                // thermometer icon.
-                if (!makeFormat(L"Consolas", kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
+                // m_fmtTemp is CENTER-aligned: the bottom panel
+                // stacks each value (TEMP / LOAD / VRAM) centred
+                // under its column label.
+                if (!makeFormat(kFontFamily, kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(L"Consolas", kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(L"Segoe UI", kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(L"Segoe UI", kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
                 return true;
             }
@@ -242,37 +251,42 @@ namespace openxr_api_layer::detail {
                 auto make = [&](D2D1::ColorF c, ComPtr<ID2D1SolidColorBrush>& out) {
                     return SUCCEEDED(rt->CreateSolidColorBrush(c, out.GetAddressOf()));
                 };
-                // Outer frame + panel backgrounds. The double-fill
-                // (bgFill behind, then panel fills on top) gives the
-                // "raised metallic panel" feel of the reference design
-                // with no actual gradient cost.
-                if (!make(D2D1::ColorF(0.043f, 0.055f, 0.067f, 0.94f), m_brushBg)) return false;          // #0B0E11 with high alpha
-                if (!make(D2D1::ColorF(0.078f, 0.094f, 0.118f, 1.00f), m_brushPanelBg)) return false;    // #14181E
-                if (!make(D2D1::ColorF(0.157f, 0.180f, 0.224f, 1.00f), m_brushFrameLine)) return false;  // #282E39
-                if (!make(D2D1::ColorF(0.220f, 0.247f, 0.298f, 1.00f), m_brushSeparator)) return false;  // #383F4C
-                // Text + accent.
-                if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.00f), m_brushTextWhite)) return false;
-                if (!make(D2D1::ColorF(0.690f, 0.733f, 0.792f, 1.00f), m_brushTextLabel)) return false;  // #B0BBCA
-                if (!make(D2D1::ColorF(0.122f, 0.851f, 0.910f, 1.00f), m_brushAccentCyan)) return false; // #1FD9E8
-                // Bar / gauge colours — match the screenshot.
-                if (!make(D2D1::ColorF(0.000f, 0.835f, 0.769f, 1.00f), m_brushGpuTeal)) return false;    // #00D5C4
-                if (!make(D2D1::ColorF(0.357f, 0.722f, 0.910f, 1.00f), m_brushCpuBlue)) return false;    // #5BB8E8
-                // Warning-tier colours used by BOTH the histogram bars
-                // (per-bar tier from barVisualForSample) and the
-                // bottom panel LOAD value text (overall tier from
-                // gaugeTierForUtilisation). Same palette = coherent
-                // "X% headroom remaining" signal across the HUD. The
-                // healthy-tier load colour reuses m_brushAccentCyan
-                // (same #1FD9E8 as the header accent numbers).
-                if (!make(D2D1::ColorF(1.000f, 0.553f, 0.000f, 1.00f), m_brushOrange)) return false;     // #FF8D00 — warning
-                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C — critical
-                // Dashed grid lines inside the histogram panels.
-                if (!make(D2D1::ColorF(0.220f, 0.250f, 0.300f, 0.55f), m_brushGridDash)) return false;
-                // Budget reference line — brighter than the grid so
-                // it reads as THE marker for 100 % budget. Soft white
-                // with moderate alpha; bars crossing it on a stutter
-                // render visibly over it (intentional overlap).
-                if (!make(D2D1::ColorF(0.90f, 0.92f, 0.95f, 0.45f), m_brushBudgetLine)) return false;
+                // Palette tuned to a "futuristic gaming HUD / racing
+                // telemetry" aesthetic — deep carbon-black background,
+                // graphite panels, soft off-white text, saturated
+                // cyan and electric-blue accents. Hex values come
+                // from the design spec; alpha 0.94 on the outer bg
+                // composites the HUD over the game with a subtle
+                // window into the world behind it.
+                if (!make(D2D1::ColorF(0.008f, 0.012f, 0.012f, 0.94f), m_brushBg)) return false;          // #020303 carbon
+                if (!make(D2D1::ColorF(0.043f, 0.051f, 0.051f, 1.00f), m_brushPanelBg)) return false;    // #0B0D0D graphite
+                if (!make(D2D1::ColorF(0.165f, 0.176f, 0.180f, 1.00f), m_brushFrameLine)) return false;  // #2A2D2E metal-line
+                if (!make(D2D1::ColorF(0.227f, 0.239f, 0.243f, 1.00f), m_brushSeparator)) return false;  // #3A3D3E
+                // Text — softly off-white (not pure #FFFFFF) is less
+                // harsh on OLED HMD panels under low ambient light,
+                // and matches the spec's #F2F4F5 / #B8BFC1.
+                if (!make(D2D1::ColorF(0.949f, 0.957f, 0.961f, 1.00f), m_brushTextWhite)) return false;  // #F2F4F5
+                if (!make(D2D1::ColorF(0.722f, 0.749f, 0.757f, 1.00f), m_brushTextLabel)) return false;  // #B8BFC1
+                // Cyan accent — more saturated than the previous
+                // #1FD9E8. One brush, two roles: header bar values
+                // (FPS AVG / P95 / P99 / P99.9) AND healthy-tier
+                // LOAD / VRAM text in the bottom row.
+                if (!make(D2D1::ColorF(0.125f, 0.847f, 0.863f, 1.00f), m_brushAccentCyan)) return false; // #20D8DC
+                // Histogram bar colours — match the spec's brand
+                // hues. Slightly lighter teal and a more saturated
+                // electric blue so the two channels read at a glance.
+                if (!make(D2D1::ColorF(0.157f, 0.878f, 0.898f, 1.00f), m_brushGpuTeal)) return false;    // #28E0E5
+                if (!make(D2D1::ColorF(0.157f, 0.686f, 1.000f, 1.00f), m_brushCpuBlue)) return false;    // #28AFFF
+                // Warning / critical tiers — kept from the previous
+                // palette. Apply to both histogram bars (per-sample)
+                // and LOAD / VRAM text (overall).
+                if (!make(D2D1::ColorF(1.000f, 0.553f, 0.000f, 1.00f), m_brushOrange)) return false;     // #FF8D00
+                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C
+                // Dashed grid + budget line — desaturated and low-
+                // alpha so they sit BEHIND the bars without competing
+                // for attention.
+                if (!make(D2D1::ColorF(0.353f, 0.431f, 0.451f, 0.30f), m_brushGridDash)) return false;   // #5A6E73 @ 30%
+                if (!make(D2D1::ColorF(0.949f, 0.957f, 0.961f, 0.45f), m_brushBudgetLine)) return false; // off-white @ 45%
 
                 // Stroke style for the dashed grid lines. ID2D1Strok
                 // Style is shareable; we cache the one we need.
@@ -471,11 +485,10 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = 688 / 5 ≈ 137 px on the 720-wide texture.
-            // Big FPS number at 42 px Consolas Bold ≈ 75 px wide for
-            // "142" — fits with comfortable margin. Accent labels go
-            // up to "P99.9" (5 chars at 14 px Segoe Semibold ≈ 50 px)
-            // and accent values to 3 digits at 36 px ≈ 65 px, both
-            // well under the 137-px cell width.
+            // Bahnschrift Bold 42 px on "142" measures ~70 px (the
+            // font is condensed so 3-digit numbers stay narrow);
+            // labels at 14 px SemiBold stay well under 50 px even
+            // for "P99.9". Comfortable margins.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -572,7 +585,8 @@ namespace openxr_api_layer::detail {
                 //   CPU panel (secondaryValue == "4.3"): "App ms 4.3 ms / Render ms 7.4 ms"
                 //
                 // Both render as a SINGLE right-aligned trailing-
-                // aligned string in m_fmtMsValue (Consolas Bold 22 px).
+                // aligned string in m_fmtMsValue (Bahnschrift Bold
+                // 22 px).
                 // Drawing the labels and values in separate rects /
                 // colours was tried in an earlier revision and caused
                 // visible baseline mismatch between the two panels —
