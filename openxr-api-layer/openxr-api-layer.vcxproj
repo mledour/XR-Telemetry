@@ -123,7 +123,7 @@
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -177,7 +177,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
@@ -235,7 +235,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -293,7 +293,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
