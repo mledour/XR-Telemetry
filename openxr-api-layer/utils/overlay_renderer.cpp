@@ -1130,8 +1130,20 @@ namespace openxr_api_layer::detail {
                 };
 
                 // Cell 0 — <prefix> TEMP / "67 °C"
+                //
+                // Use a ° escape rather than a literal ° byte:
+                // MSVC without /utf-8 treats source files as the
+                // system codepage (CP1252 on EN-US Windows), so a
+                // literal ° in the source (UTF-8 bytes 0xC2 0xB0)
+                // gets read as two CP1252 chars and the resulting
+                // wide literal is L"Â°", which renders as the
+                // mojibake we saw in the first snapshot artifact.
+                // ° sidesteps the entire source-encoding
+                // question — the wide literal is exactly L"°"
+                // regardless of how MSVC parses the surrounding
+                // bytes.
                 drawCell(l, l + colW,
-                          tempLabel.c_str(), tempValue, L" °C",
+                          tempLabel.c_str(), tempValue, L" \u00B0C",
                           m_brushTextWhite.Get(), /*useWideValue=*/true);
                 // Cell 1 — <prefix> LOAD / "92 %"
                 drawCell(l + colW, l + colW * 2.0f,
