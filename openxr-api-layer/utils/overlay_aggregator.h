@@ -72,21 +72,31 @@ namespace openxr_api_layer::detail {
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
         // FPS percentiles over a sliding window (kPercentileWindowSize
-        // samples — 5 s @ 144 Hz). Computed by sorting the recent
-        // frame_total_ns ring and indexing at the 95th and 99th
-        // percentile of the ASCENDING-sorted frametimes — the FPS
-        // value reported is `1e9 / frametime_at_that_index`, so
-        // smaller percentile-FPS means "worse N% of frames".
+        // samples — 30 s @ 144 Hz). Computed by sorting the recent
+        // frame_total_ns ring and indexing at the 95th / 99th /
+        // 99.9th percentile of the ASCENDING-sorted frametimes —
+        // the FPS value reported is `1e9 / frametime_at_that_index`,
+        // so smaller percentile-FPS means "worse N% of frames".
         //
-        //   fps_p95 = 95% of frames hit at least this FPS
-        //             (the slow 5% drop below)
-        //   fps_p99 = 99% of frames hit at least this FPS
-        //             (the worst 1% drop below)
+        //   fps_p95   = 95 % of frames hit at least this FPS
+        //               (the slow 5 % drop below)
+        //   fps_p99   = 99 % of frames hit at least this FPS
+        //               (the worst 1 % drop below)
+        //   fps_p99_9 = 99.9 % of frames hit at least this FPS
+        //               (the single worst ~0.1 % — typically a few
+        //               specific spike frames in a 30 s window)
+        //
+        // 30 s window vs the previous 5 s was specifically chosen so
+        // P99.9 has statistical meaning: at 144 Hz, 0.1 % of 4320 ≈
+        // 4 frames, enough samples to be stable against a single
+        // random background-process hiccup. At 90 Hz the window
+        // covers ~48 s = ~4 frames in P99.9 too.
         //
         // Same convention as fpsVR / SteamVR "Frame Timing".
         // 0 until the percentile window has at least one sample.
-        float fps_p95 = 0;
-        float fps_p99 = 0;
+        float fps_p95   = 0;
+        float fps_p99   = 0;
+        float fps_p99_9 = 0;
         // GPU telemetry, populated from GpuTelemetryReader::poll() via
         // OverlayAggregator::pushGpuTelemetry. NaN / 0 sentinels mean
         // "source unavailable" — see gpu_telemetry.h for the full
@@ -305,13 +315,16 @@ namespace openxr_api_layer::detail {
                     if (idx >= n) idx = n - 1;
                     return sorted[idx];
                 };
-                const int64_t ft_p95 = frametimeAtPermille(950);
-                const int64_t ft_p99 = frametimeAtPermille(990);
-                m_snapshot.fps_p95 = ft_p95 > 0 ? 1.0e9f / static_cast<float>(ft_p95) : 0.0f;
-                m_snapshot.fps_p99 = ft_p99 > 0 ? 1.0e9f / static_cast<float>(ft_p99) : 0.0f;
+                const int64_t ft_p95   = frametimeAtPermille(950);
+                const int64_t ft_p99   = frametimeAtPermille(990);
+                const int64_t ft_p99_9 = frametimeAtPermille(999);
+                m_snapshot.fps_p95   = ft_p95   > 0 ? 1.0e9f / static_cast<float>(ft_p95)   : 0.0f;
+                m_snapshot.fps_p99   = ft_p99   > 0 ? 1.0e9f / static_cast<float>(ft_p99)   : 0.0f;
+                m_snapshot.fps_p99_9 = ft_p99_9 > 0 ? 1.0e9f / static_cast<float>(ft_p99_9) : 0.0f;
             } else {
-                m_snapshot.fps_p95 = 0.0f;
-                m_snapshot.fps_p99 = 0.0f;
+                m_snapshot.fps_p95   = 0.0f;
+                m_snapshot.fps_p99   = 0.0f;
+                m_snapshot.fps_p99_9 = 0.0f;
             }
 
             // utilisation = 100 - headroom. Clamp to [0, 100] so a single
@@ -382,14 +395,20 @@ namespace openxr_api_layer::detail {
         uint64_t m_latestVramBudget = 0;
         bool     m_gotGpuTelemetry = false;
 
-        // Sliding window of frame_total_ns samples for P95/P99
-        // computation. 720 samples = 5 s @ 144 Hz / 8 s @ 90 Hz —
-        // long enough that a single stutter doesn't dominate, short
-        // enough to track sustained performance changes (turn from
-        // an open road into a town in DR2, the percentiles react
-        // within ~3 s). Stored as a fixed-size std::array to keep
-        // the aggregator allocation-free in the steady state.
-        static constexpr std::size_t kPercentileWindowSize = 720;
+        // Sliding window of frame_total_ns samples for P95 / P99 /
+        // P99.9 computation. 4320 samples = 30 s @ 144 Hz / 48 s @
+        // 90 Hz. Width chosen so P99.9 has statistical meaning
+        // (0.1 % × 4320 ≈ 4 samples — robust against a single
+        // background hiccup). The percentiles still respond to
+        // sustained changes within ~3 s because P95 ignores the
+        // newest spike until it accumulates a fair share of the
+        // window. Storage: 4320 × 8 B ≈ 34 KB per aggregator —
+        // trivial vs the OpenXR-side per-frame surface.
+        //
+        // Sort cost at publish: 4320 ints in well under 100 µs on
+        // a modern CPU (we sort ~10×/s, totalling ~1 ms/s of CPU —
+        // imperceptible against the frame thread's 11 ms budget).
+        static constexpr std::size_t kPercentileWindowSize = 4320;
         std::array<int64_t, kPercentileWindowSize> m_percentileRing{};
         std::size_t m_percentileHead = 0;
         std::size_t m_percentileCount = 0;

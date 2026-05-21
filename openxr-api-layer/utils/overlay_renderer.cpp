@@ -441,21 +441,28 @@ namespace openxr_api_layer::detail {
 
             // -------- Header bar --------------------------------------------
             //
-            // Layout: 4 cells of equal width separated by 1-px vertical
+            // Layout: 5 cells of equal width separated by 1-px vertical
             // bars. Each cell has a small uppercase label at the top
             // and a big number below. The FPS cell uses the white
-            // brush; the three accent cells (AVG / P95 / P99) use
-            // cyan.
+            // brush; the four accent cells (AVG / P95 / P99 / P99.9)
+            // use cyan.
+            //
+            // Cell width = 688 / 5 ≈ 137 px on the 720-wide texture.
+            // Big FPS number at 42 px Consolas Bold ≈ 75 px wide for
+            // "142" — fits with comfortable margin. Accent labels go
+            // up to "P99.9" (5 chars at 14 px Segoe Semibold ≈ 50 px)
+            // and accent values to 3 digits at 36 px ≈ 65 px, both
+            // well under the 137-px cell width.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
                 drawPanelBg(rt, l, t, r, b);
 
                 const float w = r - l;
-                const float cellW = w * 0.25f;
+                const float cellW = w / 5.0f;
 
-                // Vertical separators between cells (3 of them).
-                for (int i = 1; i <= 3; ++i) {
+                // Vertical separators between cells (4 of them now).
+                for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
                     rt->DrawLine(
                         D2D1::Point2F(x, t + 8.0f),
@@ -485,6 +492,11 @@ namespace openxr_api_layer::detail {
                 drawHeaderCell(rt,
                                 l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
                                 L"P99", v.fps_p99,
+                                m_fmtAccentNumber.Get(),
+                                m_brushAccentCyan.Get());
+                drawHeaderCell(rt,
+                                l + cellW * 4.0f, labelY, l + cellW * 5.0f, valueY,
+                                L"P99.9", v.fps_p99_9,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get());
             }

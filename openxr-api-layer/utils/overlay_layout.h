@@ -60,9 +60,9 @@ namespace openxr_api_layer::detail {
     //
     // Field naming mirrors the visible cell positions:
     //
-    //   ── header bar (single row, 4 cells) ─────────────────────────
-    //   FPS  142    FPS AVG 138    P95 124    P99 108
-    //   fps_instant  fps_avg       fps_p95    fps_p99
+    //   ── header bar (single row, 5 cells) ─────────────────────────
+    //   FPS 142  FPS AVG 138  P95 124  P99 108  P99.9 98
+    //   fps_instant fps_avg   fps_p95  fps_p99  fps_p99_9
     //
     //   ── GPU frametime panel ───────────────────────────────────────
     //   GPU FRAMETIME MS                          6.7 ms
@@ -90,6 +90,11 @@ namespace openxr_api_layer::detail {
         std::string fps_avg          = "--";  // cyan accent
         std::string fps_p95          = "--";  // cyan accent
         std::string fps_p99          = "--";  // cyan accent
+        std::string fps_p99_9        = "--";  // cyan accent — single
+                                                // worst ~0.1 % of frames
+                                                // over a 30 s sliding
+                                                // window (see aggregator
+                                                // for the window math)
 
         // Frametime panel current-value labels (top-right of each
         // panel — the histogram itself takes the rest of the space).
@@ -175,6 +180,7 @@ namespace openxr_api_layer::detail {
         v.fps_avg          = fmtFpsInt(snap.fps_avg);
         v.fps_p95          = fmtFpsInt(snap.fps_p95);
         v.fps_p99          = fmtFpsInt(snap.fps_p99);
+        v.fps_p99_9        = fmtFpsInt(snap.fps_p99_9);
 
         v.gpu_frametime_ms = fmtMsOneDecimal(snap.gpu_frame_ms);
         v.cpu_frametime_ms = fmtMsOneDecimal(snap.cpu_frame_ms);
