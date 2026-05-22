@@ -115,6 +115,35 @@ jobs:
       # them fails (real regression unrelated to the snapshot) the
       # output will surface it in the job log, and the maintainer
       # can decide to abort regeneration.
+      #
+      # GitHub Actions runner trap: the `shell: pwsh` runtime
+      # appends the following suffix to every user script:
+      #
+      #     if ((Test-Path -LiteralPath variable:\LASTEXITCODE))
+      #         { exit $LASTEXITCODE }
+      #
+      # So even when the user script's own statements complete
+      # successfully (the Write-Host below proves it ran), this
+      # injected suffix picks up the test binary's exit code from
+      # $LASTEXITCODE and propagates it as the step's exit code —
+      # marking the step as failed and skipping every downstream
+      # step.
+      #
+      # Adding an explicit `exit 0` here pre-empts the injected
+      # suffix: the script terminates with a clean exit BEFORE the
+      # runner's wrapper runs, so GitHub Actions sees the step as
+      # successful — which is what "regeneration mode does not gate
+      # on this" promises.
+      #
+      # (Alternative: `$global:LASTEXITCODE = 0` would also work and
+      # is preferable if more statements were ever added after the
+      # test runner — `exit 0` would silently skip them. With
+      # nothing else following, `exit 0` is the clearer intent.)
+      #
+      # First observed on run 26281392401 — Write-Host printed
+      # `Test runner finished (exit code 1; regeneration mode does
+      # not gate on this)`, then immediately after,
+      # `##[error]Process completed with exit code 1`.
       - name: Run test suite (writes overlay_snapshot.png; ignores snapshot comparison failure)
         shell: pwsh
         run: |
@@ -122,6 +151,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Test binary missing at $exe" }
           & $exe --reporters=console --force-colors
           Write-Host "Test runner finished (exit code $LASTEXITCODE; regeneration mode does not gate on this)"
+          exit 0
 
       - name: Verify the fresh PNG was produced
         shell: pwsh
