@@ -88,32 +88,25 @@ namespace openxr_api_layer::detail {
         // the strip visually, no empty top region.
         //
         // Vertical budget (top → bottom), all in pixels at native
-        // texture resolution. The actual sum is documented as a check
-        // for whoever tweaks the constants next:
+        // texture resolution. Recalibrated for the alpha0 reference
+        // (720×452) — header inline + shorter bottom row + bigger
+        // frametime panels:
         //   kOuterPad           (10)
         //   kFrameStroke         (2)
         //   inner padding        (4)   ← see innerT in paint()
-        //   kHeaderHeight       (90)
-        //   kSectionGap         (14)
-        //   kFrametimeHeight    (90) — GPU panel
-        //   kSectionGap         (14)
-        //   kFrametimeHeight    (90) — CPU panel
-        //   kSectionGap         (14)
-        //   kBottomHeight      (130)
+        //   kHeaderHeight       (50)   ← was 90, inline layout halved
+        //   kSectionGap         (10)
+        //   kFrametimeHeight   (120)   ← was 90, more histogram room
+        //   kSectionGap         (10)
+        //   kFrametimeHeight   (120)   ← was 90
+        //   kSectionGap         (10)
+        //   kBottomHeight       (80)   ← was 130, alpha0 cells are shorter
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 474. Texture height is 452, so the content
-        //   currently overflows the texture by 22 px — the bottom
-        //   of the bottom panel CLIPS in the rendered output. This
-        //   is an INTENTIONAL intermediate state on the alpha0
-        //   iteration branch: the rendered output now has the same
-        //   720×452 footprint as the alpha0 golden, so the snapshot
-        //   test passes the dimensions REQUIRE and we can read a
-        //   real pixel diff to drive subsequent layout changes
-        //   (most likely shrinking kHeaderHeight 90 → ~60 once the
-        //   header switches to an inline label+value layout, which
-        //   gives back the 22 px the bottom row currently loses).
+        //   Total = 452 (exactly matches kOverlayTexH). Zero slack —
+        //   any bump on a height needs a compensating cut somewhere
+        //   else, or kOverlayTexH itself.
         // Sourced from the public header so the snapshot test and the
         // in-headset renderer always agree on the bitmap size.
         constexpr int32_t kTexW = openxr_api_layer::detail::kOverlayTexW;
@@ -123,22 +116,18 @@ namespace openxr_api_layer::detail {
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
-        constexpr float kSectionGap     = 14.0f;
+        constexpr float kSectionGap     = 10.0f;   // alpha0 trimmed 14 → 10
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
-        // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
-        // FPS value AND the kFontTinyLabel (17 px) label above it,
-        // plus paragraph-centring margins on both. Without the bump,
-        // the FPS glyph's descender clipped at the panel bottom.
-        constexpr float kHeaderHeight     = 90.0f;
-        constexpr float kFrametimeHeight  = 90.0f;   // strip height ≈ 54 px after the
-                                                      // title row. Sized so that a normal
-                                                      // frame at ~50 % budget fills most
-                                                      // of the strip — eliminates the
-                                                      // empty top-half users observed
-                                                      // in light-load scenarios.
-        constexpr float kBottomHeight     = 130.0f;  // tall enough for the chip + thermo
-                                                      // + 22-px gauge font + label row
+        // alpha0 layout: header is INLINE (label left, chiffre right
+        // on the same row) — half the previous stacked height. Frametime
+        // panels gain the freed-up vertical room so the histogram strip
+        // is taller and more readable. Bottom row shrinks because the
+        // alpha0 cells are compact label-top / value-left arrangements
+        // rather than the previous tall stacked centred layout.
+        constexpr float kHeaderHeight     =  50.0f;  // inline label+value
+        constexpr float kFrametimeHeight  = 120.0f;  // ~88 px strip after title row
+        constexpr float kBottomHeight     =  80.0f;  // compact alpha0 cells
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
@@ -159,27 +148,25 @@ namespace openxr_api_layer::detail {
         // hierarchy. Sizes in pixels at the 720×480 native texture
         // resolution; rendered to the head-locked quad they read at
         // their natural visual weight in the HMD.
-        constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
-        // Labels and section titles render in Rajdhani SemiBold (NOT
-        // Barlow), restored to their pre-Barlow-swap sizes. Rajdhani's
-        // narrower glyphs make the original 17 / 22 px the right
-        // calibration; the temporary 14 / 18 px shrink during the
-        // all-Barlow iteration was a compensation for Barlow Medium
-        // being noticeably wider and no longer applies now that the
-        // family flipped back to Rajdhani for labels.
-        constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
-        constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
-                                                     // ("App X ms / Render Y ms") —
-                                                     // smaller so the longer
-                                                     // string still fits in the
-                                                     // top-right region.
-        constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
-                                                     // single biggest text on
-                                                     // the HUD, primary anchor.
-        constexpr float kFontAccentNumber = 32.0f;  // "138", "124", "108", "98"
-        constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
-                                                     // VRAM values
+        // alpha0 font-size pass — labels/titles smaller, chiffres
+        // smaller (to fit the inline header), bottom-cell value also
+        // smaller (the bottom row is now 80 px not 130 px). Same
+        // Rajdhani SemiBold for labels, Barlow Medium Italic for
+        // chiffres; only the point sizes change.
+        constexpr float kFontTinyLabel    = 13.0f;  // "FPS", "P95", "TEMP", "VRAM"
+        constexpr float kFontSectionTitle = 15.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontMs           = 20.0f;  // GPU panel "6.7 ms" current value
+        constexpr float kFontMsCompound   = 16.0f;  // CPU panel compound string
+                                                     // ("App X ms / Render Y ms")
+        constexpr float kFontBigNumber    = 30.0f;  // "142" FPS — inline header,
+                                                     // can't be the 52 px tower of
+                                                     // the previous stacked layout.
+        constexpr float kFontAccentNumber = 24.0f;  // "138", "124", "108", "98"
+        constexpr float kFontTemp         = 30.0f;  // bottom panel TEMP / LOAD /
+                                                     // VRAM values — same height
+                                                     // as kFontBigNumber so the
+                                                     // chiffres baseline lines up
+                                                     // across the HUD.
 
         // Vertical insets for the 1-px column separator lines.
         // Header bar uses a tighter inset (the cells are 90 px tall);
@@ -321,10 +308,13 @@ namespace openxr_api_layer::detail {
                 //     m_fmtMsCompound
                 constexpr DWRITE_FONT_WEIGHT kChiffresWeight = DWRITE_FONT_WEIGHT_MEDIUM;
                 constexpr DWRITE_FONT_WEIGHT kLabelWeight    = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+                // alpha0 inline header: chiffre TRAILING-aligned in
+                // the right half of each cell (label LEADING in the
+                // left half — same row, no longer stacked).
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontBigNumber,    kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
+                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtBigNumber)) return false;
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontAccentNumber, kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
+                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
                 // under its column label.
@@ -338,8 +328,15 @@ namespace openxr_api_layer::detail {
                 // Italic on the chiffres ranges per draw.
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontMsCompound,   kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
+                // alpha0: small labels are LEADING-aligned in their
+                // rect (both for the inline header — label left, chiffre
+                // right — and for the bottom row, where the label sits
+                // at the cell's top-left corner above the value).
+                // Variable name kept as m_fmtTinyLabelCenter for diff
+                // minimality; the actual alignment now matches its
+                // role in the new layout.
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontTinyLabel,    kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
+                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTinyLabelCenter)) return false;
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontSectionTitle, kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
 
@@ -948,15 +945,15 @@ namespace openxr_api_layer::detail {
             // brush; the four accent cells (AVG / P95 / P99 / P99.9)
             // use cyan.
             //
-            // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (innerR - innerL). Barlow Medium Italic kFontBigNumber=52 px
-            // on "142" measures ~95-100 px (Barlow is wider than the
-            // previous Rajdhani Bold ~78 px, italic slant adds a few
-            // px more). kFontTinyLabel=17 px upright Medium labels
-            // stay well under 50 px even for "P99.9". Comfortable
-            // margins. On systems without the bundled font we fall
-            // back to Bahnschrift — narrower but no true italic, so
-            // chiffres come out as synthetic-oblique upright Bahnschrift.
+            // alpha0 inline layout: each cell is 5 columns × full header
+            // height. Within the cell, the small label (Rajdhani SemiBold
+            // kFontTinyLabel=13 px) sits LEADING in the left half,
+            // vertically centred. The chiffre (Barlow Medium Italic,
+            // kFontBigNumber=30 px for FPS / kFontAccentNumber=24 px for
+            // the four percentiles) sits TRAILING in the right half,
+            // also vertically centred. Both formats are paragraph-aligned
+            // CENTER at init time, so DirectWrite handles the vertical
+            // positioning automatically.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -974,49 +971,56 @@ namespace openxr_api_layer::detail {
                         m_brushSeparator.Get(), 1.0f);
                 }
 
-                const float labelH = 22.0f;
-                const float labelY = t + 4.0f;
-                const float valueY = labelY + labelH;
-
                 drawHeaderCell(rt,
-                                l + cellW * 0.0f, labelY, l + cellW * 1.0f, valueY,
+                                l + cellW * 0.0f, t, l + cellW * 1.0f, b,
                                 L"FPS", v.fps_instant,
                                 m_fmtBigNumber.Get(),
                                 m_brushTextWhite.Get());
                 drawHeaderCell(rt,
-                                l + cellW * 1.0f, labelY, l + cellW * 2.0f, valueY,
+                                l + cellW * 1.0f, t, l + cellW * 2.0f, b,
                                 L"FPS AVG", v.fps_avg,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get());
                 drawHeaderCell(rt,
-                                l + cellW * 2.0f, labelY, l + cellW * 3.0f, valueY,
+                                l + cellW * 2.0f, t, l + cellW * 3.0f, b,
                                 L"P95", v.fps_p95,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get());
                 drawHeaderCell(rt,
-                                l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
+                                l + cellW * 3.0f, t, l + cellW * 4.0f, b,
                                 L"P99", v.fps_p99,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get());
                 drawHeaderCell(rt,
-                                l + cellW * 4.0f, labelY, l + cellW * 5.0f, valueY,
+                                l + cellW * 4.0f, t, l + cellW * 5.0f, b,
                                 L"P99.9", v.fps_p99_9,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get());
             }
 
+            // Inline label + chiffre cell. Label LEADING in left half,
+            // chiffre TRAILING in right half, both vertically centred
+            // via the formats' paragraph alignment. The two halves
+            // never collide because the label's max width is the left
+            // half (so its LEADING-aligned rendering stays left of cell
+            // center) and the chiffre's max width is the right half
+            // (so its TRAILING-aligned rendering stays right of cell
+            // center). 10 px outer padding on each side keeps text
+            // clear of the cell-separator hairlines.
             void drawHeaderCell(ID2D1RenderTarget* rt, float l, float t,
-                                 float r, float valueY,
+                                 float r, float b,
                                  const wchar_t* label,
                                  const std::string& value,
                                  IDWriteTextFormat* valueFormat,
                                  ID2D1Brush* valueBrush) const {
-                const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
+                const float cellPad = 10.0f;
+                const float midX    = (l + r) * 0.5f;
+                const D2D1_RECT_F labelRect = D2D1::RectF(
+                    l + cellPad, t, midX, b);
                 drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
                           labelRect, m_brushTextLabel.Get());
                 const D2D1_RECT_F valueRect = D2D1::RectF(
-                    l, valueY - 2.0f, r,
-                    valueY + kFontBigNumber + 6.0f);
+                    midX, t, r - cellPad, b);
                 drawAscii(rt, value, valueFormat, valueRect, valueBrush);
             }
 
@@ -1071,35 +1075,36 @@ namespace openxr_api_layer::detail {
                     drawAscii(rt, s, m_fmtMsValue.Get(), valueRect,
                                m_brushAccentCyan.Get());
                 } else {
-                    // CPU panel: compound "App {x} ms / Render {y} ms"
-                    // at the smaller kFontMsCompound — labels upright
-                    // (matching the section title weight), chiffres +
-                    // unit italic (matching the rest of the HUD
-                    // chiffres). Per-range styles via
-                    // drawMixedStyleAscii → IDWriteTextLayout +
-                    // SetFontStyle.
+                    // CPU panel: alpha0 compound
+                    // "App ms {x} ms / Render ms {y} ms" — labels
+                    // ("App ms" / "Render ms") upright Rajdhani,
+                    // chiffres ({x} ms / {y} ms) italic Barlow. The
+                    // double "ms" (after label AND after value) is
+                    // intentional per the alpha0 reference; earlier
+                    // iterations dropped the redundant label-ms but
+                    // alpha0 keeps it as a visual rhythm anchor.
                     //
                     // String layout (character offsets):
-                    //   "App "            offset  0, length 4         (upright)
-                    //   secondaryValue    offset  4, length sec.size()
+                    //   "App ms "         offset  0, length 7         (upright)
+                    //   secondaryValue    offset  7, length sec.size()
                     //   " ms"             follows, length 3            ← italic with sec
-                    //   " / Render "      length 10                    (upright)
+                    //   " / Render ms "   length 13                   (upright)
                     //   currentValue      length cur.size()
                     //   " ms"             length 3                     ← italic with cur
                     const std::string& sec = secondaryValue;
                     const std::string& cur = currentValue;
                     const std::string compound =
-                        "App " + sec + " ms / Render " + cur + " ms";
+                        "App ms " + sec + " ms / Render ms " + cur + " ms";
                     const UINT32 italicAStart =
-                        4;                                      // after "App "
+                        7;                                      // after "App ms "
                     const UINT32 italicALen   =
                         static_cast<UINT32>(sec.size()) + 3;     // sec + " ms"
                     const UINT32 italicBStart =
-                        italicAStart + italicALen + 10;          // + " / Render "
+                        italicAStart + italicALen + 13;          // + " / Render ms "
                     const UINT32 italicBLen   =
                         static_cast<UINT32>(cur.size()) + 3;     // cur + " ms"
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 320.0f, titleT - 4.0f,
+                        r - kSectionInnerPad - 360.0f, titleT - 4.0f,
                         r - kSectionInnerPad,          titleB + 6.0f);
                     drawMixedStyleAscii(
                         rt, compound, m_fmtMsCompound.Get(),
@@ -1402,14 +1407,12 @@ namespace openxr_api_layer::detail {
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
 
-                // Subtle carbon-fibre-ish diagonal hatch: thin
-                // diagonal lines at ~6 % alpha across the panel
-                // body. Spaced 6 px apart; at the design's
-                // resolution they read as a very faint texture
-                // hint, never as actual stripes. Drawn BEFORE the
-                // panel separator stroke so the stroke covers the
-                // line ends at the panel edge.
-                drawCarbonHatch(rt, l, t, r, b);
+                // alpha0 removed the carbon-fibre hatch — the design
+                // wants a flat panel background, not the textured
+                // industrial look the original spec asked for. The
+                // drawCarbonHatch helper is kept (dead code is OK
+                // for now, costs no runtime) in case a future
+                // iteration brings back textured panels.
 
                 rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
                 // Bevel highlight (top edge) and shadow (bottom
