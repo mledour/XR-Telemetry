@@ -103,14 +103,19 @@ namespace openxr_api_layer::detail {
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 474, leaving 6 px of bottom slack against the
-        //   480-px texture height. The slack is intentionally small —
-        //   each panel is sized to its content, and `bottomY + kBottomHeight
-        //   ≤ innerB` by construction (asserted via the (void)innerB
-        //   line in paint()). Bumping any of the heights past this
-        //   budget will visually clip the bottom panel.
+        //   Total = 474. Texture height is 452, so the content
+        //   currently overflows the texture by 22 px — the bottom
+        //   of the bottom panel CLIPS in the rendered output. This
+        //   is an INTENTIONAL intermediate state on the alpha0
+        //   iteration branch: the rendered output now has the same
+        //   720×452 footprint as the alpha0 golden, so the snapshot
+        //   test passes the dimensions REQUIRE and we can read a
+        //   real pixel diff to drive subsequent layout changes
+        //   (most likely shrinking kHeaderHeight 90 → ~60 once the
+        //   header switches to an inline label+value layout, which
+        //   gives back the 22 px the bottom row currently loses).
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 480;
+        constexpr int32_t kTexH = 452;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
