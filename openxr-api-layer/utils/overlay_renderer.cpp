@@ -30,6 +30,8 @@
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
 #include "framework/log.h"            // Log / ErrorLog
 
+#include <cstdio>                     // fprintf — temporary diag in init()
+
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
@@ -361,11 +363,14 @@ namespace openxr_api_layer::detail {
                 // null and the draw helpers fall through to the
                 // direct ID2D1RenderTarget::DrawTextW path — chiffres
                 // jitter, but the HUD still renders.
-                if (SUCCEEDED(m_dwriteFactory->CreateTypography(
-                        m_typography.GetAddressOf()))) {
+                HRESULT typoHr = m_dwriteFactory->CreateTypography(
+                    m_typography.GetAddressOf());
+                HRESULT featHr = E_FAIL;
+                if (SUCCEEDED(typoHr)) {
                     const DWRITE_FONT_FEATURE tnum{
                         DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1};
-                    if (FAILED(m_typography->AddFontFeature(tnum))) {
+                    featHr = m_typography->AddFontFeature(tnum);
+                    if (FAILED(featHr)) {
                         // AddFontFeature failure shouldn't be possible
                         // for a freshly-created typography — drop the
                         // object so the draw helpers stay on the
@@ -374,6 +379,16 @@ namespace openxr_api_layer::detail {
                         m_typography.Reset();
                     }
                 }
+                // [DIAG] temporary trace to confirm typography state at
+                // the time of the snapshot test run. Goes to stderr so
+                // GitHub Actions' test step picks it up. Remove once
+                // the tnum activation is confirmed working.
+                std::fprintf(stderr,
+                    "[xr_telemetry][diag] typography: CreateTypography=%#lx "
+                    "AddFontFeature=%#lx m_typography=%s\n",
+                    static_cast<unsigned long>(typoHr),
+                    static_cast<unsigned long>(featHr),
+                    m_typography ? "ALIVE" : "NULL");
                 return true;
             }
 
