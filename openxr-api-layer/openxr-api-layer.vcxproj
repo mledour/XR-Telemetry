@@ -106,13 +106,19 @@
   <ItemDefinitionGroup>
     <ResourceCompile>
       <!-- rc.exe's /I search path for the bare-basename TTF references
-           inside fonts/bundled_fonts.rc.inc (the shared font include
-           that both the layer DLL and the test EXE pull in). Without
-           this, rc.exe fails with RC2135 file-not-found on every
-           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
-           bundled resource" for why the include uses bare basenames
-           and not a path prefix. -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+           inside fonts/bundled_fonts.rc.inc AND the bare-basename PNG
+           references inside images/bundled_images.rc.inc (the two
+           shared resource includes that both the layer DLL and the
+           test EXE pull in). Without these, rc.exe fails with RC2135
+           file-not-found on every Rajdhani-*.ttf / overlay_*.png. See
+           docs/DEVELOPMENT.md "Adding a new bundled resource" for why
+           each include uses bare basenames and not a path prefix.
+           Both paths are listed because rc.exe searches /I entries in
+           order and stops at the first match — separating fonts and
+           images into two directories prevents a basename collision
+           (e.g. an icon ever named the same as a font's TTF) from
+           silently picking the wrong file. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;$(SolutionDir)openxr-api-layer\images;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -130,18 +136,22 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
-      <!-- Delay-load D3D so the layer DLL does NOT pull d3d11.dll /
-           d3dcompiler_47.dll into every OpenXR game process. Those
+      <!-- Delay-load D3D / D2D / DirectWrite / WIC so the layer DLL does
+           NOT pull any of these into every OpenXR game process. Those
            DLLs are only loaded the first time your layer code calls
            into them — e.g. when you create a D3D11 / D3D11On12 device
-           to render an auxiliary swapchain. A pure pass-through or
-           metadata-only layer never touches D3D11 at all and the
-           DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
+           to render an auxiliary swapchain, or decode the bundled PNG
+           background via WIC. A pure pass-through or metadata-only
+           layer never touches D3D11 at all and the DLLs stay unloaded
+           for the host process's lifetime. windowscodecs.dll is on the
+           list because loadBundledBackground in overlay_renderer.cpp
+           goes through IWICImagingFactory to decode the bundled PNG
+           into the D2D bitmap that paint() blits as the first step. -->
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -184,18 +194,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
-      <!-- Delay-load D3D so the layer DLL does NOT pull d3d11.dll /
-           d3dcompiler_47.dll into every OpenXR game process. Those
+      <!-- Delay-load D3D / D2D / DirectWrite / WIC so the layer DLL does
+           NOT pull any of these into every OpenXR game process. Those
            DLLs are only loaded the first time your layer code calls
            into them — e.g. when you create a D3D11 / D3D11On12 device
-           to render an auxiliary swapchain. A pure pass-through or
-           metadata-only layer never touches D3D11 at all and the
-           DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
+           to render an auxiliary swapchain, or decode the bundled PNG
+           background via WIC. A pure pass-through or metadata-only
+           layer never touches D3D11 at all and the DLLs stay unloaded
+           for the host process's lifetime. windowscodecs.dll is on the
+           list because loadBundledBackground in overlay_renderer.cpp
+           goes through IWICImagingFactory to decode the bundled PNG
+           into the D2D bitmap that paint() blits as the first step. -->
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
@@ -242,18 +256,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
-      <!-- Delay-load D3D so the layer DLL does NOT pull d3d11.dll /
-           d3dcompiler_47.dll into every OpenXR game process. Those
+      <!-- Delay-load D3D / D2D / DirectWrite / WIC so the layer DLL does
+           NOT pull any of these into every OpenXR game process. Those
            DLLs are only loaded the first time your layer code calls
            into them — e.g. when you create a D3D11 / D3D11On12 device
-           to render an auxiliary swapchain. A pure pass-through or
-           metadata-only layer never touches D3D11 at all and the
-           DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
+           to render an auxiliary swapchain, or decode the bundled PNG
+           background via WIC. A pure pass-through or metadata-only
+           layer never touches D3D11 at all and the DLLs stay unloaded
+           for the host process's lifetime. windowscodecs.dll is on the
+           list because loadBundledBackground in overlay_renderer.cpp
+           goes through IWICImagingFactory to decode the bundled PNG
+           into the D2D bitmap that paint() blits as the first step. -->
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -300,18 +318,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
-      <!-- Delay-load D3D so the layer DLL does NOT pull d3d11.dll /
-           d3dcompiler_47.dll into every OpenXR game process. Those
+      <!-- Delay-load D3D / D2D / DirectWrite / WIC so the layer DLL does
+           NOT pull any of these into every OpenXR game process. Those
            DLLs are only loaded the first time your layer code calls
            into them — e.g. when you create a D3D11 / D3D11On12 device
-           to render an auxiliary swapchain. A pure pass-through or
-           metadata-only layer never touches D3D11 at all and the
-           DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
+           to render an auxiliary swapchain, or decode the bundled PNG
+           background via WIC. A pure pass-through or metadata-only
+           layer never touches D3D11 at all and the DLLs stay unloaded
+           for the host process's lifetime. windowscodecs.dll is on the
+           list because loadBundledBackground in overlay_renderer.cpp
+           goes through IWICImagingFactory to decode the bundled PNG
+           into the D2D bitmap that paint() blits as the first step. -->
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
@@ -391,6 +413,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <None Include="fonts\Rajdhani-SemiBold.ttf" />
     <None Include="fonts\Barlow-MediumItalic.ttf" />
     <None Include="fonts\OFL.txt" />
+    <None Include="fonts\bundled_fonts.rc.inc" />
+    <None Include="images\overlay_background.png" />
+    <None Include="images\bundled_images.rc.inc" />
     <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</DeploymentContent>

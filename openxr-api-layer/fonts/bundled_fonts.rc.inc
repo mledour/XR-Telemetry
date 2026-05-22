@@ -93,6 +93,10 @@
 // free integer for application-defined types and the convention this
 // project uses. The matching numeric (MAKEINTRESOURCEW(256)) is what
 // loadBundledFontCollection passes to FindResource at runtime.
+//
+// Other resource families (images, icons) get their own RT in their
+// own include file — see images/bundled_images.rc.inc for RT_BUNDLED_IMAGE.
+// The #ifndef guard makes this include order-independent.
 #ifndef RT_BUNDLED_FONT
 #define RT_BUNDLED_FONT 256
 #endif

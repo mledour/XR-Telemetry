@@ -59,13 +59,19 @@
   <ItemDefinitionGroup>
     <ResourceCompile>
       <!-- rc.exe's /I search path for the bare-basename TTF references
-           inside fonts/bundled_fonts.rc.inc (the shared font include
-           that both the layer DLL and the test EXE pull in). Without
-           this, rc.exe fails with RC2135 file-not-found on every
-           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
-           bundled resource" for why the include uses bare basenames
-           and not a path prefix. -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+           inside fonts/bundled_fonts.rc.inc AND the bare-basename PNG
+           references inside images/bundled_images.rc.inc (the two
+           shared resource includes that both the layer DLL and the
+           test EXE pull in). Without these, rc.exe fails with RC2135
+           file-not-found on every Rajdhani-*.ttf / overlay_*.png. See
+           docs/DEVELOPMENT.md "Adding a new bundled resource" for why
+           each include uses bare basenames and not a path prefix.
+           Both paths are listed because rc.exe searches /I entries in
+           order and stops at the first match — separating fonts and
+           images into two directories prevents a basename collision
+           (e.g. an icon ever named the same as a font's TTF) from
+           silently picking the wrong file. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;$(SolutionDir)openxr-api-layer\images;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -184,16 +190,24 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
-    <!-- Font TTFs are referenced from the .rc below; listing them here too
-         makes them visible in Solution Explorer and triggers a rebuild when
-         the subset is regenerated. They are NOT copied to the output dir
-         — rc.exe bakes their bytes directly into the EXE's resource table. -->
+    <!-- Font TTFs + overlay background PNG are referenced from the .rc
+         below; listing them here too makes them visible in Solution
+         Explorer and triggers a rebuild when any of them are
+         regenerated. None of these are copied to the output dir —
+         rc.exe bakes their bytes directly into the EXE's resource
+         table. The two .rc.inc files are listed for IDE visibility
+         only; rc.exe finds them via the /I path configured on
+         ResourceCompile above. -->
     <None Include="..\openxr-api-layer\fonts\Rajdhani-SemiBold.ttf" />
     <None Include="..\openxr-api-layer\fonts\Barlow-MediumItalic.ttf" />
+    <None Include="..\openxr-api-layer\fonts\bundled_fonts.rc.inc" />
+    <None Include="..\openxr-api-layer\images\overlay_background.png" />
+    <None Include="..\openxr-api-layer\images\bundled_images.rc.inc" />
   </ItemGroup>
   <ItemGroup>
-    <!-- RT_BUNDLED_FONT resources (IDs 200 / 201). See header comment in
-         the .rc for why the test EXE needs its own copy of these. -->
+    <!-- RT_BUNDLED_FONT resources (IDs 200 / 201) and RT_BUNDLED_IMAGE
+         resource (ID 300). See header comment in the .rc for why the
+         test EXE needs its own copy of these. -->
     <ResourceCompile Include="openxr-api-layer-tests.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

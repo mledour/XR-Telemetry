@@ -63,6 +63,16 @@
 // the SAME /I configuration, so the #include statement is symmetric
 // across the two binaries — neither side needs a fragile relative
 // path that would break if the .rc files moved within the tree.
+//
+// The bundled image include below pulls in the overlay background PNG
+// the renderer blits as the first paint step (see images/bundled_images
+// .rc.inc). The test EXE needs this for the same reason it needs the
+// fonts: overlay_renderer.cpp's loadBundledBackground uses GetModule
+// HandleEx(FROM_ADDRESS, …) to find the module hosting the resource,
+// and the resolved HMODULE is the test EXE — without the resource
+// baked in, the snapshot test renders without a background and the
+// pixel diff vs the golden explodes.
 // =============================================================================
 
 #include "bundled_fonts.rc.inc"
+#include "bundled_images.rc.inc"

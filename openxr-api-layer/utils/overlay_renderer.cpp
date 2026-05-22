@@ -33,6 +33,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
+#include <wincodec.h>     // IWICImagingFactory / IWICBitmapDecoder / IWICFormatConverter — PNG → D2D bitmap
 // Extra DXGI / D3D11 headers required by the cross-device shim
 // path. pch.h's <d3d11.h> + <dxgi.h> only expose the base
 // interfaces; we need:
@@ -49,11 +50,18 @@
 #include <string>
 #include <vector>
 
-// Pragma-link D2D + DirectWrite so we don't have to add them to the
-// vcxproj's Link section. d2d1.lib and dwrite.lib ship with the Windows
-// SDK; no extra NuGet package needed.
+// Pragma-link D2D + DirectWrite + WIC so we don't have to add them to
+// the vcxproj's Link section. d2d1.lib / dwrite.lib / windowscodecs.lib
+// all ship with the Windows SDK; no extra NuGet package needed.
+//
+// WIC is used by loadBundledBackground to decode the bundled PNG
+// background into a D2D bitmap at renderer init. The test EXE already
+// linked windowscodecs.lib explicitly via its vcxproj; this pragma
+// makes the layer DLL link symmetric so the resource path is identical
+// in both binaries.
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace openxr_api_layer::detail {
 
@@ -490,6 +498,24 @@ namespace openxr_api_layer::detail {
                         dashProps, dashes,
                         static_cast<UINT32>(std::size(dashes)),
                         m_strokeDashed.GetAddressOf()))) return false;
+
+                // Load the bundled overlay background PNG as an RT-bound
+                // D2D bitmap. paint() blits it as the FIRST step (before
+                // any chiffres / bars), and only the dynamic content is
+                // drawn on top. On failure we leave m_bgBitmap null and
+                // paint() falls back to the legacy chamfered-decoration
+                // code path — same brushes, same render, just slower to
+                // converge visually with the alpha0 reference. Failure
+                // here is non-fatal for initBrushes (the chiffres + bars
+                // still render correctly without the bg).
+                if (!loadBundledBackground(rt)) {
+                    // Soft-fail: log via the framework helpers so we
+                    // can spot the degraded path in CI. m_bgBitmap
+                    // stays null; paint() branches on it.
+                    Log("xr_telemetry: bundled overlay background PNG "
+                        "failed to load — falling back to D2D chamfered "
+                        "decoration.\n");
+                }
                 return true;
             }
 
@@ -545,6 +571,34 @@ namespace openxr_api_layer::detail {
                 const float texW = static_cast<float>(kTexW);
                 const float texH = static_cast<float>(kTexH);
 
+                // Background blit: if the bundled PNG resource loaded
+                // successfully at init time, paint it as the first
+                // step. The PNG is the alpha0 design reference with
+                // all dynamic content erased — frame, panel
+                // backgrounds, slot separators, labels (FPS / FPS AVG /
+                // P95 / …), section titles, dashed grid, budget line,
+                // bottom-row labels. With this in place the rest of
+                // paint() draws ONLY dynamic content: chiffres in the
+                // header cells, frametime ms values, histogram bars,
+                // and bottom-row value+unit pairs. The static
+                // decoration code paths (drawChamferedRect, drawPanel
+                // Bg, drawSlotSeparator, drawWide for labels) are
+                // gated on `!bgLoaded` so they only run as the
+                // graceful-degrade fallback if the resource load
+                // failed (production: cleanly drops back to fully
+                // D2D-drawn HUD; CI: snapshot test still renders
+                // something testable).
+                const bool bgLoaded = (m_bgBitmap != nullptr);
+                if (bgLoaded) {
+                    const D2D1_RECT_F dstRect =
+                        D2D1::RectF(0.0f, 0.0f, texW, texH);
+                    rt->DrawBitmap(
+                        m_bgBitmap.Get(),
+                        dstRect,
+                        /*opacity=*/1.0f,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                }
+
                 // Outer frame: octagonal-ish shape with chamfered
                 // corners — matches the design spec's "cut corners"
                 // industrial-HUD look. 12-px diagonal cut at each
@@ -553,12 +607,17 @@ namespace openxr_api_layer::detail {
                 // line segments). The geometry is closed so a single
                 // FillGeometry / DrawGeometry pair handles both the
                 // background fill and the metal-line stroke.
-                const D2D1_RECT_F frameOuter = D2D1::RectF(
-                    kOuterPad, kOuterPad,
-                    texW - kOuterPad, texH - kOuterPad);
-                drawChamferedRect(rt, frameOuter, 12.0f,
-                                   m_brushBg.Get(),
-                                   m_brushFrameLine.Get(), kFrameStroke);
+                //
+                // Skipped when bgLoaded — the bundled PNG already
+                // contains a pixel-perfect version of this frame.
+                if (!bgLoaded) {
+                    const D2D1_RECT_F frameOuter = D2D1::RectF(
+                        kOuterPad, kOuterPad,
+                        texW - kOuterPad, texH - kOuterPad);
+                    drawChamferedRect(rt, frameOuter, 12.0f,
+                                       m_brushBg.Get(),
+                                       m_brushFrameLine.Get(), kFrameStroke);
+                }
 
                 // Inner content rectangle (everything sits inside this).
                 const float innerL = kOuterPad + kFrameStroke + 4.0f;
@@ -574,7 +633,7 @@ namespace openxr_api_layer::detail {
                 (void)innerB;  // bottomY + kBottomHeight ≤ innerB by construction
 
                 drawHeaderBar(rt, innerL, headerY, innerR,
-                               headerY + kHeaderHeight, v);
+                               headerY + kHeaderHeight, v, bgLoaded);
                 // GPU panel: single value top-right ("6.7 ms").
                 // CPU panel: dual value "App X.X ms / Render Y.Y
                 // ms" — the App / Render split is the diagnostic
@@ -589,14 +648,16 @@ namespace openxr_api_layer::detail {
                                     v.gpu_frametime_ms,
                                     /*secondaryValue=*/std::string{},
                                     gpuRing, snap.target_fps,
-                                    m_brushGpuTealGrad.Get());
+                                    m_brushGpuTealGrad.Get(),
+                                    bgLoaded);
                 drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
                                     cpuPanelY + kFrametimeHeight,
                                     L"CPU FRAMETIME MS",
                                     v.cpu_frametime_ms,
                                     v.cpu_app_ms,
                                     cpuRing, snap.target_fps,
-                                    m_brushCpuBlueGrad.Get());
+                                    m_brushCpuBlueGrad.Get(),
+                                    bgLoaded);
 
                 // Bottom row: 60/40 split between the GPU and CPU
                 // panels — GPU gets 3 cells (TEMP / LOAD / VRAM),
@@ -627,14 +688,16 @@ namespace openxr_api_layer::detail {
                                  v.gpu_temp_c, v.gpu_util_pct,
                                  v.gpu_util_fraction,
                                  /*vramValue=*/v.vram_pct,
-                                 /*vramFraction=*/v.vram_fraction);
+                                 /*vramFraction=*/v.vram_fraction,
+                                 bgLoaded);
                 drawBottomPanel(rt, cpuPanelL, bottomY,
                                  cpuPanelR, bottomY + kBottomHeight,
                                  L"CPU TEMP", L"CPU LOAD",
                                  v.cpu_temp_c, v.cpu_util_pct,
                                  v.cpu_util_fraction,
                                  /*vramValue=*/std::string{},
-                                 /*vramFraction=*/0.0f);
+                                 /*vramFraction=*/0.0f,
+                                 bgLoaded);
 
                 return SUCCEEDED(rt->EndDraw());
             }
@@ -823,6 +886,175 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
+            // Loads the bundled overlay background PNG (RT_BUNDLED_IMAGE,
+            // ID 300 in images/bundled_images.rc.inc — the shared include
+            // compiled into both the layer DLL and the test EXE so the
+            // same bytes resolve in either binary). The PNG holds the
+            // alpha0 design reference with all dynamic content erased
+            // (chiffres, histogram bars, value/unit pairs); paint() blits
+            // it as the first step and then draws ONLY the dynamic
+            // content on top, eliminating an entire class of D2D layout
+            // drift vs. trying to recreate every label/decoration in
+            // code.
+            //
+            // Returns true on success and stores the decoded D2D bitmap
+            // in m_bgBitmap. False = caller falls back to the legacy
+            // chamfered-decoration code path (drawChamferedRect /
+            // drawPanelBg / drawSlotSeparator) so the renderer still
+            // produces something usable even if the PNG resource is
+            // missing or WIC fails. Never throws. Never crashes the
+            // host process — the layer is loaded into VR games and
+            // the renderer is best-effort.
+            //
+            // The bitmap is RT-bound (ID2D1RenderTarget::CreateBitmap
+            // FromWicBitmap), so it lives in the SAME factory as the
+            // RT that draws it. Production path (D3D11/D3D12): the RT
+            // is created from m_d2dFactory. Snapshot test path: the
+            // test owns its own factory and the RT comes from there;
+            // m_d2dFactory in initBrushes() is already reassigned to
+            // rt->GetFactory() before this method runs, so the bitmap
+            // and the RT share a factory by construction.
+            bool loadBundledBackground(ID2D1RenderTarget* rt) {
+                if (!rt) return false;
+
+                // Lazy-init the WIC factory. CoInitialize is the host
+                // app's responsibility — every D3D11/D3D12 game has
+                // already called CoInitialize(Ex) by the time our
+                // session-create runs. The snapshot test calls
+                // CoInitializeEx in its main() before invoking
+                // renderOverlayToTarget.
+                //
+                // Failure here (E_FAIL = COM not initialised; class
+                // not registered = WIC missing) returns false and
+                // the renderer degrades to the legacy D2D
+                // decoration. We do NOT call CoInitialize ourselves
+                // — calling it on an STA host thread that's already
+                // initialised as MTA would return RPC_E_CHANGED_MODE
+                // and the game would never recover.
+                if (!m_wicFactory) {
+                    if (FAILED(::CoCreateInstance(
+                            CLSID_WICImagingFactory,
+                            /*pUnkOuter=*/nullptr,
+                            CLSCTX_INPROC_SERVER,
+                            IID_PPV_ARGS(m_wicFactory.GetAddressOf())))) {
+                        return false;
+                    }
+                }
+
+                // Resolve our DLL's HMODULE (NOT the host game's EXE
+                // module) via GetModuleHandleEx with the address of
+                // an in-DLL function. Exactly the same trick
+                // loadBundledFontCollection uses — see that helper's
+                // comment for the full rationale. pickSwapchainFormat
+                // is in the anonymous namespace of this TU and is
+                // therefore guaranteed to live in whichever module
+                // (DLL or test EXE) overlay_renderer.cpp is linked
+                // into.
+                HMODULE hMod = nullptr;
+                if (!::GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(&pickSwapchainFormat),
+                        &hMod)) {
+                    return false;
+                }
+
+                // Pull the PNG resource bytes out of the module's
+                // resource table. Same Find / Load / Lock / Sizeof
+                // dance as the font path, just with a different
+                // custom RT (RT_BUNDLED_IMAGE = 257 instead of 256).
+                constexpr WORD RT_BUNDLED_IMAGE_W = 257;
+                constexpr WORD IDR_IMAGE_OVERLAY_BACKGROUND_W = 300;
+                HRSRC res = ::FindResourceW(
+                    hMod,
+                    MAKEINTRESOURCEW(IDR_IMAGE_OVERLAY_BACKGROUND_W),
+                    MAKEINTRESOURCEW(RT_BUNDLED_IMAGE_W));
+                if (!res) return false;
+                HGLOBAL global = ::LoadResource(hMod, res);
+                if (!global) return false;
+                const void* data = ::LockResource(global);
+                const DWORD size = ::SizeofResource(hMod, res);
+                if (!data || size == 0) return false;
+
+                // WIC needs an IStream over the PNG bytes. We use
+                // IWICStream::InitializeFromMemory rather than the
+                // shell's SHCreateMemStream — same end-result (a
+                // seekable IStream over a non-owned byte range) but
+                // pulls in only windowscodecs.dll (already loaded
+                // for IWICImagingFactory) instead of dragging
+                // shlwapi.lib / shlwapi.dll into the layer's DLL
+                // dependency list. The resource bytes (`data`)
+                // stay owned by the module's resource table —
+                // stable for the module's lifetime, which outlives
+                // every WIC read of this stream.
+                ComPtr<IWICStream> stream;
+                if (FAILED(m_wicFactory->CreateStream(
+                        stream.GetAddressOf()))) {
+                    return false;
+                }
+                if (FAILED(stream->InitializeFromMemory(
+                        const_cast<BYTE*>(
+                            reinterpret_cast<const BYTE*>(data)),
+                        static_cast<DWORD>(size)))) {
+                    return false;
+                }
+
+                // Decode the PNG. WICDecodeMetadataCacheOnDemand
+                // defers most metadata parsing until first frame
+                // access — slightly lower latency for the common
+                // case of a single-frame PNG (we don't care about
+                // metadata, just the pixels).
+                ComPtr<IWICBitmapDecoder> decoder;
+                if (FAILED(m_wicFactory->CreateDecoderFromStream(
+                        stream.Get(),
+                        /*vendor=*/nullptr,
+                        WICDecodeMetadataCacheOnDemand,
+                        decoder.GetAddressOf()))) {
+                    return false;
+                }
+                ComPtr<IWICBitmapFrameDecode> frame;
+                if (FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+                    return false;
+                }
+
+                // Convert to 32bpp BGRA premultiplied — the pixel
+                // format ID2D1Bitmap accepts natively. PNGs may
+                // come in any of RGB / RGBA / palette / grayscale;
+                // the converter normalises them all to the D2D-
+                // friendly layout. Premultiplied alpha matches the
+                // D2D default render-target compositing mode
+                // (D2D1_ALPHA_MODE_PREMULTIPLIED), avoiding a
+                // per-pixel divide at DrawBitmap time.
+                ComPtr<IWICFormatConverter> converter;
+                if (FAILED(m_wicFactory->CreateFormatConverter(
+                        converter.GetAddressOf()))) {
+                    return false;
+                }
+                if (FAILED(converter->Initialize(
+                        frame.Get(),
+                        GUID_WICPixelFormat32bppPBGRA,
+                        WICBitmapDitherTypeNone,
+                        /*palette=*/nullptr,
+                        /*alphaThresholdPercent=*/0.0,
+                        WICBitmapPaletteTypeCustom))) {
+                    return false;
+                }
+
+                // Hand off to D2D. CreateBitmapFromWicBitmap copies
+                // the pixels into a render-target-resident bitmap
+                // (GPU memory on hardware RTs, system memory on
+                // WIC bitmap RTs in the snapshot path). The source
+                // IWICBitmapSource can be released immediately after
+                // — D2D no longer references the WIC chain.
+                if (FAILED(rt->CreateBitmapFromWicBitmap(
+                        converter.Get(),
+                        /*properties=*/nullptr,
+                        m_bgBitmap.ReleaseAndGetAddressOf()))) {
+                    return false;
+                }
+                return true;
+            }
+
             // ASCII-only DrawTextW shortcut. The redesign emits only
             // ASCII digits + uppercase labels — except for the °C
             // suffix, which we draw via the dedicated wide-literal
@@ -958,48 +1190,63 @@ namespace openxr_api_layer::detail {
             // positioning automatically.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
-                                const OverlayDisplayValues& v) const {
-                drawPanelBg(rt, l, t, r, b);
+                                const OverlayDisplayValues& v,
+                                bool bgLoaded) const {
+                // Static decoration: panel background + 4 vertical
+                // slot-cut separators between the 5 cells. Skipped
+                // when the bundled PNG background is in play — the
+                // PNG holds a pixel-perfect version of both.
+                if (!bgLoaded) {
+                    drawPanelBg(rt, l, t, r, b);
+                }
 
                 const float w = r - l;
                 const float cellW = w / 5.0f;
 
-                // Vertical slot-cut separators between cells (4 of them
-                // for 5 cells). The slots replace the previous 1-px
-                // hairlines with 2-px hexagonal pills (chamfered tips
-                // top and bottom) — alpha0's signature inter-cell motif.
-                for (int i = 1; i <= 4; ++i) {
-                    const float x = l + cellW * static_cast<float>(i);
-                    drawSlotSeparator(rt, x,
-                                       t + kHeaderSepInsetY,
-                                       b - kHeaderSepInsetY);
+                if (!bgLoaded) {
+                    // Vertical slot-cut separators between cells (4 of
+                    // them for 5 cells). The slots replace the previous
+                    // 1-px hairlines with 2-px hexagonal pills
+                    // (chamfered tips top and bottom) — alpha0's
+                    // signature inter-cell motif.
+                    for (int i = 1; i <= 4; ++i) {
+                        const float x = l + cellW * static_cast<float>(i);
+                        drawSlotSeparator(rt, x,
+                                           t + kHeaderSepInsetY,
+                                           b - kHeaderSepInsetY);
+                    }
                 }
 
                 drawHeaderCell(rt,
                                 l + cellW * 0.0f, t, l + cellW * 1.0f, b,
                                 L"FPS", v.fps_instant,
                                 m_fmtBigNumber.Get(),
-                                m_brushTextWhite.Get());
+                                m_brushTextWhite.Get(),
+                                bgLoaded);
                 drawHeaderCell(rt,
                                 l + cellW * 1.0f, t, l + cellW * 2.0f, b,
                                 L"FPS AVG", v.fps_avg,
                                 m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
+                                m_brushAccentCyan.Get(),
+                                bgLoaded);
                 drawHeaderCell(rt,
                                 l + cellW * 2.0f, t, l + cellW * 3.0f, b,
                                 L"P95", v.fps_p95,
                                 m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
+                                m_brushAccentCyan.Get(),
+                                bgLoaded);
                 drawHeaderCell(rt,
                                 l + cellW * 3.0f, t, l + cellW * 4.0f, b,
                                 L"P99", v.fps_p99,
                                 m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
+                                m_brushAccentCyan.Get(),
+                                bgLoaded);
                 drawHeaderCell(rt,
                                 l + cellW * 4.0f, t, l + cellW * 5.0f, b,
                                 L"P99.9", v.fps_p99_9,
                                 m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
+                                m_brushAccentCyan.Get(),
+                                bgLoaded);
             }
 
             // Inline label + chiffre cell. Label LEADING in left half,
@@ -1016,13 +1263,22 @@ namespace openxr_api_layer::detail {
                                  const wchar_t* label,
                                  const std::string& value,
                                  IDWriteTextFormat* valueFormat,
-                                 ID2D1Brush* valueBrush) const {
+                                 ID2D1Brush* valueBrush,
+                                 bool bgLoaded) const {
                 const float cellPad = 10.0f;
                 const float midX    = (l + r) * 0.5f;
-                const D2D1_RECT_F labelRect = D2D1::RectF(
-                    l + cellPad, t, midX, b);
-                drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                          labelRect, m_brushTextLabel.Get());
+                if (!bgLoaded) {
+                    // Label text ("FPS", "FPS AVG", …) — skipped when
+                    // the bundled PNG already contains it. Drawing it
+                    // on top would either match (waste) or fight the
+                    // PNG pixels (visible doubling because the label's
+                    // anti-aliased edges almost-but-don't-quite line
+                    // up with the PNG's rasterised glyphs).
+                    const D2D1_RECT_F labelRect = D2D1::RectF(
+                        l + cellPad, t, midX, b);
+                    drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
+                              labelRect, m_brushTextLabel.Get());
+                }
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     midX, t, r - cellPad, b);
                 drawAscii(rt, value, valueFormat, valueRect, valueBrush);
@@ -1042,17 +1298,27 @@ namespace openxr_api_layer::detail {
                                      const std::string& secondaryValue,
                                      const HistogramRing<kRingSize>& ring,
                                      float targetFps,
-                                     ID2D1LinearGradientBrush* barBrush) const {
-                drawPanelBg(rt, l, t, r, b);
+                                     ID2D1LinearGradientBrush* barBrush,
+                                     bool bgLoaded) const {
+                if (!bgLoaded) {
+                    drawPanelBg(rt, l, t, r, b);
+                }
 
                 // Title bar — top inner padding.
                 const float titleT = t + 6.0f;
                 const float titleB = titleT + kHistoTitleH;
-                const D2D1_RECT_F titleRect = D2D1::RectF(
-                    l + kSectionInnerPad, titleT,
-                    r - kSectionInnerPad, titleB);
-                drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
-                          m_brushTextLabel.Get());
+                if (!bgLoaded) {
+                    // Section title ("GPU FRAMETIME MS" / "CPU FRAME
+                    // TIME MS") is baked into the PNG when bg loaded —
+                    // skip the D2D paint to avoid the doubled-glyph
+                    // shimmer that would result from any sub-pixel
+                    // mismatch between PNG raster and D2D render.
+                    const D2D1_RECT_F titleRect = D2D1::RectF(
+                        l + kSectionInnerPad, titleT,
+                        r - kSectionInnerPad, titleB);
+                    drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
+                              m_brushTextLabel.Get());
+                }
 
                 // Current value (top-right). Two shapes depending on
                 // whether `secondaryValue` is empty:
@@ -1124,24 +1390,34 @@ namespace openxr_api_layer::detail {
                 const float histoT = titleB + 6.0f;
                 const float histoB = b - kSectionInnerPad;
 
-                drawDashedGrid(rt, histoL, histoT, histoR, histoB,
-                                /*lineCount=*/4);
+                if (!bgLoaded) {
+                    // Dashed grid lines — static decoration, in PNG.
+                    drawDashedGrid(rt, histoL, histoT, histoR, histoB,
+                                    /*lineCount=*/4);
+                }
 
                 const int64_t budgetNs = targetFps > 0.0f
                     ? static_cast<int64_t>(1.0e9f / targetFps)
                     : 0;
+                // Histogram bars are dynamic content (per-frame
+                // samples) — always painted, regardless of bg
+                // mode.
                 drawHistogramBars(rt, ring, budgetNs,
                                    histoL, histoT, histoR, histoB,
                                    barBrush);
 
-                // Budget reference line — drawn AFTER the bars so
-                // bars that cross it (overruns ≥ budget) visually
-                // overlap the line and the user sees the breach.
-                // Position from the top: budgetLineFraction (= 1/6).
-                // Brighter than the dashed grid so it reads as the
-                // "this is your budget" marker rather than just one
-                // more grid line.
-                drawBudgetLine(rt, histoL, histoT, histoR, histoB);
+                if (!bgLoaded) {
+                    // Budget reference line — drawn AFTER the bars so
+                    // bars that cross it (overruns ≥ budget) visually
+                    // overlap the line and the user sees the breach.
+                    // Position from the top: budgetLineFraction (= 1/6).
+                    // Brighter than the dashed grid so it reads as the
+                    // "this is your budget" marker rather than just one
+                    // more grid line. Static y position (depends only
+                    // on the histogram region's geometry) — in PNG
+                    // when bg loaded.
+                    drawBudgetLine(rt, histoL, histoT, histoR, histoB);
+                }
             }
 
             // Budget reference line — fine solid line at the Y
@@ -1273,8 +1549,11 @@ namespace openxr_api_layer::detail {
                                   const std::string& utilValue,
                                   float utilFraction,
                                   const std::string& vramValue,
-                                  float vramFraction) const {
-                drawPanelBg(rt, l, t, r, b);
+                                  float vramFraction,
+                                  bool bgLoaded) const {
+                if (!bgLoaded) {
+                    drawPanelBg(rt, l, t, r, b);
+                }
 
                 // Tier-brush helper: same logic for LOAD and VRAM.
                 // < 80 % = cyan default, 80–89 % = orange warning,
@@ -1292,14 +1571,17 @@ namespace openxr_api_layer::detail {
                 const int  numCols = hasVram ? 3 : 2;
                 const float colW   = (r - l) / static_cast<float>(numCols);
 
-                // Vertical slot-cut separators between cells (same
-                // hexagonal-pill geometry as the header bar — alpha0
-                // uses the same motif on both panels).
-                for (int i = 1; i < numCols; ++i) {
-                    const float x = l + colW * static_cast<float>(i);
-                    drawSlotSeparator(rt, x,
-                                       t + kBottomSepInsetY,
-                                       b - kBottomSepInsetY);
+                if (!bgLoaded) {
+                    // Vertical slot-cut separators between cells (same
+                    // hexagonal-pill geometry as the header bar —
+                    // alpha0 uses the same motif on both panels). In
+                    // the PNG when bg loaded.
+                    for (int i = 1; i < numCols; ++i) {
+                        const float x = l + colW * static_cast<float>(i);
+                        drawSlotSeparator(rt, x,
+                                           t + kBottomSepInsetY,
+                                           b - kBottomSepInsetY);
+                    }
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -1343,13 +1625,16 @@ namespace openxr_api_layer::detail {
                                       const std::string& asciiValue,
                                       const wchar_t* unitSuffix,  // always wide
                                       ID2D1Brush* valueBrush) {
-                    // Row 1 — label TOP-LEFT.
-                    drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                              D2D1::RectF(cellL + kCellPad,
-                                           t + kCellLabelTop,
-                                           cellR - kCellPad,
-                                           t + kCellLabelTop + kCellLabelH),
-                              m_brushTextLabel.Get());
+                    if (!bgLoaded) {
+                        // Row 1 — label TOP-LEFT. Skipped when the
+                        // bundled PNG already contains it.
+                        drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
+                                  D2D1::RectF(cellL + kCellPad,
+                                               t + kCellLabelTop,
+                                               cellR - kCellPad,
+                                               t + kCellLabelTop + kCellLabelH),
+                                  m_brushTextLabel.Get());
+                    }
 
                     // Row 2 — value + unit. Build a single wide string
                     // "<value> <unit>" so the TextLayout can apply
@@ -1612,6 +1897,18 @@ namespace openxr_api_layer::detail {
             // -------- Members -----------------------------------------------
             ComPtr<ID2D1Factory>      m_d2dFactory;
             ComPtr<IDWriteFactory>    m_dwriteFactory;
+            // WIC factory + decoded background bitmap. The factory is
+            // lazy-instantiated in loadBundledBackground (one Co
+            // CreateInstance per renderer); the bitmap is allocated
+            // once at initBrushes() time from the bundled PNG resource
+            // and reused on every paint via DrawBitmap. m_bgBitmap is
+            // RT-bound (created via rt->CreateBitmapFromWicBitmap), so
+            // its factory matches whichever RT painted it — D2D's
+            // factory-mismatch deferred-error trap that's caught us
+            // before can't fire here. Null bitmap = legacy chamfered
+            // decoration path runs as fallback in paint().
+            ComPtr<IWICImagingFactory> m_wicFactory;
+            ComPtr<ID2D1Bitmap>        m_bgBitmap;
             // Bundled-font state. Held for the lifetime of the
             // CoreRenderer so the IDWriteInMemoryFontFileLoader stays
             // registered with the factory and the font files stay

@@ -73,3 +73,18 @@ END
 // found. /I is the rc.exe-documented mechanism.)
 // -----------------------------------------------------------------------------
 #include "bundled_fonts.rc.inc"
+
+// -----------------------------------------------------------------------------
+// Bundled images — overlay background PNG (the alpha0 design reference with
+// dynamic content erased, blitted as the first paint step so the renderer
+// only has to draw chiffres/bars on top — see images/bundled_images.rc.inc
+// for the design rationale).
+//
+// Resolved via a SEPARATE /I path ($(SolutionDir)openxr-api-layer\images)
+// also configured in this project's vcxproj. Splitting fonts vs. images
+// into two includes keeps each file scoped to one asset family — fonts
+// can be re-subsetted without touching the image declarations, and a new
+// image can be added without risking accidental damage to the font ID
+// table that DirectWrite is keyed against.
+// -----------------------------------------------------------------------------
+#include "bundled_images.rc.inc"
