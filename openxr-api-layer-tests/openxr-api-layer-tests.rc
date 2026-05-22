@@ -56,11 +56,13 @@
 // place where fonts are declared. See docs/DEVELOPMENT.md "Adding a new
 // bundled resource" for the rationale.
 //
-// rc.exe resolves the bare-basename file references inside the include
-// via the /I path set in this project's vcxproj (ResourceCompile/
-// AdditionalIncludeDirectories points at $(SolutionDir)openxr-api-layer\
-// fonts). Same configuration as the layer DLL project — both binaries'
-// rc.exe invocations end up reading the SAME .ttf bytes off disk.
+// rc.exe resolves both the #include below and the bare-basename TTF
+// references inside it via the /I path set in this project's vcxproj
+// (ResourceCompile/AdditionalIncludeDirectories points at
+// $(SolutionDir)openxr-api-layer\fonts). The layer DLL's vcxproj has
+// the SAME /I configuration, so the #include statement is symmetric
+// across the two binaries — neither side needs a fragile relative
+// path that would break if the .rc files moved within the tree.
 // =============================================================================
 
-#include "../openxr-api-layer/fonts/bundled_fonts.rc.inc"
+#include "bundled_fonts.rc.inc"

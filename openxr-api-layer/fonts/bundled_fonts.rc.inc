@@ -57,18 +57,26 @@
 // based "FONTS_PREFIX + basename" trick fails with RC2135 file-not-found
 // errors. /I is the supported mechanism.)
 //
-// Adding a new bundled resource:
-//   1. Drop the file in openxr-api-layer/fonts/ (or wherever appropriate;
-//      future non-font resources can live in a parallel directory — pick
-//      one and add it to BOTH vcxprojs' ResourceCompile include dirs).
-//   2. Add the #define for its ID below (≥ 200 — < 200 reserved for icons
-//      / dialogs the DLL's .rc.in template may add later).
+// Scope: this file is **fonts only** (RT_BUNDLED_FONT entries). If a
+// future feature needs to bundle a different resource type (icons,
+// audio, …), it gets its OWN include file alongside this one —
+// `bundled_icons.rc.inc`, etc. — with a matching /I path setup in the
+// vcxprojs. The narrow scope keeps each include's purpose obvious from
+// its name, and lets the lifecycle (subset / re-bundle) be managed
+// independently per resource family.
+//
+// Adding a new bundled font:
+//   1. Drop the TTF in openxr-api-layer/fonts/. Subset it first so the
+//      DLL doesn't pay the full multi-script weight — see
+//      docs/DEVELOPMENT.md for the pyftsubset invocation.
+//   2. Add the #define for its ID below (≥ 200 — < 200 reserved for
+//      icons / dialogs the DLL's .rc.in template may add later).
 //   3. Add the resource declaration line. The file argument is a bare
-//      basename; rc.exe resolves it via the include path.
+//      basename; rc.exe resolves it via the /I include path.
 //   4. List the .ttf in BOTH vcxprojs as <None Include="..."> for IDE
 //      visibility and to trigger a rebuild when the file changes.
 //   5. Regenerate the snapshot golden via the Update overlay snapshot
-//      workflow (#15) since the new resource will affect rendering.
+//      workflow (#15) since the new font will affect rendering.
 //
 // What this file MUST NOT contain:
 //   - VERSIONINFO blocks (those are per-binary and live in each project's

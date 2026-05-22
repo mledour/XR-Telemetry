@@ -97,6 +97,24 @@
     <IntDir>$(SolutionDir)\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>$(SolutionName)-32</TargetName>
   </PropertyGroup>
+  <!-- Defaults inherited by every conditional ItemDefinitionGroup below.
+       Defining ResourceCompile/AdditionalIncludeDirectories here once
+       avoids the 4× / 2× duplication that was reviewed away from the
+       initial commit on this PR. Configurations that need to override
+       (rare) can still add their own <ResourceCompile> inside their
+       conditional group. -->
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <!-- rc.exe's /I search path for the bare-basename TTF references
+           inside fonts/bundled_fonts.rc.inc (the shared font include
+           that both the layer DLL and the test EXE pull in). Without
+           this, rc.exe fails with RC2135 file-not-found on every
+           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
+           bundled resource" for why the include uses bare basenames
+           and not a path prefix. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -125,17 +143,6 @@
            DLLs stay unloaded for the host process's lifetime. -->
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
-    <ResourceCompile>
-      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
-           the bare basenames in bundled_fonts.rc.inc (the shared font
-           include that both the layer DLL and the test EXE pull in).
-           Without this, rc.exe would fail with RC2135 file-not-found
-           on every Rajdhani-*.ttf since the include uses no path prefix.
-           Keeping the include / declarations identical across both
-           binaries is the whole point — see docs/DEVELOPMENT.md
-           "Adding a new bundled resource". -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ResourceCompile>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
 copy $(SolutionDir)\scripts\Install-Layer.ps1 $(OutDir)
@@ -190,17 +197,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            DLLs stay unloaded for the host process's lifetime. -->
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
-    <ResourceCompile>
-      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
-           the bare basenames in bundled_fonts.rc.inc (the shared font
-           include that both the layer DLL and the test EXE pull in).
-           Without this, rc.exe would fail with RC2135 file-not-found
-           on every Rajdhani-*.ttf since the include uses no path prefix.
-           Keeping the include / declarations identical across both
-           binaries is the whole point — see docs/DEVELOPMENT.md
-           "Adding a new bundled resource". -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ResourceCompile>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
 copy $(SolutionDir)\scripts\Install-Layer32.ps1 $(OutDir)
@@ -259,17 +255,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            DLLs stay unloaded for the host process's lifetime. -->
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
-    <ResourceCompile>
-      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
-           the bare basenames in bundled_fonts.rc.inc (the shared font
-           include that both the layer DLL and the test EXE pull in).
-           Without this, rc.exe would fail with RC2135 file-not-found
-           on every Rajdhani-*.ttf since the include uses no path prefix.
-           Keeping the include / declarations identical across both
-           binaries is the whole point — see docs/DEVELOPMENT.md
-           "Adding a new bundled resource". -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ResourceCompile>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
 copy $(SolutionDir)\scripts\Install-Layer.ps1 $(OutDir)
@@ -328,17 +313,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            DLLs stay unloaded for the host process's lifetime. -->
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
-    <ResourceCompile>
-      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
-           the bare basenames in bundled_fonts.rc.inc (the shared font
-           include that both the layer DLL and the test EXE pull in).
-           Without this, rc.exe would fail with RC2135 file-not-found
-           on every Rajdhani-*.ttf since the include uses no path prefix.
-           Keeping the include / declarations identical across both
-           binaries is the whole point — see docs/DEVELOPMENT.md
-           "Adding a new bundled resource". -->
-      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ResourceCompile>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
 copy $(SolutionDir)\scripts\Install-Layer32.ps1 $(OutDir)

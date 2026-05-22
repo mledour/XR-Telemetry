@@ -60,12 +60,16 @@ END
 // resource: edit bundled_fonts.rc.inc once and BOTH binaries pick it up.
 // See docs/DEVELOPMENT.md "Adding a new bundled resource".
 //
-// rc.exe resolves the bare-basename file references inside the include
-// via the /I path set in this project's vcxproj (ResourceCompile/
-// AdditionalIncludeDirectories points at $(SolutionDir)openxr-api-layer\
-// fonts). No FONTS_PREFIX macro needed — rc.exe does NOT concatenate
-// adjacent string literals the way the C compiler does, which broke an
-// earlier "FONTS_PREFIX + basename" attempt with RC2135 file-not-found
-// errors. /I is the supported mechanism.
+// rc.exe resolves both the #include below and the bare-basename TTF
+// references inside it via the /I path set in this project's vcxproj
+// (ResourceCompile/AdditionalIncludeDirectories points at
+// $(SolutionDir)openxr-api-layer\fonts). Same /I configuration in the
+// test EXE's vcxproj, so the #include statement is symmetric — neither
+// side needs a relative path that would break if the .rc files moved.
+//
+// (An earlier attempt used a FONTS_PREFIX macro counting on rc.exe
+// concatenating adjacent string literals the way the C compiler does;
+// rc.exe does NOT do that, and the build fails with RC2135 file-not-
+// found. /I is the rc.exe-documented mechanism.)
 // -----------------------------------------------------------------------------
-#include "fonts/bundled_fonts.rc.inc"
+#include "bundled_fonts.rc.inc"
