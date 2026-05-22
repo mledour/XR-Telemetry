@@ -115,6 +115,17 @@ jobs:
       # them fails (real regression unrelated to the snapshot) the
       # output will surface it in the job log, and the maintainer
       # can decide to abort regeneration.
+      #
+      # PowerShell trap: `pwsh` on GitHub Actions defaults to
+      # `$PSNativeCommandUseErrorActionPreference = $true`, which
+      # means the shell's exit code inherits `$LASTEXITCODE` from
+      # the last native command — even if subsequent statements
+      # (like the Write-Host below) run successfully. Adding an
+      # explicit `exit 0` at the end overrides that and forces the
+      # step to succeed regardless of the test binary's exit code.
+      # Without this, the workflow step fails (we observed this on
+      # run 26281392401: Write-Host did run, then ##[error]Process
+      # completed with exit code 1).
       - name: Run test suite (writes overlay_snapshot.png; ignores snapshot comparison failure)
         shell: pwsh
         run: |
@@ -122,6 +133,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Test binary missing at $exe" }
           & $exe --reporters=console --force-colors
           Write-Host "Test runner finished (exit code $LASTEXITCODE; regeneration mode does not gate on this)"
+          exit 0
 
       - name: Verify the fresh PNG was produced
         shell: pwsh
