@@ -53,10 +53,23 @@ END
 //
 // IDs 200/201 are used at runtime via FindResource(...) +
 // IDWriteFactory5::CreateInMemoryFontFileLoader — see overlay_renderer.cpp.
+//
+// Declarations live in the shared include below — the SAME file is included
+// by openxr-api-layer-tests.rc so the test EXE and the layer DLL bundle
+// IDENTICAL font tables. Adding a new font / changing an ID / removing a
+// resource: edit bundled_fonts.rc.inc once and BOTH binaries pick it up.
+// See docs/DEVELOPMENT.md "Adding a new bundled resource".
+//
+// rc.exe resolves both the #include below and the bare-basename TTF
+// references inside it via the /I path set in this project's vcxproj
+// (ResourceCompile/AdditionalIncludeDirectories points at
+// $(SolutionDir)openxr-api-layer\fonts). Same /I configuration in the
+// test EXE's vcxproj, so the #include statement is symmetric — neither
+// side needs a relative path that would break if the .rc files moved.
+//
+// (An earlier attempt used a FONTS_PREFIX macro counting on rc.exe
+// concatenating adjacent string literals the way the C compiler does;
+// rc.exe does NOT do that, and the build fails with RC2135 file-not-
+// found. /I is the rc.exe-documented mechanism.)
 // -----------------------------------------------------------------------------
-#define IDR_FONT_RAJDHANI_SEMIBOLD 200
-#define IDR_FONT_RAJDHANI_BOLD     201
-#define RT_BUNDLED_FONT            256
-
-IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "fonts\\Rajdhani-SemiBold.ttf"
-IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "fonts\\Rajdhani-Bold.ttf"
+#include "bundled_fonts.rc.inc"

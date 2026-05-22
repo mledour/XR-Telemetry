@@ -50,6 +50,24 @@
     <IntDir>$(SolutionDir)\obj\$(Platform)\$(Configuration)\tests\</IntDir>
     <TargetName>openxr-api-layer-tests</TargetName>
   </PropertyGroup>
+  <!-- Defaults inherited by every conditional ItemDefinitionGroup below.
+       Defining ResourceCompile/AdditionalIncludeDirectories here once
+       avoids the 4× / 2× duplication that was reviewed away from the
+       initial commit on this PR. Configurations that need to override
+       (rare) can still add their own <ResourceCompile> inside their
+       conditional group. -->
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <!-- rc.exe's /I search path for the bare-basename TTF references
+           inside fonts/bundled_fonts.rc.inc (the shared font include
+           that both the layer DLL and the test EXE pull in). Without
+           this, rc.exe fails with RC2135 file-not-found on every
+           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
+           bundled resource" for why the include uses bare basenames
+           and not a path prefix. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

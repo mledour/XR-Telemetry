@@ -234,19 +234,43 @@ same `GetModuleHandleEx` call returns the **test EXE's** `HMODULE`
 and `FindResource` hits the **test EXE's** resource table.
 
 Net consequence: any resource the renderer wants to read at runtime
-must be declared in BOTH `.rc` files, with identical custom type
-and IDs. Skip the test `.rc` entry and `FindResource` returns null
-in the test EXE — the renderer falls back to its degraded path
-(e.g. system Bahnschrift instead of bundled Rajdhani for fonts),
-which makes the snapshot diverge from the in-headset rendering and
-defeats the regression-test value.
+must be present at the SAME custom type + ID in BOTH binaries'
+resource tables. If the test EXE's table is missing an entry the
+DLL's table has, `FindResource` returns null in the test, the
+renderer silently falls back to its degraded path (e.g. system
+Bahnschrift instead of bundled Rajdhani for fonts), and the
+snapshot test compares against a render that doesn't match
+production — defeating the visual-regression contract.
+
+To make this drift impossible by construction, the project keeps
+the resource declarations in a **single shared include**:
+`openxr-api-layer/fonts/bundled_fonts.rc.inc`. Both
+`openxr-api-layer/openxr-api-layer.rc.in` (layer DLL) and
+`openxr-api-layer-tests/openxr-api-layer-tests.rc` (test EXE)
+`#include` it. The TTF basenames inside the include are bare —
+each project's vcxproj sets a `<ResourceCompile>`
+`<AdditionalIncludeDirectories>` pointing at
+`$(SolutionDir)openxr-api-layer\fonts` so rc.exe's `/I`
+search-path resolves the basenames to the same files on disk
+regardless of which binary is being built.
+
+(An earlier attempt used a `FONTS_PREFIX` macro defined to a
+per-project relative path and counted on the rc preprocessor
+concatenating adjacent string literals the way the C compiler
+does — it doesn't, RC2135 file-not-found at build time. The `/I`
+mechanism is what rc.exe actually documents.)
+
+Both sides compile down to byte-for-byte identical resource
+tables. Adding a font / changing an ID / removing a resource is
+now a one-file edit — there's no longer a "second place" where
+someone could forget.
 
 Checklist for adding a new bundled resource:
 
-1. **Place the file** under `openxr-api-layer/<some-folder>/` (e.g.
-   `openxr-api-layer/fonts/` for fonts, `openxr-api-layer/images/`
-   for PNGs). Pick a stable folder so both `.rc` files can reference
-   the same path.
+1. **Place the file** under `openxr-api-layer/fonts/` (or another
+   folder, IF you also add that folder to both vcxprojs'
+   `<ResourceCompile><AdditionalIncludeDirectories>` so rc.exe's
+   `/I` finds it).
 2. **Pick a custom resource type** if you don't already have one.
    Numeric IDs ≥ 256 are safe (Windows reserves 1–255 for the
    predefined types like `RT_BITMAP`, `RT_ICON`, etc.). Reuse
@@ -254,30 +278,42 @@ Checklist for adding a new bundled resource:
 3. **Pick a resource ID** ≥ 200 (this codebase's convention; under
    200 is reserved for IDs the DLL's `.rc.in` template might add for
    icons, dialogs, etc.).
-4. **Declare in `openxr-api-layer/openxr-api-layer.rc.in`**:
+4. **Declare in the shared include**
+   `openxr-api-layer/fonts/bundled_fonts.rc.inc` — single source of
+   truth, no other `.rc` file should grow an inline declaration:
    ```rc
-   #define IDR_MY_NEW_RESOURCE   202
-   #define RT_BUNDLED_FONT       256   // reuse if existing
-   IDR_MY_NEW_RESOURCE RT_BUNDLED_FONT "fonts\\MyFile.ttf"
+   #define IDR_MY_NEW_RESOURCE 202
+   IDR_MY_NEW_RESOURCE RT_BUNDLED_FONT "MyFile.ttf"
    ```
-5. **Declare in `openxr-api-layer-tests/openxr-api-layer-tests.rc`**
-   with the SAME ID and type — path is relative to the test project
-   so it'll be `..\openxr-api-layer\fonts\MyFile.ttf` (the file lives
-   in the layer project, the .rc only references it):
-   ```rc
-   #define IDR_MY_NEW_RESOURCE   202
-   #define RT_BUNDLED_FONT       256
-   IDR_MY_NEW_RESOURCE RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\MyFile.ttf"
-   ```
-6. **Add the file to both vcxprojs as `<None Include>`** so Solution
+   The filename argument is a **bare basename** — no `fonts\\`
+   prefix, no `..\\openxr-api-layer\\fonts\\` prefix. rc.exe finds
+   the actual file on disk via the project's
+   `<ResourceCompile><AdditionalIncludeDirectories>` `/I` entry.
+5. **Add the file to both vcxprojs as `<None Include>`** so Solution
    Explorer shows it and the build triggers when it changes. The
-   `<ResourceCompile>` entry that pulls in the `.rc` is already
-   there — no new entry needed.
-7. **Re-render and refresh the golden**: the snapshot will now use
+   `<ResourceCompile>` entries that pull in the `.rc` files are
+   already there — no new entry needed.
+6. **Re-render and refresh the golden**: the snapshot will now use
    your new resource. See "Regenerating the golden" below — either
    the `Update overlay snapshot golden` workflow does the work, or
    you copy the failing CI run's fresh render into `screenshots/`
    by hand.
+
+What NOT to do:
+
+- **Don't add `RT_BUNDLED_FONT` declarations directly inside
+  `openxr-api-layer.rc.in` or `openxr-api-layer-tests.rc`.** They
+  belong in the shared include. A direct declaration in only one
+  side defeats the purpose of the shared include and re-opens
+  the silent-drift bug.
+- **Don't put a path prefix on the filename argument.** Write the
+  bare basename ("MyFile.ttf"), not "fonts\\MyFile.ttf" or
+  "..\\openxr-api-layer\\fonts\\MyFile.ttf". A prefix hard-codes
+  one binary's view of the filesystem into the shared include —
+  it breaks the other binary's build (or worse, succeeds because
+  the prefix happens to also resolve from the other project's
+  directory by coincidence). `/I` is the documented mechanism for
+  cross-binary path resolution; let it do its job.
 
 ### When the diff fails
 
