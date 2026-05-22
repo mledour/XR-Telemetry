@@ -211,14 +211,31 @@ jobs:
             Copy-Item screenshots/overlay_snapshot.png artifact/old/overlay_snapshot.png
           }
 
+          # actions/upload-artifact@v4 rejects names containing any of
+          # / \ : * ? " < > | (NTFS path-illegal chars). For
+          # workflow_dispatch on a branch like `feat/overlay-barlow-font`,
+          # github.ref_name IS the branch name verbatim — so any slash
+          # in the convention (feat/, ci-test/, fix/, …) breaks the
+          # upload below. Same sanitisation as build-and-release.yml's
+          # snapshot-diff artifact (see PR #18) — replace anything that
+          # isn't [A-Za-z0-9-_.] with a dash, publish as ARTIFACT_REF_TAG
+          # for the upload step.
+          $rawRef = '${{ github.ref_name }}'
+          $safeRef = $rawRef -replace '[^a-zA-Z0-9\-_.]', '-'
+          Write-Host "ref_name raw='$rawRef' sanitised='$safeRef'"
+          "ARTIFACT_REF_TAG=$safeRef" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Upload before / after PNGs for review
         if: steps.diff.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
         with:
-          # Branch name in the artifact name so a reviewer can tell
-          # at a glance which session produced it when several
-          # regenerations have happened on different branches.
-          name: overlay-snapshot-regen-${{ github.ref_name }}
+          # ARTIFACT_REF_TAG comes from the staging step above — it's
+          # github.ref_name sanitised against actions/upload-artifact
+          # @v4's naming rules. Branch name in the tag so a reviewer
+          # can tell at a glance which session produced the artifact
+          # when several regenerations have happened on different
+          # branches.
+          name: overlay-snapshot-regen-${{ env.ARTIFACT_REF_TAG }}
           path: artifact/
           if-no-files-found: warn
 
