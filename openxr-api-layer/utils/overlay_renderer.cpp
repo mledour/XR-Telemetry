@@ -114,8 +114,12 @@ namespace openxr_api_layer::detail {
         //   (most likely shrinking kHeaderHeight 90 → ~60 once the
         //   header switches to an inline label+value layout, which
         //   gives back the 22 px the bottom row currently loses).
-        constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 452;
+        // Sourced from the public header so the snapshot test and the
+        // in-headset renderer always agree on the bitmap size.
+        constexpr int32_t kTexW = openxr_api_layer::detail::kOverlayTexW;
+        constexpr int32_t kTexH = openxr_api_layer::detail::kOverlayTexH;
+        static_assert(kTexW == 720, "kTexW out of sync with public kOverlayTexW");
+        static_assert(kTexH == 452, "kTexH out of sync with public kOverlayTexH");
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;

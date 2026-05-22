@@ -148,6 +148,17 @@ namespace openxr_api_layer::detail {
     // (and the cpp's static_assert below guards against drift).
     constexpr std::size_t kOverlayHistoRingSize = 120;
 
+    // Texture dimensions the renderer paints into. Exposed so the
+    // snapshot test can size its WIC bitmap render target to match
+    // — otherwise the test creates a fixed-size bitmap, the renderer
+    // paints assuming kOverlayTexW × kOverlayTexH, and any size
+    // mismatch leaves dead pixels on the edges that fail the
+    // pixel-by-pixel comparison against the golden. A static_assert
+    // on the .cpp side guards the dimensions from drifting out of
+    // sync with the renderer's internal layout constants.
+    constexpr int32_t kOverlayTexW = 720;
+    constexpr int32_t kOverlayTexH = 452;
+
     // errOut: optional. On false return, populated with a short string
     // identifying which step failed (init / initBrushes / paint). Used
     // by the snapshot test to surface a useful failure message via

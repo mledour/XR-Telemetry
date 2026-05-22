@@ -228,8 +228,15 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     // 720×480 BGRA-premultiplied bitmap — matches the D2D render
     // target's default pixel format so no conversion is needed at
     // commit time.
-    constexpr UINT W = 720;
-    constexpr UINT H = 480;
+    // Pull the bitmap dimensions from the public renderer header so
+    // changes to kOverlayTexH (etc.) flow through the test without an
+    // edit here. The bitmap MUST match the renderer's internal kTexH
+    // for the snapshot to capture the full painted region — see the
+    // header comment on kOverlayTexW / kOverlayTexH.
+    constexpr UINT W = static_cast<UINT>(
+        openxr_api_layer::detail::kOverlayTexW);
+    constexpr UINT H = static_cast<UINT>(
+        openxr_api_layer::detail::kOverlayTexH);
     ComPtr<IWICBitmap> bitmap;
     REQUIRE(SUCCEEDED(wic->CreateBitmap(
         W, H, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
