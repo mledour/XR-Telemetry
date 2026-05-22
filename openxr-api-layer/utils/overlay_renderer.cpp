@@ -30,8 +30,6 @@
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
 #include "framework/log.h"            // Log / ErrorLog
 
-#include <cstdio>                     // fprintf — temporary diag in init()
-
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
@@ -336,59 +334,20 @@ namespace openxr_api_layer::detail {
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontSectionTitle, kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
 
-                // -------- Tabular figures (`tnum`) ----------------------
-                //
-                // Without `tnum`, both Rajdhani and Barlow ship with
-                // proportional figures (`pnum`) as the default — so
-                // "1" renders narrower than "8", and the rendered
-                // chiffres string visibly shifts horizontally as
-                // values change frame-to-frame (FPS 138 ↔ 142, ms
-                // 6.7 ↔ 9.1, …). At the HUD's 10 Hz refresh, the
-                // shift is just frequent enough to be a perceived
-                // motion-blur / jitter, especially in peripheral
-                // vision in VR.
-                //
-                // The OpenType `tnum` feature forces uniform digit
-                // widths. The opt-in lives on IDWriteTypography,
-                // which attaches to IDWriteTextLayout (NOT to
-                // IDWriteTextFormat — the format only carries
-                // size / weight / style / alignment, not OpenType
-                // features). Since the typography object is
-                // immutable once we add the feature, we create it
-                // once here and reuse across every layout in
-                // drawAscii / drawWide / drawMixedStyleAscii via
-                // SetTypography(m_typography, fullRange).
-                //
-                // Failure here is non-fatal: m_typography stays
-                // null and the draw helpers fall through to the
-                // direct ID2D1RenderTarget::DrawTextW path — chiffres
-                // jitter, but the HUD still renders.
-                HRESULT typoHr = m_dwriteFactory->CreateTypography(
-                    m_typography.GetAddressOf());
-                HRESULT featHr = E_FAIL;
-                if (SUCCEEDED(typoHr)) {
-                    const DWRITE_FONT_FEATURE tnum{
-                        DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1};
-                    featHr = m_typography->AddFontFeature(tnum);
-                    if (FAILED(featHr)) {
-                        // AddFontFeature failure shouldn't be possible
-                        // for a freshly-created typography — drop the
-                        // object so the draw helpers stay on the
-                        // direct-DrawTextW fast path instead of
-                        // building layouts that do nothing useful.
-                        m_typography.Reset();
-                    }
-                }
-                // [DIAG] temporary trace to confirm typography state at
-                // the time of the snapshot test run. Goes to stderr so
-                // GitHub Actions' test step picks it up. Remove once
-                // the tnum activation is confirmed working.
-                std::fprintf(stderr,
-                    "[xr_telemetry][diag] typography: CreateTypography=%#lx "
-                    "AddFontFeature=%#lx m_typography=%s\n",
-                    static_cast<unsigned long>(typoHr),
-                    static_cast<unsigned long>(featHr),
-                    m_typography ? "ALIVE" : "NULL");
+                // TODO(barlow-followup): activate OpenType `tnum`
+                // (tabular figures) on the chiffres formats so digit
+                // widths stay uniform — without it, FPS bouncing
+                // between "138" and "142" makes the rendered string
+                // visibly shift horizontally at 10 Hz refresh. The
+                // typography opt-in lives on IDWriteTextLayout, not
+                // on IDWriteTextFormat, so it requires refactoring
+                // drawAscii/drawWide from ID2D1RenderTarget::DrawTextW
+                // to IDWriteTextLayout + DrawTextLayout. Not done in
+                // this PR (font swap is already a chunk). Tracked as
+                // a follow-up because both Rajdhani (previous) and
+                // Barlow (this) have proportional figures by default
+                // — switching fonts doesn't introduce regression on
+                // this axis, both versions of the HUD jitter equally.
                 return true;
             }
 
@@ -856,61 +815,17 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Generic single-style text draw used by drawAscii / drawWide.
-            // When m_typography is alive (init() succeeded in creating
-            // it), routes through IDWriteTextLayout so the tabular-
-            // figures (`tnum`) OpenType feature can be applied — without
-            // that, digit glyph widths vary between "1" (narrow) and
-            // "8" (wide), and the chiffres visibly jitter laterally at
-            // 10 Hz refresh as values change. When m_typography is null
-            // (creation failed, non-fatal), falls through to the direct
-            // ID2D1RenderTarget::DrawTextW path — chiffres jitter, but
-            // the HUD still renders.
-            //
-            // The layout inherits alignment / paragraph alignment from
-            // the IDWriteTextFormat, so the rendered output matches
-            // DrawTextW(format, ...) modulo the per-character font-
-            // feature overrides.
-            void drawWideRange(ID2D1RenderTarget* rt,
-                                const wchar_t* s, UINT32 len,
-                                IDWriteTextFormat* fmt,
-                                const D2D1_RECT_F& rect,
-                                ID2D1Brush* brush) const {
-                if (!s || len == 0) return;
-                if (!m_typography) {
-                    rt->DrawTextW(s, len, fmt, rect, brush);
-                    return;
-                }
-                ComPtr<IDWriteTextLayout> layout;
-                if (FAILED(m_dwriteFactory->CreateTextLayout(
-                        s, len, fmt,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        layout.GetAddressOf()))) {
-                    // Layout creation failed — fall back to the simple
-                    // path so the panel still shows something. tnum
-                    // is sacrificed for this frame only.
-                    rt->DrawTextW(s, len, fmt, rect, brush);
-                    return;
-                }
-                layout->SetTypography(
-                    m_typography.Get(),
-                    DWRITE_TEXT_RANGE{0, len});
-                rt->DrawTextLayout(
-                    D2D1::Point2F(rect.left, rect.top),
-                    layout.Get(), brush);
-            }
-
-            // ASCII-only convenience: the redesign emits ASCII digits +
-            // uppercase labels for almost everything except the °C
-            // suffix (which goes through drawWide).
+            // ASCII-only DrawTextW shortcut. The redesign emits only
+            // ASCII digits + uppercase labels — except for the °C
+            // suffix, which we draw via the dedicated wide-literal
+            // path drawWide().
             void drawAscii(ID2D1RenderTarget* rt, const std::string& s,
                             IDWriteTextFormat* fmt,
                             const D2D1_RECT_F& rect,
                             ID2D1Brush* brush) const {
                 if (s.empty()) return;
                 std::wstring wide(s.begin(), s.end());
-                drawWideRange(rt, wide.c_str(),
+                rt->DrawTextW(wide.c_str(),
                               static_cast<UINT32>(wide.length()),
                               fmt, rect, brush);
             }
@@ -921,8 +836,7 @@ namespace openxr_api_layer::detail {
                            ID2D1Brush* brush) const {
                 if (!s) return;
                 const std::size_t len = std::wcslen(s);
-                drawWideRange(rt, s, static_cast<UINT32>(len),
-                              fmt, rect, brush);
+                rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
             // Renders an ASCII string where selected character ranges
@@ -943,13 +857,32 @@ namespace openxr_api_layer::detail {
             // three overrides on each (start, len) range, and draws
             // via DrawTextLayout.
             //
-            // Side benefit: when we eventually activate tabular
-            // figures via IDWriteTypography::AddFontFeature
-            // (DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES) — see the
-            // TODO in init() — the hook point is here, alongside the
-            // existing SetFont* calls. The typography setting is
-            // per-layout, not per-format, so this path is already
-            // the right place.
+            // NOTE on tabular figures (`tnum`): an earlier iteration
+            // attached an IDWriteTypography with DWRITE_FONT_FEATURE_TAG
+            // _TABULAR_FIGURES via layout->SetTypography here AND on
+            // every drawAscii / drawWide path. A diagnostic CI run
+            // (see PR #21 commits e453b52 / b067bdc) confirmed the
+            // typography object was created successfully and SetTypography
+            // returned S_OK, yet the rendered output was bit-identical
+            // to the no-tnum baseline — chiffres "1" stayed at 318
+            // width units instead of widening to 494 like the font's
+            // tnum lookup specifies.
+            //
+            // Root cause hypothesis: DirectWrite's shape engine ignores
+            // IDWriteTypography feature overrides when the resolved font
+            // face comes from a custom IDWriteFontCollection populated
+            // via IDWriteInMemoryFontFileLoader (the path used by
+            // loadBundledFontCollection above). The same code wired
+            // against a system font collection would likely apply the
+            // feature.
+            //
+            // The chiffres-jitter cosmetic issue stays unaddressed until
+            // we either find a working DirectWrite path (different
+            // font loader, manual IDWriteTextAnalyzer pipeline, …) or
+            // accept the jitter as a known footnote. The hook point if
+            // we ever revisit is exactly here — applied per-layout, not
+            // per-format, so this helper would gain a SetTypography
+            // call without further refactor.
             void drawMixedStyleAscii(
                 ID2D1RenderTarget* rt,
                 const std::string& s,
@@ -992,18 +925,6 @@ namespace openxr_api_layer::detail {
                     layout->SetFontFamilyName(L"Barlow", range);
                     layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, range);
                     layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
-                }
-                // Tabular figures over the WHOLE layout. The compound
-                // is "App {x} ms / Render {y} ms" — only the digit
-                // glyphs inside x and y are affected by `tnum`; the
-                // label characters pass through unchanged. Applying
-                // on the full range is simpler than computing per-
-                // chiffre sub-ranges and produces the same render.
-                if (m_typography) {
-                    layout->SetTypography(
-                        m_typography.Get(),
-                        DWRITE_TEXT_RANGE{0,
-                            static_cast<UINT32>(wide.length())});
                 }
                 rt->DrawTextLayout(
                     D2D1::Point2F(rect.left, rect.top),
@@ -1597,16 +1518,6 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteInMemoryFontFileLoader> m_inMemoryFontLoader;
             std::vector<ComPtr<IDWriteFontFile>>  m_bundledFontFiles;
             ComPtr<IDWriteFontCollection>         m_customFontCollection;
-            // Cached typography object carrying the tabular-figures
-            // (`tnum`) OpenType feature. Attached to every
-            // IDWriteTextLayout we build in drawWideRange and
-            // drawMixedStyleAscii so the chiffres render with uniform
-            // digit widths (no per-frame jitter as "1" / "8" / etc.
-            // swap glyphs in the displayed value). Null when
-            // CreateTypography or AddFontFeature failed at init —
-            // draw helpers fall through to direct ID2D1RenderTarget
-            // ::DrawTextW in that case (chiffres jitter but render).
-            ComPtr<IDWriteTypography>             m_typography;
             // Text formats — one per (font, size, alignment) combo
             // the layout uses. All immutable post-init, so paint()
             // never allocates a format.
