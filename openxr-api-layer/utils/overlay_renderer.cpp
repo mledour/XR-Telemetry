@@ -1217,32 +1217,59 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
+                // Cell-right boundaries calibrated to the bundled alpha0
+                // PNG. The PNG's chamfered slot separators slant the
+                // cell boundaries — the cells are NOT equal-width. Pixel
+                // measurement of the golden's chiffre positions (see
+                // tools/measure_overlay_zones.py, intent captured in
+                // commit msg) yielded these absolute x positions of
+                // each cell's RIGHT edge in the 720-wide texture:
+                //   cell 0 (FPS)     : 160
+                //   cell 1 (FPS AVG) : 340
+                //   cell 2 (P95)     : 490
+                //   cell 3 (P99)     : 610
+                //   cell 4 (P99.9)   : texture right (l + w = innerR)
+                // Sum of widths from innerL=15 = 145 + 180 + 150 + 120 + (innerR-610).
+                //
+                // When bgLoaded the equal-fifth layout above is ignored;
+                // when bgLoaded is FALSE (resource missing fallback) the
+                // chamfered separators above plus the per-cell rectangles
+                // here keep working — the equal-fifth slot-separator
+                // layout above doesn't get used in that case because
+                // drawHeaderCell uses the per-cell rectangles passed in.
+                const float cellL0 = l;
+                const float cellR0 = bgLoaded ? 160.0f : l + cellW * 1.0f;
+                const float cellR1 = bgLoaded ? 340.0f : l + cellW * 2.0f;
+                const float cellR2 = bgLoaded ? 490.0f : l + cellW * 3.0f;
+                const float cellR3 = bgLoaded ? 610.0f : l + cellW * 4.0f;
+                const float cellR4 =                     r;
+
                 drawHeaderCell(rt,
-                                l + cellW * 0.0f, t, l + cellW * 1.0f, b,
+                                cellL0, t, cellR0, b,
                                 L"FPS", v.fps_instant,
                                 m_fmtBigNumber.Get(),
                                 m_brushTextWhite.Get(),
                                 bgLoaded);
                 drawHeaderCell(rt,
-                                l + cellW * 1.0f, t, l + cellW * 2.0f, b,
+                                cellR0, t, cellR1, b,
                                 L"FPS AVG", v.fps_avg,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get(),
                                 bgLoaded);
                 drawHeaderCell(rt,
-                                l + cellW * 2.0f, t, l + cellW * 3.0f, b,
+                                cellR1, t, cellR2, b,
                                 L"P95", v.fps_p95,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get(),
                                 bgLoaded);
                 drawHeaderCell(rt,
-                                l + cellW * 3.0f, t, l + cellW * 4.0f, b,
+                                cellR2, t, cellR3, b,
                                 L"P99", v.fps_p99,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get(),
                                 bgLoaded);
                 drawHeaderCell(rt,
-                                l + cellW * 4.0f, t, l + cellW * 5.0f, b,
+                                cellR3, t, cellR4, b,
                                 L"P99.9", v.fps_p99_9,
                                 m_fmtAccentNumber.Get(),
                                 m_brushAccentCyan.Get(),
