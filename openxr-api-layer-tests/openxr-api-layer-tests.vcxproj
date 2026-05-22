@@ -81,6 +81,17 @@
       <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>d3d11.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
+    <ResourceCompile>
+      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
+           the bare basenames in bundled_fonts.rc.inc (the shared font
+           include that both the layer DLL and the test EXE pull in).
+           Without this, rc.exe would fail with RC2135 file-not-found
+           on every Rajdhani-*.ttf since the include uses no path prefix.
+           Keeping the include / declarations identical across both
+           binaries is the whole point — see docs/DEVELOPMENT.md
+           "Adding a new bundled resource". -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -111,6 +122,17 @@
       <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>d3d11.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
+    <ResourceCompile>
+      <!-- Tells rc.exe to search openxr-api-layer/fonts/ when resolving
+           the bare basenames in bundled_fonts.rc.inc (the shared font
+           include that both the layer DLL and the test EXE pull in).
+           Without this, rc.exe would fail with RC2135 file-not-found
+           on every Rajdhani-*.ttf since the include uses no path prefix.
+           Keeping the include / declarations identical across both
+           binaries is the whole point — see docs/DEVELOPMENT.md
+           "Adding a new bundled resource". -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <!-- Order-only dependency on the layer project. We compile layer.cpp /
        dispatch.gen.cpp / log.cpp directly into the test binary (so no

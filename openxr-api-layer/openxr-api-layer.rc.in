@@ -60,9 +60,12 @@ END
 // resource: edit bundled_fonts.rc.inc once and BOTH binaries pick it up.
 // See docs/DEVELOPMENT.md "Adding a new bundled resource".
 //
-// FONTS_PREFIX resolves the include's basename paths against this .rc.in's
-// directory (so "Rajdhani-SemiBold.ttf" finds openxr-api-layer/fonts/
-// Rajdhani-SemiBold.ttf at rc.exe time).
+// rc.exe resolves the bare-basename file references inside the include
+// via the /I path set in this project's vcxproj (ResourceCompile/
+// AdditionalIncludeDirectories points at $(SolutionDir)openxr-api-layer\
+// fonts). No FONTS_PREFIX macro needed — rc.exe does NOT concatenate
+// adjacent string literals the way the C compiler does, which broke an
+// earlier "FONTS_PREFIX + basename" attempt with RC2135 file-not-found
+// errors. /I is the supported mechanism.
 // -----------------------------------------------------------------------------
-#define FONTS_PREFIX "fonts\\"
 #include "fonts/bundled_fonts.rc.inc"

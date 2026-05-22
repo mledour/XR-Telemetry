@@ -56,10 +56,11 @@
 // place where fonts are declared. See docs/DEVELOPMENT.md "Adding a new
 // bundled resource" for the rationale.
 //
-// FONTS_PREFIX resolves the include's basename paths against THIS .rc
-// file's directory — the test project sits next to the layer project
-// so the TTFs live at ../openxr-api-layer/fonts/.
+// rc.exe resolves the bare-basename file references inside the include
+// via the /I path set in this project's vcxproj (ResourceCompile/
+// AdditionalIncludeDirectories points at $(SolutionDir)openxr-api-layer\
+// fonts). Same configuration as the layer DLL project — both binaries'
+// rc.exe invocations end up reading the SAME .ttf bytes off disk.
 // =============================================================================
 
-#define FONTS_PREFIX "..\\openxr-api-layer\\fonts\\"
 #include "../openxr-api-layer/fonts/bundled_fonts.rc.inc"

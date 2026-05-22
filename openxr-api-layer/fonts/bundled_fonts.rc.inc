@@ -45,34 +45,36 @@
 // How the include is used:
 //
 //   // <some-project>.rc:
-//   #define FONTS_PREFIX "fonts\\"                       // layer DLL side
-//   // OR
-//   #define FONTS_PREFIX "..\\openxr-api-layer\\fonts\\" // test EXE side
 //   #include "<relative-path>/bundled_fonts.rc.inc"
 //
-// The C/RC preprocessor concatenates adjacent string literals at compile
-// time, so `FONTS_PREFIX "Foo.ttf"` after macro expansion becomes
-// `"fonts\\Foo.ttf"` (layer) or `"..\\openxr-api-layer\\fonts\\Foo.ttf"`
-// (test) — both resolve to the SAME bytes on disk because both paths
-// point at the same TTF files under openxr-api-layer/fonts/.
+// That's it on the .rc side. The TTF basenames here are bare — rc.exe
+// resolves them via its /I include-search-path list. Both projects'
+// vcxproj files have a <ResourceCompile><AdditionalIncludeDirectories>
+// entry pointing at $(SolutionDir)openxr-api-layer\fonts so rc.exe
+// finds each .ttf at exactly one location regardless of which binary
+// is being built. (We learned the hard way: rc.exe does NOT concatenate
+// adjacent string literals the way the C compiler does, so a macro-
+// based "FONTS_PREFIX + basename" trick fails with RC2135 file-not-found
+// errors. /I is the supported mechanism.)
 //
 // Adding a new bundled resource:
 //   1. Drop the file in openxr-api-layer/fonts/ (or wherever appropriate;
-//      future non-font resources can live in a parallel directory).
+//      future non-font resources can live in a parallel directory — pick
+//      one and add it to BOTH vcxprojs' ResourceCompile include dirs).
 //   2. Add the #define for its ID below (≥ 200 — < 200 reserved for icons
 //      / dialogs the DLL's .rc.in template may add later).
-//   3. Add the resource declaration line. The file path uses FONTS_PREFIX
-//      and is just the basename — the includer's FONTS_PREFIX makes the
-//      full path resolve correctly per-binary.
+//   3. Add the resource declaration line. The file argument is a bare
+//      basename; rc.exe resolves it via the include path.
 //   4. List the .ttf in BOTH vcxprojs as <None Include="..."> for IDE
-//      visibility (purely cosmetic — rc.exe finds the file via the
-//      string literal regardless).
+//      visibility and to trigger a rebuild when the file changes.
 //   5. Regenerate the snapshot golden via the Update overlay snapshot
 //      workflow (#15) since the new resource will affect rendering.
 //
 // What this file MUST NOT contain:
 //   - VERSIONINFO blocks (those are per-binary and live in each project's
 //     own .rc).
+//   - Path prefixes on the file arguments — those defeat the /I include
+//     mechanism, hard-coding a single binary's view of the filesystem.
 //   - Anything that requires expression evaluation against project
 //     properties — those need to be in the includer .rc/.rc.in where
 //     MSBuild's @VAR@ substitutions run.
@@ -92,9 +94,7 @@
 #define IDR_FONT_RAJDHANI_SEMIBOLD 200
 #define IDR_FONT_RAJDHANI_BOLD     201
 
-// The resource declarations themselves. FONTS_PREFIX MUST be defined by
-// the includer; the project's build will fail with a rc.exe error
-// otherwise — preferable to a silent fallback that ships a half-bundled
-// binary.
-IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT FONTS_PREFIX "Rajdhani-SemiBold.ttf"
-IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT FONTS_PREFIX "Rajdhani-Bold.ttf"
+// Bare basenames — rc.exe finds the actual TTFs via the /I include path
+// configured in each project's vcxproj ResourceCompile section.
+IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "Rajdhani-SemiBold.ttf"
+IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "Rajdhani-Bold.ttf"
