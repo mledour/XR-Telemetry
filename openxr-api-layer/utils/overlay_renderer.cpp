@@ -964,13 +964,15 @@ namespace openxr_api_layer::detail {
                 const float w = r - l;
                 const float cellW = w / 5.0f;
 
-                // Vertical separators between cells (4 of them now).
+                // Vertical slot-cut separators between cells (4 of them
+                // for 5 cells). The slots replace the previous 1-px
+                // hairlines with 2-px hexagonal pills (chamfered tips
+                // top and bottom) — alpha0's signature inter-cell motif.
                 for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kHeaderSepInsetY),
-                        D2D1::Point2F(x, b - kHeaderSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    drawSlotSeparator(rt, x,
+                                       t + kHeaderSepInsetY,
+                                       b - kHeaderSepInsetY);
                 }
 
                 drawHeaderCell(rt,
@@ -1290,15 +1292,14 @@ namespace openxr_api_layer::detail {
                 const int  numCols = hasVram ? 3 : 2;
                 const float colW   = (r - l) / static_cast<float>(numCols);
 
-                // Vertical separators between cells. Same brush as
-                // the panel inner stroke so they read as subtle
-                // column dividers, not hard borders.
+                // Vertical slot-cut separators between cells (same
+                // hexagonal-pill geometry as the header bar — alpha0
+                // uses the same motif on both panels).
                 for (int i = 1; i < numCols; ++i) {
                     const float x = l + colW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kBottomSepInsetY),
-                        D2D1::Point2F(x, b - kBottomSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    drawSlotSeparator(rt, x,
+                                       t + kBottomSepInsetY,
+                                       b - kBottomSepInsetY);
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -1480,6 +1481,58 @@ namespace openxr_api_layer::detail {
             // Cost: ~(w + h) / spacing DrawLine calls per panel.
             // For a 280-px-wide × 90-px-tall frametime panel at
             // 6 px spacing that's ~62 lines. At 4-5 panels per
+            // Vertical "slot" separator between cells in the header
+            // bar and bottom row. Replaces the previous 1-px hairline
+            // line with a 2-px wide hexagonal pill: vertical sides
+            // joined by 3-px chamfered tips at top and bottom. Reads
+            // as a small industrial-bezel cutout between cells —
+            // the alpha0 reference's signature inter-cell motif.
+            //
+            // x is the horizontal center of the slot; (t, b) the
+            // vertical extent. Fills with m_brushSeparator (same
+            // brush the old hairline used) so the slot reads as a
+            // subtle texture cut, not a hard border.
+            //
+            // Fallback to the old DrawLine if the geometry can't be
+            // built — keeps the cell still visually delimited.
+            void drawSlotSeparator(ID2D1RenderTarget* rt,
+                                     float x, float t, float b) const {
+                constexpr float kSlotW         = 2.0f;
+                constexpr float kSlotChamfer   = 3.0f;
+                const float halfW = kSlotW * 0.5f;
+
+                ComPtr<ID2D1PathGeometry> path;
+                if (FAILED(m_d2dFactory->CreatePathGeometry(
+                        path.GetAddressOf()))) {
+                    rt->DrawLine(D2D1::Point2F(x, t),
+                                 D2D1::Point2F(x, b),
+                                 m_brushSeparator.Get(), 1.0f);
+                    return;
+                }
+                ComPtr<ID2D1GeometrySink> sink;
+                if (FAILED(path->Open(sink.GetAddressOf()))) return;
+                // Hexagonal pill walk (starting at top-left of the
+                // central rectangle, going clockwise):
+                //   (x - halfW, t + ch) → (x, t)               top-left chamfer
+                //   (x, t)              → (x + halfW, t + ch)  top-right chamfer
+                //   (x + halfW, t + ch) → (x + halfW, b - ch)  right edge
+                //   (x + halfW, b - ch) → (x, b)               bottom-right chamfer
+                //   (x, b)              → (x - halfW, b - ch)  bottom-left chamfer
+                //   (x - halfW, b - ch) → (x - halfW, t + ch)  left edge (close)
+                sink->BeginFigure(
+                    D2D1::Point2F(x - halfW, t + kSlotChamfer),
+                    D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(x, t));
+                sink->AddLine(D2D1::Point2F(x + halfW, t + kSlotChamfer));
+                sink->AddLine(D2D1::Point2F(x + halfW, b - kSlotChamfer));
+                sink->AddLine(D2D1::Point2F(x, b));
+                sink->AddLine(D2D1::Point2F(x - halfW, b - kSlotChamfer));
+                sink->AddLine(D2D1::Point2F(x - halfW, t + kSlotChamfer));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                rt->FillGeometry(path.Get(), m_brushSeparator.Get());
+            }
+
             // frame and 144 Hz that's ~45k DrawLine/s — well within
             // D2D's budget for a 720×480 target. Could be cached to
             // an offscreen bitmap brush later if it ever shows up
