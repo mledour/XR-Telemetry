@@ -188,7 +188,7 @@
          makes them visible in Solution Explorer and triggers a rebuild when
          the subset is regenerated. They are NOT copied to the output dir
          — rc.exe bakes their bytes directly into the EXE's resource table. -->
-    <None Include="..\openxr-api-layer\fonts\Barlow-Medium.ttf" />
+    <None Include="..\openxr-api-layer\fonts\Rajdhani-SemiBold.ttf" />
     <None Include="..\openxr-api-layer\fonts\Barlow-MediumItalic.ttf" />
   </ItemGroup>
   <ItemGroup>

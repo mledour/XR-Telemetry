@@ -100,21 +100,31 @@
 // Resource IDs. Stay ≥ 200 to leave headroom for future icons / dialogs
 // in the layer's .rc.in (Windows-shell convention puts those at 100-199).
 //
-// Barlow Medium (500) + Medium Italic by Jeremy Tribby / The Barlow
-// Project Authors (SIL OFL). Replaces the earlier Rajdhani SemiBold /
-// Bold bundle. Why this swap: the chiffres in the HUD design need a
-// true italic (not synthetic oblique), and Barlow Medium reads better
-// at small HUD sizes than the previous Rajdhani Bold did. ~23-25 KB
-// per face after pyftsubset to the HUD glyph set (digits, ASCII
-// letters, °/µ/×, punctuation) — slightly larger than Rajdhani's
-// ~11 KB because Barlow ships more OpenType features (notably tabular
-// figures via the `tnum` feature, which the renderer activates via
-// IDWriteTypography to stop the chiffres jittering as digit widths
-// change frame-to-frame at 10 Hz refresh).
-#define IDR_FONT_BARLOW_MEDIUM         200
+// Mixed bundle, two families, two purposes:
+//   - Rajdhani SemiBold (600) by Indian Type Foundry — used UPRIGHT for
+//     all labels, section titles, and the "App" / "Render" portions of
+//     the CPU panel's compound string. Narrower, technical-feeling
+//     grotesque; reads as crisp small-cap labels at 14-22 px.
+//   - Barlow Medium Italic (500) by The Barlow Project Authors — used
+//     ITALIC for the chiffres (FPS, frametimes, °C, %, ms values).
+//     Wider geometric grotesque with a real italic cut (no synthetic
+//     oblique), gives the chiffres a "motion / dynamic readout" feel
+//     distinct from the static labels.
+//
+// Both fonts are SIL OFL licensed (see fonts/OFL.txt for the dual
+// copyright notice).
+//
+// The renderer's `init()` builds two sets of IDWriteTextFormats: chiffres
+// formats anchor to "Barlow" with weight MEDIUM + style ITALIC; label /
+// title formats anchor to "Rajdhani" with weight SEMI_BOLD + style
+// NORMAL. The compound CPU-panel string (which mixes label + chiffres
+// in one rendered run) anchors to Rajdhani upright as its BASE and uses
+// IDWriteTextLayout::SetFontFamilyName + SetFontWeight + SetFontStyle
+// to override the chiffres ranges to Barlow Medium Italic at draw time.
+#define IDR_FONT_RAJDHANI_SEMIBOLD     200
 #define IDR_FONT_BARLOW_MEDIUM_ITALIC  201
 
 // Bare basenames — rc.exe finds the actual TTFs via the /I include path
 // configured in each project's vcxproj ResourceCompile section.
-IDR_FONT_BARLOW_MEDIUM        RT_BUNDLED_FONT "Barlow-Medium.ttf"
+IDR_FONT_RAJDHANI_SEMIBOLD    RT_BUNDLED_FONT "Rajdhani-SemiBold.ttf"
 IDR_FONT_BARLOW_MEDIUM_ITALIC RT_BUNDLED_FONT "Barlow-MediumItalic.ttf"
