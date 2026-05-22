@@ -318,8 +318,10 @@ namespace openxr_api_layer::detail {
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
                 // under its column label.
+                // alpha0 bottom row: value is LEFT-aligned in its rect
+                // (label TOP-LEFT above + value+unit on a row below).
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontTemp,         kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
+                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtTemp)) return false;
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontMs,           kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
                 // m_fmtMsCompound's BASE is Rajdhani SemiBold upright
@@ -1302,66 +1304,104 @@ namespace openxr_api_layer::detail {
                 // tempLabel / loadLabel arrive pre-built as wide
                 // string literals (L"GPU TEMP", L"CPU LOAD", …) — see
                 // the comment at the drawBottomPanel call site in
-                // paint(). VRAM stays a singleton label ("VRAM")
-                // because it's implicitly GPU-side — no "GPU VRAM"
-                // because that would be redundant and use a full
-                // extra word of horizontal space.
+                // paint().
+                //
+                // alpha0 cell layout per cell:
+                //   Row 1 (top, ~16 px tall): small Rajdhani SemiBold
+                //                              label LEADING-aligned
+                //                              at top-left of the cell
+                //                              (e.g. "GPU TEMP").
+                //   Row 2 (bottom, ~40 px):    value + unit as a
+                //                              single TextLayout, both
+                //                              LEFT-aligned at the
+                //                              cell's left padding.
+                //                              The value is the cell's
+                //                              big chiffre in Barlow
+                //                              Medium Italic kFontTemp;
+                //                              the unit ("°C" / "%")
+                //                              swaps to upright
+                //                              Rajdhani SemiBold at a
+                //                              smaller size, applied
+                //                              via per-range overrides
+                //                              on the layout (same
+                //                              mechanism as
+                //                              drawMixedStyleAscii but
+                //                              inverted: base is the
+                //                              chiffre format, the
+                //                              unit range overrides to
+                //                              the label family).
 
-                // Vertical positions inside the panel:
-                //   labelY : small label (m_fmtTinyLabelCenter,
-                //            kFontTinyLabel = 17 px SemiBold)
-                //   valueY : big value (m_fmtTemp, kFontTemp = 43 px
-                //            Bold) — extends down to the panel bottom
-                //            and paragraph-centres for the "label
-                //            above / value below" stack the design
-                //            asks for.
-                const float labelY = t + (b - t) * 0.18f;
-                const float valueY = t + (b - t) * 0.40f;
+                constexpr float kCellPad        = 10.0f;
+                constexpr float kCellLabelTop   = 6.0f;   // y offset of label baseline anchor
+                constexpr float kCellLabelH     = 16.0f;  // label row height
+                constexpr float kCellValueTop   = 26.0f;  // y offset of value row top
+                constexpr float kCellUnitSize   = 16.0f;  // smaller Rajdhani for °C / %
 
                 auto drawCell = [&](float cellL, float cellR,
                                       const wchar_t* label,
                                       const std::string& asciiValue,
-                                      const wchar_t* unitSuffix,
-                                      ID2D1Brush* valueBrush,
-                                      bool useWideValue) {
+                                      const wchar_t* unitSuffix,  // always wide
+                                      ID2D1Brush* valueBrush) {
+                    // Row 1 — label TOP-LEFT.
                     drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                              D2D1::RectF(cellL, labelY, cellR,
-                                           labelY + 22.0f),
+                              D2D1::RectF(cellL + kCellPad,
+                                           t + kCellLabelTop,
+                                           cellR - kCellPad,
+                                           t + kCellLabelTop + kCellLabelH),
                               m_brushTextLabel.Get());
-                    if (useWideValue) {
-                        // For the °C suffix the whole string must be
-                        // wide. tempValue is ASCII, so byte-widening
-                        // it and concatenating L" °C" works.
-                        std::wstring wide(asciiValue.begin(),
-                                           asciiValue.end());
-                        wide += unitSuffix;
+
+                    // Row 2 — value + unit. Build a single wide string
+                    // "<value> <unit>" so the TextLayout can apply
+                    // per-range overrides on the unit portion (different
+                    // family, weight, style, size from the value).
+                    std::wstring wide(asciiValue.begin(),
+                                       asciiValue.end());
+                    const UINT32 valueLen = static_cast<UINT32>(
+                        wide.length());
+                    wide += unitSuffix;
+                    const UINT32 unitStart = valueLen;
+                    const UINT32 unitLen   = static_cast<UINT32>(
+                        wide.length() - valueLen);
+                    const D2D1_RECT_F valueRect = D2D1::RectF(
+                        cellL + kCellPad,
+                        t + kCellValueTop,
+                        cellR - kCellPad,
+                        b - kBottomCellTextBottomPad);
+
+                    // Fast path when the typography / TextLayout setup
+                    // fails: just render the whole string in the base
+                    // chiffre format (Barlow Italic). Loses the
+                    // small-upright unit but the cell still reads.
+                    ComPtr<IDWriteTextLayout> layout;
+                    if (FAILED(m_dwriteFactory->CreateTextLayout(
+                            wide.c_str(),
+                            static_cast<UINT32>(wide.length()),
+                            m_fmtTemp.Get(),
+                            valueRect.right - valueRect.left,
+                            valueRect.bottom - valueRect.top,
+                            layout.GetAddressOf()))) {
                         drawWide(rt, wide.c_str(), m_fmtTemp.Get(),
-                                  D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                  valueBrush);
-                    } else {
-                        // % and other ASCII-safe suffixes — single
-                        // ASCII drawAscii call, no wide conversion.
-                        std::string full = asciiValue;
-                        // Append the suffix as narrow chars. Caller
-                        // contract: !useWideValue means unitSuffix is
-                        // ASCII-only (`%`, ` ms`, ` x`, …). The assert
-                        // guards against future drift — if someone
-                        // passes ` °C` through this branch (the byte
-                        // 0xB0 alone, without the wide-conversion
-                        // path), the narrow cast silently produces
-                        // mojibake. Same family of bug as the
-                        // CP1252-source mishap we caught with the
-                        // first snapshot artifact.
-                        for (const wchar_t* p = unitSuffix; *p; ++p) {
-                            assert(static_cast<unsigned>(*p) < 0x80 &&
-                                   "ASCII-only suffix expected on the "
-                                   "!useWideValue path");
-                            full.push_back(static_cast<char>(*p));
-                        }
-                        drawAscii(rt, full, m_fmtTemp.Get(),
-                                   D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                   valueBrush);
+                                  valueRect, valueBrush);
+                        return;
                     }
+                    // Override the unit range to Rajdhani SemiBold
+                    // upright at kCellUnitSize. SetFontFamilyName /
+                    // Weight / Style / Size all per-range. The
+                    // custom IDWriteFontCollection attached to
+                    // m_fmtTemp at CreateTextFormat time contains
+                    // both "Barlow" and "Rajdhani", so the family
+                    // swap resolves without falling back to system
+                    // fonts.
+                    const DWRITE_TEXT_RANGE unitRange{unitStart, unitLen};
+                    layout->SetFontFamilyName(L"Rajdhani", unitRange);
+                    layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                           unitRange);
+                    layout->SetFontStyle(DWRITE_FONT_STYLE_NORMAL,
+                                          unitRange);
+                    layout->SetFontSize(kCellUnitSize, unitRange);
+                    rt->DrawTextLayout(
+                        D2D1::Point2F(valueRect.left, valueRect.top),
+                        layout.Get(), valueBrush);
                 };
 
                 // Cell 0 — <prefix> TEMP / "67 °C"
@@ -1379,16 +1419,16 @@ namespace openxr_api_layer::detail {
                 // bytes.
                 drawCell(l, l + colW,
                           tempLabel, tempValue, L" \u00B0C",
-                          m_brushTextWhite.Get(), /*useWideValue=*/true);
+                          m_brushTextWhite.Get());
                 // Cell 1 — <prefix> LOAD / "92 %"
                 drawCell(l + colW, l + colW * 2.0f,
                           loadLabel, utilValue, L" %",
-                          tierBrush(utilFraction), /*useWideValue=*/false);
+                          tierBrush(utilFraction));
                 // Cell 2 — VRAM / "76 %" (GPU panel only)
                 if (hasVram) {
                     drawCell(l + colW * 2.0f, r,
                               L"VRAM", vramValue, L" %",
-                              tierBrush(vramFraction), /*useWideValue=*/false);
+                              tierBrush(vramFraction));
                 }
             }
 
