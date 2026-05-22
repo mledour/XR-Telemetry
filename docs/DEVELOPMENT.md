@@ -31,7 +31,7 @@ openxr-api-layer/
     overlay_aggregator.{h,cpp}      ← per-frame metric accumulator
     histogram_ring.h                ← ring buffer for frametime samples
     gpu_telemetry.{h,cpp}           ← NvAPI / DXGI VRAM polling
-  fonts/                            ← bundled Rajdhani (subset to ASCII + °)
+  fonts/                            ← bundled Barlow (Medium + Medium Italic, subset)
   layer.cpp / layer.h               ← YOUR layer logic
   pch.h                             ← D3D11 + D3D12 includes (delay-loaded)
   openxr-api-layer.rc.in            ← VERSIONINFO + RT_BUNDLED_FONT template
@@ -171,9 +171,10 @@ The rendering is deterministic across CI runners because:
   no driver differences).
 - The mock snapshot in `makeMockSnapshot()` is a hard-coded `OverlaySnapshot`
   struct — no clock reads, no system queries.
-- The bundled Rajdhani font (subsetted to ASCII + `°`/`µ`/`×`, ~11 KB
-  each weight) is embedded in the test EXE so DirectWrite never falls
-  back to whatever system font happens to be installed.
+- The bundled Barlow font (Medium + Medium Italic, subsetted to
+  digits / ASCII letters / `°`/`µ`/`×` / punctuation, ~23-25 KB per
+  face) is embedded in the test EXE so DirectWrite never falls back
+  to whatever system font happens to be installed.
 - Both halves of the comparison go through the same PNG
   encode + un-premultiply + decode pipeline (the fresh PNG is written
   to disk, then re-decoded), so PBGRA→BGRA precision noise cancels out.
@@ -181,7 +182,7 @@ The rendering is deterministic across CI runners because:
 ### How a CI run plays out
 
 1. MSBuild compiles `openxr-api-layer-tests.rc` into the test EXE
-   alongside the C++ TUs. rc.exe bakes the Rajdhani TTF bytes into
+   alongside the C++ TUs. rc.exe bakes the Barlow TTF bytes into
    the EXE's resource table (custom type `RT_BUNDLED_FONT` == 256,
    IDs 200 + 201).
 2. The PowerShell test step runs `openxr-api-layer-tests.exe`. The
@@ -204,9 +205,9 @@ count of differing pixels and the `(x, y)` of the first one.
 | File | Role |
 |---|---|
 | `openxr-api-layer-tests/test_overlay_snapshot.cpp` | The TEST_CASE, mock data, WIC encode + decode + diff helpers |
-| `openxr-api-layer-tests/openxr-api-layer-tests.rc` | Resource script that embeds the Rajdhani TTFs into the test EXE |
+| `openxr-api-layer-tests/openxr-api-layer-tests.rc` | Resource script that embeds the Barlow TTFs into the test EXE |
 | `openxr-api-layer/openxr-api-layer.rc.in` | Production-DLL counterpart — same TTFs, same IDs, same custom type |
-| `openxr-api-layer/fonts/Rajdhani-{SemiBold,Bold}.ttf` | The bundled fonts — referenced from both `.rc` files |
+| `openxr-api-layer/fonts/Barlow-Medium{,Italic}.ttf` | The bundled fonts — referenced from both `.rc` files |
 | `screenshots/overlay_snapshot.png` | The golden, 720×480 RGBA, ~68 KB |
 | `openxr-api-layer/utils/overlay_renderer.cpp` | `renderOverlayToTarget()` — the shared entry point used by both the in-headset path and the snapshot test |
 
@@ -238,7 +239,7 @@ must be present at the SAME custom type + ID in BOTH binaries'
 resource tables. If the test EXE's table is missing an entry the
 DLL's table has, `FindResource` returns null in the test, the
 renderer silently falls back to its degraded path (e.g. system
-Bahnschrift instead of bundled Rajdhani for fonts), and the
+Bahnschrift instead of bundled Barlow for fonts), and the
 snapshot test compares against a render that doesn't match
 production — defeating the visual-regression contract.
 

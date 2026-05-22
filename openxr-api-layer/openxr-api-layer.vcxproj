@@ -388,8 +388,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <None Include="XR_APILAYER_MLEDOUR_xr_telemetry-32.json" />
     <None Include="openxr-api-layer.rc.in" />
     <None Include="version.h.in" />
-    <None Include="fonts\Rajdhani-SemiBold.ttf" />
-    <None Include="fonts\Rajdhani-Bold.ttf" />
+    <None Include="fonts\Barlow-Medium.ttf" />
+    <None Include="fonts\Barlow-MediumItalic.ttf" />
     <None Include="fonts\OFL.txt" />
     <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>

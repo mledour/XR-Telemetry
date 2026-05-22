@@ -239,30 +239,37 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Load the BUNDLED Rajdhani font (subset to ASCII +
-                // °/µ/× glyphs). The TTF files live as RT_BUNDLED_FONT
-                // resources in the DLL (see openxr-api-layer.rc.in);
-                // we feed their bytes into an IDWriteInMemoryFontFile
-                // Loader and build a custom IDWriteFontCollection
-                // around them. The collection is then referenced by
-                // family name ("Rajdhani") in every CreateTextFormat
-                // call below — DirectWrite resolves through the
-                // custom collection, never falling back to system
-                // fonts.
+                // Load the BUNDLED Barlow font (Medium + Medium Italic,
+                // subset to digits / ASCII letters / °/µ/× / punctuation).
+                // The TTF files live as RT_BUNDLED_FONT resources in the
+                // DLL (see fonts/bundled_fonts.rc.inc); we feed their
+                // bytes into an IDWriteInMemoryFontFileLoader and build
+                // a custom IDWriteFontCollection around them. The
+                // collection is then referenced by family name ("Barlow")
+                // in every CreateTextFormat call below — DirectWrite
+                // resolves through the custom collection, never falling
+                // back to system fonts.
                 //
-                // Why bundled: the design spec specifies Rajdhani,
-                // and shipping the font as a 22 KB total resource
-                // guarantees the HUD looks identical on every machine
-                // (vs. relying on whatever condensed sans the system
-                // happens to ship — Bahnschrift on Win10+, but a
-                // different glyph shape on older versions).
+                // Why bundled: design proposal lands on a true italic
+                // for the chiffres (5 of the 7 cached formats below);
+                // synthesising italic via DWRITE_FONT_STYLE_OBLIQUE on
+                // a non-italic face produces a sheared geometric look
+                // that's noticeably uglier than a real italic cut.
+                // Shipping the two faces as ~48 KB total resource
+                // bytes guarantees the HUD looks identical on every
+                // machine (vs. relying on whatever condensed sans the
+                // system happens to ship — Bahnschrift on Win10+, but
+                // a different glyph shape on older versions).
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the
                 // custom collection and let CreateTextFormat fall
-                // back to system default. Graceful degrade — never
-                // crash the host process for a cosmetic font.
-                const wchar_t* kFontFamily = L"Rajdhani";
+                // back to system default — Bahnschrift on Win10+. The
+                // fallback face is upright-only, so chiffres formats
+                // will render upright instead of italic. Graceful
+                // degrade — never crash the host process for a
+                // cosmetic font.
+                const wchar_t* kFontFamily = L"Barlow";
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
                                                  m_customFontCollection)) {
@@ -276,29 +283,61 @@ namespace openxr_api_layer::detail {
 
                 // The redesign packs labels, big FPS numbers, accent
                 // numbers, ms-suffix labels, temp readouts, and gauge
-                // percentages — each at a different point size and
-                // alignment. DirectWrite formats are immutable once
-                // created (alignment changes require a new format);
-                // we cache one format per (font, size, alignment)
-                // combination at init time so paint() never allocates
-                // a format.
-                if (!makeFormat(kFontFamily, customCollection, kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
+                // percentages — each at a different point size,
+                // alignment, AND style (italic for chiffres, normal
+                // for labels). DirectWrite formats are immutable once
+                // created (alignment / style changes require a new
+                // format); we cache one format per (font, size,
+                // alignment, style) combination at init time so
+                // paint() never allocates a format.
+                //
+                // Style split:
+                //   ITALIC : m_fmtBigNumber, m_fmtAccentNumber,
+                //            m_fmtTemp, m_fmtMsValue, m_fmtMsCompound
+                //            — all "chiffres" formats matching the
+                //            design proposal in PR #19.
+                //   NORMAL : m_fmtTinyLabelCenter, m_fmtSectionTitle
+                //            — uppercase labels like "FPS", "P95",
+                //            "GPU FRAMETIME MS" stay upright.
+                //
+                // Weight: Barlow Medium (500) for every format. Earlier
+                // Rajdhani used Bold (700) for chiffres and SemiBold
+                // (600) for labels; Medium reads better at HUD sizes
+                // for italic chiffres, and the matching upright Medium
+                // labels keep the visual weight balanced.
+                constexpr DWRITE_FONT_WEIGHT kWeight = DWRITE_FONT_WEIGHT_MEDIUM;
+                if (!makeFormat(kFontFamily, customCollection, kFontBigNumber,    kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontAccentNumber, kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
                 // under its column label.
-                if (!makeFormat(kFontFamily, customCollection, kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontTemp,         kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontMs,           kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    kWeight, DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFontFamily, customCollection, kFontSectionTitle, kWeight, DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
+
+                // TODO(barlow-followup): activate OpenType `tnum`
+                // (tabular figures) on the chiffres formats so digit
+                // widths stay uniform — without it, FPS bouncing
+                // between "138" and "142" makes the rendered string
+                // visibly shift horizontally at 10 Hz refresh. The
+                // typography opt-in lives on IDWriteTextLayout, not
+                // on IDWriteTextFormat, so it requires refactoring
+                // drawAscii/drawWide from ID2D1RenderTarget::DrawTextW
+                // to IDWriteTextLayout + DrawTextLayout. Not done in
+                // this PR (font swap is already a chunk). Tracked as
+                // a follow-up because both Rajdhani (previous) and
+                // Barlow (this) have proportional figures by default
+                // — switching fonts doesn't introduce regression on
+                // this axis, both versions of the HUD jitter equally.
                 return true;
             }
 
@@ -586,19 +625,31 @@ namespace openxr_api_layer::detail {
             // -------- Format / brush helpers --------------------------------
             //
             // makeFormat takes an optional IDWriteFontCollection — non-null
-            // when the renderer loaded the bundled Rajdhani fonts, null when
+            // when the renderer loaded the bundled Barlow fonts, null when
             // we fell back to system fonts. CreateTextFormat resolves the
             // family name through the supplied collection (or the system
             // collection on null).
+            //
+            // `style` selects upright (`DWRITE_FONT_STYLE_NORMAL`) vs
+            // true italic (`_ITALIC`). DirectWrite resolves the right
+            // font FACE inside the collection — for Barlow that means
+            // picking Barlow-Medium.ttf vs Barlow-MediumItalic.ttf
+            // (both bundled, see fonts/bundled_fonts.rc.inc). If the
+            // collection only has the upright face and ITALIC is
+            // requested, DirectWrite falls back to synthetic-oblique
+            // (sheared upright glyphs) — uglier but functional, and
+            // happens only on the system-fallback path where we
+            // couldn't load the bundle.
             bool makeFormat(const wchar_t* family,
                             IDWriteFontCollection* collection,
                             float size,
                             DWRITE_FONT_WEIGHT weight,
+                            DWRITE_FONT_STYLE style,
                             DWRITE_TEXT_ALIGNMENT alignment,
                             ComPtr<IDWriteTextFormat>& out) {
                 if (FAILED(m_dwriteFactory->CreateTextFormat(
                         family, collection, weight,
-                        DWRITE_FONT_STYLE_NORMAL,
+                        style,
                         DWRITE_FONT_STRETCH_NORMAL,
                         size, L"en-US", out.GetAddressOf()))) {
                     return false;
@@ -608,12 +659,15 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Loads the bundled Rajdhani font resources (RT_BUNDLED_FONT,
-            // IDs 200 + 201 in openxr-api-layer.rc.in) into a custom
-            // IDWriteFontCollection. Uses IDWriteFactory5's in-memory
-            // font-file-loader API (Windows 10 1703+) to avoid the
-            // boilerplate of implementing IDWriteFontFileLoader /
-            // IDWriteFontFileStream / IDWriteFontCollectionLoader by hand.
+            // Loads the bundled Barlow font resources (RT_BUNDLED_FONT,
+            // IDs 200 + 201 in fonts/bundled_fonts.rc.inc — the shared
+            // include compiled into both the layer DLL and the test EXE
+            // so loadBundledFontCollection finds the same bytes in
+            // either binary) into a custom IDWriteFontCollection. Uses
+            // IDWriteFactory5's in-memory font-file-loader API (Windows
+            // 10 1703+) to avoid the boilerplate of implementing
+            // IDWriteFontFileLoader / IDWriteFontFileStream /
+            // IDWriteFontCollectionLoader by hand.
             //
             // Returns true on success and writes the collection into
             // `outCollection`. False = caller falls back to system fonts.
@@ -712,8 +766,9 @@ namespace openxr_api_layer::detail {
                     // font format before we add it to the set;
                     // AddFontFile internally handles all faces in
                     // the file (single face per file for our
-                    // Rajdhani subsets, but the API is robust
-                    // either way).
+                    // Barlow subsets — Barlow-Medium.ttf is one
+                    // upright face, Barlow-MediumItalic.ttf is one
+                    // italic face — but the API is robust either way).
                     BOOL supported = FALSE;
                     DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
                     DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
@@ -773,12 +828,14 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (innerR - innerL). Rajdhani Bold kFontBigNumber=52 px on
-            // "142" measures ~78 px (the font is condensed so 3-digit
-            // numbers stay narrow); kFontTinyLabel=17 px SemiBold labels
+            // (innerR - innerL). Barlow Medium Italic kFontBigNumber=52 px
+            // on "142" measures ~95-100 px (Barlow is wider than the
+            // previous Rajdhani Bold ~78 px, italic slant adds a few
+            // px more). kFontTinyLabel=17 px upright Medium labels
             // stay well under 50 px even for "P99.9". Comfortable
             // margins. On systems without the bundled font we fall
-            // back to Bahnschrift — slightly wider but still fits.
+            // back to Bahnschrift — narrower but no true italic, so
+            // chiffres come out as synthetic-oblique upright Bahnschrift.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -875,8 +932,8 @@ namespace openxr_api_layer::detail {
                 //   CPU panel (secondaryValue == "4.3"): "App ms 4.3 ms / Render ms 7.4 ms"
                 //
                 // Both render as a SINGLE right-aligned trailing-
-                // aligned string in m_fmtMsValue (Bahnschrift Bold
-                // 22 px).
+                // aligned string in m_fmtMsValue (Barlow Medium
+                // Italic kFontMs=26 px).
                 // Drawing the labels and values in separate rects /
                 // colours was tried in an earlier revision and caused
                 // visible baseline mismatch between the two panels —
@@ -2269,7 +2326,7 @@ namespace openxr_api_layer::detail {
     // render target, this function paints the HUD into it, caller saves
     // the bitmap to PNG. Reuses the same CoreRenderer as the in-engine
     // path, so the snapshot reflects EXACTLY what the user sees in the
-    // headset (modulo font availability — see the bundled-Rajdhani
+    // headset (modulo font availability — see the bundled-Barlow
     // fallback in init()).
     //
     // Not suitable for per-frame use: every call allocates a fresh

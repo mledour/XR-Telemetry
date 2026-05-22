@@ -99,10 +99,22 @@
 
 // Resource IDs. Stay ≥ 200 to leave headroom for future icons / dialogs
 // in the layer's .rc.in (Windows-shell convention puts those at 100-199).
-#define IDR_FONT_RAJDHANI_SEMIBOLD 200
-#define IDR_FONT_RAJDHANI_BOLD     201
+//
+// Barlow Medium (500) + Medium Italic by Jeremy Tribby / The Barlow
+// Project Authors (SIL OFL). Replaces the earlier Rajdhani SemiBold /
+// Bold bundle. Why this swap: the chiffres in the HUD design need a
+// true italic (not synthetic oblique), and Barlow Medium reads better
+// at small HUD sizes than the previous Rajdhani Bold did. ~23-25 KB
+// per face after pyftsubset to the HUD glyph set (digits, ASCII
+// letters, °/µ/×, punctuation) — slightly larger than Rajdhani's
+// ~11 KB because Barlow ships more OpenType features (notably tabular
+// figures via the `tnum` feature, which the renderer activates via
+// IDWriteTypography to stop the chiffres jittering as digit widths
+// change frame-to-frame at 10 Hz refresh).
+#define IDR_FONT_BARLOW_MEDIUM         200
+#define IDR_FONT_BARLOW_MEDIUM_ITALIC  201
 
 // Bare basenames — rc.exe finds the actual TTFs via the /I include path
 // configured in each project's vcxproj ResourceCompile section.
-IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "Rajdhani-SemiBold.ttf"
-IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "Rajdhani-Bold.ttf"
+IDR_FONT_BARLOW_MEDIUM        RT_BUNDLED_FONT "Barlow-Medium.ttf"
+IDR_FONT_BARLOW_MEDIUM_ITALIC RT_BUNDLED_FONT "Barlow-MediumItalic.ttf"
