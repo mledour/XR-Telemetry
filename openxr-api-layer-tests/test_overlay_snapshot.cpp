@@ -36,14 +36,15 @@
 // tests AND the snapshot generation. No new vcxproj, no new solution
 // entry, no order-of-build worries.
 //
-// The renderer's bundled-Rajdhani path uses FindResource against the
-// LAYER DLL's resource table — the test EXE has no such resources, so
-// CoreRenderer::init() gracefully falls back to system Bahnschrift
-// (see the kFontFamily branch in overlay_renderer.cpp). The snapshot
-// glyphs will therefore be slightly different from the in-game
-// rendering, but layout, colours, gradients, gradients, dashed
-// placeholders — every visual element other than the font face — match
-// production exactly. Good enough for layout / palette regression.
+// The renderer's bundled-Barlow path uses FindResource against the
+// running module's resource table. The test EXE has its OWN copy of
+// the Barlow resources via openxr-api-layer-tests.rc (see "Snapshot
+// tests" in docs/DEVELOPMENT.md), so the test renders with the same
+// fonts as the in-headset HUD — pixel-for-pixel match modulo the
+// runtime path differences (in-game uses a swapchain D2D RT, the test
+// uses a WIC bitmap RT, both software-rasterised). The shared
+// bundled_fonts.rc.inc include guarantees the test and the production
+// DLL embed byte-identical font tables.
 // =============================================================================
 
 #include <doctest/doctest.h>

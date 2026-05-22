@@ -152,9 +152,16 @@ namespace openxr_api_layer::detail {
         // their natural visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
         constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
+        // Labels and section titles render in Rajdhani SemiBold (NOT
+        // Barlow), restored to their pre-Barlow-swap sizes. Rajdhani's
+        // narrower glyphs make the original 17 / 22 px the right
+        // calibration; the temporary 14 / 18 px shrink during the
+        // all-Barlow iteration was a compensation for Barlow Medium
+        // being noticeably wider and no longer applies now that the
+        // family flipped back to Rajdhani for labels.
         constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
-                                                     // ("App ms X / Render ms Y") —
+                                                     // ("App X ms / Render Y ms") —
                                                      // smaller so the longer
                                                      // string still fits in the
                                                      // top-right region.
@@ -239,66 +246,108 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Load the BUNDLED Rajdhani font (subset to ASCII +
-                // °/µ/× glyphs). The TTF files live as RT_BUNDLED_FONT
-                // resources in the DLL (see openxr-api-layer.rc.in);
-                // we feed their bytes into an IDWriteInMemoryFontFile
-                // Loader and build a custom IDWriteFontCollection
-                // around them. The collection is then referenced by
-                // family name ("Rajdhani") in every CreateTextFormat
-                // call below — DirectWrite resolves through the
-                // custom collection, never falling back to system
-                // fonts.
+                // Load the BUNDLED Barlow font (Medium + Medium Italic,
+                // subset to digits / ASCII letters / °/µ/× / punctuation).
+                // The TTF files live as RT_BUNDLED_FONT resources in the
+                // DLL (see fonts/bundled_fonts.rc.inc); we feed their
+                // bytes into an IDWriteInMemoryFontFileLoader and build
+                // a custom IDWriteFontCollection around them. The
+                // collection is then referenced by family name ("Barlow")
+                // in every CreateTextFormat call below — DirectWrite
+                // resolves through the custom collection, never falling
+                // back to system fonts.
                 //
-                // Why bundled: the design spec specifies Rajdhani,
-                // and shipping the font as a 22 KB total resource
-                // guarantees the HUD looks identical on every machine
-                // (vs. relying on whatever condensed sans the system
-                // happens to ship — Bahnschrift on Win10+, but a
-                // different glyph shape on older versions).
+                // Why bundle two families: design lands on a true italic
+                // for the chiffres (Barlow Medium Italic) but keeps the
+                // labels and section titles in the original technical-
+                // grotesque feel (Rajdhani SemiBold upright). Synthesising
+                // italic via DWRITE_FONT_STYLE_OBLIQUE on a non-italic
+                // face produces a sheared geometric look that's
+                // noticeably uglier than a real italic cut, so we ship
+                // Barlow-MediumItalic.ttf for the italic chiffres.
+                // Rajdhani is brought back specifically because its
+                // narrower upright glyphs read crisper for short caps
+                // labels ("FPS", "GPU TEMP", "VRAM") than Barlow's
+                // wider Medium would.
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the
                 // custom collection and let CreateTextFormat fall
-                // back to system default. Graceful degrade — never
-                // crash the host process for a cosmetic font.
-                const wchar_t* kFontFamily = L"Rajdhani";
+                // back to system default — Bahnschrift on Win10+. The
+                // fallback face is upright-only, so chiffres formats
+                // will render upright instead of italic. Graceful
+                // degrade — never crash the host process for a
+                // cosmetic font.
+                const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
+                const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
                                                  m_customFontCollection)) {
                     // Fallback: leave m_customFontCollection null and
                     // let DirectWrite use system fonts. Bahnschrift
-                    // is the next-best match where available.
-                    kFontFamily = L"Bahnschrift";
+                    // is the next-best match for both roles — italic
+                    // chiffres will be synthesised oblique on the
+                    // fallback face since system Bahnschrift has no
+                    // true italic face.
+                    kFamilyChiffres = L"Bahnschrift";
+                    kFamilyLabels   = L"Bahnschrift";
                 } else {
                     customCollection = m_customFontCollection.Get();
                 }
 
-                // The redesign packs labels, big FPS numbers, accent
-                // numbers, ms-suffix labels, temp readouts, and gauge
-                // percentages — each at a different point size and
-                // alignment. DirectWrite formats are immutable once
-                // created (alignment changes require a new format);
-                // we cache one format per (font, size, alignment)
-                // combination at init time so paint() never allocates
-                // a format.
-                if (!makeFormat(kFontFamily, customCollection, kFontBigNumber,    DWRITE_FONT_WEIGHT_BOLD,
+                // Format split — 5 chiffres formats use Barlow Medium
+                // ITALIC, 2 label formats use Rajdhani SemiBold NORMAL.
+                // The compound format (App / Render) anchors to Rajdhani
+                // upright as its BASE and gets per-range Barlow Medium
+                // Italic overrides at draw time via drawMixedStyleAscii
+                // → IDWriteTextLayout::SetFontFamilyName + SetFontWeight
+                // + SetFontStyle on the chiffres ranges.
+                //
+                //   Chiffres (Barlow Medium Italic, ID 201):
+                //     m_fmtBigNumber, m_fmtAccentNumber, m_fmtTemp,
+                //     m_fmtMsValue
+                //   Labels / titles / compound base (Rajdhani SemiBold
+                //   upright, ID 200):
+                //     m_fmtTinyLabelCenter, m_fmtSectionTitle,
+                //     m_fmtMsCompound
+                constexpr DWRITE_FONT_WEIGHT kChiffresWeight = DWRITE_FONT_WEIGHT_MEDIUM;
+                constexpr DWRITE_FONT_WEIGHT kLabelWeight    = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+                if (!makeFormat(kFamilyChiffres, customCollection, kFontBigNumber,    kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontAccentNumber, DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFamilyChiffres, customCollection, kFontAccentNumber, kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
                 // under its column label.
-                if (!makeFormat(kFontFamily, customCollection, kFontTemp,         DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFamilyChiffres, customCollection, kFontTemp,         kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontMs,           DWRITE_FONT_WEIGHT_BOLD,
+                if (!makeFormat(kFamilyChiffres, customCollection, kFontMs,           kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   DWRITE_FONT_WEIGHT_BOLD,
+                // m_fmtMsCompound's BASE is Rajdhani SemiBold upright
+                // (it's the "App" / " / Render " label portions of the
+                // compound). drawMixedStyleAscii applies Barlow Medium
+                // Italic on the chiffres ranges per draw.
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontMsCompound,   kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontTinyLabel,    kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontSectionTitle, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontSectionTitle, kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
+
+                // TODO(barlow-followup): activate OpenType `tnum`
+                // (tabular figures) on the chiffres formats so digit
+                // widths stay uniform — without it, FPS bouncing
+                // between "138" and "142" makes the rendered string
+                // visibly shift horizontally at 10 Hz refresh. The
+                // typography opt-in lives on IDWriteTextLayout, not
+                // on IDWriteTextFormat, so it requires refactoring
+                // drawAscii/drawWide from ID2D1RenderTarget::DrawTextW
+                // to IDWriteTextLayout + DrawTextLayout. Not done in
+                // this PR (font swap is already a chunk). Tracked as
+                // a follow-up because both Rajdhani (previous) and
+                // Barlow (this) have proportional figures by default
+                // — switching fonts doesn't introduce regression on
+                // this axis, both versions of the HUD jitter equally.
                 return true;
             }
 
@@ -450,7 +499,7 @@ namespace openxr_api_layer::detail {
             //   - GPU FRAMETIME MS panel: title + "X.X ms" value
             //     (top-right) + dashed grid + teal-gradient histogram.
             //   - CPU FRAMETIME MS panel: title + compound
-            //     "App ms X / Render ms Y" (top-right) + blue-gradient
+            //     "App X ms / Render Y ms" (top-right) + blue-gradient
             //     histogram.
             //   - Bottom row (60 / 40 split between two panels):
             //       GPU panel = TEMP / LOAD / VRAM (3 cells). LOAD &
@@ -519,7 +568,7 @@ namespace openxr_api_layer::detail {
                 drawHeaderBar(rt, innerL, headerY, innerR,
                                headerY + kHeaderHeight, v);
                 // GPU panel: single value top-right ("6.7 ms").
-                // CPU panel: dual value "App ms X.X ms / Render ms Y.Y
+                // CPU panel: dual value "App X.X ms / Render Y.Y
                 // ms" — the App / Render split is the diagnostic
                 // value of the design (see comment in
                 // overlay_aggregator.h for what each metric covers).
@@ -586,19 +635,31 @@ namespace openxr_api_layer::detail {
             // -------- Format / brush helpers --------------------------------
             //
             // makeFormat takes an optional IDWriteFontCollection — non-null
-            // when the renderer loaded the bundled Rajdhani fonts, null when
+            // when the renderer loaded the bundled Barlow fonts, null when
             // we fell back to system fonts. CreateTextFormat resolves the
             // family name through the supplied collection (or the system
             // collection on null).
+            //
+            // `style` selects upright (`DWRITE_FONT_STYLE_NORMAL`) vs
+            // true italic (`_ITALIC`). DirectWrite resolves the right
+            // font FACE inside the collection — for Barlow that means
+            // picking Barlow-Medium.ttf vs Barlow-MediumItalic.ttf
+            // (both bundled, see fonts/bundled_fonts.rc.inc). If the
+            // collection only has the upright face and ITALIC is
+            // requested, DirectWrite falls back to synthetic-oblique
+            // (sheared upright glyphs) — uglier but functional, and
+            // happens only on the system-fallback path where we
+            // couldn't load the bundle.
             bool makeFormat(const wchar_t* family,
                             IDWriteFontCollection* collection,
                             float size,
                             DWRITE_FONT_WEIGHT weight,
+                            DWRITE_FONT_STYLE style,
                             DWRITE_TEXT_ALIGNMENT alignment,
                             ComPtr<IDWriteTextFormat>& out) {
                 if (FAILED(m_dwriteFactory->CreateTextFormat(
                         family, collection, weight,
-                        DWRITE_FONT_STYLE_NORMAL,
+                        style,
                         DWRITE_FONT_STRETCH_NORMAL,
                         size, L"en-US", out.GetAddressOf()))) {
                     return false;
@@ -608,12 +669,22 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Loads the bundled Rajdhani font resources (RT_BUNDLED_FONT,
-            // IDs 200 + 201 in openxr-api-layer.rc.in) into a custom
-            // IDWriteFontCollection. Uses IDWriteFactory5's in-memory
-            // font-file-loader API (Windows 10 1703+) to avoid the
-            // boilerplate of implementing IDWriteFontFileLoader /
-            // IDWriteFontFileStream / IDWriteFontCollectionLoader by hand.
+            // Loads the bundled font resources (RT_BUNDLED_FONT, IDs
+            // 200 + 201 in fonts/bundled_fonts.rc.inc — the shared
+            // include compiled into both the layer DLL and the test
+            // EXE so loadBundledFontCollection finds the same bytes
+            // in either binary) into a custom IDWriteFontCollection.
+            // The collection holds two families:
+            //   ID 200 → Rajdhani SemiBold (labels + section titles)
+            //   ID 201 → Barlow Medium Italic (chiffres)
+            // DirectWrite reads the family + style from each TTF's
+            // `name` table, so the loader code below is family-
+            // agnostic and just adds the two files to the same set.
+            //
+            // Uses IDWriteFactory5's in-memory font-file-loader API (Windows
+            // 10 1703+) to avoid the boilerplate of implementing
+            // IDWriteFontFileLoader / IDWriteFontFileStream /
+            // IDWriteFontCollectionLoader by hand.
             //
             // Returns true on success and writes the collection into
             // `outCollection`. False = caller falls back to system fonts.
@@ -711,9 +782,13 @@ namespace openxr_api_layer::detail {
                     // Analyze validates the file is a recognised
                     // font format before we add it to the set;
                     // AddFontFile internally handles all faces in
-                    // the file (single face per file for our
-                    // Rajdhani subsets, but the API is robust
-                    // either way).
+                    // the file (single face per file for our subsets
+                    // — Rajdhani-SemiBold.ttf is one upright face in
+                    // the Rajdhani family, Barlow-MediumItalic.ttf is
+                    // one italic face in the Barlow family — but the
+                    // API is robust either way; DirectWrite reads
+                    // each file's `name` table to know which family /
+                    // weight / style face it contains).
                     BOOL supported = FALSE;
                     DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
                     DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
@@ -764,6 +839,98 @@ namespace openxr_api_layer::detail {
                 rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
+            // Renders an ASCII string where selected character ranges
+            // are flipped to the chiffres font (Barlow Medium Italic),
+            // while the rest of the string keeps the base format
+            // (Rajdhani SemiBold upright, for labels).
+            //
+            // Used for the CPU panel's compound "App {x} ms / Render
+            // {y} ms" where labels stay upright Rajdhani and chiffres
+            // are italic Barlow.
+            //
+            // IDWriteTextFormat carries exactly one (family, weight,
+            // style) tuple for the whole string — to mix two fonts in
+            // one rendered string, the right DirectWrite primitive is
+            // IDWriteTextLayout, which exposes per-range overrides via
+            // SetFontFamilyName + SetFontWeight + SetFontStyle. This
+            // helper builds a layout from `baseFmt`, applies the
+            // three overrides on each (start, len) range, and draws
+            // via DrawTextLayout.
+            //
+            // NOTE on tabular figures (`tnum`): an earlier iteration
+            // attached an IDWriteTypography with DWRITE_FONT_FEATURE_TAG
+            // _TABULAR_FIGURES via layout->SetTypography here AND on
+            // every drawAscii / drawWide path. A diagnostic CI run
+            // (see PR #21 commits e453b52 / b067bdc) confirmed the
+            // typography object was created successfully and SetTypography
+            // returned S_OK, yet the rendered output was bit-identical
+            // to the no-tnum baseline — chiffres "1" stayed at 318
+            // width units instead of widening to 494 like the font's
+            // tnum lookup specifies.
+            //
+            // Root cause hypothesis: DirectWrite's shape engine ignores
+            // IDWriteTypography feature overrides when the resolved font
+            // face comes from a custom IDWriteFontCollection populated
+            // via IDWriteInMemoryFontFileLoader (the path used by
+            // loadBundledFontCollection above). The same code wired
+            // against a system font collection would likely apply the
+            // feature.
+            //
+            // The chiffres-jitter cosmetic issue stays unaddressed until
+            // we either find a working DirectWrite path (different
+            // font loader, manual IDWriteTextAnalyzer pipeline, …) or
+            // accept the jitter as a known footnote. The hook point if
+            // we ever revisit is exactly here — applied per-layout, not
+            // per-format, so this helper would gain a SetTypography
+            // call without further refactor.
+            void drawMixedStyleAscii(
+                ID2D1RenderTarget* rt,
+                const std::string& s,
+                IDWriteTextFormat* baseFmt,
+                std::initializer_list<std::pair<UINT32, UINT32>> chiffresRanges,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush) const {
+                if (s.empty() || !baseFmt) return;
+                // ASCII → wide byte-for-byte. Same contract as drawAscii:
+                // caller guarantees s contains only ASCII codepoints
+                // (which matches the compound's "App / Render / digits /
+                // space / slash / ms" character set).
+                std::wstring wide(s.begin(), s.end());
+
+                ComPtr<IDWriteTextLayout> layout;
+                if (FAILED(m_dwriteFactory->CreateTextLayout(
+                        wide.c_str(),
+                        static_cast<UINT32>(wide.length()),
+                        baseFmt,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        layout.GetAddressOf()))) {
+                    // Fall back to the simple single-style path so the
+                    // panel still shows something readable. The whole
+                    // string renders in the BASE format (upright
+                    // Rajdhani for the compound case) — chiffres lose
+                    // their italic Barlow flavour for this frame.
+                    drawAscii(rt, s, baseFmt, rect, brush);
+                    return;
+                }
+                // Per-range overrides: family (Barlow), weight (Medium),
+                // style (Italic) — three SetFont* calls per range. The
+                // font resolution happens against m_customFontCollection
+                // attached to baseFmt at CreateTextFormat time; that
+                // collection holds both "Rajdhani" and "Barlow" so the
+                // family swap resolves without falling back to system
+                // fonts.
+                for (const auto& [start, len] : chiffresRanges) {
+                    const DWRITE_TEXT_RANGE range{start, len};
+                    layout->SetFontFamilyName(L"Barlow", range);
+                    layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, range);
+                    layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+                }
+                rt->DrawTextLayout(
+                    D2D1::Point2F(rect.left, rect.top),
+                    layout.Get(), brush);
+            }
+
             // -------- Header bar --------------------------------------------
             //
             // Layout: 5 cells of equal width separated by 1-px vertical
@@ -773,12 +940,14 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (innerR - innerL). Rajdhani Bold kFontBigNumber=52 px on
-            // "142" measures ~78 px (the font is condensed so 3-digit
-            // numbers stay narrow); kFontTinyLabel=17 px SemiBold labels
+            // (innerR - innerL). Barlow Medium Italic kFontBigNumber=52 px
+            // on "142" measures ~95-100 px (Barlow is wider than the
+            // previous Rajdhani Bold ~78 px, italic slant adds a few
+            // px more). kFontTinyLabel=17 px upright Medium labels
             // stay well under 50 px even for "P99.9". Comfortable
             // margins. On systems without the bundled font we fall
-            // back to Bahnschrift — slightly wider but still fits.
+            // back to Bahnschrift — narrower but no true italic, so
+            // chiffres come out as synthetic-oblique upright Bahnschrift.
             void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -872,48 +1041,63 @@ namespace openxr_api_layer::detail {
                 // whether `secondaryValue` is empty:
                 //
                 //   GPU panel (secondaryValue == "")   : "6.7 ms"
-                //   CPU panel (secondaryValue == "4.3"): "App ms 4.3 ms / Render ms 7.4 ms"
+                //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
                 //
-                // Both render as a SINGLE right-aligned trailing-
-                // aligned string in m_fmtMsValue (Bahnschrift Bold
-                // 22 px).
-                // Drawing the labels and values in separate rects /
-                // colours was tried in an earlier revision and caused
-                // visible baseline mismatch between the two panels —
-                // the single-string approach keeps right edges and
-                // baselines identical across GPU / CPU and across
-                // resize events. The colour split between "labels"
-                // and "values" is sacrificed for layout robustness;
-                // can be revisited via IDWriteTextLayout if the
-                // visual hierarchy needs more separation.
-                std::string topRightStr;
-                float valueRectWidth;
-                IDWriteTextFormat* topRightFmt;
+                // GPU panel is a single right-aligned string in
+                // m_fmtMsValue (Barlow Medium Italic kFontMs=26 px).
+                // CPU panel goes through IDWriteTextLayout with
+                // mixed styles: upright "App" / " / Render " labels
+                // (matching the section-title weight) + italic
+                // chiffres+unit ("4.3 ms" / "7.4 ms") matching the
+                // rest of the HUD's chiffres.
                 if (secondaryValue.empty()) {
                     // GPU panel: short "6.7 ms" at the larger
                     // kFontMs (26 px) — primary frametime read-out.
-                    topRightStr = currentValue + " ms";
-                    valueRectWidth = 160.0f;
-                    topRightFmt = m_fmtMsValue.Get();
+                    // Single-style italic from m_fmtMsValue, plain
+                    // drawAscii call.
+                    const std::string s = currentValue + " ms";
+                    const D2D1_RECT_F valueRect = D2D1::RectF(
+                        r - kSectionInnerPad - 160.0f, titleT - 4.0f,
+                        r - kSectionInnerPad,          titleB + 6.0f);
+                    drawAscii(rt, s, m_fmtMsValue.Get(), valueRect,
+                               m_brushAccentCyan.Get());
                 } else {
-                    // CPU panel: compound "App ms X / Render ms Y"
-                    // at the smaller kFontMsCompound (18 px). The
-                    // string is ~32 chars so the size drop keeps
-                    // it inside the panel without crowding the
-                    // section title on the left. Both labels and
-                    // values render in cyan accent — colour-coded
-                    // sub-grouping deferred (would need multi-run
-                    // text layout, see earlier commit's caveat).
-                    topRightStr = "App ms " + secondaryValue +
-                                   " ms / Render ms " + currentValue + " ms";
-                    valueRectWidth = 360.0f;
-                    topRightFmt = m_fmtMsCompound.Get();
+                    // CPU panel: compound "App {x} ms / Render {y} ms"
+                    // at the smaller kFontMsCompound — labels upright
+                    // (matching the section title weight), chiffres +
+                    // unit italic (matching the rest of the HUD
+                    // chiffres). Per-range styles via
+                    // drawMixedStyleAscii → IDWriteTextLayout +
+                    // SetFontStyle.
+                    //
+                    // String layout (character offsets):
+                    //   "App "            offset  0, length 4         (upright)
+                    //   secondaryValue    offset  4, length sec.size()
+                    //   " ms"             follows, length 3            ← italic with sec
+                    //   " / Render "      length 10                    (upright)
+                    //   currentValue      length cur.size()
+                    //   " ms"             length 3                     ← italic with cur
+                    const std::string& sec = secondaryValue;
+                    const std::string& cur = currentValue;
+                    const std::string compound =
+                        "App " + sec + " ms / Render " + cur + " ms";
+                    const UINT32 italicAStart =
+                        4;                                      // after "App "
+                    const UINT32 italicALen   =
+                        static_cast<UINT32>(sec.size()) + 3;     // sec + " ms"
+                    const UINT32 italicBStart =
+                        italicAStart + italicALen + 10;          // + " / Render "
+                    const UINT32 italicBLen   =
+                        static_cast<UINT32>(cur.size()) + 3;     // cur + " ms"
+                    const D2D1_RECT_F valueRect = D2D1::RectF(
+                        r - kSectionInnerPad - 320.0f, titleT - 4.0f,
+                        r - kSectionInnerPad,          titleB + 6.0f);
+                    drawMixedStyleAscii(
+                        rt, compound, m_fmtMsCompound.Get(),
+                        {{italicAStart, italicALen},
+                         {italicBStart, italicBLen}},
+                        valueRect, m_brushAccentCyan.Get());
                 }
-                const D2D1_RECT_F valueRect = D2D1::RectF(
-                    r - kSectionInnerPad - valueRectWidth, titleT - 4.0f,
-                    r - kSectionInnerPad,                  titleB + 6.0f);
-                drawAscii(rt, topRightStr, topRightFmt, valueRect,
-                           m_brushAccentCyan.Get());
 
                 // Histogram region — below the title row, with inner
                 // padding on all sides.
@@ -1341,7 +1525,7 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
             ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
             ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU, 26 px)
-            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ms ... / Render ms ..." (CPU, 18 px)
+            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, 18 px, mixed style)
             ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
@@ -2269,7 +2453,7 @@ namespace openxr_api_layer::detail {
     // render target, this function paints the HUD into it, caller saves
     // the bitmap to PNG. Reuses the same CoreRenderer as the in-engine
     // path, so the snapshot reflects EXACTLY what the user sees in the
-    // headset (modulo font availability — see the bundled-Rajdhani
+    // headset (modulo font availability — see the bundled-Barlow
     // fallback in init()).
     //
     // Not suitable for per-frame use: every call allocates a fresh
