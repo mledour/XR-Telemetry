@@ -150,11 +150,22 @@ namespace openxr_api_layer::detail {
         // hierarchy. Sizes in pixels at the 720×480 native texture
         // resolution; rendered to the head-locked quad they read at
         // their natural visual weight in the HMD.
-        constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontTinyLabel    = 14.0f;  // "FPS", "P95", "TEMP", "VRAM"
+                                                     // — bumped 17 → 14 on the
+                                                     // Barlow swap because
+                                                     // Barlow Medium is wider
+                                                     // than Rajdhani SemiBold
+                                                     // at equivalent point
+                                                     // sizes, and the alpha0
+                                                     // design has smaller
+                                                     // labels relative to
+                                                     // chiffres.
+        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
+                                                     // — bumped 22 → 18 for
+                                                     // the same reason.
         constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
-                                                     // ("App ms X / Render ms Y") —
+                                                     // ("App X ms / Render Y ms") —
                                                      // smaller so the longer
                                                      // string still fits in the
                                                      // top-right region.
@@ -317,7 +328,13 @@ namespace openxr_api_layer::detail {
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
                 if (!makeFormat(kFontFamily, customCollection, kFontMs,           kWeight, DWRITE_FONT_STYLE_ITALIC,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   kWeight, DWRITE_FONT_STYLE_ITALIC,
+                // m_fmtMsCompound's BASE style is upright (NORMAL): the
+                // compound string "App {x} ms / Render {y} ms" has
+                // upright LABELS ("App", "Render") and italic chiffres
+                // ("{x} ms", "{y} ms"). The italic ranges are applied
+                // per-draw via IDWriteTextLayout::SetFontStyle — see
+                // drawCompoundFrametime in drawFrametimePanel.
+                if (!makeFormat(kFontFamily, customCollection, kFontMsCompound,   kWeight, DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
                 if (!makeFormat(kFontFamily, customCollection, kFontTinyLabel,    kWeight, DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
@@ -489,7 +506,7 @@ namespace openxr_api_layer::detail {
             //   - GPU FRAMETIME MS panel: title + "X.X ms" value
             //     (top-right) + dashed grid + teal-gradient histogram.
             //   - CPU FRAMETIME MS panel: title + compound
-            //     "App ms X / Render ms Y" (top-right) + blue-gradient
+            //     "App X ms / Render Y ms" (top-right) + blue-gradient
             //     histogram.
             //   - Bottom row (60 / 40 split between two panels):
             //       GPU panel = TEMP / LOAD / VRAM (3 cells). LOAD &
@@ -558,7 +575,7 @@ namespace openxr_api_layer::detail {
                 drawHeaderBar(rt, innerL, headerY, innerR,
                                headerY + kHeaderHeight, v);
                 // GPU panel: single value top-right ("6.7 ms").
-                // CPU panel: dual value "App ms X.X ms / Render ms Y.Y
+                // CPU panel: dual value "App X.X ms / Render Y.Y
                 // ms" — the App / Render split is the diagnostic
                 // value of the design (see comment in
                 // overlay_aggregator.h for what each metric covers).
@@ -819,6 +836,63 @@ namespace openxr_api_layer::detail {
                 rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
+            // Renders an ASCII string with selected character ranges
+            // in italic, while the rest keeps the format's base style.
+            // Used for the CPU panel's compound "App {x} ms / Render
+            // {y} ms" where the labels stay upright (matching the
+            // section title style) and the chiffres+unit are italic
+            // (matching the rest of the HUD chiffres).
+            //
+            // IDWriteTextFormat carries exactly one style for the
+            // whole string — to mix styles, the right DirectWrite
+            // primitive is IDWriteTextLayout, which lets us call
+            // SetFontStyle on character ranges. This helper builds
+            // a layout from `baseFmt` + the wide-converted string,
+            // overrides style on each (start, len) range to ITALIC,
+            // and draws via DrawTextLayout.
+            //
+            // Side benefit: when we eventually activate tabular
+            // figures via SetTypography (see the TODO in init()),
+            // the hook point will be here, alongside the existing
+            // SetFontStyle calls.
+            void drawMixedStyleAscii(
+                ID2D1RenderTarget* rt,
+                const std::string& s,
+                IDWriteTextFormat* baseFmt,
+                std::initializer_list<std::pair<UINT32, UINT32>> italicRanges,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush) const {
+                if (s.empty() || !baseFmt) return;
+                // ASCII → wide byte-for-byte. Same contract as drawAscii:
+                // caller guarantees s contains only ASCII codepoints
+                // (which matches the compound's "App / Render / digits /
+                // space / slash / ms" character set).
+                std::wstring wide(s.begin(), s.end());
+
+                ComPtr<IDWriteTextLayout> layout;
+                if (FAILED(m_dwriteFactory->CreateTextLayout(
+                        wide.c_str(),
+                        static_cast<UINT32>(wide.length()),
+                        baseFmt,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        layout.GetAddressOf()))) {
+                    // Fall back to the simple single-style path so the
+                    // panel still shows something readable. Loses the
+                    // upright/italic split for this frame.
+                    drawAscii(rt, s, baseFmt, rect, brush);
+                    return;
+                }
+                for (const auto& [start, len] : italicRanges) {
+                    layout->SetFontStyle(
+                        DWRITE_FONT_STYLE_ITALIC,
+                        DWRITE_TEXT_RANGE{start, len});
+                }
+                rt->DrawTextLayout(
+                    D2D1::Point2F(rect.left, rect.top),
+                    layout.Get(), brush);
+            }
+
             // -------- Header bar --------------------------------------------
             //
             // Layout: 5 cells of equal width separated by 1-px vertical
@@ -929,48 +1003,63 @@ namespace openxr_api_layer::detail {
                 // whether `secondaryValue` is empty:
                 //
                 //   GPU panel (secondaryValue == "")   : "6.7 ms"
-                //   CPU panel (secondaryValue == "4.3"): "App ms 4.3 ms / Render ms 7.4 ms"
+                //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
                 //
-                // Both render as a SINGLE right-aligned trailing-
-                // aligned string in m_fmtMsValue (Barlow Medium
-                // Italic kFontMs=26 px).
-                // Drawing the labels and values in separate rects /
-                // colours was tried in an earlier revision and caused
-                // visible baseline mismatch between the two panels —
-                // the single-string approach keeps right edges and
-                // baselines identical across GPU / CPU and across
-                // resize events. The colour split between "labels"
-                // and "values" is sacrificed for layout robustness;
-                // can be revisited via IDWriteTextLayout if the
-                // visual hierarchy needs more separation.
-                std::string topRightStr;
-                float valueRectWidth;
-                IDWriteTextFormat* topRightFmt;
+                // GPU panel is a single right-aligned string in
+                // m_fmtMsValue (Barlow Medium Italic kFontMs=26 px).
+                // CPU panel goes through IDWriteTextLayout with
+                // mixed styles: upright "App" / " / Render " labels
+                // (matching the section-title weight) + italic
+                // chiffres+unit ("4.3 ms" / "7.4 ms") matching the
+                // rest of the HUD's chiffres.
                 if (secondaryValue.empty()) {
                     // GPU panel: short "6.7 ms" at the larger
                     // kFontMs (26 px) — primary frametime read-out.
-                    topRightStr = currentValue + " ms";
-                    valueRectWidth = 160.0f;
-                    topRightFmt = m_fmtMsValue.Get();
+                    // Single-style italic from m_fmtMsValue, plain
+                    // drawAscii call.
+                    const std::string s = currentValue + " ms";
+                    const D2D1_RECT_F valueRect = D2D1::RectF(
+                        r - kSectionInnerPad - 160.0f, titleT - 4.0f,
+                        r - kSectionInnerPad,          titleB + 6.0f);
+                    drawAscii(rt, s, m_fmtMsValue.Get(), valueRect,
+                               m_brushAccentCyan.Get());
                 } else {
-                    // CPU panel: compound "App ms X / Render ms Y"
-                    // at the smaller kFontMsCompound (18 px). The
-                    // string is ~32 chars so the size drop keeps
-                    // it inside the panel without crowding the
-                    // section title on the left. Both labels and
-                    // values render in cyan accent — colour-coded
-                    // sub-grouping deferred (would need multi-run
-                    // text layout, see earlier commit's caveat).
-                    topRightStr = "App ms " + secondaryValue +
-                                   " ms / Render ms " + currentValue + " ms";
-                    valueRectWidth = 360.0f;
-                    topRightFmt = m_fmtMsCompound.Get();
+                    // CPU panel: compound "App {x} ms / Render {y} ms"
+                    // at the smaller kFontMsCompound — labels upright
+                    // (matching the section title weight), chiffres +
+                    // unit italic (matching the rest of the HUD
+                    // chiffres). Per-range styles via
+                    // drawMixedStyleAscii → IDWriteTextLayout +
+                    // SetFontStyle.
+                    //
+                    // String layout (character offsets):
+                    //   "App "            offset  0, length 4         (upright)
+                    //   secondaryValue    offset  4, length sec.size()
+                    //   " ms"             follows, length 3            ← italic with sec
+                    //   " / Render "      length 10                    (upright)
+                    //   currentValue      length cur.size()
+                    //   " ms"             length 3                     ← italic with cur
+                    const std::string& sec = secondaryValue;
+                    const std::string& cur = currentValue;
+                    const std::string compound =
+                        "App " + sec + " ms / Render " + cur + " ms";
+                    const UINT32 italicAStart =
+                        4;                                      // after "App "
+                    const UINT32 italicALen   =
+                        static_cast<UINT32>(sec.size()) + 3;     // sec + " ms"
+                    const UINT32 italicBStart =
+                        italicAStart + italicALen + 10;          // + " / Render "
+                    const UINT32 italicBLen   =
+                        static_cast<UINT32>(cur.size()) + 3;     // cur + " ms"
+                    const D2D1_RECT_F valueRect = D2D1::RectF(
+                        r - kSectionInnerPad - 320.0f, titleT - 4.0f,
+                        r - kSectionInnerPad,          titleB + 6.0f);
+                    drawMixedStyleAscii(
+                        rt, compound, m_fmtMsCompound.Get(),
+                        {{italicAStart, italicALen},
+                         {italicBStart, italicBLen}},
+                        valueRect, m_brushAccentCyan.Get());
                 }
-                const D2D1_RECT_F valueRect = D2D1::RectF(
-                    r - kSectionInnerPad - valueRectWidth, titleT - 4.0f,
-                    r - kSectionInnerPad,                  titleB + 6.0f);
-                drawAscii(rt, topRightStr, topRightFmt, valueRect,
-                           m_brushAccentCyan.Get());
 
                 // Histogram region — below the title row, with inner
                 // padding on all sides.
@@ -1398,7 +1487,7 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
             ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
             ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU, 26 px)
-            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ms ... / Render ms ..." (CPU, 18 px)
+            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, 18 px, mixed style)
             ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
