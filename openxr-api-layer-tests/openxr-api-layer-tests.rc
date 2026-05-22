@@ -47,15 +47,19 @@
 // runs in CI only), so the Windows-shell version metadata adds no
 // value. The fonts are the ONLY resource the test actually needs
 // from the .rc — keep this file minimal.
+//
+// Declarations live in openxr-api-layer/fonts/bundled_fonts.rc.inc — the
+// SAME include the layer DLL's openxr-api-layer.rc.in pulls in, so the
+// test EXE and the layer DLL bundle IDENTICAL font tables by
+// construction. Any divergence between the two (someone adds a font to
+// only one side) is now structurally impossible: there is exactly one
+// place where fonts are declared. See docs/DEVELOPMENT.md "Adding a new
+// bundled resource" for the rationale.
+//
+// FONTS_PREFIX resolves the include's basename paths against THIS .rc
+// file's directory — the test project sits next to the layer project
+// so the TTFs live at ../openxr-api-layer/fonts/.
 // =============================================================================
 
-#define IDR_FONT_RAJDHANI_SEMIBOLD 200
-#define IDR_FONT_RAJDHANI_BOLD     201
-#define RT_BUNDLED_FONT            256
-
-// Paths are relative to THIS .rc file's directory (rc.exe's default
-// search root). The TTFs live under the layer project's fonts\ folder
-// — referenced rather than copied so a future re-subset only has to
-// be done in one place.
-IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\Rajdhani-SemiBold.ttf"
-IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "..\\openxr-api-layer\\fonts\\Rajdhani-Bold.ttf"
+#define FONTS_PREFIX "..\\openxr-api-layer\\fonts\\"
+#include "../openxr-api-layer/fonts/bundled_fonts.rc.inc"

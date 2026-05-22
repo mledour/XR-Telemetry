@@ -53,10 +53,16 @@ END
 //
 // IDs 200/201 are used at runtime via FindResource(...) +
 // IDWriteFactory5::CreateInMemoryFontFileLoader — see overlay_renderer.cpp.
+//
+// Declarations live in the shared include below — the SAME file is included
+// by openxr-api-layer-tests.rc so the test EXE and the layer DLL bundle
+// IDENTICAL font tables. Adding a new font / changing an ID / removing a
+// resource: edit bundled_fonts.rc.inc once and BOTH binaries pick it up.
+// See docs/DEVELOPMENT.md "Adding a new bundled resource".
+//
+// FONTS_PREFIX resolves the include's basename paths against this .rc.in's
+// directory (so "Rajdhani-SemiBold.ttf" finds openxr-api-layer/fonts/
+// Rajdhani-SemiBold.ttf at rc.exe time).
 // -----------------------------------------------------------------------------
-#define IDR_FONT_RAJDHANI_SEMIBOLD 200
-#define IDR_FONT_RAJDHANI_BOLD     201
-#define RT_BUNDLED_FONT            256
-
-IDR_FONT_RAJDHANI_SEMIBOLD RT_BUNDLED_FONT "fonts\\Rajdhani-SemiBold.ttf"
-IDR_FONT_RAJDHANI_BOLD     RT_BUNDLED_FONT "fonts\\Rajdhani-Bold.ttf"
+#define FONTS_PREFIX "fonts\\"
+#include "fonts/bundled_fonts.rc.inc"
