@@ -11,10 +11,45 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# The release job needs `contents: write` to create GitHub releases
-# and attach assets to them.
+# Top-level permissions cover both jobs:
+#   contents: write      -> release job creates GitHub releases AND
+#                           build job pushes snapshot diff PNGs to the
+#                           orphan `snapshot-previews` branch.
+#   pull-requests: write -> build job upserts the sticky PR comment
+#                           on snapshot test failure.
+# The PR-comment usage is gated on `pull_request` + same-repo HEAD so
+# fork PRs (read-only GITHUB_TOKEN by GitHub design) just skip it.
 permissions:
   contents: write
+  pull-requests: write
+
+# Cancel superseded PR builds; serialise main / tag pushes.
+#
+# Group key:
+#   - pull_request: `github.head_ref` is the SOURCE branch (e.g.
+#     `ci/snapshot-preview-comment`), so rapid pushes on the same PR
+#     collide on a single group and the newer one wins.
+#   - push (main or tags) / workflow_dispatch: `github.head_ref` is
+#     empty, so the key falls through to `github.ref` (`refs/heads/
+#     main`, `refs/tags/v0.0.8`, …). Different tags get different
+#     keys (no contention between releases); rapid commits to main
+#     share a key but queue without cancellation — see below.
+#
+# cancel-in-progress:
+#   - true on pull_request: pushing a fix on top of a still-running
+#     CI run cancels the older run. Saves CI minutes; the older
+#     artifacts would be obsolete anyway, and on snapshot test
+#     failure the newer run posts a fresh sticky comment that
+#     supersedes the prior one via marocchino's `header:` dedup.
+#   - false on push / tag / workflow_dispatch: never cancel a main
+#     commit's CI (every main commit's green status is part of
+#     permanent history) nor a tag build (the tag IS the release —
+#     a partial release artifact set is worse than a slightly-stale
+#     one). Queueing serialises them; subsequent runs wait for the
+#     in-flight one to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SOLUTION: XR_APILAYER_MLEDOUR_xr_telemetry.sln
@@ -24,6 +59,19 @@ env:
   # this triggers a fresh download because the cache key changes —
   # exactly the behavior we want for Certum MSI updates.
   SIMPLYSIGN_VERSION: '9.4.3.90'
+  # Sticky-comment dedup key consumed by marocchino/sticky-pull-
+  # request-comment in the snapshot-diff steps below. Single source
+  # of truth for the two `header:` references — a typo in one would
+  # silently break stickiness (the action would POST a new comment
+  # each run instead of PATCHing the existing one).
+  STICKY_HEADER: snapshot-preview-bot
+  # Orphan branch carrying the snapshot diff PNGs that PR comments
+  # link to. Referenced by the push step below in ~7 git commands;
+  # hoisting prevents drift between them. NOT consumed by the seeded
+  # README content nor the prose comment at the top of this file —
+  # those keep `snapshot-previews` in user-facing text and have to
+  # be updated by hand if this name ever changes.
+  PREVIEW_BRANCH: snapshot-previews
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -36,6 +84,29 @@ jobs:
       fail-fast: false
       matrix:
         configuration: [Release, Debug]
+
+    # Single source of truth for "inline-comment-eligible": same-repo
+    # PR + Release matrix entry. Replaces a 3-conjunct predicate that
+    # was duplicated across 4 step `if:` expressions below. Evaluated
+    # once when the matrix job starts; stable for the rest of the job
+    # (matrix + github contexts don't change mid-job).
+    #
+    # Why each conjunct:
+    #   - Release-only: Debug renders bit-identically to Release (the
+    #     entire WIC + D2D pipeline is software), so running the
+    #     inline-comment flow from both matrix entries would have
+    #     them race on the same sticky comment for no UX gain.
+    #   - pull_request only: there's nowhere to post a sticky comment
+    #     on a push-to-main or tag build.
+    #   - same-repo HEAD only: fork PRs get a read-only GITHUB_TOKEN
+    #     by GitHub design, so marocchino + the orphan-branch push
+    #     would 403 → degrade gracefully to the artifact-only flow.
+    #
+    # The value is the string "true" or "false" (GitHub Actions casts
+    # boolean expressions to strings when stored in env). Step `if:`
+    # checks compare against the literal 'true'.
+    env:
+      INLINE_ELIGIBLE: ${{ matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
 
     steps:
       - name: Checkout (with submodules)
@@ -241,6 +312,55 @@ jobs:
             throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
           }
 
+      # ---- Sticky PR comment: success path ------------------------------
+      #
+      # Counterpart of the failure-path "Post sticky PR comment with
+      # snapshot diff" step below. When the snapshot test passes on a PR
+      # that previously had a failure comment, this step rewrites that
+      # comment to "now passing" so reviewers aren't misled by stale
+      # failure UI. `only_update: true` makes the step a no-op when no
+      # prior sticky exists (typical case: PR that never failed the
+      # snapshot).
+      #
+      # Step `if:` is implicit `success()` — i.e. this runs only when
+      # the test step (and every earlier step in the job) succeeded.
+      # If the test failed, this step is skipped and the dedicated
+      # failure-path steps below post the diff instead. We gate on
+      # Release-only to mirror the failure path (avoids the Debug and
+      # Release matrix jobs racing on the same comment).
+      #
+      # `head.repo.full_name == github.repository` excludes fork PRs,
+      # where GITHUB_TOKEN is read-only and the action would 403.
+      # Same-repo PRs get the inline experience; fork PRs degrade
+      # gracefully to the artifact-only flow.
+      #
+      # marocchino/sticky-pull-request-comment uses `header:` as the
+      # dedup key — it embeds the value as an HTML comment inside the
+      # body and PATCHes any prior comment matching the same header.
+      # Replaces ~40 lines of hand-rolled `gh api .../comments
+      # --paginate --jq ... | head` plus a PATCH-or-skip switch.
+      #
+      # Body is deliberately stable across pushes (no run_id /
+      # attempt / URL) AND `skip_unchanged: true` is set, so on a PR
+      # that lands its first "now passing" comment, subsequent pushes
+      # see byte-identical content and the action no-ops at the
+      # diff stage (no PATCH call → no `updated_at` bump → no
+      # spurious notification → comment doesn't re-float to the top
+      # of the PR timeline). The green CI status check on each
+      # commit already provides the per-run proof a reviewer would
+      # have clicked through this comment for.
+      - name: Update sticky PR comment if snapshot test now passes
+        if: env.INLINE_ELIGIBLE == 'true'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: ${{ env.STICKY_HEADER }}
+          only_update: true
+          skip_unchanged: true
+          message: |
+            ## Overlay snapshot test now passing
+
+            The overlay snapshot test passes on this PR.
+
       # ---- Snapshot diff artifact (on test failure, Release only) -------
       #
       # When the snapshot test fails ("snapshot diverges from golden: N
@@ -299,6 +419,76 @@ jobs:
           Write-Host "ref_name raw='$rawRef' sanitised='$safeRef'"
           "ARTIFACT_REF_TAG=$safeRef" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # ---- Visual diff PNG (on test failure, Release only) -------------
+      #
+      # odiff is a fast OCaml-backed pixel-diff tool (anti-alias-aware,
+      # parallelised) that compares old.png with new.png and writes a
+      # third PNG where the differing pixels are highlighted over a
+      # desaturated copy of the original. It's distributed as a npm
+      # package (`odiff-bin`) with prebuilt native binaries — Node is
+      # preinstalled on the windows-2022 runner so no setup-node step
+      # is needed.
+      #
+      # Exit codes:
+      #   0  -> images identical (no diff file written) — we shouldn't
+      #         reach this branch because we're gated on failure(), but
+      #         tolerate it just in case the test failed for a
+      #         non-snapshot reason.
+      #   21 -> images differ (diff file written) — the expected path.
+      #   *  -> tool error — warn and continue without a diff image.
+      - name: Generate visual diff PNG (on test failure)
+        if: failure() && matrix.configuration == 'Release'
+        shell: bash
+        run: |
+          NEW=artifact/snapshot-diff/new/overlay_snapshot.png
+          OLD=artifact/snapshot-diff/old/overlay_snapshot.png
+          DIFF=artifact/snapshot-diff/diff/overlay_snapshot.png
+
+          if [ ! -f "$NEW" ] || [ ! -f "$OLD" ]; then
+            echo "Need both old.png and new.png to compute a diff - skipping."
+            exit 0
+          fi
+
+          mkdir -p artifact/snapshot-diff/diff
+          # Pin the version — odiff-bin's Windows packaging has shifted
+          # between releases (see broken-shim workaround below); pinning
+          # protects against silent upstream regressions. Bump deliberately
+          # after re-testing the shim workaround against the new version.
+          npm install -g odiff-bin@4.3.8 --silent
+
+          # The npm-generated Windows launcher for odiff-bin is broken:
+          # it passes the native .exe to `node`, which then tries to
+          # parse the PE binary as JavaScript and fails on the `MZ`
+          # header byte ("SyntaxError: Invalid or unexpected token").
+          # Observed on the first odiff run, log lines:
+          #     C:\npm\prefix\node_modules\odiff-bin\bin\odiff.exe:1
+          #     MZx
+          #     SyntaxError: Invalid or unexpected token
+          # Bypass the shim by invoking the binary directly at its
+          # installed path under `npm root -g`. Mixed `/` + `\`
+          # separators are fine — Windows accepts either.
+          NPM_ROOT="$(npm root -g)"
+          ODIFF_BIN="${NPM_ROOT}/odiff-bin/bin/odiff.exe"
+          if [ ! -f "$ODIFF_BIN" ]; then
+            echo "::warning::odiff binary not found at $ODIFF_BIN - diff step skipped."
+            exit 0
+          fi
+          echo "odiff binary: $ODIFF_BIN"
+
+          # set +e because odiff returns non-zero on diff (which is
+          # the whole point here) and we want to inspect the exit code
+          # rather than tripping `set -e`.
+          set +e
+          "$ODIFF_BIN" "$OLD" "$NEW" "$DIFF" --diff-color "#ff00ff"
+          rc=$?
+          set -e
+
+          case "$rc" in
+            0)  echo "odiff: images identical - no diff file produced." ;;
+            21) echo "odiff: images differ - diff written to $DIFF ($(wc -c < "$DIFF") bytes)." ;;
+            *)  echo "::warning::odiff exited $rc - diff image may be missing." ;;
+          esac
+
       - name: Upload snapshot diff (on test failure)
         if: failure() && matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4
@@ -310,6 +500,291 @@ jobs:
           name: overlay-snapshot-diff-${{ env.ARTIFACT_REF_TAG }}-${{ github.run_attempt }}
           path: artifact/snapshot-diff/
           if-no-files-found: warn
+
+      # ---- Inline PR comment: push diff PNGs to orphan branch -----------
+      #
+      # GitHub artifacts (the step above) are downloadable ZIPs — they
+      # do NOT render inline in PR comments or in the PR description.
+      # To show the old-vs-new diff at-a-glance to a reviewer, the
+      # PNGs need to live at an URL that GitHub-Flavoured Markdown
+      # will embed via `![alt](url)`. The cleanest GitHub-native
+      # storage for that is an orphan branch in this same repo —
+      # referenced from the comment via
+      # `github.com/<owner>/<repo>/raw/<sha>/...` URLs (NOT the
+      # `raw.githubusercontent.com` form, which is an unauthenticated
+      # CDN that 404s for private repos — see the URL construction in
+      # the upsert step below).
+      #
+      # Why orphan branch and not `main`:
+      #   - binary PNGs would bloat `main`'s history forever
+      #   - a dedicated branch can be pruned (per-PR folders deleted
+      #     when the PR closes) without rewriting `main`'s history
+      #
+      # Path layout: `pr-<num>/run-<id>-attempt-<k>/{old,new}.png`.
+      # Per-attempt folders avoid filename collisions when CI is
+      # re-run and let reviewers compare different attempts.
+      #
+      # Why pin the raw URL on a commit SHA rather than the branch
+      # ref: branch-tipped URLs are mutated by every subsequent push,
+      # so the PR comment from run 7 would silently show run 9's
+      # PNGs after a re-run. SHA-pinned URLs are immutable.
+      #
+      # `pull_request` + same-repo gate: fork PRs get a read-only
+      # GITHUB_TOKEN (GitHub design), so the push would 403. They
+      # fall back to downloading the artifact above.
+      - name: Push snapshot diff to preview branch (on test failure)
+        if: failure() && env.INLINE_ELIGIBLE == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Bail early if the staging step above produced nothing —
+          # the test likely bailed before the PNG encoder ran. The
+          # downstream comment step uses PREVIEW_SHA being non-empty
+          # to decide whether to post.
+          if [ ! -f artifact/snapshot-diff/new/overlay_snapshot.png ] \
+             && [ ! -f artifact/snapshot-diff/old/overlay_snapshot.png ]; then
+            echo "::warning::No staged PNGs - skipping inline snapshot comment; reviewer falls back to artifact zip."
+            exit 0
+          fi
+
+          REL_PATH="pr-${PR_NUMBER}/run-${RUN_ID}-attempt-${RUN_ATTEMPT}"
+          # `${REL_PATH%/*}` strips the trailing `/<segment>` from
+          # REL_PATH — the per-PR parent directory. Used by the
+          # cleanup below; deriving it here means a future layout
+          # change (e.g. `previews/pr-N/run-X-attempt-Y/`) only
+          # needs REL_PATH bumped — the cleanup follows.
+          PR_PREFIX="${REL_PATH%/*}"
+
+          # Copy the PNGs OUT of the workspace before checking out the
+          # orphan branch — `git checkout --orphan` followed by
+          # `git rm -rf .` would otherwise wipe them. Looped + if/fi
+          # rather than `[ -f ] && cp` because the latter's `set -e`
+          # interaction is brittle (works on bash 4+ but not formally
+          # guaranteed when the failing test is the simple command of
+          # a list).
+          STAGE_DIR="$(mktemp -d)"
+          for kind in new old diff; do
+            src="artifact/snapshot-diff/$kind/overlay_snapshot.png"
+            if [ -f "$src" ]; then
+              cp "$src" "$STAGE_DIR/$kind.png"
+            fi
+          done
+
+          # Fresh clone of just the preview branch (or init if it
+          # doesn't exist yet) into a temp dir. Working outside
+          # GITHUB_WORKSPACE avoids polluting the matrix job's tree.
+          # GITHUB_SERVER_URL is `https://github.com` on github.com and
+          # the GHES base URL elsewhere — strip the scheme to build
+          # the credentialed remote.
+          PREVIEW_DIR="$(mktemp -d)"
+          cd "$PREVIEW_DIR"
+          git init -q
+          GIT_HOST="${GITHUB_SERVER_URL#https://}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@${GIT_HOST}/${REPO}.git"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin "$PREVIEW_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$PREVIEW_BRANCH"
+            git checkout -q "$PREVIEW_BRANCH"
+          else
+            # First-ever failure on this repo: seed the orphan branch
+            # with a README explaining what it is.
+            git checkout -q --orphan "$PREVIEW_BRANCH"
+            cat > README.md <<'README_EOF'
+          # snapshot-previews
+
+          Auto-managed branch carrying overlay snapshot diff PNGs referenced from
+          PR comments posted by `build-and-release.yml` on snapshot test failure.
+
+          Each `pr-<n>/run-<id>-attempt-<k>/` folder corresponds to one snapshot
+          test failure on a PR and contains `old.png` (the committed golden at
+          the time the test ran) plus `new.png` (the fresh render that failed
+          comparison).
+
+          Folders under a `pr-<n>/` prefix for closed PRs are safe to garbage
+          collect — no code references them once the PR is merged or closed.
+
+          Do not commit anything to this branch by hand.
+          README_EOF
+            git add README.md
+          fi
+
+          # Drop earlier attempts of this same PR to keep the orphan
+          # branch from accumulating PNGs that nothing references
+          # anymore — the sticky comment always points to the latest
+          # attempt. `git rm -rqf` (rather than `rm -rf`) records the
+          # deletions in the commit we're about to create. PR_PREFIX
+          # is derived from REL_PATH above, so layout changes propagate.
+          if [ -d "$PR_PREFIX" ]; then
+            git rm -rqf "$PR_PREFIX" >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p "$REL_PATH"
+          for kind in new old diff; do
+            if [ -f "$STAGE_DIR/$kind.png" ]; then
+              cp "$STAGE_DIR/$kind.png" "$REL_PATH/$kind.png"
+            fi
+          done
+          git add "$REL_PATH"
+          git commit -m "preview: snapshot diff for PR #${PR_NUMBER} run ${RUN_ID} attempt ${RUN_ATTEMPT}"
+
+          # One retry on race: two concurrent failing PRs both
+          # pushing at once. Per-PR/per-run paths can't conflict, so
+          # rebase-then-push is conflict-free in practice.
+          if ! git push origin "$PREVIEW_BRANCH"; then
+            echo "Push collided - rebasing onto remote and retrying..."
+            git fetch origin "$PREVIEW_BRANCH"
+            if ! git rebase "origin/$PREVIEW_BRANCH"; then
+              git rebase --abort 2>/dev/null || true
+              echo "::warning::Snapshot push collided and rebase failed (likely concurrent first-time README seed) - skipping inline comment; reviewer falls back to artifact zip."
+              exit 0
+            fi
+            if ! git push origin "$PREVIEW_BRANCH"; then
+              echo "::warning::Snapshot push retry failed - skipping inline comment; reviewer falls back to artifact zip."
+              exit 0
+            fi
+          fi
+
+          PREVIEW_SHA="$(git rev-parse HEAD)"
+          {
+            echo "PREVIEW_SHA=${PREVIEW_SHA}"
+            echo "PREVIEW_REL_PATH=${REL_PATH}"
+            [ -f "$REL_PATH/new.png" ]  && echo "PREVIEW_HAS_NEW=true"  || echo "PREVIEW_HAS_NEW=false"
+            [ -f "$REL_PATH/old.png" ]  && echo "PREVIEW_HAS_OLD=true"  || echo "PREVIEW_HAS_OLD=false"
+            [ -f "$REL_PATH/diff.png" ] && echo "PREVIEW_HAS_DIFF=true" || echo "PREVIEW_HAS_DIFF=false"
+          } >> "$GITHUB_ENV"
+
+      # ---- Inline PR comment: compose body ------------------------------
+      #
+      # Builds the markdown body for the sticky comment, conditional on
+      # which PNGs the push step above managed to upload to the orphan
+      # branch. The body is written to a workspace file so the
+      # marocchino step below can consume it via `path:` — cleaner than
+      # smuggling a multi-line body through `$GITHUB_ENV`.
+      #
+      # `env.PREVIEW_SHA != ''` guards the case where the push step
+      # bailed (no staged PNGs / push collision retry failed). Without
+      # it, this step would compose a body with broken URLs.
+      - name: Compose snapshot diff comment body
+        if: failure() && env.INLINE_ELIGIBLE == 'true' && env.PREVIEW_SHA != ''
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PREVIEW_SHA: ${{ env.PREVIEW_SHA }}
+          PREVIEW_REL_PATH: ${{ env.PREVIEW_REL_PATH }}
+          PREVIEW_HAS_NEW: ${{ env.PREVIEW_HAS_NEW }}
+          PREVIEW_HAS_OLD: ${{ env.PREVIEW_HAS_OLD }}
+          PREVIEW_HAS_DIFF: ${{ env.PREVIEW_HAS_DIFF }}
+        run: |
+          set -euo pipefail
+
+          # <server>/<repo>/raw/<ref>/<path> (NOT raw.githubusercontent.com/...)
+          # because the latter is an unauthenticated CDN and 404s for
+          # private repos — same-domain .../raw/ goes through the
+          # authenticated frontend that 302s to a signed CDN URL for
+          # logged-in users with repo access. Pattern lifted from
+          # opengisch/comment-pr-with-images (their `_get_github_image_url`).
+          # GITHUB_SERVER_URL is `https://github.com` on github.com and
+          # the GHES base URL elsewhere.
+          BASE_URL="${GITHUB_SERVER_URL}/${REPO}/raw/${PREVIEW_SHA}/${PREVIEW_REL_PATH}"
+          RUN_URL="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
+          UPDATE_WORKFLOW_URL="${GITHUB_SERVER_URL}/${REPO}/actions/workflows/update-overlay-snapshot.yml"
+
+          # Compose the diff body conditionally on which PNGs the
+          # push step managed to upload. Most common case is both
+          # present (standard pixel diff).
+          # Table header labels are intentionally short and symmetric
+          # ("Actual" / "Expected") so the two markdown columns get
+          # the same auto-layout width — long asymmetric labels make
+          # the right column narrower and the image inside it visually
+          # smaller. Column order matches the typical test-runner
+          # ordering: actual (what we got, this PR's fresh render)
+          # first, expected (golden) second.
+          if [ "$PREVIEW_HAS_OLD" = "true" ] && [ "$PREVIEW_HAS_NEW" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          | Actual | Expected |
+          |:--:|:--:|
+          | ![actual](${BASE_URL}/new.png) | ![expected](${BASE_URL}/old.png) |
+          EOF
+          )
+          elif [ "$PREVIEW_HAS_OLD" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          **Only the expected golden was captured** — the test bailed before producing the actual render. See the [run log](${RUN_URL}) for the first failed REQUIRE.
+
+          ![expected](${BASE_URL}/old.png)
+          EOF
+          )
+          elif [ "$PREVIEW_HAS_NEW" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          **Only the actual render was captured** — no expected golden exists yet (first-time seed).
+
+          ![actual](${BASE_URL}/new.png)
+          EOF
+          )
+          else
+            DIFF_BODY="_No PNGs were captured. See [run log](${RUN_URL})._"
+          fi
+
+          # Full-width visual diff (changed pixels highlighted in
+          # magenta over a desaturated copy of the original) goes
+          # below the side-by-side table. We use a raw `<img>` tag
+          # with `width="100%"` rather than the markdown `![]()`
+          # form because the latter renders at the image's natural
+          # 720px and leaves dead space on the right of the comment
+          # container (which is wider). GitHub's HTML sanitiser
+          # allows the `width` attribute on `<img>`.
+          if [ "$PREVIEW_HAS_DIFF" = "true" ]; then
+            DIFF_VISUAL=$(cat <<EOF
+
+
+          **Pixel diff** (changed pixels in magenta):
+
+          <img src="${BASE_URL}/diff.png" alt="diff" width="100%">
+          EOF
+          )
+          else
+            DIFF_VISUAL=""
+          fi
+
+          # No leading marker line — marocchino injects its own HTML-
+          # comment dedup key derived from `header:` at post time.
+          cat > snapshot-comment-body.md <<EOF
+          ## Overlay snapshot test failed
+
+          The overlay snapshot test failed on run [\`${RUN_ID}\` attempt ${RUN_ATTEMPT}](${RUN_URL}).
+
+          ${DIFF_BODY}
+          ${DIFF_VISUAL}
+
+          <sub>If the new render is the intended change, run the [\`Update overlay snapshot golden\`](${UPDATE_WORKFLOW_URL}) workflow on this branch with \`commit\` ticked to update the baseline. Raw PNGs are also available as a downloadable artifact attached to this run.</sub>
+          EOF
+
+      # ---- Inline PR comment: post via marocchino -----------------------
+      #
+      # Replaces the hand-rolled "look up comment by HTML-comment marker,
+      # then PATCH or POST" pattern (~25 lines of `gh api --paginate
+      # --jq | head -n1` plus a switch) with the canonical
+      # sticky-pull-request-comment action. `header:` is the dedup key —
+      # the action embeds it as an HTML comment inside the body and
+      # treats matching headers as the same sticky. Default behaviour
+      # is create-or-update, which is what we want here. The body file
+      # is produced by the compose step above.
+      - name: Post sticky PR comment with snapshot diff
+        if: failure() && env.INLINE_ELIGIBLE == 'true' && env.PREVIEW_SHA != ''
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: ${{ env.STICKY_HEADER }}
+          path: snapshot-comment-body.md
 
       # ---- Inno Setup installer (Release only) --------------------------
       # Produces a single Setup.exe that installs the DLL + JSON manifest

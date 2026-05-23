@@ -51,6 +51,7 @@
 #include <log.h>
 #include <utils/default_settings_template.h>
 #include <utils/hotkey.h>
+#include <utils/name_utils.h>
 #include <utils/settings.h>
 
 #include <chrono>
@@ -114,6 +115,23 @@ namespace {
         // the bypass / hotkey branches without depending on the layer's
         // bootstrap path.
         const std::filesystem::path& tempDir() const { return m_tempDir; }
+
+        // Pre-write a per-app settings file that explicitly enables log
+        // writing. The in-binary default and the installer template both
+        // ship `log.enabled = false` (opt-in feature, matches the
+        // overlay convention), so any test that needs the layer to
+        // produce a CSV must call this BEFORE startLayer. The file
+        // basename comes from sanitizeForFilename so the bypass-style
+        // hand-rolled path (`bypasstest_settings.json`) and this helper
+        // stay in lockstep with what the layer's resolvePerAppConfigPath
+        // looks up.
+        void enableLog(const char* appName) {
+            const auto perAppPath = m_tempDir /
+                (openxr_api_layer::sanitizeForFilename(appName) + "_settings.json");
+            std::ofstream out(perAppPath);
+            REQUIRE(out.is_open());
+            out << R"({"log":{"enabled":true}})";
+        }
 
         // Common setup: wire the singleton to the mock runtime and call
         // xrCreateInstance. Resolves m_xrWaitFrame / m_xrBeginFrame /
@@ -276,6 +294,7 @@ namespace {
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: xrCreateInstance creates a session CSV with the expected header") {
     TelemetryFixture fix;
+    fix.enableLog("HelloXR");
     fix.startLayer("HelloXR");
 
     const auto csv = findSessionCsv(fix.sessionsDir());
@@ -305,6 +324,7 @@ TEST_CASE("telemetry: app names with special characters are sanitised in the CSV
     // The OpenXR spec caps applicationName at 128 chars; pick a name with
     // every character class the sanitiser handles plus one valid alnum
     // sentinel on each side so we can spot the boundary.
+    fix.enableLog("A<B>C:D\"E/F\\G|H?I*J K-_.");
     fix.startLayer("A<B>C:D\"E/F\\G|H?I*J K-_."); // mixed: alnum, dashes, dots, junk
 
     const auto csv = findSessionCsv(fix.sessionsDir());
@@ -337,6 +357,7 @@ TEST_CASE("telemetry: app names with special characters are sanitised in the CSV
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: empty app name falls back to 'unknown'") {
     TelemetryFixture fix;
+    fix.enableLog("");
     fix.startLayer("");
     const auto csv = findSessionCsv(fix.sessionsDir());
     REQUIRE(csv.has_value());
@@ -351,6 +372,7 @@ TEST_CASE("telemetry: empty app name falls back to 'unknown'") {
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: probe XrInstance (no frames) deletes the empty CSV on destroy") {
     TelemetryFixture fix;
+    fix.enableLog("ProbeApp");
     auto* api = fix.startLayer("ProbeApp");
 
     // File exists right after Create (header was written).
@@ -371,6 +393,7 @@ TEST_CASE("telemetry: probe XrInstance (no frames) deletes the empty CSV on dest
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: one frame produces one CSV data row + footer") {
     TelemetryFixture fix;
+    fix.enableLog("SingleFrameApp");
     auto* api = fix.startLayer("SingleFrameApp");
 
     driveOneFrame(api);
@@ -407,6 +430,7 @@ TEST_CASE("telemetry: one frame produces one CSV data row + footer") {
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: frame_total_ns is 0 on frame 0 and positive thereafter") {
     TelemetryFixture fix;
+    fix.enableLog("MultiFrameApp");
     auto* api = fix.startLayer("MultiFrameApp");
 
     constexpr int kFrames = 5;
@@ -454,6 +478,7 @@ TEST_CASE("telemetry: per-frame timing columns are non-negative and self-consist
     // enough to dominate measurement noise and we can assert > 0.
     mock::state().waitFrameSleepMicros = 1000;
 
+    fix.enableLog("WaitBlockApp");
     auto* api = fix.startLayer("WaitBlockApp");
     constexpr int kFrames = 3;
     for (int i = 0; i < kFrames; ++i) {
@@ -498,6 +523,16 @@ TEST_CASE("telemetry: per-frame timing columns are non-negative and self-consist
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: double xrCreateInstance on the same singleton survives") {
     TelemetryFixture fix;
+    fix.enableLog("FirstInit");
+    // Enable log for the SECOND app name too: under the opt-in default
+    // the second xrCreateInstance re-reads settings keyed on the new
+    // applicationName, and without a per-app file it would fall back to
+    // log.enabled=false → both features off → m_bypassApiLayer=true,
+    // which clobbers the first call's recording state. With log enabled
+    // on both, the second call hits CsvWriter::start's idempotent guard
+    // (the original purpose of this test) and the first init's CSV
+    // remains the single on-disk artefact.
+    fix.enableLog("SecondInit");
     auto* api = fix.startLayer("FirstInit");
 
     // Without destroying, drive a second xrCreateInstance through the layer.
@@ -530,6 +565,7 @@ TEST_CASE("telemetry: should_render XR_FALSE is recorded as 0 in the CSV") {
     TelemetryFixture fix;
     mock::state().shouldRender = XR_FALSE;
 
+    fix.enableLog("SkippedFrameApp");
     auto* api = fix.startLayer("SkippedFrameApp");
     driveOneFrame(api);
     openxr_api_layer::ResetInstance();
@@ -573,6 +609,7 @@ TEST_CASE("telemetry: layer is pure pass-through w.r.t. downstream call counts")
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: gpu_time_ns is 0 and gpu_headroom_pct is 100% when no D3D11 binding is set up") {
     TelemetryFixture fix;
+    fix.enableLog("NoGpuTimingApp");
     auto* api = fix.startLayer("NoGpuTimingApp");
 
     constexpr int kFrames = 3;
