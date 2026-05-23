@@ -12,9 +12,16 @@ on:
   workflow_dispatch:
 
 # The release job needs `contents: write` to create GitHub releases
-# and attach assets to them.
+# and attach assets to them. The build job additionally needs:
+#   - contents: write   -> push snapshot diff PNGs to the orphan
+#                          `snapshot-previews` branch on test failure.
+#   - pull-requests: write -> create / update the sticky PR comment
+#                          showing the old-vs-new diff inline.
+# Both extra usages are gated on `pull_request` + same-repo HEAD so
+# fork PRs (read-only GITHUB_TOKEN by GitHub design) just skip them.
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   SOLUTION: XR_APILAYER_MLEDOUR_xr_telemetry.sln
@@ -241,6 +248,62 @@ jobs:
             throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
           }
 
+      # ---- Sticky PR comment: success path ------------------------------
+      #
+      # Counterpart of "Upsert sticky PR comment with snapshot diff" below.
+      # When the snapshot test passes on a PR that previously had a
+      # failure comment, this step rewrites that comment to "now
+      # passing" so reviewers aren't misled by stale failure UI. No-op
+      # if no prior sticky comment exists for this PR.
+      #
+      # Step `if:` is implicit `success()` — i.e. this runs only when
+      # the test step (and every earlier step in the job) succeeded.
+      # If the test failed, this step is skipped and the dedicated
+      # failure-path step below posts the diff instead. We gate on
+      # Release-only to mirror the failure path (avoids the Debug and
+      # Release matrix jobs racing on the same comment ID).
+      #
+      # `head.repo.full_name == github.repository` excludes fork PRs,
+      # where GITHUB_TOKEN is read-only and `gh api PATCH` would 403.
+      # Same-repo PRs get the inline experience; fork PRs degrade
+      # gracefully to the artifact-only flow.
+      - name: Update sticky PR comment if snapshot test now passes
+        if: matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Pull ALL comments (paginated) then jq-filter for the
+          # marker. Two-stage capture (full output, then head -n1) so
+          # we never SIGPIPE gh under `set -o pipefail`. Empty result
+          # = no prior sticky comment, treat as no-op.
+          ALL_IDS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- snapshot-preview-bot -->"))) | .id')
+          COMMENT_ID=$(echo "$ALL_IDS" | head -n1)
+          if [ -z "$COMMENT_ID" ]; then
+            echo "No prior sticky snapshot comment - nothing to update."
+            exit 0
+          fi
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
+          BODY=$(cat <<EOF
+          <!-- snapshot-preview-bot -->
+          ## Overlay snapshot test now passing
+
+          The overlay snapshot test passes as of run [\`${RUN_ID}\` attempt ${RUN_ATTEMPT}](${RUN_URL}).
+          EOF
+          )
+          # Use --input via jq so the JSON body is correctly escaped
+          # regardless of newlines / backticks / pipes in BODY.
+          jq -n --arg body "$BODY" '{body: $body}' \
+            | gh api --method PATCH "repos/${REPO}/issues/comments/${COMMENT_ID}" --input -
+          echo "Updated sticky comment ${COMMENT_ID} to 'now passing'."
+
       # ---- Snapshot diff artifact (on test failure, Release only) -------
       #
       # When the snapshot test fails ("snapshot diverges from golden: N
@@ -310,6 +373,224 @@ jobs:
           name: overlay-snapshot-diff-${{ env.ARTIFACT_REF_TAG }}-${{ github.run_attempt }}
           path: artifact/snapshot-diff/
           if-no-files-found: warn
+
+      # ---- Inline PR comment: push diff PNGs to orphan branch -----------
+      #
+      # GitHub artifacts (the step above) are downloadable ZIPs — they
+      # do NOT render inline in PR comments or in the PR description.
+      # To show the old-vs-new diff at-a-glance to a reviewer, the
+      # PNGs need to live at an URL that GitHub-Flavoured Markdown
+      # will embed via `![alt](url)`. The cleanest GitHub-native
+      # storage for that is an orphan branch in this same repo —
+      # `raw.githubusercontent.com/<owner>/<repo>/<sha>/...` URLs
+      # render inline and are cacheable by commit SHA.
+      #
+      # Why orphan branch and not `main`:
+      #   - binary PNGs would bloat `main`'s history forever
+      #   - a dedicated branch can be pruned (per-PR folders deleted
+      #     when the PR closes) without rewriting `main`'s history
+      #
+      # Path layout: `pr-<num>/run-<id>-attempt-<k>/{old,new}.png`.
+      # Per-attempt folders avoid filename collisions when CI is
+      # re-run and let reviewers compare different attempts.
+      #
+      # Why pin the raw URL on a commit SHA rather than the branch
+      # ref: branch-tipped URLs are mutated by every subsequent push,
+      # so the PR comment from run 7 would silently show run 9's
+      # PNGs after a re-run. SHA-pinned URLs are immutable.
+      #
+      # `pull_request` + same-repo gate: fork PRs get a read-only
+      # GITHUB_TOKEN (GitHub design), so the push would 403. They
+      # fall back to downloading the artifact above.
+      - name: Push snapshot diff to preview branch (on test failure)
+        if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Bail early if the staging step above produced nothing —
+          # the test likely bailed before the PNG encoder ran. The
+          # downstream comment step uses PREVIEW_SHA being non-empty
+          # to decide whether to post.
+          if [ ! -f artifact/snapshot-diff/new/overlay_snapshot.png ] \
+             && [ ! -f artifact/snapshot-diff/old/overlay_snapshot.png ]; then
+            echo "No staged PNGs - nothing to push."
+            exit 0
+          fi
+
+          REL_PATH="pr-${PR_NUMBER}/run-${RUN_ID}-attempt-${RUN_ATTEMPT}"
+
+          # Copy the PNGs OUT of the workspace before checking out the
+          # orphan branch — `git checkout --orphan` followed by
+          # `git rm -rf .` would otherwise wipe them.
+          STAGE_DIR="$(mktemp -d)"
+          [ -f artifact/snapshot-diff/new/overlay_snapshot.png ] \
+            && cp artifact/snapshot-diff/new/overlay_snapshot.png "$STAGE_DIR/new.png"
+          [ -f artifact/snapshot-diff/old/overlay_snapshot.png ] \
+            && cp artifact/snapshot-diff/old/overlay_snapshot.png "$STAGE_DIR/old.png"
+
+          # Fresh clone of just the preview branch (or init if it
+          # doesn't exist yet) into a temp dir. Working outside
+          # GITHUB_WORKSPACE avoids polluting the matrix job's tree.
+          PREVIEW_DIR="$(mktemp -d)"
+          cd "$PREVIEW_DIR"
+          git init -q
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin snapshot-previews >/dev/null 2>&1; then
+            git fetch --depth=1 origin snapshot-previews
+            git checkout -q snapshot-previews
+          else
+            # First-ever failure on this repo: seed the orphan branch
+            # with a README explaining what it is.
+            git checkout -q --orphan snapshot-previews
+            cat > README.md <<'README_EOF'
+          # snapshot-previews
+
+          Auto-managed branch carrying overlay snapshot diff PNGs referenced from
+          PR comments posted by `build-and-release.yml` on snapshot test failure.
+
+          Each `pr-<n>/run-<id>-attempt-<k>/` folder corresponds to one snapshot
+          test failure on a PR and contains `old.png` (the committed golden at
+          the time the test ran) plus `new.png` (the fresh render that failed
+          comparison).
+
+          Folders under a `pr-<n>/` prefix for closed PRs are safe to garbage
+          collect — no code references them once the PR is merged or closed.
+
+          Do not commit anything to this branch by hand.
+          README_EOF
+            git add README.md
+          fi
+
+          mkdir -p "$REL_PATH"
+          [ -f "$STAGE_DIR/new.png" ] && cp "$STAGE_DIR/new.png" "$REL_PATH/new.png"
+          [ -f "$STAGE_DIR/old.png" ] && cp "$STAGE_DIR/old.png" "$REL_PATH/old.png"
+          git add "$REL_PATH"
+          git commit -m "preview: snapshot diff for PR #${PR_NUMBER} run ${RUN_ID} attempt ${RUN_ATTEMPT}"
+
+          # One retry on race: two concurrent failing PRs both
+          # pushing at once. Per-PR/per-run paths can't conflict, so
+          # rebase-then-push is conflict-free in practice.
+          if ! git push origin snapshot-previews; then
+            echo "Push collided - rebasing onto remote and retrying..."
+            git fetch origin snapshot-previews
+            if ! git rebase origin/snapshot-previews; then
+              git rebase --abort 2>/dev/null || true
+              echo "Rebase failed unexpectedly - skipping inline comment; reviewer falls back to artifact."
+              exit 0
+            fi
+            if ! git push origin snapshot-previews; then
+              echo "Retry push failed - skipping inline comment; reviewer falls back to artifact."
+              exit 0
+            fi
+          fi
+
+          PREVIEW_SHA="$(git rev-parse HEAD)"
+          {
+            echo "PREVIEW_SHA=${PREVIEW_SHA}"
+            echo "PREVIEW_REL_PATH=${REL_PATH}"
+            [ -f "$REL_PATH/new.png" ] && echo "PREVIEW_HAS_NEW=true" || echo "PREVIEW_HAS_NEW=false"
+            [ -f "$REL_PATH/old.png" ] && echo "PREVIEW_HAS_OLD=true" || echo "PREVIEW_HAS_OLD=false"
+          } >> "$GITHUB_ENV"
+
+      # ---- Inline PR comment: upsert sticky comment ---------------------
+      #
+      # Looks up the sticky comment by an HTML-comment marker
+      # (`<!-- snapshot-preview-bot -->`) authored by
+      # `github-actions[bot]`. If present, PATCH; otherwise POST.
+      # Single comment per PR — re-runs and new pushes update it in
+      # place rather than spamming the PR with one per failure.
+      #
+      # `env.PREVIEW_SHA != ''` guards the case where the push step
+      # above bailed (no staged PNGs / push collision retry failed).
+      # Without it, this step would post a comment with broken
+      # raw.githubusercontent.com URLs.
+      - name: Upsert sticky PR comment with snapshot diff
+        if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && env.PREVIEW_SHA != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          PREVIEW_SHA: ${{ env.PREVIEW_SHA }}
+          PREVIEW_REL_PATH: ${{ env.PREVIEW_REL_PATH }}
+          PREVIEW_HAS_NEW: ${{ env.PREVIEW_HAS_NEW }}
+          PREVIEW_HAS_OLD: ${{ env.PREVIEW_HAS_OLD }}
+        run: |
+          set -euo pipefail
+
+          BASE_URL="https://raw.githubusercontent.com/${REPO}/${PREVIEW_SHA}/${PREVIEW_REL_PATH}"
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
+          UPDATE_WORKFLOW_URL="https://github.com/${REPO}/actions/workflows/update-overlay-snapshot.yml"
+
+          # Compose the diff body conditionally on which PNGs the
+          # push step managed to upload. Most common case is both
+          # present (standard pixel diff).
+          if [ "$PREVIEW_HAS_OLD" = "true" ] && [ "$PREVIEW_HAS_NEW" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          | Current golden (\`screenshots/overlay_snapshot.png\`) | New render (this PR) |
+          |:--:|:--:|
+          | ![old](${BASE_URL}/old.png) | ![new](${BASE_URL}/new.png) |
+          EOF
+          )
+          elif [ "$PREVIEW_HAS_OLD" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          **Only the current golden was captured** — the test bailed before producing the new PNG. See the [run log](${RUN_URL}) for the first failed REQUIRE.
+
+          ![old](${BASE_URL}/old.png)
+          EOF
+          )
+          elif [ "$PREVIEW_HAS_NEW" = "true" ]; then
+            DIFF_BODY=$(cat <<EOF
+          **Only the new render was captured** — no current golden exists yet (first-time seed).
+
+          ![new](${BASE_URL}/new.png)
+          EOF
+          )
+          else
+            DIFF_BODY="_No PNGs were captured. See [run log](${RUN_URL})._"
+          fi
+
+          BODY=$(cat <<EOF
+          <!-- snapshot-preview-bot -->
+          ## Overlay snapshot test failed
+
+          The overlay snapshot test failed on run [\`${RUN_ID}\` attempt ${RUN_ATTEMPT}](${RUN_URL}).
+
+          ${DIFF_BODY}
+
+          <sub>If the new render is the intended change, run the [\`Update overlay snapshot golden\`](${UPDATE_WORKFLOW_URL}) workflow on this branch with \`commit\` ticked to update the baseline. Raw PNGs are also available as a downloadable artifact attached to this run.</sub>
+          EOF
+          )
+
+          # Two-stage capture (full output, then head) so we never
+          # SIGPIPE gh under `set -o pipefail` — same pattern as the
+          # success-path step above.
+          ALL_IDS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- snapshot-preview-bot -->"))) | .id')
+          COMMENT_ID=$(echo "$ALL_IDS" | head -n1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing sticky comment ${COMMENT_ID}"
+            jq -n --arg body "$BODY" '{body: $body}' \
+              | gh api --method PATCH "repos/${REPO}/issues/comments/${COMMENT_ID}" --input -
+          else
+            echo "Creating new sticky comment"
+            jq -n --arg body "$BODY" '{body: $body}' \
+              | gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input -
+          fi
 
       # ---- Inno Setup installer (Release only) --------------------------
       # Produces a single Setup.exe that installs the DLL + JSON manifest
