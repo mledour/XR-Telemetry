@@ -589,11 +589,19 @@ jobs:
           # to one config key. GitHub Actions masks GITHUB_TOKEN in
           # logs either way, but extraheader is the safer default —
           # pattern lifted from actions/checkout.
+          #
+          # Scheme: HTTP Basic with `x-access-token:<token>` base64-
+          # encoded. GitHub's git HTTPS endpoint rejects bearer (the
+          # REST API accepts it, but git operations do not), so the
+          # token must be wrapped as Basic auth even though we're
+          # only using it for `git push` / `git fetch`.
           PREVIEW_DIR="$(mktemp -d)"
           cd "$PREVIEW_DIR"
           git init -q
           git remote add origin "${GITHUB_SERVER_URL}/${REPO}.git"
-          git config --local http.extraheader "AUTHORIZATION: bearer ${GH_TOKEN}"
+          BASIC_AUTH=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')
+          git config --local http.extraheader "AUTHORIZATION: basic ${BASIC_AUTH}"
+          unset BASIC_AUTH
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
