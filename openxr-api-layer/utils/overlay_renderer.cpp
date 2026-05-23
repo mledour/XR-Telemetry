@@ -117,6 +117,15 @@ namespace openxr_api_layer::detail {
         constexpr float kSectionGap     = 14.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
+        // Chamfer (corner-cut) sizes, in pixels at native texture
+        // resolution. The outer frame uses 12 px to read clearly at
+        // HMD viewing distance; inner panels use a smaller cut so the
+        // section corners read as "matching" the outer chamfer
+        // without dominating the layout (the panels are 6-10× smaller
+        // in area than the outer frame).
+        constexpr float kOuterFrameChamferPx = 12.0f;
+        constexpr float kPanelChamferPx      =  6.0f;
+
         // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
         // FPS value AND the kFontTinyLabel (17 px) label above it,
         // plus paragraph-centring margins on both. Without the bump,
@@ -179,6 +188,15 @@ namespace openxr_api_layer::detail {
         // breathing room above and below.
         constexpr float kHeaderSepInsetY      =  8.0f;
         constexpr float kBottomSepInsetY      = 14.0f;
+        // Horizontal skew applied to the column separator lines so
+        // they lean diagonally (top-right → bottom-left) rather than
+        // dropping straight down. Picked to match the "/" cuts in the
+        // design's KPI strip: the line's top endpoint sits at
+        // x + skewPx, the bottom at x - skewPx. With the header's
+        // ~74 px effective length (90 − 2×8) this gives ~6° tilt;
+        // bottom panel's ~102 px gives ~4.5° (less tilt over the
+        // taller panel preserves visual harmony).
+        constexpr float kDividerSkewPx        =  4.0f;
         // Bottom margin for the big value text inside each bottom-
         // panel cell (drawCell's text rect). Keeps the descender of
         // glyphs like the "9" tail in "99" clear of the panel edge.
@@ -548,7 +566,7 @@ namespace openxr_api_layer::detail {
                 const D2D1_RECT_F frameOuter = D2D1::RectF(
                     kOuterPad, kOuterPad,
                     texW - kOuterPad, texH - kOuterPad);
-                drawChamferedRect(rt, frameOuter, 12.0f,
+                drawChamferedRect(rt, frameOuter, kOuterFrameChamferPx,
                                    m_brushBg.Get(),
                                    m_brushFrameLine.Get(), kFrameStroke);
 
@@ -956,13 +974,17 @@ namespace openxr_api_layer::detail {
                 const float w = r - l;
                 const float cellW = w / 5.0f;
 
-                // Vertical separators between cells (4 of them now).
+                // Oblique separators between cells (4 of them now) —
+                // see kDividerSkewPx for the lean direction and
+                // angle. Replaces the previous vertical 1-px lines
+                // to match the design's "/" cuts in the KPI strip.
                 for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kHeaderSepInsetY),
-                        D2D1::Point2F(x, b - kHeaderSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    drawObliqueDivider(rt, x,
+                                        t + kHeaderSepInsetY,
+                                        b - kHeaderSepInsetY,
+                                        kDividerSkewPx,
+                                        m_brushSeparator.Get());
                 }
 
                 const float labelH = 22.0f;
@@ -1274,15 +1296,19 @@ namespace openxr_api_layer::detail {
                 const int  numCols = hasVram ? 3 : 2;
                 const float colW   = (r - l) / static_cast<float>(numCols);
 
-                // Vertical separators between cells. Same brush as
+                // Oblique separators between cells. Same brush as
                 // the panel inner stroke so they read as subtle
-                // column dividers, not hard borders.
+                // column dividers, not hard borders. Lean direction
+                // and angle are shared with drawHeaderBar so the KPI
+                // strip and the bottom panel feel visually
+                // consistent — see kDividerSkewPx.
                 for (int i = 1; i < numCols; ++i) {
                     const float x = l + colW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kBottomSepInsetY),
-                        D2D1::Point2F(x, b - kBottomSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    drawObliqueDivider(rt, x,
+                                        t + kBottomSepInsetY,
+                                        b - kBottomSepInsetY,
+                                        kDividerSkewPx,
+                                        m_brushSeparator.Get());
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -1384,25 +1410,42 @@ namespace openxr_api_layer::detail {
             // Adds a top-edge bevel highlight (lighter) and a
             // bottom-edge bevel shadow (darker) so each panel reads
             // as a slightly raised metal surface, matching the
-            // design spec's industrial-HUD look. The corner-radius
-            // strokes are subtle enough that a straight horizontal
-            // line crossing the panel doesn't break visually.
+            // design spec's industrial-HUD look. Inner panels share
+            // the chamfered (cut-corner) silhouette of the outer
+            // frame so the section corners visually rhyme with the
+            // overall HUD outline; the smaller kPanelChamferPx (vs
+            // the outer 12 px) keeps the section corners from
+            // dominating the per-panel layout.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
-                const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
-                    D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
-                rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
+                const D2D1_RECT_F rect = D2D1::RectF(l, t, r, b);
+                auto path = buildChamferedGeometry(rect, kPanelChamferPx);
 
-                // Subtle carbon-fibre-ish diagonal hatch: thin
-                // diagonal lines at ~6 % alpha across the panel
-                // body. Spaced 6 px apart; at the design's
-                // resolution they read as a very faint texture
-                // hint, never as actual stripes. Drawn BEFORE the
-                // panel separator stroke so the stroke covers the
-                // line ends at the panel edge.
-                drawCarbonHatch(rt, l, t, r, b);
+                // Path build is the only failure surface for the
+                // chamfered shape (D2D factory failure). Falls back
+                // to the previous rounded-rect look so a panel still
+                // paints in the degenerate case — better than a
+                // blank section.
+                if (!path) {
+                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+                        rect, 4.0f, 4.0f);
+                    rt->FillRoundedRectangle(rr, m_brushPanelBg.Get());
+                    drawCarbonHatch(rt, l, t, r, b);
+                    rt->DrawRoundedRectangle(rr, m_brushSeparator.Get(), 1.0f);
+                } else {
+                    rt->FillGeometry(path.Get(), m_brushPanelBg.Get());
 
-                rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
+                    // Subtle carbon-fibre-ish diagonal hatch: thin
+                    // diagonal lines at ~6 % alpha across the panel
+                    // body. Spaced 6 px apart; at the design's
+                    // resolution they read as a very faint texture
+                    // hint, never as actual stripes. Drawn BEFORE
+                    // the panel separator stroke so the stroke
+                    // covers the line ends at the panel edge.
+                    drawCarbonHatch(rt, l, t, r, b);
+
+                    rt->DrawGeometry(path.Get(), m_brushSeparator.Get(), 1.0f);
+                }
                 // Bevel highlight (top edge) and shadow (bottom
                 // edge). Inset by 1.5 px from the panel border so
                 // the bevel lines sit JUST inside the separator
@@ -1457,32 +1500,26 @@ namespace openxr_api_layer::detail {
                 rt->PopAxisAlignedClip();
             }
 
-            // Outer frame with chamfered (cut) corners. Builds an
-            // octagonal-ish closed path: 4 straight edges joined by
-            // 4 diagonal cuts at the corners. `chamfer` is the
-            // diagonal cut length in pixels (12 px matches the
-            // design's industrial-HUD look). Single fill + stroke
-            // pair, no per-corner arc geometry needed.
-            void drawChamferedRect(ID2D1RenderTarget* rt,
-                                     const D2D1_RECT_F& rect,
-                                     float chamfer,
-                                     ID2D1Brush* fillBrush,
-                                     ID2D1Brush* strokeBrush,
-                                     float strokeWidth) const {
+            // Build the closed octagonal path geometry for a
+            // chamfered rect: 4 straight edges joined by 4 diagonal
+            // cuts at the corners. `chamfer` is the diagonal cut
+            // length in pixels. Returns nullptr on D2D factory
+            // failure (shouldn't happen in practice — the factory
+            // outlives paint()). Exposed so callers that need to
+            // interleave operations between fill and stroke (e.g.
+            // drawPanelBg, which draws the carbon hatch under the
+            // panel separator stroke) can reuse the same geometry
+            // without duplicating the 8-segment build loop.
+            ComPtr<ID2D1PathGeometry> buildChamferedGeometry(
+                const D2D1_RECT_F& rect, float chamfer) const {
                 ComPtr<ID2D1PathGeometry> path;
                 if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
-                    // Fallback to a plain rounded-rect if path
-                    // creation fails for any reason (shouldn't
-                    // happen in practice — D2D factory is always
-                    // alive at paint time).
-                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
-                        rect, 8.0f, 8.0f);
-                    rt->FillRoundedRectangle(rr, fillBrush);
-                    rt->DrawRoundedRectangle(rr, strokeBrush, strokeWidth);
-                    return;
+                    return nullptr;
                 }
                 ComPtr<ID2D1GeometrySink> sink;
-                if (FAILED(path->Open(sink.GetAddressOf()))) return;
+                if (FAILED(path->Open(sink.GetAddressOf()))) {
+                    return nullptr;
+                }
                 const float L = rect.left;
                 const float Rg = rect.right;
                 const float T = rect.top;
@@ -1500,8 +1537,47 @@ namespace openxr_api_layer::detail {
                 sink->AddLine(D2D1::Point2F(L + c, T));         // top-left cut (close)
                 sink->EndFigure(D2D1_FIGURE_END_CLOSED);
                 sink->Close();
+                return path;
+            }
+
+            // Outer frame with chamfered (cut) corners. Thin wrapper
+            // over buildChamferedGeometry that does a single
+            // fill + stroke pair. Used wherever the caller doesn't
+            // need to insert anything between fill and stroke.
+            void drawChamferedRect(ID2D1RenderTarget* rt,
+                                     const D2D1_RECT_F& rect,
+                                     float chamfer,
+                                     ID2D1Brush* fillBrush,
+                                     ID2D1Brush* strokeBrush,
+                                     float strokeWidth) const {
+                auto path = buildChamferedGeometry(rect, chamfer);
+                if (!path) {
+                    // Fallback to a plain rounded-rect if path
+                    // creation fails for any reason.
+                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+                        rect, 8.0f, 8.0f);
+                    rt->FillRoundedRectangle(rr, fillBrush);
+                    rt->DrawRoundedRectangle(rr, strokeBrush, strokeWidth);
+                    return;
+                }
                 rt->FillGeometry(path.Get(), fillBrush);
                 rt->DrawGeometry(path.Get(), strokeBrush, strokeWidth);
+            }
+
+            // Single-segment skewed divider line. `x` is the
+            // vertical-baseline X of the divider; the line goes from
+            // (x + skewPx, yTop) to (x - skewPx, yBottom), so a
+            // positive skewPx leans top-right → bottom-left (matches
+            // the "/" cuts in the design's KPI strip). Same brush
+            // contract as the rt->DrawLine it replaces.
+            void drawObliqueDivider(ID2D1RenderTarget* rt,
+                                      float x, float yTop, float yBottom,
+                                      float skewPx,
+                                      ID2D1Brush* brush,
+                                      float strokeWidth = 1.0f) const {
+                rt->DrawLine(D2D1::Point2F(x + skewPx, yTop),
+                              D2D1::Point2F(x - skewPx, yBottom),
+                              brush, strokeWidth);
             }
 
             // -------- Members -----------------------------------------------
