@@ -651,16 +651,19 @@ jobs:
 
           # Full-width visual diff (changed pixels highlighted in
           # magenta over a desaturated copy of the original) goes
-          # below the side-by-side table. Standalone image — no
-          # surrounding table — so it renders at natural width
-          # (capped by the comment container's max-width).
+          # below the side-by-side table. We use a raw `<img>` tag
+          # with `width="100%"` rather than the markdown `![]()`
+          # form because the latter renders at the image's natural
+          # 720px and leaves dead space on the right of the comment
+          # container (which is wider). GitHub's HTML sanitiser
+          # allows the `width` attribute on `<img>`.
           if [ "$PREVIEW_HAS_DIFF" = "true" ]; then
             DIFF_VISUAL=$(cat <<EOF
 
 
           **Pixel diff** (changed pixels in magenta):
 
-          ![diff](${BASE_URL}/diff.png)
+          <img src="${BASE_URL}/diff.png" alt="diff" width="100%">
           EOF
           )
           else
