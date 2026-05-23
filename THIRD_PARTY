@@ -227,3 +227,53 @@ Microsoft OpenXR Mixed Reality SDK
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
+OpenXR-Layer-Template framework (openxr-api-layer/framework/, the dispatch generator, module.def, entry point, logging helpers)
+-----------------------------------------------------------------------------------------------------------------------------
+
+    Copyright (c) 2021-2023 Matthieu Bucchianeri
+
+    MIT License
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+    Source upstream: https://github.com/mbucchia/OpenXR-Layer-Template
+
+Bundled fonts (openxr-api-layer/fonts/*.ttf)
+---------------------------------------------
+
+    Copyright 2014 The Rajdhani Project Authors (https://github.com/itfoundry/rajdhani)
+    Copyright 2017 The Barlow Project Authors (https://github.com/jpt/barlow)
+
+    SIL Open Font License, Version 1.1. The full license text covering both
+    families is shipped at openxr-api-layer/fonts/OFL.txt.
+
+fmt (header-only, pulled via NuGet `fmt 7.0.1` at build time — not redistributed in source form here)
+-----------------------------------------------------------------------------------------------------
+
+    Copyright (c) 2012 - present, Victor Zverovich and {fmt} contributors
+
+    MIT License — https://github.com/fmtlib/fmt/blob/master/LICENSE
+
+Microsoft.Windows.ImplementationLibrary / WIL (header-only, pulled via NuGet at build time — not redistributed in source form here)
+----------------------------------------------------------------------------------------------------------------------------------
+
+    Copyright (c) Microsoft Corporation
+
+    MIT License — https://github.com/microsoft/wil/blob/master/LICENSE
