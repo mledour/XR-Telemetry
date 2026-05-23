@@ -31,7 +31,7 @@ openxr-api-layer/
     overlay_aggregator.{h,cpp}      ← per-frame metric accumulator
     histogram_ring.h                ← ring buffer for frametime samples
     gpu_telemetry.{h,cpp}           ← NvAPI / DXGI VRAM polling
-  fonts/                            ← bundled Barlow (Medium + Medium Italic, subset)
+  fonts/                            ← bundled font collection (see bundled_fonts.rc.inc)
   layer.cpp / layer.h               ← YOUR layer logic
   pch.h                             ← D3D11 + D3D12 includes (delay-loaded)
   openxr-api-layer.rc.in            ← VERSIONINFO + RT_BUNDLED_FONT template
@@ -171,10 +171,10 @@ The rendering is deterministic across CI runners because:
   no driver differences).
 - The mock snapshot in `makeMockSnapshot()` is a hard-coded `OverlaySnapshot`
   struct — no clock reads, no system queries.
-- The bundled Barlow font (Medium + Medium Italic, subsetted to
-  digits / ASCII letters / `°`/`µ`/`×` / punctuation, ~23-25 KB per
-  face) is embedded in the test EXE so DirectWrite never falls back
-  to whatever system font happens to be installed.
+- The bundled font collection (see
+  [`openxr-api-layer/fonts/bundled_fonts.rc.inc`](../openxr-api-layer/fonts/bundled_fonts.rc.inc))
+  is embedded in the test EXE so DirectWrite never falls back to
+  whatever system font happens to be installed.
 - Both halves of the comparison go through the same PNG
   encode + un-premultiply + decode pipeline (the fresh PNG is written
   to disk, then re-decoded), so PBGRA→BGRA precision noise cancels out.
@@ -182,12 +182,12 @@ The rendering is deterministic across CI runners because:
 ### How a CI run plays out
 
 1. MSBuild compiles `openxr-api-layer-tests.rc` into the test EXE
-   alongside the C++ TUs. rc.exe bakes the Barlow TTF bytes into
+   alongside the C++ TUs. rc.exe bakes the bundled TTF bytes into
    the EXE's resource table (custom type `RT_BUNDLED_FONT` == 256,
-   IDs 200 + 201).
+   declared in `bundled_fonts.rc.inc`).
 2. The PowerShell test step runs `openxr-api-layer-tests.exe`. The
-   snapshot test creates a 720×480 WIC bitmap RT, calls
-   `renderOverlayToTarget(...)`, encodes to `overlay_snapshot.png`
+   snapshot test creates a WIC bitmap RT sized to the overlay texture,
+   calls `renderOverlayToTarget(...)`, encodes to `overlay_snapshot.png`
    in the runner's CWD.
 3. The test then decodes both the golden (`screenshots/overlay_snapshot.png`,
    path resolved from `__FILE__` so it's CWD-independent) and the
@@ -205,10 +205,10 @@ count of differing pixels and the `(x, y)` of the first one.
 | File | Role |
 |---|---|
 | `openxr-api-layer-tests/test_overlay_snapshot.cpp` | The TEST_CASE, mock data, WIC encode + decode + diff helpers |
-| `openxr-api-layer-tests/openxr-api-layer-tests.rc` | Resource script that embeds the Barlow TTFs into the test EXE |
+| `openxr-api-layer-tests/openxr-api-layer-tests.rc` | Resource script that embeds the bundled TTFs into the test EXE |
 | `openxr-api-layer/openxr-api-layer.rc.in` | Production-DLL counterpart — same TTFs, same IDs, same custom type |
-| `openxr-api-layer/fonts/Barlow-Medium{,Italic}.ttf` | The bundled fonts — referenced from both `.rc` files |
-| `screenshots/overlay_snapshot.png` | The golden, 720×480 RGBA, ~68 KB |
+| `openxr-api-layer/fonts/*.ttf` | The bundled font files — declared in `bundled_fonts.rc.inc`, referenced from both `.rc` files |
+| `screenshots/overlay_snapshot.png` | The golden image diffed by the snapshot test |
 | `openxr-api-layer/utils/overlay_renderer.cpp` | `renderOverlayToTarget()` — the shared entry point used by both the in-headset path and the snapshot test |
 
 ### Adding a new resource (font, image, …) used by the renderer

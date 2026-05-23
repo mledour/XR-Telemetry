@@ -66,7 +66,7 @@ disabling the feature, so a typo never kills your session.
 ## Overlay
 
 The overlay is a head-locked HUD that follows your view at a fixed
-corner of your FOV. Two-column fpsVR-style layout, ~720×450 px.
+corner of your FOV. Two-column fpsVR-style layout.
 
 ![Overlay snapshot](screenshots/overlay_snapshot.png)
 
@@ -110,7 +110,7 @@ cap on a 90 Hz HMD).
 | `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. Must match exactly — `Ctrl+Alt+Shift+O` does NOT trigger a `Ctrl+Shift+O` binding. |
 | `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
 | `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. |
-| `scale` | float | `1.0` | Multiplier on the default quad size (~0.20 m × 0.075 m at 1 m view-space distance — about 11° × 4° of FOV). Clamped to `[0.5, 2.0]`. |
+| `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
 
 **Graphics-API support.** D3D11 hosts paint via DirectWrite + Direct2D
 straight into a BGRA8 swapchain. D3D12 hosts go through D3D11On12 so
