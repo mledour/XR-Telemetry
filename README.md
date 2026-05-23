@@ -19,9 +19,24 @@ and run it. The installer registers the layer under `HKLM` so every
 OpenXR runtime on the machine picks it up, and creates an Add/Remove
 Programs entry for clean uninstall.
 
-The layer is **opt-in** for the overlay (HUD hidden by default) and
-**opt-in** for the log (CSV recording off by default) — see Settings
-below. Until you enable at least one, the layer is a pass-through.
+Once installed, the **CSV log is on by default** (one file per OpenXR
+session, written under `%LOCALAPPDATA%\…\sessions\`); the **overlay
+HUD is off by default**. See Settings below to flip either, or to bind
+a hotkey so neither runs unless explicitly toggled.
+
+## Quickstart
+
+1. Install via `Setup.exe`.
+2. Launch your OpenXR game — a CSV is already being written to
+   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\sessions\`. Open it
+   in Excel / Pandas / LibreOffice to see per-frame timings.
+3. To see the HUD too, set `overlay.enabled = true` in
+   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\settings.json` and
+   relaunch the game.
+
+Prefer in-game toggles? Set `mode = "hotkey"` on either feature, then
+press `Ctrl+Shift+O` (overlay) or `Ctrl+Shift+T` (log) while the game
+has focus.
 
 ## Settings
 
