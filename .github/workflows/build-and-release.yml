@@ -580,14 +580,28 @@ jobs:
           # Fresh clone of just the preview branch (or init if it
           # doesn't exist yet) into a temp dir. Working outside
           # GITHUB_WORKSPACE avoids polluting the matrix job's tree.
-          # GITHUB_SERVER_URL is `https://github.com` on github.com and
-          # the GHES base URL elsewhere — strip the scheme to build
-          # the credentialed remote.
+          #
+          # Authentication: set `http.extraheader` rather than
+          # embedding `x-access-token:${GH_TOKEN}@` in the remote
+          # URL. The URL form leaks the token into `git remote -v`
+          # / `git config --list` output and any error message that
+          # echoes the remote; extraheader keeps the token confined
+          # to one config key. GitHub Actions masks GITHUB_TOKEN in
+          # logs either way, but extraheader is the safer default —
+          # pattern lifted from actions/checkout.
+          #
+          # Scheme: HTTP Basic with `x-access-token:<token>` base64-
+          # encoded. GitHub's git HTTPS endpoint rejects bearer (the
+          # REST API accepts it, but git operations do not), so the
+          # token must be wrapped as Basic auth even though we're
+          # only using it for `git push` / `git fetch`.
           PREVIEW_DIR="$(mktemp -d)"
           cd "$PREVIEW_DIR"
           git init -q
-          GIT_HOST="${GITHUB_SERVER_URL#https://}"
-          git remote add origin "https://x-access-token:${GH_TOKEN}@${GIT_HOST}/${REPO}.git"
+          git remote add origin "${GITHUB_SERVER_URL}/${REPO}.git"
+          BASIC_AUTH=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')
+          git config --local http.extraheader "AUTHORIZATION: basic ${BASIC_AUTH}"
+          unset BASIC_AUTH
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -596,24 +610,14 @@ jobs:
             git checkout -q "$PREVIEW_BRANCH"
           else
             # First-ever failure on this repo: seed the orphan branch
-            # with a README explaining what it is.
+            # with a README explaining what it is. Source lives at
+            # .github/snapshot-previews-readme.md in the main checkout
+            # — kept out of the workflow YAML so reformatting the
+            # run: block can't break heredoc indentation. Only seeded
+            # on first creation; later edits to the source file
+            # don't auto-propagate to the orphan branch.
             git checkout -q --orphan "$PREVIEW_BRANCH"
-            cat > README.md <<'README_EOF'
-          # snapshot-previews
-
-          Auto-managed branch carrying overlay snapshot diff PNGs referenced from
-          PR comments posted by `build-and-release.yml` on snapshot test failure.
-
-          Each `pr-<n>/run-<id>-attempt-<k>/` folder corresponds to one snapshot
-          test failure on a PR and contains `old.png` (the committed golden at
-          the time the test ran) plus `new.png` (the fresh render that failed
-          comparison).
-
-          Folders under a `pr-<n>/` prefix for closed PRs are safe to garbage
-          collect — no code references them once the PR is merged or closed.
-
-          Do not commit anything to this branch by hand.
-          README_EOF
+            cp "${GITHUB_WORKSPACE}/.github/snapshot-previews-readme.md" README.md
             git add README.md
           fi
 
