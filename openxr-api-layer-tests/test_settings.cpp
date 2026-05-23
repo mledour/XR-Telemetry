@@ -42,12 +42,12 @@ using openxr_api_layer::detail::formatHotkey;
 
 namespace {
     // The defaults documented in installer/default_settings.json:
-    // log.enabled=true, log.mode=auto, log.hotkey=Ctrl+Shift+T,
+    // log.enabled=false, log.mode=auto, log.hotkey=Ctrl+Shift+T,
     // overlay.enabled=false, overlay.mode=auto, overlay.hotkey=Ctrl+Shift+O,
     // overlay.refresh_hz=10, overlay.position=head_top_right.
     void checkDocumentedDefaults(const ParsedSettings& p) {
         CHECK(p.error.empty());
-        CHECK(p.settings.log.enabled);
+        CHECK_FALSE(p.settings.log.enabled);
         CHECK(p.settings.log.mode == LogMode::Auto);
         CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
         CHECK_FALSE(p.settings.overlay.enabled);
@@ -150,7 +150,7 @@ TEST_CASE("parseSettings: bare key with no modifiers parses cleanly") {
 TEST_CASE("parseSettings: log.enabled with non-bool falls back to default") {
     const auto p = parseSettings(R"({ "log": { "enabled": "yes please" } })");
     CHECK(p.error.empty());
-    CHECK(p.settings.log.enabled);  // default true
+    CHECK_FALSE(p.settings.log.enabled);  // default false (opt-in)
 }
 
 TEST_CASE("parseSettings: log.mode with non-string falls back to default") {
@@ -183,14 +183,14 @@ TEST_CASE("parseSettings: modifiers array with non-strings filters silently") {
 TEST_CASE("parseSettings: malformed JSON surfaces error, settings = defaults") {
     const auto p = parseSettings(R"({"log": )");
     CHECK_FALSE(p.error.empty());
-    CHECK(p.settings.log.enabled);
+    CHECK_FALSE(p.settings.log.enabled);
     CHECK(p.settings.log.mode == LogMode::Auto);
 }
 
 TEST_CASE("parseSettings: root is a JSON array, not an object") {
     const auto p = parseSettings(R"([1, 2, 3])");
     CHECK_FALSE(p.error.empty());
-    CHECK(p.settings.log.enabled);
+    CHECK_FALSE(p.settings.log.enabled);
 }
 
 // =============================================================================

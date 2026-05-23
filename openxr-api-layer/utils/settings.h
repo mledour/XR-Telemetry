@@ -27,7 +27,7 @@
 //
 //   {
 //     "log": {
-//       "enabled": true,
+//       "enabled": false,
 //       "mode": "auto" | "hotkey",
 //       "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
 //     },
@@ -67,8 +67,12 @@ namespace openxr_api_layer::detail {
     // Parsed "log" block. `hotkey` is only consulted when mode == Hotkey, but
     // it's always populated from the JSON (or the default) so logs can show
     // the bound combo regardless of mode.
+    //
+    // Defaults are deliberately opt-in: enabled=false. A fresh install does
+    // nothing until the user explicitly turns the CSV on (or the overlay),
+    // so the layer never silently leaves artefacts on disk.
     struct LogSettings {
-        bool enabled = true;
+        bool enabled = false;
         LogMode mode = LogMode::Auto;
         HotkeySpec hotkey{};
     };
@@ -187,7 +191,7 @@ namespace openxr_api_layer::detail {
         ParsedSettings result;
         // Apply the documented defaults up-front so EVERY return path below
         // produces a well-formed TelemetrySettings.
-        result.settings.log.enabled = true;
+        result.settings.log.enabled = false;
         result.settings.log.mode = LogMode::Auto;
         result.settings.log.hotkey = defaultHotkey();
         result.settings.overlay.enabled = false;
@@ -222,7 +226,7 @@ namespace openxr_api_layer::detail {
         const auto logIt = doc.FindMember("log");
         if (logIt != doc.MemberEnd() && logIt->value.IsObject()) {
             const auto& log = logIt->value;
-            result.settings.log.enabled = getBoolOr(log, "enabled", true);
+            result.settings.log.enabled = getBoolOr(log, "enabled", false);
             const std::string modeStr = getStringOr(log, "mode", "auto");
             if (iequalsAscii(modeStr, "hotkey")) {
                 result.settings.log.mode = LogMode::Hotkey;

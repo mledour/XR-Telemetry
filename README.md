@@ -19,24 +19,23 @@ and run it. The installer registers the layer under `HKLM` so every
 OpenXR runtime on the machine picks it up, and creates an Add/Remove
 Programs entry for clean uninstall.
 
-Once installed, the **CSV log is on by default** (one file per OpenXR
-session, written under `%LOCALAPPDATA%\…\sessions\`); the **overlay
-HUD is off by default**. See Settings below to flip either, or to bind
-a hotkey so neither runs unless explicitly toggled.
+The overlay (HUD) and the CSV log are both **off by default** — until
+you enable at least one in `settings.json`, the layer is a pure
+pass-through. See Settings below.
 
 ## Quickstart
 
-1. Install via `Setup.exe`.
-2. Launch your OpenXR game — a CSV is already being written to
-   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\sessions\`. Open it
-   in Excel / Pandas / LibreOffice to see per-frame timings.
-3. To see the HUD too, set `overlay.enabled = true` in
-   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\settings.json` and
-   relaunch the game.
+1. Install via `Setup.exe`. It drops a default `settings.json` into
+   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`.
+2. Edit `settings.json` and flip `log.enabled = true` and/or
+   `overlay.enabled = true`.
+3. Launch your OpenXR game. With `log` on, a CSV appears in
+   `…\sessions\` (one per OpenXR session). With `overlay` on, the
+   HUD shows in the top-right of your FOV.
 
-Prefer in-game toggles? Set `mode = "hotkey"` on either feature, then
-press `Ctrl+Shift+O` (overlay) or `Ctrl+Shift+T` (log) while the game
-has focus.
+Prefer to keep both dormant and toggle from inside the game? Set
+`mode = "hotkey"` on either feature, then press `Ctrl+Shift+T` (log)
+or `Ctrl+Shift+O` (overlay) while the game has focus.
 
 ## Settings
 
@@ -57,7 +56,7 @@ Full schema:
 ```json
 {
   "log": {
-    "enabled": true,
+    "enabled": false,
     "mode": "auto",
     "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
   },
@@ -263,7 +262,7 @@ computing GPU averages.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `true` | Master switch for the CSV. `false` skips writing entirely; combined with `overlay.enabled=false`, the layer becomes a pure pass-through. |
+| `enabled` | bool | `false` | Master switch for the CSV. `false` (the default) skips writing entirely; combined with `overlay.enabled=false` (also the default), the layer is a pure pass-through. |
 | `mode` | string | `"auto"` | `auto` = one CSV per session, opened at session start and closed at session end. `hotkey` = no CSV until the user presses the combo; each press starts/stops a recording window (one fresh file per window — short sessions don't merge into one giant log). |
 | `hotkey.key` | string | `"T"` | Main key. Same set of recognised names as the overlay hotkey. |
 | `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers. Same set as the overlay hotkey. |

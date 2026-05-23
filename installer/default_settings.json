@@ -1,8 +1,8 @@
 {
   "_comment": "Default template for XR_APILAYER_MLEDOUR_xr_telemetry. Each OpenXR application gets a copy of this file the first time it runs (named <app>_settings.json next to this one). Edit values here to change the defaults that apply to NEW games; existing per-app files are never touched on subsequent runs.",
   "log": {
-    "_comment": "Per-frame CSV capture. mode=auto opens a CSV at session start and closes it at session end (the original always-on behaviour). mode=hotkey keeps the CSV closed until the user presses the configured combo, then toggles open/closed on each subsequent press. The hotkey is polled once per frame inside xrEndFrame, so it only fires while the game has focus and is rendering OpenXR.",
-    "enabled": true,
+    "_comment": "Per-frame CSV capture. Off by default (opt-in feature). mode=auto opens a CSV at session start and closes it at session end. mode=hotkey keeps the CSV closed until the user presses the configured combo, then toggles open/closed on each subsequent press. The hotkey is polled once per frame inside xrEndFrame, so it only fires while the game has focus and is rendering OpenXR.",
+    "enabled": false,
     "mode": "auto",
     "hotkey": {
       "_comment": "Recognised keys: A-Z, 0-9, F1-F24, Space, Tab, Enter, Escape, Backspace, Insert, Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right. Punctuation is intentionally unsupported (locale-dependent). Recognised modifiers: ctrl, shift, alt, win. Unknown modifier names are ignored; an unknown key falls back to the documented default (Ctrl+Shift+T) so a typo never disables the hotkey entirely.",
