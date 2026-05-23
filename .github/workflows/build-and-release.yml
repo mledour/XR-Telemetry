@@ -382,8 +382,11 @@ jobs:
       # PNGs need to live at an URL that GitHub-Flavoured Markdown
       # will embed via `![alt](url)`. The cleanest GitHub-native
       # storage for that is an orphan branch in this same repo —
-      # `raw.githubusercontent.com/<owner>/<repo>/<sha>/...` URLs
-      # render inline and are cacheable by commit SHA.
+      # referenced from the comment via
+      # `github.com/<owner>/<repo>/raw/<sha>/...` URLs (NOT the
+      # `raw.githubusercontent.com` form, which is an unauthenticated
+      # CDN that 404s for private repos — see the URL construction in
+      # the upsert step below).
       #
       # Why orphan branch and not `main`:
       #   - binary PNGs would bloat `main`'s history forever
@@ -530,7 +533,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_URL="https://raw.githubusercontent.com/${REPO}/${PREVIEW_SHA}/${PREVIEW_REL_PATH}"
+          # github.com/<repo>/raw/<ref>/<path> (NOT raw.githubusercontent.com/...)
+          # because the latter is an unauthenticated CDN and 404s for
+          # private repos — same-domain github.com/.../raw/ goes through
+          # the authenticated frontend that 302s to a signed CDN URL
+          # for logged-in users with repo access. Pattern lifted from
+          # opengisch/comment-pr-with-images (their `_get_github_image_url`).
+          BASE_URL="https://github.com/${REPO}/raw/${PREVIEW_SHA}/${PREVIEW_REL_PATH}"
           RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
           UPDATE_WORKFLOW_URL="https://github.com/${REPO}/actions/workflows/update-overlay-snapshot.yml"
 
