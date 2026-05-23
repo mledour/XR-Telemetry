@@ -288,16 +288,27 @@ jobs:
       # body and PATCHes any prior comment matching the same header.
       # Replaces ~40 lines of hand-rolled `gh api .../comments
       # --paginate --jq ... | head` plus a PATCH-or-skip switch.
+      #
+      # Body is deliberately stable across pushes (no run_id /
+      # attempt / URL) AND `skip_unchanged: true` is set, so on a PR
+      # that lands its first "now passing" comment, subsequent pushes
+      # see byte-identical content and the action no-ops at the
+      # diff stage (no PATCH call → no `updated_at` bump → no
+      # spurious notification → comment doesn't re-float to the top
+      # of the PR timeline). The green CI status check on each
+      # commit already provides the per-run proof a reviewer would
+      # have clicked through this comment for.
       - name: Update sticky PR comment if snapshot test now passes
         if: matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: ${{ env.STICKY_HEADER }}
           only_update: true
+          skip_unchanged: true
           message: |
             ## Overlay snapshot test now passing
 
-            The overlay snapshot test passes as of run [`${{ github.run_id }}` attempt ${{ github.run_attempt }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
+            The overlay snapshot test passes on this PR.
 
       # ---- Snapshot diff artifact (on test failure, Release only) -------
       #
