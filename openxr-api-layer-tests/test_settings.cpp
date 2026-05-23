@@ -331,5 +331,5 @@ TEST_CASE("parseSettings: unknown top-level keys are tolerated") {
         "log": {}, "future_feature": true, "x": [1, 2]
     })");
     CHECK(p.error.empty());
-    CHECK(p.settings.log.enabled);
+    CHECK_FALSE(p.settings.log.enabled);  // empty log{} → opt-in default
 }
