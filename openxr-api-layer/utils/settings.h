@@ -91,12 +91,11 @@ namespace openxr_api_layer::detail {
         HotkeySpec hotkey{};
         int refresh_hz = 10;       // matches fpsvr's cadence
         std::string position = "head_top_right";
-        // Multiplier on the default 0.20 m × 0.075 m quad (at 1 m view-
-        // space distance). 1.0 = default size (~11° × 4° of FOV in the
-        // top-right corner); 0.5 → half-size; 2.0 → double. Anything
-        // outside [0.5, 2.0] is clamped so a typo can't render a quad
-        // big enough to obscure the cockpit or smaller than the font
-        // can be drawn legibly.
+        // Multiplier on the default quad size. 1.0 = stock (head-locked,
+        // off-axis in a corner of the FOV); 0.5 → half-size; 2.0 →
+        // double. Anything outside [0.5, 2.0] is clamped so a typo
+        // can't render a quad big enough to obscure the cockpit or
+        // smaller than the font can be drawn legibly.
         float scale = 1.0f;
     };
 

@@ -182,7 +182,7 @@ falls behind, but in practice drops are zero on healthy hardware).
 | Column | Definition | What it captures |
 |---|---|---|
 | `frame` | Sequential 0-based counter | Frame index since the session start. |
-| `timestamp_qpc` | `QueryPerformanceCounter` ticks at `xrEndFrame` entry | Frame-end wall clock. Convert to seconds with `QueryPerformanceFrequency` — divide by ~10⁷ on most modern Windows boxes. |
+| `timestamp_qpc` | `QueryPerformanceCounter` ticks at `xrEndFrame` entry | Frame-end wall clock. Convert to seconds by dividing by `QueryPerformanceFrequency` (typically ~10 MHz on modern Windows hosts). |
 | `wait_block_ns` | `tWaitOut − tWaitIn` | **Compositor throttle.** Time the runtime made the app wait inside `xrWaitFrame`. Big = compositor has headroom and is rate-limiting the app (good). Small = app is the bottleneck. |
 | `pre_begin_ns` | `tBegin − tWaitOut` | **Housekeeping.** Time between `xrWaitFrame` returning and `xrBeginFrame` being called — input poll, state update. Usually ~50–300 µs. |
 | `app_cpu_ns` | `tEnd − tWaitOut` | **Wait→End window** = `pre_begin_ns` + render submission. CPU time the app spent between `xrWaitFrame` returning and `xrEndFrame` being called — render-thread heaviness. |
