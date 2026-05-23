@@ -78,7 +78,7 @@ namespace {
         openxr_api_layer::detail::OverlaySnapshot s;
         s.valid       = true;
         s.version     = 1;
-        s.fps_instant = 142.0f;
+        s.fps_instant = 199.0f;  // TEMP: bumped to exercise snapshot-push robustness on PR #29
         s.fps_avg     = 138.0f;
         s.fps_p95     = 124.0f;
         s.fps_p99     = 108.0f;
