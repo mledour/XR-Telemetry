@@ -31,6 +31,19 @@ env:
   # this triggers a fresh download because the cache key changes —
   # exactly the behavior we want for Certum MSI updates.
   SIMPLYSIGN_VERSION: '9.4.3.90'
+  # Sticky-comment dedup key consumed by marocchino/sticky-pull-
+  # request-comment in the snapshot-diff steps below. Single source
+  # of truth for the two `header:` references — a typo in one would
+  # silently break stickiness (the action would POST a new comment
+  # each run instead of PATCHing the existing one).
+  STICKY_HEADER: snapshot-preview-bot
+  # Orphan branch carrying the snapshot diff PNGs that PR comments
+  # link to. Referenced by the push step below in ~7 git commands;
+  # hoisting prevents drift between them. NOT consumed by the seeded
+  # README content nor the prose comment at the top of this file —
+  # those keep `snapshot-previews` in user-facing text and have to
+  # be updated by hand if this name ever changes.
+  PREVIEW_BRANCH: snapshot-previews
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -279,7 +292,7 @@ jobs:
         if: matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: marocchino/sticky-pull-request-comment@v3
         with:
-          header: snapshot-preview-bot
+          header: ${{ env.STICKY_HEADER }}
           only_update: true
           message: |
             ## Overlay snapshot test now passing
@@ -506,13 +519,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git ls-remote --exit-code --heads origin snapshot-previews >/dev/null 2>&1; then
-            git fetch --depth=1 origin snapshot-previews
-            git checkout -q snapshot-previews
+          if git ls-remote --exit-code --heads origin "$PREVIEW_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$PREVIEW_BRANCH"
+            git checkout -q "$PREVIEW_BRANCH"
           else
             # First-ever failure on this repo: seed the orphan branch
             # with a README explaining what it is.
-            git checkout -q --orphan snapshot-previews
+            git checkout -q --orphan "$PREVIEW_BRANCH"
             cat > README.md <<'README_EOF'
           # snapshot-previews
 
@@ -551,15 +564,15 @@ jobs:
           # One retry on race: two concurrent failing PRs both
           # pushing at once. Per-PR/per-run paths can't conflict, so
           # rebase-then-push is conflict-free in practice.
-          if ! git push origin snapshot-previews; then
+          if ! git push origin "$PREVIEW_BRANCH"; then
             echo "Push collided - rebasing onto remote and retrying..."
-            git fetch origin snapshot-previews
-            if ! git rebase origin/snapshot-previews; then
+            git fetch origin "$PREVIEW_BRANCH"
+            if ! git rebase "origin/$PREVIEW_BRANCH"; then
               git rebase --abort 2>/dev/null || true
               echo "::warning::Snapshot push collided and rebase failed (likely concurrent first-time README seed) - skipping inline comment; reviewer falls back to artifact zip."
               exit 0
             fi
-            if ! git push origin snapshot-previews; then
+            if ! git push origin "$PREVIEW_BRANCH"; then
               echo "::warning::Snapshot push retry failed - skipping inline comment; reviewer falls back to artifact zip."
               exit 0
             fi
@@ -695,7 +708,7 @@ jobs:
         if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && env.PREVIEW_SHA != ''
         uses: marocchino/sticky-pull-request-comment@v3
         with:
-          header: snapshot-preview-bot
+          header: ${{ env.STICKY_HEADER }}
           path: snapshot-comment-body.md
 
       # ---- Inno Setup installer (Release only) --------------------------
