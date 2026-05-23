@@ -85,6 +85,29 @@ jobs:
       matrix:
         configuration: [Release, Debug]
 
+    # Single source of truth for "inline-comment-eligible": same-repo
+    # PR + Release matrix entry. Replaces a 3-conjunct predicate that
+    # was duplicated across 4 step `if:` expressions below. Evaluated
+    # once when the matrix job starts; stable for the rest of the job
+    # (matrix + github contexts don't change mid-job).
+    #
+    # Why each conjunct:
+    #   - Release-only: Debug renders bit-identically to Release (the
+    #     entire WIC + D2D pipeline is software), so running the
+    #     inline-comment flow from both matrix entries would have
+    #     them race on the same sticky comment for no UX gain.
+    #   - pull_request only: there's nowhere to post a sticky comment
+    #     on a push-to-main or tag build.
+    #   - same-repo HEAD only: fork PRs get a read-only GITHUB_TOKEN
+    #     by GitHub design, so marocchino + the orphan-branch push
+    #     would 403 → degrade gracefully to the artifact-only flow.
+    #
+    # The value is the string "true" or "false" (GitHub Actions casts
+    # boolean expressions to strings when stored in env). Step `if:`
+    # checks compare against the literal 'true'.
+    env:
+      INLINE_ELIGIBLE: ${{ matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
@@ -327,7 +350,7 @@ jobs:
       # commit already provides the per-run proof a reviewer would
       # have clicked through this comment for.
       - name: Update sticky PR comment if snapshot test now passes
-        if: matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: env.INLINE_ELIGIBLE == 'true'
         uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: ${{ env.STICKY_HEADER }}
@@ -510,7 +533,7 @@ jobs:
       # GITHUB_TOKEN (GitHub design), so the push would 403. They
       # fall back to downloading the artifact above.
       - name: Push snapshot diff to preview branch (on test failure)
-        if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: failure() && env.INLINE_ELIGIBLE == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -532,17 +555,27 @@ jobs:
           fi
 
           REL_PATH="pr-${PR_NUMBER}/run-${RUN_ID}-attempt-${RUN_ATTEMPT}"
+          # `${REL_PATH%/*}` strips the trailing `/<segment>` from
+          # REL_PATH — the per-PR parent directory. Used by the
+          # cleanup below; deriving it here means a future layout
+          # change (e.g. `previews/pr-N/run-X-attempt-Y/`) only
+          # needs REL_PATH bumped — the cleanup follows.
+          PR_PREFIX="${REL_PATH%/*}"
 
           # Copy the PNGs OUT of the workspace before checking out the
           # orphan branch — `git checkout --orphan` followed by
-          # `git rm -rf .` would otherwise wipe them.
+          # `git rm -rf .` would otherwise wipe them. Looped + if/fi
+          # rather than `[ -f ] && cp` because the latter's `set -e`
+          # interaction is brittle (works on bash 4+ but not formally
+          # guaranteed when the failing test is the simple command of
+          # a list).
           STAGE_DIR="$(mktemp -d)"
-          [ -f artifact/snapshot-diff/new/overlay_snapshot.png ] \
-            && cp artifact/snapshot-diff/new/overlay_snapshot.png "$STAGE_DIR/new.png"
-          [ -f artifact/snapshot-diff/old/overlay_snapshot.png ] \
-            && cp artifact/snapshot-diff/old/overlay_snapshot.png "$STAGE_DIR/old.png"
-          [ -f artifact/snapshot-diff/diff/overlay_snapshot.png ] \
-            && cp artifact/snapshot-diff/diff/overlay_snapshot.png "$STAGE_DIR/diff.png"
+          for kind in new old diff; do
+            src="artifact/snapshot-diff/$kind/overlay_snapshot.png"
+            if [ -f "$src" ]; then
+              cp "$src" "$STAGE_DIR/$kind.png"
+            fi
+          done
 
           # Fresh clone of just the preview branch (or init if it
           # doesn't exist yet) into a temp dir. Working outside
@@ -588,15 +621,18 @@ jobs:
           # branch from accumulating PNGs that nothing references
           # anymore — the sticky comment always points to the latest
           # attempt. `git rm -rqf` (rather than `rm -rf`) records the
-          # deletions in the commit we're about to create.
-          if [ -d "pr-${PR_NUMBER}" ]; then
-            git rm -rqf "pr-${PR_NUMBER}" >/dev/null 2>&1 || true
+          # deletions in the commit we're about to create. PR_PREFIX
+          # is derived from REL_PATH above, so layout changes propagate.
+          if [ -d "$PR_PREFIX" ]; then
+            git rm -rqf "$PR_PREFIX" >/dev/null 2>&1 || true
           fi
 
           mkdir -p "$REL_PATH"
-          [ -f "$STAGE_DIR/new.png" ]  && cp "$STAGE_DIR/new.png"  "$REL_PATH/new.png"
-          [ -f "$STAGE_DIR/old.png" ]  && cp "$STAGE_DIR/old.png"  "$REL_PATH/old.png"
-          [ -f "$STAGE_DIR/diff.png" ] && cp "$STAGE_DIR/diff.png" "$REL_PATH/diff.png"
+          for kind in new old diff; do
+            if [ -f "$STAGE_DIR/$kind.png" ]; then
+              cp "$STAGE_DIR/$kind.png" "$REL_PATH/$kind.png"
+            fi
+          done
           git add "$REL_PATH"
           git commit -m "preview: snapshot diff for PR #${PR_NUMBER} run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
@@ -638,7 +674,7 @@ jobs:
       # bailed (no staged PNGs / push collision retry failed). Without
       # it, this step would compose a body with broken URLs.
       - name: Compose snapshot diff comment body
-        if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && env.PREVIEW_SHA != ''
+        if: failure() && env.INLINE_ELIGIBLE == 'true' && env.PREVIEW_SHA != ''
         shell: bash
         env:
           REPO: ${{ github.repository }}
@@ -744,7 +780,7 @@ jobs:
       # is create-or-update, which is what we want here. The body file
       # is produced by the compose step above.
       - name: Post sticky PR comment with snapshot diff
-        if: failure() && matrix.configuration == 'Release' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && env.PREVIEW_SHA != ''
+        if: failure() && env.INLINE_ELIGIBLE == 'true' && env.PREVIEW_SHA != ''
         uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: ${{ env.STICKY_HEADER }}
