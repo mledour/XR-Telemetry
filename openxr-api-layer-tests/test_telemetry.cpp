@@ -524,6 +524,15 @@ TEST_CASE("telemetry: per-frame timing columns are non-negative and self-consist
 TEST_CASE("telemetry: double xrCreateInstance on the same singleton survives") {
     TelemetryFixture fix;
     fix.enableLog("FirstInit");
+    // Enable log for the SECOND app name too: under the opt-in default
+    // the second xrCreateInstance re-reads settings keyed on the new
+    // applicationName, and without a per-app file it would fall back to
+    // log.enabled=false → both features off → m_bypassApiLayer=true,
+    // which clobbers the first call's recording state. With log enabled
+    // on both, the second call hits CsvWriter::start's idempotent guard
+    // (the original purpose of this test) and the first init's CSV
+    // remains the single on-disk artefact.
+    fix.enableLog("SecondInit");
     auto* api = fix.startLayer("FirstInit");
 
     // Without destroying, drive a second xrCreateInstance through the layer.
