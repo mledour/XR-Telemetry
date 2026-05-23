@@ -395,11 +395,30 @@ jobs:
           mkdir -p artifact/snapshot-diff/diff
           npm install -g odiff-bin --silent
 
+          # The npm-generated Windows launcher for odiff-bin is broken:
+          # it passes the native .exe to `node`, which then tries to
+          # parse the PE binary as JavaScript and fails on the `MZ`
+          # header byte ("SyntaxError: Invalid or unexpected token").
+          # Observed on the first odiff run, log lines:
+          #     C:\npm\prefix\node_modules\odiff-bin\bin\odiff.exe:1
+          #     MZx
+          #     SyntaxError: Invalid or unexpected token
+          # Bypass the shim by invoking the binary directly at its
+          # installed path under `npm root -g`. Mixed `/` + `\`
+          # separators are fine — Windows accepts either.
+          NPM_ROOT="$(npm root -g)"
+          ODIFF_BIN="${NPM_ROOT}/odiff-bin/bin/odiff.exe"
+          if [ ! -f "$ODIFF_BIN" ]; then
+            echo "::warning::odiff binary not found at $ODIFF_BIN - diff step skipped."
+            exit 0
+          fi
+          echo "odiff binary: $ODIFF_BIN"
+
           # set +e because odiff returns non-zero on diff (which is
           # the whole point here) and we want to inspect the exit code
           # rather than tripping `set -e`.
           set +e
-          odiff "$OLD" "$NEW" "$DIFF" --diff-color "#ff00ff"
+          "$ODIFF_BIN" "$OLD" "$NEW" "$DIFF" --diff-color "#ff00ff"
           rc=$?
           set -e
 
