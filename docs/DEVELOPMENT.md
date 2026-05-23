@@ -58,6 +58,7 @@ scripts/
   Test-CertumTotp.ps1               ← offline TOTP self-test
   Install-Layer.ps1                 ← HKLM register (manual install)
   Uninstall-Layer.ps1               ← HKLM unregister
+  Tracing.wprp                      ← WPR profile for ETW capture
 ```
 
 ## Relationship to upstream
@@ -406,6 +407,41 @@ becomes flaky despite the software path, the right fix is to find
 the source of nondeterminism (system time leaking into a string?
 locale-sensitive number format? font fallback?), not to widen the
 tolerance.
+
+## ETW tracing
+
+The layer emits structured events via `TraceLoggingWrite(...)` to an
+ETW provider named `OpenXRTemplate`
+(`{cbf3adcd-42b1-4c38-830c-91980af201f8}`). `Log()` writes a parallel
+text log alongside the `sessions/` folder under `%LOCALAPPDATA%\<layer>\`,
+but ETW is what surfaces in profilers and merges cleanly with kernel /
+D3D / DXGI traces.
+
+[`scripts/Tracing.wprp`](../scripts/Tracing.wprp) is a Windows
+Performance Recorder profile bundling the layer's provider with
+Watson + DXGI Debug:
+
+```powershell
+# Capture (admin shell)
+wpr -start scripts\Tracing.wprp -filemode
+# … reproduce the issue inside the OpenXR game …
+wpr -stop trace.etl
+
+# View: open trace.etl in Windows Performance Analyzer (WPA), or
+# `tracelog -dump trace.etl` for a textual dump.
+```
+
+The provider name is inherited from mbucchia's template, so WPA
+labels traces as `OpenXRTemplate` rather than `XrTelemetry`. Edit
+[`framework/log.cpp`](../openxr-api-layer/framework/log.cpp) (provider
+name + GUID) if you want to rebrand.
+
+## Conformance testing
+
+Before tagging a `v*.*.*` release, run the OpenXR Conformance Test
+Suite against the layer on your target runtime — see
+[`CTS_TESTING.md`](./CTS_TESTING.md) for the release-gate playbook
+(baseline vs with-layer diff, runtime setup, release checklist).
 
 ## Releases
 
