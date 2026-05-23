@@ -546,25 +546,32 @@ jobs:
           # Compose the diff body conditionally on which PNGs the
           # push step managed to upload. Most common case is both
           # present (standard pixel diff).
+          # Table header labels are intentionally short and symmetric
+          # ("Actual" / "Expected") so the two markdown columns get
+          # the same auto-layout width — long asymmetric labels make
+          # the right column narrower and the image inside it visually
+          # smaller. Column order matches the typical test-runner
+          # ordering: actual (what we got, this PR's fresh render)
+          # first, expected (golden) second.
           if [ "$PREVIEW_HAS_OLD" = "true" ] && [ "$PREVIEW_HAS_NEW" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
-          | Current golden (\`screenshots/overlay_snapshot.png\`) | New render (this PR) |
+          | Actual | Expected |
           |:--:|:--:|
-          | ![old](${BASE_URL}/old.png) | ![new](${BASE_URL}/new.png) |
+          | ![actual](${BASE_URL}/new.png) | ![expected](${BASE_URL}/old.png) |
           EOF
           )
           elif [ "$PREVIEW_HAS_OLD" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
-          **Only the current golden was captured** — the test bailed before producing the new PNG. See the [run log](${RUN_URL}) for the first failed REQUIRE.
+          **Only the expected golden was captured** — the test bailed before producing the actual render. See the [run log](${RUN_URL}) for the first failed REQUIRE.
 
-          ![old](${BASE_URL}/old.png)
+          ![expected](${BASE_URL}/old.png)
           EOF
           )
           elif [ "$PREVIEW_HAS_NEW" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
-          **Only the new render was captured** — no current golden exists yet (first-time seed).
+          **Only the actual render was captured** — no expected golden exists yet (first-time seed).
 
-          ![new](${BASE_URL}/new.png)
+          ![actual](${BASE_URL}/new.png)
           EOF
           )
           else
