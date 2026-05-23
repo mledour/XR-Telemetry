@@ -524,22 +524,19 @@ TEST_CASE("telemetry: per-frame timing columns are non-negative and self-consist
 TEST_CASE("telemetry: double xrCreateInstance on the same singleton survives") {
     TelemetryFixture fix;
     fix.enableLog("FirstInit");
-    // Enable log for the SECOND app name too: under the opt-in default
-    // the second xrCreateInstance re-reads settings keyed on the new
-    // applicationName, and without a per-app file it would fall back to
-    // log.enabled=false → both features off → m_bypassApiLayer=true,
-    // which clobbers the first call's recording state. With log enabled
-    // on both, the second call hits CsvWriter::start's idempotent guard
-    // (the original purpose of this test) and the first init's CSV
-    // remains the single on-disk artefact.
-    fix.enableLog("SecondInit");
     auto* api = fix.startLayer("FirstInit");
 
     // Without destroying, drive a second xrCreateInstance through the layer.
     // The framework's GetInstance returns the existing singleton (no
     // ResetInstance has fired), so this hits the same OpenXrLayer twice —
-    // exactly the OC pattern. CsvWriter::start's idempotent guard makes the
-    // second call a no-op rather than std::terminate via thread reassignment.
+    // exactly the OC pattern. The layer's m_layerInitialized guard early-
+    // returns on the second call without re-running the settings bootstrap
+    // (which would otherwise flip m_bypassApiLayer to true under the opt-in
+    // default, since no per-app settings file exists for "SecondInit", and
+    // silently halt CSV row appends from the next frame on). Defence in
+    // depth: CsvWriter::start is idempotent too — even if the layer guard
+    // ever regressed, the second start() is a no-op rather than
+    // std::terminate via thread reassignment.
     XrApplicationInfo appInfo{};
     std::strcpy(appInfo.applicationName, "SecondInit");
     appInfo.applicationVersion = 1;

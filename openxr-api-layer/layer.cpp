@@ -1395,6 +1395,25 @@ namespace openxr_api_layer {
                 return result;
             }
 
+            // Idempotency guard. A second xrCreateInstance on the same
+            // singleton (OpenComposite probe-then-real, or any host that
+            // re-initialises without an intervening xrDestroyInstance)
+            // must NOT re-run our bootstrap: re-reading settings keyed
+            // on a possibly different applicationName could flip
+            // m_bypassApiLayer mid-session and silently halt CSV row
+            // appends from the next frame onwards (the file would stay
+            // open from the first init, but every per-frame override
+            // would pass-through on the new flag). The base-class
+            // forward above has already given the loader a result; we
+            // just preserve layer state and exit.
+            if (m_layerInitialized) {
+                Log(fmt::format("xr_telemetry: ignoring second xrCreateInstance for '{}' "
+                                "(already initialised as '{}') — keeping existing layer state\n",
+                                appName, m_appName));
+                return result;
+            }
+            m_layerInitialized = true;
+
             // Runtime identity. Useful in logs when supporting multiple
             // runtimes — anti-cheat reports often reference the runtime
             // by name. Skip gracefully if the runtime doesn't fill in
@@ -2202,6 +2221,12 @@ namespace openxr_api_layer {
         }
 
         bool m_bypassApiLayer = false;
+        // Latched true after the first xrCreateInstance completes its
+        // bootstrap. Guards a second xrCreateInstance on the same
+        // singleton (OpenComposite probe-then-real) from re-reading
+        // settings under a possibly different applicationName — see the
+        // idempotency guard in xrCreateInstance.
+        bool m_layerInitialized = false;
         int64_t m_qpcFrequency = 1;
 
         // Frame timing state — written from Wait/Begin thread, read from End
