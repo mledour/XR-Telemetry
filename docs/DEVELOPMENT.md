@@ -1,9 +1,10 @@
 # Development
 
-Notes for anyone forking this template to build their own OpenXR API
-layer. End-user install and configuration of YOUR layer go in your
-fork's [README](../README.md); this file documents the template's
-build system, CI pipeline, and signing flow.
+Notes for developers building, testing, or contributing to this layer.
+End-user install and configuration live in the [README](../README.md);
+this file documents the build system, CI pipeline, snapshot tests, and
+signing flow — most of which is inherited from the upstream template
+(see "Relationship to upstream" below).
 
 ## Prerequisites
 
@@ -68,29 +69,27 @@ Three repos in the lineage:
    — the original framework. Owns everything under
    `openxr-api-layer/framework/`, the dispatch generator, the entry
    point, the logging helpers, and the basic vcxproj structure.
-2. **`mledour/OpenXR-Layer-Template`** (this repo) —
-   adds the CI pipeline, code signing, Inno Setup installer, doctest
-   + mock runtime, D3D12 support in `pch.h`, and the post-clone init
-   script. Framework code is untouched.
-3. **Your layer** — a clone of this template via the GitHub "Use this
-   template" button. You add layer-specific logic in `layer.cpp` and
-   tests in `openxr-api-layer-tests/test_*.cpp`.
+2. **`mledour/OpenXR-Layer-Template`** — adds the CI pipeline, code
+   signing, Inno Setup installer, doctest + mock runtime, D3D12
+   support in `pch.h`, and the post-clone init script on top of
+   mbucchia's framework. Framework code is untouched.
+3. **This repo (`OpenXR-Layer-XrTelemetry`)** — the actual layer,
+   spun off from (2) via the GitHub "Use this template" button. Adds
+   the layer-specific logic in `layer.cpp` / `utils/*` and tests in
+   `openxr-api-layer-tests/test_*.cpp`.
 
-Upstream framework changes from mbucchia land in this template via a
-manual sync (rare). Your own layer doesn't need to track those —
-this template is your stable base.
+Framework + tooling changes from (1)/(2) land here via a manual sync
+(rare). Day-to-day work on this layer doesn't track those — the
+template is the stable base.
 
 ## Building from source
 
 ```powershell
 git submodule update --init --recursive
-# (one-time, after using the GitHub Template button)
-powershell -ExecutionPolicy Bypass -File .\scripts\Init-Template.ps1
 ```
 
-Then open `XR_APILAYER_MLEDOUR_xr_telemetry.sln` (real names
-after init) in Visual Studio and build `Release|x64`. The pre-build
-event chain:
+Then open `XR_APILAYER_MLEDOUR_xr_telemetry.sln` in Visual Studio and
+build `Release|x64`. The pre-build event chain:
 
 1. `framework/dispatch_generator.py` reads `framework/layer_apis.py`
    and regenerates `dispatch.gen.{h,cpp}` with one virtual method per
@@ -103,7 +102,7 @@ event chain:
 A post-build event runs `scripts\sed.exe` to substitute
 `$(SolutionName)` into the loader's JSON manifest, so renaming the
 `.sln` automatically renames the manifest too — useful if you ever
-need to rename a layer after the init script has run.
+need to rename the layer.
 
 The test binary (`openxr-api-layer-tests.exe`) builds alongside the
 DLL and runs your `test_*.cpp` files via doctest. A non-zero exit

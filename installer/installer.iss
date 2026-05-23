@@ -36,8 +36,8 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher=Michael Ledour
-AppPublisherURL=https://github.com/mledour/OpenXR-Layer-xr_telemetry
-AppSupportURL=https://github.com/mledour/OpenXR-Layer-xr_telemetry/issues
+AppPublisherURL=https://github.com/mledour/OpenXR-Layer-XrTelemetry
+AppSupportURL=https://github.com/mledour/OpenXR-Layer-XrTelemetry/issues
 DefaultDirName={autopf}\OpenXR-Layer-xr_telemetry
 ; No Start Menu group — this layer has no user-facing executable.
 DisableProgramGroupPage=yes
