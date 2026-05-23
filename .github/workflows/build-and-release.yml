@@ -362,6 +362,53 @@ jobs:
           Write-Host "ref_name raw='$rawRef' sanitised='$safeRef'"
           "ARTIFACT_REF_TAG=$safeRef" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # ---- Visual diff PNG (on test failure, Release only) -------------
+      #
+      # odiff is a fast OCaml-backed pixel-diff tool (anti-alias-aware,
+      # parallelised) that compares old.png with new.png and writes a
+      # third PNG where the differing pixels are highlighted over a
+      # desaturated copy of the original. It's distributed as a npm
+      # package (`odiff-bin`) with prebuilt native binaries — Node is
+      # preinstalled on the windows-2022 runner so no setup-node step
+      # is needed.
+      #
+      # Exit codes:
+      #   0  -> images identical (no diff file written) — we shouldn't
+      #         reach this branch because we're gated on failure(), but
+      #         tolerate it just in case the test failed for a
+      #         non-snapshot reason.
+      #   21 -> images differ (diff file written) — the expected path.
+      #   *  -> tool error — warn and continue without a diff image.
+      - name: Generate visual diff PNG (on test failure)
+        if: failure() && matrix.configuration == 'Release'
+        shell: bash
+        run: |
+          NEW=artifact/snapshot-diff/new/overlay_snapshot.png
+          OLD=artifact/snapshot-diff/old/overlay_snapshot.png
+          DIFF=artifact/snapshot-diff/diff/overlay_snapshot.png
+
+          if [ ! -f "$NEW" ] || [ ! -f "$OLD" ]; then
+            echo "Need both old.png and new.png to compute a diff - skipping."
+            exit 0
+          fi
+
+          mkdir -p artifact/snapshot-diff/diff
+          npm install -g odiff-bin --silent
+
+          # set +e because odiff returns non-zero on diff (which is
+          # the whole point here) and we want to inspect the exit code
+          # rather than tripping `set -e`.
+          set +e
+          odiff "$OLD" "$NEW" "$DIFF" --diff-color "#ff00ff"
+          rc=$?
+          set -e
+
+          case "$rc" in
+            0)  echo "odiff: images identical - no diff file produced." ;;
+            21) echo "odiff: images differ - diff written to $DIFF ($(wc -c < "$DIFF") bytes)." ;;
+            *)  echo "::warning::odiff exited $rc - diff image may be missing." ;;
+          esac
+
       - name: Upload snapshot diff (on test failure)
         if: failure() && matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4
@@ -437,6 +484,8 @@ jobs:
             && cp artifact/snapshot-diff/new/overlay_snapshot.png "$STAGE_DIR/new.png"
           [ -f artifact/snapshot-diff/old/overlay_snapshot.png ] \
             && cp artifact/snapshot-diff/old/overlay_snapshot.png "$STAGE_DIR/old.png"
+          [ -f artifact/snapshot-diff/diff/overlay_snapshot.png ] \
+            && cp artifact/snapshot-diff/diff/overlay_snapshot.png "$STAGE_DIR/diff.png"
 
           # Fresh clone of just the preview branch (or init if it
           # doesn't exist yet) into a temp dir. Working outside
@@ -475,8 +524,9 @@ jobs:
           fi
 
           mkdir -p "$REL_PATH"
-          [ -f "$STAGE_DIR/new.png" ] && cp "$STAGE_DIR/new.png" "$REL_PATH/new.png"
-          [ -f "$STAGE_DIR/old.png" ] && cp "$STAGE_DIR/old.png" "$REL_PATH/old.png"
+          [ -f "$STAGE_DIR/new.png" ]  && cp "$STAGE_DIR/new.png"  "$REL_PATH/new.png"
+          [ -f "$STAGE_DIR/old.png" ]  && cp "$STAGE_DIR/old.png"  "$REL_PATH/old.png"
+          [ -f "$STAGE_DIR/diff.png" ] && cp "$STAGE_DIR/diff.png" "$REL_PATH/diff.png"
           git add "$REL_PATH"
           git commit -m "preview: snapshot diff for PR #${PR_NUMBER} run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
@@ -501,8 +551,9 @@ jobs:
           {
             echo "PREVIEW_SHA=${PREVIEW_SHA}"
             echo "PREVIEW_REL_PATH=${REL_PATH}"
-            [ -f "$REL_PATH/new.png" ] && echo "PREVIEW_HAS_NEW=true" || echo "PREVIEW_HAS_NEW=false"
-            [ -f "$REL_PATH/old.png" ] && echo "PREVIEW_HAS_OLD=true" || echo "PREVIEW_HAS_OLD=false"
+            [ -f "$REL_PATH/new.png" ]  && echo "PREVIEW_HAS_NEW=true"  || echo "PREVIEW_HAS_NEW=false"
+            [ -f "$REL_PATH/old.png" ]  && echo "PREVIEW_HAS_OLD=true"  || echo "PREVIEW_HAS_OLD=false"
+            [ -f "$REL_PATH/diff.png" ] && echo "PREVIEW_HAS_DIFF=true" || echo "PREVIEW_HAS_DIFF=false"
           } >> "$GITHUB_ENV"
 
       # ---- Inline PR comment: upsert sticky comment ---------------------
@@ -530,6 +581,7 @@ jobs:
           PREVIEW_REL_PATH: ${{ env.PREVIEW_REL_PATH }}
           PREVIEW_HAS_NEW: ${{ env.PREVIEW_HAS_NEW }}
           PREVIEW_HAS_OLD: ${{ env.PREVIEW_HAS_OLD }}
+          PREVIEW_HAS_DIFF: ${{ env.PREVIEW_HAS_DIFF }}
         run: |
           set -euo pipefail
 
@@ -578,6 +630,24 @@ jobs:
             DIFF_BODY="_No PNGs were captured. See [run log](${RUN_URL})._"
           fi
 
+          # Full-width visual diff (changed pixels highlighted in
+          # magenta over a desaturated copy of the original) goes
+          # below the side-by-side table. Standalone image — no
+          # surrounding table — so it renders at natural width
+          # (capped by the comment container's max-width).
+          if [ "$PREVIEW_HAS_DIFF" = "true" ]; then
+            DIFF_VISUAL=$(cat <<EOF
+
+
+          **Pixel diff** (changed pixels in magenta):
+
+          ![diff](${BASE_URL}/diff.png)
+          EOF
+          )
+          else
+            DIFF_VISUAL=""
+          fi
+
           BODY=$(cat <<EOF
           <!-- snapshot-preview-bot -->
           ## Overlay snapshot test failed
@@ -585,6 +655,7 @@ jobs:
           The overlay snapshot test failed on run [\`${RUN_ID}\` attempt ${RUN_ATTEMPT}](${RUN_URL}).
 
           ${DIFF_BODY}
+          ${DIFF_VISUAL}
 
           <sub>If the new render is the intended change, run the [\`Update overlay snapshot golden\`](${UPDATE_WORKFLOW_URL}) workflow on this branch with \`commit\` ticked to update the baseline. Raw PNGs are also available as a downloadable artifact attached to this run.</sub>
           EOF
