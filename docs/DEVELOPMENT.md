@@ -52,7 +52,6 @@ screenshots/
   overlay_snapshot.png              ← golden image diffed by the snapshot test
 
 scripts/
-  Init-Template.ps1                 ← post-clone placeholder substitution
   Generate-VersionRc.ps1            ← bakes git tag into VERSIONINFO
   Sign-Artifact.ps1                 ← headless Certum signing (CI)
   Get-CertumTotp.ps1                ← RFC 6238 TOTP generator
