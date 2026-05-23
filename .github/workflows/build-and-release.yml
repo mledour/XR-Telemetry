@@ -23,6 +23,34 @@ permissions:
   contents: write
   pull-requests: write
 
+# Cancel superseded PR builds; serialise main / tag pushes.
+#
+# Group key:
+#   - pull_request: `github.head_ref` is the SOURCE branch (e.g.
+#     `ci/snapshot-preview-comment`), so rapid pushes on the same PR
+#     collide on a single group and the newer one wins.
+#   - push (main or tags) / workflow_dispatch: `github.head_ref` is
+#     empty, so the key falls through to `github.ref` (`refs/heads/
+#     main`, `refs/tags/v0.0.8`, …). Different tags get different
+#     keys (no contention between releases); rapid commits to main
+#     share a key but queue without cancellation — see below.
+#
+# cancel-in-progress:
+#   - true on pull_request: pushing a fix on top of a still-running
+#     CI run cancels the older run. Saves CI minutes; the older
+#     artifacts would be obsolete anyway, and on snapshot test
+#     failure the newer run posts a fresh sticky comment that
+#     supersedes the prior one via marocchino's `header:` dedup.
+#   - false on push / tag / workflow_dispatch: never cancel a main
+#     commit's CI (every main commit's green status is part of
+#     permanent history) nor a tag build (the tag IS the release —
+#     a partial release artifact set is worse than a slightly-stale
+#     one). Queueing serialises them; subsequent runs wait for the
+#     in-flight one to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SOLUTION: XR_APILAYER_MLEDOUR_xr_telemetry.sln
   LAYER_NAME: XR_APILAYER_MLEDOUR_xr_telemetry
