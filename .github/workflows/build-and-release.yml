@@ -322,12 +322,16 @@ jobs:
       # prior sticky exists (typical case: PR that never failed the
       # snapshot).
       #
-      # Step `if:` is implicit `success()` — i.e. this runs only when
-      # the test step (and every earlier step in the job) succeeded.
-      # If the test failed, this step is skipped and the dedicated
-      # failure-path steps below post the diff instead. We gate on
-      # Release-only to mirror the failure path (avoids the Debug and
-      # Release matrix jobs racing on the same comment).
+      # Step `if:` cites `success()` explicitly to mirror the
+      # failure-path steps' explicit `failure()` — both status
+      # functions are already injected by GitHub Actions when an
+      # `if:` omits them, but the symmetry keeps the lifecycle
+      # contract readable without having to recall the implicit
+      # rule. If the test failed, this step is skipped and the
+      # dedicated failure-path steps below post the diff instead.
+      # We gate on Release-only via INLINE_ELIGIBLE to mirror the
+      # failure path (avoids the Debug and Release matrix jobs
+      # racing on the same comment).
       #
       # `head.repo.full_name == github.repository` excludes fork PRs,
       # where GITHUB_TOKEN is read-only and the action would 403.
@@ -350,8 +354,8 @@ jobs:
       # commit already provides the per-run proof a reviewer would
       # have clicked through this comment for.
       - name: Update sticky PR comment if snapshot test now passes
-        if: env.INLINE_ELIGIBLE == 'true'
-        uses: marocchino/sticky-pull-request-comment@v3
+        if: success() && env.INLINE_ELIGIBLE == 'true'
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
         with:
           header: ${{ env.STICKY_HEADER }}
           only_update: true
@@ -785,7 +789,7 @@ jobs:
       # is produced by the compose step above.
       - name: Post sticky PR comment with snapshot diff
         if: failure() && env.INLINE_ELIGIBLE == 'true' && env.PREVIEW_SHA != ''
-        uses: marocchino/sticky-pull-request-comment@v3
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
         with:
           header: ${{ env.STICKY_HEADER }}
           path: snapshot-comment-body.md
