@@ -1040,6 +1040,30 @@ namespace openxr_api_layer::detail {
                     return;
                 }
 
+                // Lock the layout's line spacing to the base format's
+                // natural metrics BEFORE applying any per-range font
+                // overrides. Without this, swapping the digit ranges to
+                // Barlow Medium Italic widens the line (DirectWrite
+                // takes max ascent/descent across the line's fonts),
+                // which shifts the paragraph-centred baseline a couple
+                // of pixels relative to the histogram title rendered
+                // via DrawTextW (which stays on pure-base-format line
+                // metrics). GetLineMetrics here reads the natural
+                // Rajdhani-only line because no overrides have been
+                // applied yet; piping those values through
+                // SetLineSpacing(UNIFORM, …) freezes them so the later
+                // Barlow per-range swap can't shift them.
+                {
+                    DWRITE_LINE_METRICS lm{};
+                    UINT32 lineCount = 0;
+                    if (SUCCEEDED(layout->GetLineMetrics(&lm, 1, &lineCount))
+                        && lineCount > 0) {
+                        layout->SetLineSpacing(
+                            DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                            lm.height, lm.baseline);
+                    }
+                }
+
                 for (const ValueRun& run : findValueRuns(wide)) {
                     // Italic sub-range → Barlow Medium Italic. Skipped
                     // when the prefix is dash/dot-only (italicLen == 0
