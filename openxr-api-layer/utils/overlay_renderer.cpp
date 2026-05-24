@@ -1038,7 +1038,7 @@ namespace openxr_api_layer::detail {
                     l + kSectionInnerPad, titleT,
                     r - kSectionInnerPad, titleB);
                 drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
-                          m_brushTextLabel.Get());
+                          m_brushTextWhite.Get());
 
                 // Current value (top-right). Two shapes depending on
                 // whether `secondaryValue` is empty:
