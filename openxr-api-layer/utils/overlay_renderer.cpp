@@ -289,21 +289,28 @@ namespace openxr_api_layer::detail {
                     customCollection = m_customFontCollection.Get();
                 }
 
-                // Format split — 5 chiffres formats use Barlow Medium
-                // ITALIC, 2 label formats use Rajdhani SemiBold NORMAL.
-                // The compound format (App / Render) anchors to Rajdhani
-                // upright as its BASE and gets per-range Barlow Medium
-                // Italic overrides at draw time via drawMixedStyleAscii
-                // → IDWriteTextLayout::SetFontFamilyName + SetFontWeight
-                // + SetFontStyle on the chiffres ranges.
+                // Format split — Barlow Medium Italic is reserved for
+                // digit characters only; everything else (labels,
+                // titles, unit suffixes like " ms" / "°C" / "%") uses
+                // Rajdhani SemiBold upright. The two pure-digit formats
+                // (m_fmtBigNumber / m_fmtAccentNumber) stay anchored
+                // directly on Barlow Italic because their strings are
+                // always digit-only (FPS / AVG / P95 / …). The mixed
+                // formats (m_fmtTemp, m_fmtMsValue, m_fmtMsCompound)
+                // anchor on Rajdhani upright and get per-range Barlow
+                // Italic overrides at draw time via drawValueAscii /
+                // drawValueWide — those helpers auto-detect digit runs
+                // and call drawMixedStyle{Ascii,Wide} which apply
+                // SetFontFamilyName + SetFontWeight + SetFontStyle on
+                // each digit range.
                 //
-                //   Chiffres (Barlow Medium Italic, ID 201):
-                //     m_fmtBigNumber, m_fmtAccentNumber, m_fmtTemp,
-                //     m_fmtMsValue
-                //   Labels / titles / compound base (Rajdhani SemiBold
-                //   upright, ID 200):
-                //     m_fmtTinyLabelCenter, m_fmtSectionTitle,
-                //     m_fmtMsCompound
+                //   Pure-digit (Barlow Medium Italic):
+                //     m_fmtBigNumber, m_fmtAccentNumber
+                //   Mixed value (Rajdhani SemiBold upright BASE +
+                //   per-digit Barlow Italic overrides):
+                //     m_fmtTemp, m_fmtMsValue, m_fmtMsCompound
+                //   Labels / titles (Rajdhani SemiBold upright):
+                //     m_fmtTinyLabelCenter, m_fmtSectionTitle
                 constexpr DWRITE_FONT_WEIGHT kChiffresWeight = DWRITE_FONT_WEIGHT_MEDIUM;
                 constexpr DWRITE_FONT_WEIGHT kLabelWeight    = DWRITE_FONT_WEIGHT_SEMI_BOLD;
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontBigNumber,    kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
@@ -312,15 +319,21 @@ namespace openxr_api_layer::detail {
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
-                // under its column label.
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontTemp,         kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
+                // under its column label. Anchored on Rajdhani
+                // upright so the " °C" / " %" / " GB" unit suffixes
+                // render upright; digit prefixes get Barlow Italic
+                // via drawValueWide / drawValueAscii.
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontTemp,         kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontMs,           kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
+                // m_fmtMsValue anchors on Rajdhani upright too:
+                // the " ms" suffix renders upright and the digit
+                // prefix flips to Barlow Italic via drawValueAscii.
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontMs,           kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
                 // m_fmtMsCompound's BASE is Rajdhani SemiBold upright
-                // (it's the "App" / " / Render " label portions of the
-                // compound). drawMixedStyleAscii applies Barlow Medium
-                // Italic on the chiffres ranges per draw.
+                // (it's the "App" / " / Render " label portions plus
+                // the " ms" unit suffixes). drawValueAscii applies
+                // Barlow Medium Italic on the digit ranges per draw.
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontMsCompound,   kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontTinyLabel,    kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
@@ -834,14 +847,16 @@ namespace openxr_api_layer::detail {
                 rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
-            // Renders an ASCII string where selected character ranges
-            // are flipped to the chiffres font (Barlow Medium Italic),
-            // while the rest of the string keeps the base format
-            // (Rajdhani SemiBold upright, for labels).
+            // Renders a string where selected character ranges flip
+            // to the chiffres font (Barlow Medium Italic) while the
+            // rest of the string keeps the base format (Rajdhani
+            // SemiBold upright, for labels and unit suffixes).
             //
-            // Used for the CPU panel's compound "App {x} ms / Render
-            // {y} ms" where labels stay upright Rajdhani and chiffres
-            // are italic Barlow.
+            // Used by drawValueAscii / drawValueWide to paint digit
+            // runs in italic Barlow inside otherwise upright Rajdhani
+            // value strings ("67 °C", "6.7 ms", "App 4.3 ms / Render
+            // 7.4 ms" — same code path, only the digit-range layout
+            // differs).
             //
             // IDWriteTextFormat carries exactly one (family, weight,
             // style) tuple for the whole string — to mix two fonts in
@@ -878,20 +893,15 @@ namespace openxr_api_layer::detail {
             // we ever revisit is exactly here — applied per-layout, not
             // per-format, so this helper would gain a SetTypography
             // call without further refactor.
-            void drawMixedStyleAscii(
+            void drawMixedStyleWide(
                 ID2D1RenderTarget* rt,
-                const std::string& s,
+                const std::wstring& wide,
                 IDWriteTextFormat* baseFmt,
-                std::initializer_list<std::pair<UINT32, UINT32>> chiffresRanges,
+                const std::vector<std::pair<UINT32, UINT32>>& chiffresRanges,
                 const D2D1_RECT_F& rect,
                 ID2D1Brush* brush,
                 ID2D1Brush* chiffresBrush = nullptr) const {
-                if (s.empty() || !baseFmt) return;
-                // ASCII → wide byte-for-byte. Same contract as drawAscii:
-                // caller guarantees s contains only ASCII codepoints
-                // (which matches the compound's "App / Render / digits /
-                // space / slash / ms" character set).
-                std::wstring wide(s.begin(), s.end());
+                if (wide.empty() || !baseFmt) return;
 
                 ComPtr<IDWriteTextLayout> layout;
                 if (FAILED(m_dwriteFactory->CreateTextLayout(
@@ -904,9 +914,9 @@ namespace openxr_api_layer::detail {
                     // Fall back to the simple single-style path so the
                     // panel still shows something readable. The whole
                     // string renders in the BASE format (upright
-                    // Rajdhani for the compound case) — chiffres lose
-                    // their italic Barlow flavour for this frame.
-                    drawAscii(rt, s, baseFmt, rect, brush);
+                    // Rajdhani for the value cases) — digit ranges
+                    // lose their italic Barlow flavour for this frame.
+                    drawWide(rt, wide.c_str(), baseFmt, rect, brush);
                     return;
                 }
                 // Per-range overrides: family (Barlow), weight (Medium),
@@ -919,7 +929,8 @@ namespace openxr_api_layer::detail {
                 // also get SetDrawingEffect(chiffresBrush) so D2D's
                 // default text renderer paints them with that brush
                 // instead of the base `brush` — used for "App / Render"
-                // in white and digits + " ms" in cyan within one layout.
+                // and " ms" in white and digit runs in cyan within one
+                // layout.
                 for (const auto& [start, len] : chiffresRanges) {
                     const DWRITE_TEXT_RANGE range{start, len};
                     layout->SetFontFamilyName(L"Barlow", range);
@@ -932,6 +943,94 @@ namespace openxr_api_layer::detail {
                 rt->DrawTextLayout(
                     D2D1::Point2F(rect.left, rect.top),
                     layout.Get(), brush);
+            }
+
+            // ASCII overload — byte-widens to wstring and forwards.
+            // Caller contract: `s` is ASCII-only (same as drawAscii).
+            void drawMixedStyleAscii(
+                ID2D1RenderTarget* rt,
+                const std::string& s,
+                IDWriteTextFormat* baseFmt,
+                const std::vector<std::pair<UINT32, UINT32>>& chiffresRanges,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr) const {
+                if (s.empty()) return;
+                std::wstring wide(s.begin(), s.end());
+                drawMixedStyleWide(rt, wide, baseFmt, chiffresRanges,
+                                    rect, brush, chiffresBrush);
+            }
+
+            // Detect digit runs inside `s`: maximal contiguous spans
+            // of [0-9.] that contain at least one digit. The dot is
+            // grouped with the digits so "6.7" stays one italic run
+            // (no awkward upright dot between the italic digits);
+            // dot-only or dash-only fragments (e.g. "--.-" placeholder)
+            // produce no runs and render entirely in the base format.
+            // Used by drawValueAscii / drawValueWide.
+            template <typename CharT>
+            static std::vector<std::pair<UINT32, UINT32>>
+            findDigitRuns(const std::basic_string<CharT>& s) {
+                std::vector<std::pair<UINT32, UINT32>> runs;
+                const UINT32 n = static_cast<UINT32>(s.size());
+                UINT32 i = 0;
+                while (i < n) {
+                    while (i < n
+                            && !((s[i] >= CharT('0') && s[i] <= CharT('9'))
+                                  || s[i] == CharT('.'))) {
+                        ++i;
+                    }
+                    if (i >= n) break;
+                    const UINT32 start = i;
+                    bool hasDigit = false;
+                    while (i < n
+                            && ((s[i] >= CharT('0') && s[i] <= CharT('9'))
+                                 || s[i] == CharT('.'))) {
+                        if (s[i] >= CharT('0') && s[i] <= CharT('9')) {
+                            hasDigit = true;
+                        }
+                        ++i;
+                    }
+                    if (hasDigit) {
+                        runs.emplace_back(start, i - start);
+                    }
+                }
+                return runs;
+            }
+
+            // Render a value string with digit characters in Barlow
+            // Medium Italic and non-digit characters in the base
+            // format's family/style (typically Rajdhani SemiBold
+            // upright). Auto-detects digit ranges from the string
+            // content — caller passes the assembled "67 °C" / "92 %"
+            // / "App 4.3 ms / Render 7.4 ms" string and the helper
+            // figures out which sub-ranges should flip to Barlow.
+            //
+            // `brush` paints non-digit chars (or every char when
+            // `chiffresBrush` is null). `chiffresBrush`, when
+            // non-null, paints the digit runs — used by the CPU
+            // compound to keep digits cyan while the surrounding
+            // "App" / "/ Render" / " ms" labels render in white.
+            void drawValueWide(
+                ID2D1RenderTarget* rt,
+                const std::wstring& s,
+                IDWriteTextFormat* baseFmt,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr) const {
+                drawMixedStyleWide(rt, s, baseFmt, findDigitRuns(s),
+                                    rect, brush, chiffresBrush);
+            }
+
+            void drawValueAscii(
+                ID2D1RenderTarget* rt,
+                const std::string& s,
+                IDWriteTextFormat* baseFmt,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr) const {
+                drawMixedStyleAscii(rt, s, baseFmt, findDigitRuns(s),
+                                     rect, brush, chiffresBrush);
             }
 
             // -------- Header bar --------------------------------------------
@@ -1046,61 +1145,42 @@ namespace openxr_api_layer::detail {
                 //   GPU panel (secondaryValue == "")   : "6.7 ms"
                 //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
                 //
-                // GPU panel is a single right-aligned string in
-                // m_fmtMsValue (Barlow Medium Italic, kFontMs).
-                // CPU panel goes through IDWriteTextLayout with
-                // mixed styles: upright "App" / " / Render " labels
-                // (matching the section-title weight) + italic
-                // chiffres+unit ("4.3 ms" / "7.4 ms") matching the
-                // rest of the HUD's chiffres.
+                // Both panels go through drawValueAscii: digit runs
+                // in the string flip to Barlow Medium Italic and the
+                // rest stays in the base format (Rajdhani SemiBold
+                // upright). The GPU panel uses a single cyan brush —
+                // "6.7" italic Barlow cyan + " ms" upright Rajdhani
+                // cyan. The CPU compound passes two brushes so the
+                // upright "App" / " / Render " / " ms" portions
+                // render in white while only the italic digit runs
+                // pop in cyan.
                 if (secondaryValue.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
-                    // read-out. Single-style italic from m_fmtMsValue,
-                    // plain drawAscii call.
+                    // read-out. drawValueAscii auto-detects the "6.7"
+                    // digit run and applies Barlow Italic; " ms" stays
+                    // upright Rajdhani.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 160.0f, titleT - 4.0f,
                         r - kSectionInnerPad,          titleB + 6.0f);
-                    drawAscii(rt, s, m_fmtMsValue.Get(), valueRect,
-                               m_brushAccentCyan.Get());
+                    drawValueAscii(rt, s, m_fmtMsValue.Get(), valueRect,
+                                    m_brushAccentCyan.Get());
                 } else {
-                    // CPU panel: compound "App {x} ms / Render {y} ms"
-                    // at kFontMsCompound — labels upright in white
-                    // (matching the section title weight), digits +
-                    // unit italic in cyan (matching the rest of the
-                    // HUD chiffres). Per-range styles via
-                    // drawMixedStyleAscii → IDWriteTextLayout +
-                    // SetFontStyle + SetDrawingEffect.
-                    //
-                    // String layout (character offsets):
-                    //   "App "            offset  0, length 4         (upright)
-                    //   secondaryValue    offset  4, length sec.size()
-                    //   " ms"             follows, length 3            ← italic with sec
-                    //   " / Render "      length 10                    (upright)
-                    //   currentValue      length cur.size()
-                    //   " ms"             length 3                     ← italic with cur
-                    const std::string& sec = secondaryValue;
-                    const std::string& cur = currentValue;
+                    // CPU panel: compound "App {x} ms / Render {y} ms".
+                    // drawValueAscii finds the two digit runs (sec, cur)
+                    // and flips them to Barlow Italic + cyan via the
+                    // chiffres brush; "App" / " ms" / " / Render " all
+                    // stay upright Rajdhani in white.
                     const std::string compound =
-                        "App " + sec + " ms / Render " + cur + " ms";
-                    const UINT32 italicAStart =
-                        4;                                      // after "App "
-                    const UINT32 italicALen   =
-                        static_cast<UINT32>(sec.size()) + 3;     // sec + " ms"
-                    const UINT32 italicBStart =
-                        italicAStart + italicALen + 10;          // + " / Render "
-                    const UINT32 italicBLen   =
-                        static_cast<UINT32>(cur.size()) + 3;     // cur + " ms"
+                        "App " + secondaryValue + " ms / Render "
+                        + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 320.0f, titleT - 4.0f,
                         r - kSectionInnerPad,          titleB + 6.0f);
-                    drawMixedStyleAscii(
-                        rt, compound, m_fmtMsCompound.Get(),
-                        {{italicAStart, italicALen},
-                         {italicBStart, italicBLen}},
-                        valueRect,
-                        m_brushTextWhite.Get(),    // "App", " / Render "
-                        m_brushAccentCyan.Get());  // italic digits + " ms"
+                    drawValueAscii(rt, compound, m_fmtMsCompound.Get(),
+                                    valueRect,
+                                    m_brushTextWhite.Get(),    // labels + " ms"
+                                    m_brushAccentCyan.Get());  // digit runs
                 }
 
                 // Histogram region — below the title row, with inner
@@ -1300,11 +1380,10 @@ namespace openxr_api_layer::detail {
                 // Vertical positions inside the panel:
                 //   labelY : small label (m_fmtTinyLabelCenter,
                 //            kFontTinyLabel = 17 px SemiBold)
-                //   valueY : big value (m_fmtTemp, kFontTemp = 43 px
-                //            Bold) — extends down to the panel bottom
-                //            and paragraph-centres for the "label
-                //            above / value below" stack the design
-                //            asks for.
+                //   valueY : big value (m_fmtTemp at kFontTemp) —
+                //            extends down to the panel bottom and
+                //            paragraph-centres for the "label above /
+                //            value below" stack the design asks for.
                 const float labelY = t + (b - t) * 0.18f;
                 const float valueY = t + (b - t) * 0.40f;
 
@@ -1318,6 +1397,14 @@ namespace openxr_api_layer::detail {
                               D2D1::RectF(cellL, labelY, cellR,
                                            labelY + 22.0f),
                               m_brushTextLabel.Get());
+                    // m_fmtTemp's BASE is Rajdhani upright; the digit
+                    // prefix flips to Barlow Italic via drawValueWide /
+                    // drawValueAscii's auto-detected ranges, while the
+                    // unit suffix (" °C" / " %" / " GB") keeps the base
+                    // family/style. Single brush — the whole value
+                    // shares the per-tier colour (white / cyan / orange
+                    // / red), only the font face changes between digit
+                    // and unit.
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
@@ -1325,12 +1412,12 @@ namespace openxr_api_layer::detail {
                         std::wstring wide(asciiValue.begin(),
                                            asciiValue.end());
                         wide += unitSuffix;
-                        drawWide(rt, wide.c_str(), m_fmtTemp.Get(),
-                                  D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                  valueBrush);
+                        drawValueWide(rt, wide, m_fmtTemp.Get(),
+                                       D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
+                                       valueBrush);
                     } else {
                         // % and other ASCII-safe suffixes — single
-                        // ASCII drawAscii call, no wide conversion.
+                        // ASCII drawValueAscii call, no wide conversion.
                         std::string full = asciiValue;
                         // Append the suffix as narrow chars. Caller
                         // contract: !useWideValue means unitSuffix is
@@ -1348,9 +1435,9 @@ namespace openxr_api_layer::detail {
                                    "!useWideValue path");
                             full.push_back(static_cast<char>(*p));
                         }
-                        drawAscii(rt, full, m_fmtTemp.Get(),
-                                   D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                   valueBrush);
+                        drawValueAscii(rt, full, m_fmtTemp.Get(),
+                                        D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
+                                        valueBrush);
                     }
                 };
 
