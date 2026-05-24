@@ -427,11 +427,16 @@ namespace openxr_api_layer::detail {
                 // the texture is just visible without becoming
                 // visible stripes.
                 if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
-                // Text — neutral off-white, #F7F7F7. Used for primary
-                // read-outs (FPS number) and for the upright "App",
-                // "/ Render" labels in the CPU compound.
+                // Text — neutral off-white, #F7F7F7. The HUD's single
+                // text brush: covers header micro-labels (FPS / P95 /
+                // P99 / …), footer captions (GPU TEMP / LOAD / VRAM),
+                // histogram titles (GPU FRAMETIME MS / CPU FRAMETIME
+                // MS), the FPS big number, and the upright "App" /
+                // " / Render " labels in the CPU compound. Earlier
+                // iterations split into a brighter "text" brush and a
+                // dimmer "label" brush, but the design lands on the
+                // same off-white for every text role.
                 if (!make(D2D1::ColorF(0.969f, 0.969f, 0.969f, 1.00f), m_brushTextWhite)) return false;  // #F7F7F7
-                if (!make(D2D1::ColorF(0.620f, 0.659f, 0.671f, 1.00f), m_brushTextLabel)) return false;  // #9EA8AB
                 // Cyan accent — the "duller" cyan from the spec
                 // (#19D1D9), reserved for TEXT accents (FPS AVG /
                 // P95 / P99 / P99.9 + healthy LOAD / VRAM). The
@@ -1163,7 +1168,7 @@ namespace openxr_api_layer::detail {
                                  ID2D1Brush* valueBrush) const {
                 const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
                 drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                          labelRect, m_brushTextLabel.Get());
+                          labelRect, m_brushTextWhite.Get());
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     l, valueY - 2.0f, r,
                     valueY + kFontBigNumber + 6.0f);
@@ -1694,7 +1699,6 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushBevelShadow;
             ComPtr<ID2D1SolidColorBrush> m_brushCarbonHatch;
             ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
-            ComPtr<ID2D1SolidColorBrush> m_brushTextLabel;
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             // Histogram bar brushes use linear gradients (top→
             // bottom) rather than solid colours, matching the design
