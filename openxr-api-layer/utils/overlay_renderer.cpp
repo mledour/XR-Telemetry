@@ -153,12 +153,12 @@ namespace openxr_api_layer::detail {
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
         constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
         // Labels and section titles render in Rajdhani SemiBold.
-        constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
+        constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
                                                      // ("App X ms / Render Y ms") —
-                                                     // smaller so the longer
-                                                     // string still fits in the
-                                                     // top-right region.
+                                                     // matches kFontMs so the GPU
+                                                     // and CPU read-outs share the
+                                                     // same visual weight.
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
                                                      // single biggest text on
                                                      // the HUD, primary anchor.
@@ -1038,17 +1038,16 @@ namespace openxr_api_layer::detail {
                 //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
                 //
                 // GPU panel is a single right-aligned string in
-                // m_fmtMsValue (Barlow Medium Italic kFontMs=26 px).
+                // m_fmtMsValue (Barlow Medium Italic, kFontMs).
                 // CPU panel goes through IDWriteTextLayout with
                 // mixed styles: upright "App" / " / Render " labels
                 // (matching the section-title weight) + italic
                 // chiffres+unit ("4.3 ms" / "7.4 ms") matching the
                 // rest of the HUD's chiffres.
                 if (secondaryValue.empty()) {
-                    // GPU panel: short "6.7 ms" at the larger
-                    // kFontMs (26 px) — primary frametime read-out.
-                    // Single-style italic from m_fmtMsValue, plain
-                    // drawAscii call.
+                    // GPU panel: short "6.7 ms" primary frametime
+                    // read-out. Single-style italic from m_fmtMsValue,
+                    // plain drawAscii call.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 160.0f, titleT - 4.0f,
@@ -1057,7 +1056,7 @@ namespace openxr_api_layer::detail {
                                m_brushAccentCyan.Get());
                 } else {
                     // CPU panel: compound "App {x} ms / Render {y} ms"
-                    // at the smaller kFontMsCompound — labels upright
+                    // at kFontMsCompound — labels upright
                     // (matching the section title weight), chiffres +
                     // unit italic (matching the rest of the HUD
                     // chiffres). Per-range styles via
@@ -1518,8 +1517,8 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
             ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
-            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU, 26 px)
-            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, 18 px, mixed style)
+            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU)
+            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, mixed style)
             ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
