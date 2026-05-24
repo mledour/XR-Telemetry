@@ -99,18 +99,18 @@ namespace openxr_api_layer::detail {
         //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — CPU panel
         //   kSectionGap          (8)
-        //   kBottomHeight      (105)
+        //   kBottomHeight      (109)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 431, leaving 6 px of bottom slack against the
-        //   437-px texture height. The slack is intentionally small —
+        //   Total = 435, leaving 6 px of bottom slack against the
+        //   441-px texture height. The slack is intentionally small —
         //   each panel is sized to its content, and `bottomY + kBottomHeight
         //   ≤ innerB` by construction (asserted via the (void)innerB
         //   line in paint()). Bumping any of the heights past this
         //   budget will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 437;
+        constexpr int32_t kTexH = 441;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
@@ -128,10 +128,10 @@ namespace openxr_api_layer::detail {
                                                       // of the strip — eliminates the
                                                       // empty top-half users observed
                                                       // in light-load scenarios.
-        constexpr float kBottomHeight     = 105.0f;  // tight cell — top-anchored caption,
-                                                      // centred 43-px digit, ~5 px gap
-                                                      // between, ~31 px equal margin top
-                                                      // and bottom around the digit.
+        constexpr float kBottomHeight     = 109.0f;  // 16 + label(22) + 14 +
+                                                      // metric(43) + 14 — explicit
+                                                      // gap stack per design spec
+                                                      // (see drawBottomPanel below).
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
@@ -1437,17 +1437,33 @@ namespace openxr_api_layer::detail {
                 // because that would be redundant and use a full
                 // extra word of horizontal space.
 
-                // Cell layout — label hugging the top of the cell and
-                // big value paragraph-centred in the WHOLE cell rect.
-                // The value's rect spans the full panel height so
-                // paragraph CENTER places the digit's vertical centre
-                // on the cell's vertical centre — equal blank space
-                // above (cell top → digit top) and below (digit bottom
-                // → cell bottom). The label drawn at the top sits
-                // inside that "above" region without overlapping the
-                // digit (digit centre ≈ cellH/2, label height ≈ 22 px
-                // << cellH/2 even at the smallest kBottomHeight).
-                const float labelY = t + 4.0f;
+                // Cell vertical stack — explicit gap spec from the
+                // design mockup:
+                //
+                //   cell top                        ── 0
+                //     │                             16 px
+                //   label rect top (kLabelH = 22)   ── 16
+                //     │ label glyph centred in rect
+                //   label rect bottom               ── 38
+                //     │                             14 px
+                //   value rect top (digit = 43)     ── 52
+                //     │ digit paragraph-centred + " unit" baseline-aligned
+                //   value rect bottom               ── 95
+                //     │                             14 px
+                //   cell bottom                     ── 109 == kBottomHeight
+                //
+                // The value rect is sized exactly to the 43-px digit
+                // height so paragraph CENTER (inherited from m_fmtTemp)
+                // places the digit at top:52 → bottom:95, with the
+                // smaller " °C" / " %" / " GB" suffix baseline-aligned
+                // alongside it.
+                constexpr float kLabelTop = 16.0f;
+                constexpr float kLabelH   = 22.0f;
+                constexpr float kLabelToMetric = 14.0f;
+                constexpr float kMetricH       = 43.0f;  // == kFontTemp
+                const float labelY  = t + kLabelTop;
+                const float metricT = t + kLabelTop + kLabelH + kLabelToMetric;
+                const float metricB = metricT + kMetricH;
 
                 auto drawCell = [&](float cellL, float cellR,
                                       const wchar_t* label,
@@ -1457,7 +1473,7 @@ namespace openxr_api_layer::detail {
                                       bool useWideValue) {
                     drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
                               D2D1::RectF(cellL, labelY, cellR,
-                                           labelY + 22.0f),
+                                           labelY + kLabelH),
                               m_brushTextWhite.Get());
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
                     // prefix flips to Barlow Italic via drawValueWide /
@@ -1471,7 +1487,7 @@ namespace openxr_api_layer::detail {
                     // the whole value shares the per-tier colour (white
                     // / cyan / orange / red), only the font face and
                     // size change between digit and unit.
-                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, t, cellR, b);
+                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, metricT, cellR, metricB);
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
