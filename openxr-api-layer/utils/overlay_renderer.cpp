@@ -151,14 +151,8 @@ namespace openxr_api_layer::detail {
         // resolution; rendered to the head-locked quad they read at
         // their natural visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
-        // Labels and section titles render in Rajdhani SemiBold (NOT
-        // Barlow), restored to their pre-Barlow-swap sizes. Rajdhani's
-        // narrower glyphs make the original 17 / 22 px the right
-        // calibration; the temporary 14 / 18 px shrink during the
-        // all-Barlow iteration was a compensation for Barlow Medium
-        // being noticeably wider and no longer applies now that the
-        // family flipped back to Rajdhani for labels.
+        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
+        // Labels and section titles render in Rajdhani SemiBold.
         constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
                                                      // ("App X ms / Render Y ms") —
