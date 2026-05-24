@@ -68,10 +68,10 @@ namespace openxr_api_layer::detail {
 
     namespace {
 
-        // -------- Layout constants (fpsVR redesign, 720×480) ----------------
+        // -------- Layout constants (fpsVR redesign) -------------------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 720×480 (3:2) packs
+        // QUAD in 3D scales, not the resolution. kTexW × kTexH packs
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
         //   - GPU FRAMETIME MS panel with histogram + current value
@@ -94,27 +94,27 @@ namespace openxr_api_layer::detail {
         //   kFrameStroke         (2)
         //   inner padding        (4)   ← see innerT in paint()
         //   kHeaderHeight       (90)
-        //   kSectionGap         (14)
+        //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — GPU panel
-        //   kSectionGap         (14)
+        //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — CPU panel
-        //   kSectionGap         (14)
+        //   kSectionGap          (8)
         //   kBottomHeight      (130)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 474, leaving 6 px of bottom slack against the
-        //   480-px texture height. The slack is intentionally small —
+        //   Total = 456, leaving 6 px of bottom slack against the
+        //   462-px texture height. The slack is intentionally small —
         //   each panel is sized to its content, and `bottomY + kBottomHeight
         //   ≤ innerB` by construction (asserted via the (void)innerB
         //   line in paint()). Bumping any of the heights past this
         //   budget will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 480;
+        constexpr int32_t kTexH = 462;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
-        constexpr float kSectionGap     = 14.0f;
+        constexpr float kSectionGap     =  8.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
         // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
@@ -147,9 +147,9 @@ namespace openxr_api_layer::detail {
                        "bump both in lockstep if tuning the histogram length");
 
         // Font sizes — calibrated against the design spec's
-        // hierarchy. Sizes in pixels at the 720×480 native texture
-        // resolution; rendered to the head-locked quad they read at
-        // their natural visual weight in the HMD.
+        // hierarchy. Sizes in pixels at the native texture resolution;
+        // rendered to the head-locked quad they read at their natural
+        // visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
         constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
         // Labels and section titles render in Rajdhani SemiBold.
@@ -180,10 +180,6 @@ namespace openxr_api_layer::detail {
         // breathing room above and below.
         constexpr float kHeaderSepInsetY      =  8.0f;
         constexpr float kBottomSepInsetY      = 14.0f;
-        // Bottom margin for the big value text inside each bottom-
-        // panel cell (drawCell's text rect). Keeps the descender of
-        // glyphs like the "9" tail in "99" clear of the panel edge.
-        constexpr float kBottomCellTextBottomPad = 8.0f;
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -1439,15 +1435,17 @@ namespace openxr_api_layer::detail {
                 // because that would be redundant and use a full
                 // extra word of horizontal space.
 
-                // Vertical positions inside the panel:
-                //   labelY : small label (m_fmtTinyLabelCenter,
-                //            kFontTinyLabel = 17 px SemiBold)
-                //   valueY : big value (m_fmtTemp at kFontTemp) —
-                //            extends down to the panel bottom and
-                //            paragraph-centres for the "label above /
-                //            value below" stack the design asks for.
-                const float labelY = t + (b - t) * 0.18f;
-                const float valueY = t + (b - t) * 0.40f;
+                // Cell layout — label hugging the top of the cell and
+                // big value paragraph-centred in the WHOLE cell rect.
+                // The value's rect spans the full panel height so
+                // paragraph CENTER places the digit's vertical centre
+                // on the cell's vertical centre — equal blank space
+                // above (cell top → digit top) and below (digit bottom
+                // → cell bottom). The label drawn at the top sits
+                // inside that "above" region without overlapping the
+                // digit (digit centre ≈ cellH/2, label height ≈ 22 px
+                // << cellH/2 even at the smallest kBottomHeight).
+                const float labelY = t + 4.0f;
 
                 auto drawCell = [&](float cellL, float cellR,
                                       const wchar_t* label,
@@ -1471,6 +1469,7 @@ namespace openxr_api_layer::detail {
                     // the whole value shares the per-tier colour (white
                     // / cyan / orange / red), only the font face and
                     // size change between digit and unit.
+                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, t, cellR, b);
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
@@ -1479,7 +1478,7 @@ namespace openxr_api_layer::detail {
                                            asciiValue.end());
                         wide += unitSuffix;
                         drawValueWide(rt, wide, m_fmtTemp.Get(),
-                                       D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
+                                       valueRect,
                                        valueBrush,
                                        /*chiffresBrush=*/nullptr,
                                        /*unitFontSize=*/kFontTempUnit);
@@ -1504,7 +1503,7 @@ namespace openxr_api_layer::detail {
                             full.push_back(static_cast<char>(*p));
                         }
                         drawValueAscii(rt, full, m_fmtTemp.Get(),
-                                        D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
+                                        valueRect,
                                         valueBrush,
                                         /*chiffresBrush=*/nullptr,
                                         /*unitFontSize=*/kFontTempUnit);
@@ -1590,7 +1589,7 @@ namespace openxr_api_layer::detail {
             // For a 280-px-wide × 90-px-tall frametime panel at
             // 6 px spacing that's ~62 lines. At 4-5 panels per
             // frame and 144 Hz that's ~45k DrawLine/s — well within
-            // D2D's budget for a 720×480 target. Could be cached to
+            // D2D's budget for this overlay target. Could be cached to
             // an offscreen bitmap brush later if it ever shows up
             // in a profile.
             void drawCarbonHatch(ID2D1RenderTarget* rt, float l, float t,

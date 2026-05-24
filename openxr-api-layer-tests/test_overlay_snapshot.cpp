@@ -24,11 +24,11 @@
 // test_overlay_snapshot.cpp — visual-regression snapshot of the overlay.
 //
 // Renders the HUD with hard-coded mock data (the same numbers from the
-// design mockup) to a 720×480 WIC bitmap via the standard D2D
-// CreateWicBitmapRenderTarget path, then encodes the bitmap to
-// overlay_snapshot.png in the test binary's working directory. CI
-// uploads the PNG as a build artifact so a reviewer can eyeball the
-// rendering without spinning up a HMD.
+// design mockup) to a WIC bitmap sized to the renderer's native
+// texture dimensions via the standard D2D CreateWicBitmapRenderTarget
+// path, then encodes the bitmap to overlay_snapshot.png in the test
+// binary's working directory. CI uploads the PNG as a build artifact
+// so a reviewer can eyeball the rendering without spinning up a HMD.
 //
 // Why a doctest TEST_CASE rather than a standalone EXE: the existing
 // tests project already pulls in overlay_renderer.cpp (along with its
@@ -225,11 +225,13 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
         CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(wic.GetAddressOf()))));
 
-    // 720×480 BGRA-premultiplied bitmap — matches the D2D render
-    // target's default pixel format so no conversion is needed at
-    // commit time.
+    // BGRA-premultiplied bitmap sized to the renderer's native
+    // texture dimensions — matches the D2D render target's default
+    // pixel format so no conversion is needed at commit time. If the
+    // renderer's kTexW / kTexH change, bump these in lockstep so the
+    // snapshot output covers the full painted area.
     constexpr UINT W = 720;
-    constexpr UINT H = 480;
+    constexpr UINT H = 462;
     ComPtr<IWICBitmap> bitmap;
     REQUIRE(SUCCEEDED(wic->CreateBitmap(
         W, H, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
