@@ -408,9 +408,10 @@ namespace openxr_api_layer::detail {
                 // the texture is just visible without becoming
                 // visible stripes.
                 if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
-                // Text — slightly cooler white than before. Matches
-                // the spec's #EBF0F2 (was #F2F4F5).
-                if (!make(D2D1::ColorF(0.922f, 0.941f, 0.949f, 1.00f), m_brushTextWhite)) return false;  // #EBF0F2
+                // Text — neutral off-white, #F7F7F7. Used for primary
+                // read-outs (FPS number) and for the upright "App",
+                // "/ Render" labels in the CPU compound.
+                if (!make(D2D1::ColorF(0.969f, 0.969f, 0.969f, 1.00f), m_brushTextWhite)) return false;  // #F7F7F7
                 if (!make(D2D1::ColorF(0.620f, 0.659f, 0.671f, 1.00f), m_brushTextLabel)) return false;  // #9EA8AB
                 // Cyan accent — the "duller" cyan from the spec
                 // (#19D1D9), reserved for TEXT accents (FPS AVG /
@@ -883,7 +884,8 @@ namespace openxr_api_layer::detail {
                 IDWriteTextFormat* baseFmt,
                 std::initializer_list<std::pair<UINT32, UINT32>> chiffresRanges,
                 const D2D1_RECT_F& rect,
-                ID2D1Brush* brush) const {
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr) const {
                 if (s.empty() || !baseFmt) return;
                 // ASCII → wide byte-for-byte. Same contract as drawAscii:
                 // caller guarantees s contains only ASCII codepoints
@@ -913,12 +915,19 @@ namespace openxr_api_layer::detail {
                 // attached to baseFmt at CreateTextFormat time; that
                 // collection holds both "Rajdhani" and "Barlow" so the
                 // family swap resolves without falling back to system
-                // fonts.
+                // fonts. When chiffresBrush is non-null, the same ranges
+                // also get SetDrawingEffect(chiffresBrush) so D2D's
+                // default text renderer paints them with that brush
+                // instead of the base `brush` — used for "App / Render"
+                // in white and digits + " ms" in cyan within one layout.
                 for (const auto& [start, len] : chiffresRanges) {
                     const DWRITE_TEXT_RANGE range{start, len};
                     layout->SetFontFamilyName(L"Barlow", range);
                     layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, range);
                     layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+                    if (chiffresBrush) {
+                        layout->SetDrawingEffect(chiffresBrush, range);
+                    }
                 }
                 rt->DrawTextLayout(
                     D2D1::Point2F(rect.left, rect.top),
@@ -1056,12 +1065,12 @@ namespace openxr_api_layer::detail {
                                m_brushAccentCyan.Get());
                 } else {
                     // CPU panel: compound "App {x} ms / Render {y} ms"
-                    // at kFontMsCompound — labels upright
-                    // (matching the section title weight), chiffres +
-                    // unit italic (matching the rest of the HUD
-                    // chiffres). Per-range styles via
+                    // at kFontMsCompound — labels upright in white
+                    // (matching the section title weight), digits +
+                    // unit italic in cyan (matching the rest of the
+                    // HUD chiffres). Per-range styles via
                     // drawMixedStyleAscii → IDWriteTextLayout +
-                    // SetFontStyle.
+                    // SetFontStyle + SetDrawingEffect.
                     //
                     // String layout (character offsets):
                     //   "App "            offset  0, length 4         (upright)
@@ -1089,7 +1098,9 @@ namespace openxr_api_layer::detail {
                         rt, compound, m_fmtMsCompound.Get(),
                         {{italicAStart, italicALen},
                          {italicBStart, italicBLen}},
-                        valueRect, m_brushAccentCyan.Get());
+                        valueRect,
+                        m_brushTextWhite.Get(),    // "App", " / Render "
+                        m_brushAccentCyan.Get());  // italic digits + " ms"
                 }
 
                 // Histogram region — below the title row, with inner
