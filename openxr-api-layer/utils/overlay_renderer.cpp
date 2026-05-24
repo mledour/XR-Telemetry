@@ -165,6 +165,13 @@ namespace openxr_api_layer::detail {
         constexpr float kFontAccentNumber = 32.0f;  // "138", "124", "108", "98"
         constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
                                                      // VRAM values
+        constexpr float kFontTempUnit     = 19.0f;  // " °C" / " %" / " GB" unit
+                                                     // suffix in the bottom panel —
+                                                     // a touch larger than the
+                                                     // 17 px tiny label sitting
+                                                     // above it, so the unit reads
+                                                     // as part of the value rather
+                                                     // than fading into the caption.
 
         // Vertical insets for the 1-px column separator lines.
         // Header bar uses a tighter inset (the cells are 90 px tall);
@@ -1446,19 +1453,19 @@ namespace openxr_api_layer::detail {
                     drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
                               D2D1::RectF(cellL, labelY, cellR,
                                            labelY + 22.0f),
-                              m_brushTextLabel.Get());
+                              m_brushTextWhite.Get());
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
                     // prefix flips to Barlow Italic via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
                     // unit suffix (" °C" / " %" / " GB") keeps the base
-                    // family/style AND shrinks to kFontTinyLabel — the
-                    // same size as the "GPU TEMP" / "LOAD" / "VRAM"
-                    // label sitting just above it, so the unit reads as
-                    // an annotation rather than a co-equal part of the
-                    // big-number digit. Single brush — the whole value
-                    // shares the per-tier colour (white / cyan / orange
-                    // / red), only the font face and size change between
-                    // digit and unit.
+                    // family/style AND shrinks to kFontTempUnit — a
+                    // touch larger than the "GPU TEMP" / "LOAD" / "VRAM"
+                    // caption sitting just above it, so the unit reads
+                    // as an annotation on the big-number digit without
+                    // disappearing into the caption row. Single brush —
+                    // the whole value shares the per-tier colour (white
+                    // / cyan / orange / red), only the font face and
+                    // size change between digit and unit.
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
@@ -1470,7 +1477,7 @@ namespace openxr_api_layer::detail {
                                        D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
                                        valueBrush,
                                        /*chiffresBrush=*/nullptr,
-                                       /*unitFontSize=*/kFontTinyLabel);
+                                       /*unitFontSize=*/kFontTempUnit);
                     } else {
                         // % and other ASCII-safe suffixes — single
                         // ASCII drawValueAscii call, no wide conversion.
@@ -1495,7 +1502,7 @@ namespace openxr_api_layer::detail {
                                         D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
                                         valueBrush,
                                         /*chiffresBrush=*/nullptr,
-                                        /*unitFontSize=*/kFontTinyLabel);
+                                        /*unitFontSize=*/kFontTempUnit);
                     }
                 };
 
