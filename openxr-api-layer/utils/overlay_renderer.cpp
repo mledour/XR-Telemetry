@@ -99,18 +99,18 @@ namespace openxr_api_layer::detail {
         //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — CPU panel
         //   kSectionGap          (8)
-        //   kBottomHeight      (130)
+        //   kBottomHeight      (105)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 456, leaving 6 px of bottom slack against the
-        //   462-px texture height. The slack is intentionally small —
+        //   Total = 431, leaving 6 px of bottom slack against the
+        //   437-px texture height. The slack is intentionally small —
         //   each panel is sized to its content, and `bottomY + kBottomHeight
         //   ≤ innerB` by construction (asserted via the (void)innerB
         //   line in paint()). Bumping any of the heights past this
         //   budget will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 462;
+        constexpr int32_t kTexH = 437;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
@@ -128,8 +128,10 @@ namespace openxr_api_layer::detail {
                                                       // of the strip — eliminates the
                                                       // empty top-half users observed
                                                       // in light-load scenarios.
-        constexpr float kBottomHeight     = 130.0f;  // tall enough for the chip + thermo
-                                                      // + 22-px gauge font + label row
+        constexpr float kBottomHeight     = 105.0f;  // tight cell — top-anchored caption,
+                                                      // centred 43-px digit, ~5 px gap
+                                                      // between, ~31 px equal margin top
+                                                      // and bottom around the digit.
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.

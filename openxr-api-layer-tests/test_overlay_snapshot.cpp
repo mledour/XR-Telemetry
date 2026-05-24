@@ -231,7 +231,7 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     // renderer's kTexW / kTexH change, bump these in lockstep so the
     // snapshot output covers the full painted area.
     constexpr UINT W = 720;
-    constexpr UINT H = 462;
+    constexpr UINT H = 437;
     ComPtr<IWICBitmap> bitmap;
     REQUIRE(SUCCEEDED(wic->CreateBitmap(
         W, H, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,

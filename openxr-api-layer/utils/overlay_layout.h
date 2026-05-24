@@ -267,17 +267,16 @@ namespace openxr_api_layer::detail {
     // [0.5, 2.0] by parseSettings).
     inline OverlayGeometry geometryForPosition(const std::string& position,
                                                 float scale) noexcept {
-        // Aspect matches the 720×462 texture (kTexW × kTexH in the
-        // renderer). Quad dimensions chosen so pixel density stays
-        // square: width_m / height_m == kTexW / kTexH. At 1 m
-        // view-space distance the quad covers roughly the same
-        // horizontal FOV as the previous (taller) texture iteration;
-        // the vertical FOV shrinks proportionally as the texture
-        // grew tighter vertically. Corner offsets are tuned so the
-        // quad's CORNER (not centre) still lands near the previous
+        // Aspect matches the renderer's kTexW × kTexH texture. Quad
+        // dimensions chosen so pixel density stays square in the HMD:
+        // width_m / height_m == kTexW / kTexH. At 1 m view-space
+        // distance the quad covers a fixed horizontal FOV (kBaseWidth);
+        // the vertical FOV tracks the texture aspect each time the
+        // layout's vertical budget changes. Corner offsets are tuned
+        // so the quad's CORNER (not centre) still lands near the
         // off-axis target.
         constexpr float kBaseWidth  = 0.28f;
-        constexpr float kBaseHeight = 0.180f;
+        constexpr float kBaseHeight = 0.170f;
         constexpr float kZ          = -1.0f;          // 1 m forward
         constexpr float kCornerOffX = 0.22f;
         constexpr float kCornerOffY = 0.14f;
