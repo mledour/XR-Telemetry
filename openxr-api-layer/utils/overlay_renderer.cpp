@@ -128,10 +128,13 @@ namespace openxr_api_layer::detail {
                                                       // of the strip — eliminates the
                                                       // empty top-half users observed
                                                       // in light-load scenarios.
-        constexpr float kBottomHeight     = 109.0f;  // 16 + label(22) + 14 +
-                                                      // metric(43) + 14 — explicit
-                                                      // gap stack per design spec
-                                                      // (see drawBottomPanel below).
+        constexpr float kBottomHeight     = 109.0f;  // 4 + label(22) + ~7 gap +
+                                                      // metric(43) cell-centred +
+                                                      // ~33 bottom margin. Sized
+                                                      // so the centred digit lands
+                                                      // with equal top/bottom space
+                                                      // (33 px each) and the label
+                                                      // sits in the upper region.
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
@@ -1437,33 +1440,18 @@ namespace openxr_api_layer::detail {
                 // because that would be redundant and use a full
                 // extra word of horizontal space.
 
-                // Cell vertical stack — explicit gap spec from the
-                // design mockup:
-                //
-                //   cell top                        ── 0
-                //     │                             16 px
-                //   label rect top (kLabelH = 22)   ── 16
-                //     │ label glyph centred in rect
-                //   label rect bottom               ── 38
-                //     │                             14 px
-                //   value rect top (digit = 43)     ── 52
-                //     │ digit paragraph-centred + " unit" baseline-aligned
-                //   value rect bottom               ── 95
-                //     │                             14 px
-                //   cell bottom                     ── 109 == kBottomHeight
-                //
-                // The value rect is sized exactly to the 43-px digit
-                // height so paragraph CENTER (inherited from m_fmtTemp)
-                // places the digit at top:52 → bottom:95, with the
-                // smaller " °C" / " %" / " GB" suffix baseline-aligned
-                // alongside it.
-                constexpr float kLabelTop = 16.0f;
-                constexpr float kLabelH   = 22.0f;
-                constexpr float kLabelToMetric = 14.0f;
-                constexpr float kMetricH       = 43.0f;  // == kFontTemp
-                const float labelY  = t + kLabelTop;
-                const float metricT = t + kLabelTop + kLabelH + kLabelToMetric;
-                const float metricB = metricT + kMetricH;
+                // Cell layout — label anchored near the top, metric
+                // paragraph-centred in the whole cell. The value rect
+                // spans the full cell height so paragraph CENTER
+                // (inherited from m_fmtTemp) puts the 43-px digit on
+                // the cell's vertical centre — equal blank space
+                // above (cell top → digit top) and below (digit
+                // bottom → cell bottom). The label sits in the upper
+                // region without overlapping (digit centre ≈ cellH/2,
+                // label rect = 22 px from t+4 → t+26 stays well above
+                // the digit at t+33 → t+76 for the current
+                // kBottomHeight = 109).
+                const float labelY = t + 4.0f;
 
                 auto drawCell = [&](float cellL, float cellR,
                                       const wchar_t* label,
@@ -1473,7 +1461,7 @@ namespace openxr_api_layer::detail {
                                       bool useWideValue) {
                     drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
                               D2D1::RectF(cellL, labelY, cellR,
-                                           labelY + kLabelH),
+                                           labelY + 22.0f),
                               m_brushTextWhite.Get());
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
                     // prefix flips to Barlow Italic via drawValueWide /
@@ -1487,7 +1475,7 @@ namespace openxr_api_layer::detail {
                     // the whole value shares the per-tier colour (white
                     // / cyan / orange / red), only the font face and
                     // size change between digit and unit.
-                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, metricT, cellR, metricB);
+                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, t, cellR, b);
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
