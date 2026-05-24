@@ -1216,6 +1216,11 @@ namespace openxr_api_layer::detail {
                 // passes two brushes so only the "App" / " / Render "
                 // label copy renders in white; each "X.X ms" value run
                 // (digit + unit) picks up the chiffres brush in cyan.
+                // Value rect shares the title rect's vertical bounds
+                // (titleT → titleB) so paragraph CENTER places the
+                // value baseline at the same line as the title — both
+                // fonts are now at kFontMs / kFontMsCompound /
+                // kFontSectionTitle = 18 px so the line metrics match.
                 if (secondaryValue.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
@@ -1223,8 +1228,8 @@ namespace openxr_api_layer::detail {
                     // upright Rajdhani, both cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 160.0f, titleT - 4.0f,
-                        r - kSectionInnerPad,          titleB + 6.0f);
+                        r - kSectionInnerPad - 160.0f, titleT,
+                        r - kSectionInnerPad,          titleB);
                     drawValueAscii(rt, s, m_fmtMsValue.Get(), valueRect,
                                     m_brushAccentCyan.Get());
                 } else {
@@ -1238,8 +1243,8 @@ namespace openxr_api_layer::detail {
                         "App " + secondaryValue + " ms / Render "
                         + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 320.0f, titleT - 4.0f,
-                        r - kSectionInnerPad,          titleB + 6.0f);
+                        r - kSectionInnerPad - 320.0f, titleT,
+                        r - kSectionInnerPad,          titleB);
                     drawValueAscii(rt, compound, m_fmtMsCompound.Get(),
                                     valueRect,
                                     m_brushTextWhite.Get(),    // "App" / "/ Render"
