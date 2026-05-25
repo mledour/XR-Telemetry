@@ -519,15 +519,23 @@ namespace openxr_api_layer::detail {
             //       CPU panel = TEMP / LOAD (2 cells). TEMP shows
             //         "-- °C" until PawnIO support lands.
             //
-            // Skip D2D entirely when the snapshot version hasn't ticked
-            // since the last successful paint. The aggregator publishes
-            // ~10×/s while the host renders at 90-144 Hz, so 9 frames
-            // out of 10 the shim texture we'd paint into already holds
-            // pixel-identical content. The caller still does the
-            // per-frame CopyResource into the runtime-cycled swapchain
-            // image, so the HUD stays visible — we just don't redraw
-            // identical pixels. Returns `true` on the skip so callers
-            // treat the shim as valid and proceed to compose.
+            // Skip D2D when the snapshot version hasn't ticked AND we
+            // painted recently. Two triggers force a repaint:
+            //   1. snap.version changed (aggregator published new data
+            //      at ~10 Hz: FPS, P95, temps, etc.)
+            //   2. kMaxFramesBetweenPaints elapsed since the last
+            //      paint — needed because the histogram ring buffer
+            //      advances at the host frame rate (90-144 Hz) via
+            //      pushFrameSample(), not at the aggregator's tempo.
+            //      Repainting only on (1) gave a saccaded histogram
+            //      that jumped 9-10 bars at once every 100 ms. With
+            //      K=3 the histogram refreshes at ~30 Hz minimum, which
+            //      reads as smooth scrolling to the eye while still
+            //      skipping ~2/3 of the D2D work.
+            //
+            // Returns `true` on a skip: the shim still holds valid
+            // pixels and the caller will CopyResource them into this
+            // frame's swapchain image.
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
                        const HistogramRing<kRingSize>& cpuRing,
@@ -535,7 +543,9 @@ namespace openxr_api_layer::detail {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
 
-                if (snap.version == m_lastPaintedVersion) {
+                if (snap.version == m_lastPaintedVersion &&
+                    m_framesSincePaint + 1 < kMaxFramesBetweenPaints) {
+                    ++m_framesSincePaint;
                     return true;  // shim still holds the previously painted frame
                 }
 
@@ -645,7 +655,10 @@ namespace openxr_api_layer::detail {
                                  /*vramFraction=*/0.0f);
 
                 const bool ok = SUCCEEDED(rt->EndDraw());
-                if (ok) m_lastPaintedVersion = snap.version;
+                if (ok) {
+                    m_lastPaintedVersion = snap.version;
+                    m_framesSincePaint = 0;
+                }
                 return ok;
             }
 
@@ -1681,14 +1694,26 @@ namespace openxr_api_layer::detail {
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 
-            // Last snapshot version we painted into the shim. paint()
-            // bails out early when snap.version matches — the shim
-            // still holds pixel-identical content, so we skip every
-            // D2D call between frames where the aggregator hasn't
-            // republished. UINT64_MAX as sentinel forces the first
-            // paint regardless of the aggregator's starting version.
+            // Repaint cadence state. paint() skips D2D when
+            // `snap.version == m_lastPaintedVersion` AND fewer than
+            // kMaxFramesBetweenPaints frames have elapsed — the
+            // floor keeps the histogram scrolling smoothly even
+            // though `snap.version` only ticks at ~10 Hz, while the
+            // ring buffer is fed every frame. UINT64_MAX as sentinel
+            // forces the first paint regardless of the aggregator's
+            // starting version.
+            //
+            // K=3 → ~30 Hz visual refresh on a 90 Hz HMD (48 Hz on
+            // 144 Hz). The histogram still advances in 3-sample
+            // groups, but the eye reads ≥30 Hz as fluid motion.
+            // Raising K saves more CPU at the cost of choppier
+            // scrolling — the proper fix (paint static stuff at 10 Hz
+            // and only the histogram region per frame) lives outside
+            // this knob.
+            static constexpr int kMaxFramesBetweenPaints = 3;
             OverlayDisplayValues m_cachedValues;
             uint64_t             m_lastPaintedVersion = UINT64_MAX;
+            int                  m_framesSincePaint = 0;
         };
 
         // -------- D3D11 native renderer --------------------------------------
