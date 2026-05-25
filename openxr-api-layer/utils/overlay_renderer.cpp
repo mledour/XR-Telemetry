@@ -417,17 +417,11 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.035f, 0.039f, 0.039f, 1.00f), m_brushPanelBg)) return false;    // #090A0A
                 if (!make(D2D1::ColorF(0.122f, 0.133f, 0.133f, 1.00f), m_brushFrameLine)) return false;  // #1F2222 darker frame
                 if (!make(D2D1::ColorF(0.184f, 0.200f, 0.204f, 1.00f), m_brushSeparator)) return false;  // #2F3334
-                // Bevel highlight (lighter, top edge of each panel)
-                // and shadow (darker, bottom edge). 1-px lines at
-                // these colours give the "raised metal" impression
-                // around every panel rim — see drawPanelBg.
-                if (!make(D2D1::ColorF(0.322f, 0.349f, 0.361f, 1.00f), m_brushBevelHighlight)) return false; // #52595C
+                // Bevel shadow (darker, bottom edge). 1-px line that
+                // anchors each panel's lower rim — see drawPanelBg.
+                // The matching top-edge highlight was dropped per
+                // design ask for a flatter panel look.
                 if (!make(D2D1::ColorF(0.110f, 0.122f, 0.125f, 1.00f), m_brushBevelShadow)) return false;    // #1C1F20
-                // Carbon-fibre hatch — drawn as low-alpha diagonal
-                // lines across the panel backgrounds. ~6 % white so
-                // the texture is just visible without becoming
-                // visible stripes.
-                if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
                 // Text — neutral off-white, #F7F7F7. The HUD's single
                 // text brush: covers header micro-labels (FPS / P95 /
                 // P99 / …), footer captions (GPU TEMP / LOAD / VRAM),
@@ -1573,83 +1567,28 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // Panel background — slightly raised dark-blue panel with
-            // a 1-px separator stroke on the inside. Used for the
-            // header, both frametime panels, and the bottom row pair.
-            // Adds a top-edge bevel highlight (lighter) and a
-            // bottom-edge bevel shadow (darker) so each panel reads
-            // as a slightly raised metal surface, matching the
-            // design spec's industrial-HUD look. The corner-radius
-            // strokes are subtle enough that a straight horizontal
-            // line crossing the panel doesn't break visually.
+            // Panel background — flat dark-blue panel with a 1-px
+            // separator stroke on the inside and a faint bottom-edge
+            // bevel shadow. Used for the header, both frametime
+            // panels, and the bottom row pair. Earlier iterations
+            // added a top-edge bevel highlight and a low-alpha
+            // diagonal carbon-fibre hatch for a "raised metal"
+            // industrial look; both were dropped in favour of a
+            // flatter design.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
                 const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
 
-                // Subtle carbon-fibre-ish diagonal hatch: thin
-                // diagonal lines at ~6 % alpha across the panel
-                // body. Spaced 6 px apart; at the design's
-                // resolution they read as a very faint texture
-                // hint, never as actual stripes. Drawn BEFORE the
-                // panel separator stroke so the stroke covers the
-                // line ends at the panel edge.
-                drawCarbonHatch(rt, l, t, r, b);
-
                 rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
-                // Bevel highlight (top edge) and shadow (bottom
-                // edge). Inset by 1.5 px from the panel border so
-                // the bevel lines sit JUST inside the separator
-                // stroke without overlapping it.
-                const float bevelInset = 1.5f;
+                // Bevel shadow on the bottom edge only. Inset by
+                // 1.5 px from the panel border so the line sits just
+                // inside the separator stroke without overlapping it.
                 rt->DrawLine(
-                    D2D1::Point2F(l + 6.0f, t + bevelInset),
-                    D2D1::Point2F(r - 6.0f, t + bevelInset),
-                    m_brushBevelHighlight.Get(), 1.0f);
-                rt->DrawLine(
-                    D2D1::Point2F(l + 6.0f, b - bevelInset),
-                    D2D1::Point2F(r - 6.0f, b - bevelInset),
+                    D2D1::Point2F(l + 6.0f, b - 1.5f),
+                    D2D1::Point2F(r - 6.0f, b - 1.5f),
                     m_brushBevelShadow.Get(), 1.0f);
-            }
-
-            // Carbon-fibre hatch — diagonal 45° lines spanning the
-            // panel, at very low alpha so they read as a subtle
-            // texture rather than as visible stripes. The lines are
-            // clipped to the panel's rounded-rect bounds by axis-
-            // aligned clipping — close enough for the visual intent
-            // at this opacity.
-            //
-            // Cost: ~(w + h) / spacing DrawLine calls per panel.
-            // For a 280-px-wide × 90-px-tall frametime panel at
-            // 6 px spacing that's ~62 lines. At 4-5 panels per
-            // frame and 144 Hz that's ~45k DrawLine/s — well within
-            // D2D's budget for this overlay target. Could be cached to
-            // an offscreen bitmap brush later if it ever shows up
-            // in a profile.
-            void drawCarbonHatch(ID2D1RenderTarget* rt, float l, float t,
-                                   float r, float b) const {
-                constexpr float kSpacing = 6.0f;
-                // Clip rect: panel inner area. Slight inset so the
-                // hatch doesn't bleed into the rounded corners.
-                D2D1_RECT_F clip = D2D1::RectF(l + 1.0f, t + 1.0f,
-                                                r - 1.0f, b - 1.0f);
-                rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                // Diagonal lines going down-right. We need to cover
-                // the panel from its top-right corner to its bottom-
-                // left corner, so the start positions range from
-                // (l - panel_h, t) to (r, t). The diagonal length is
-                // bounded by the panel diagonal.
-                const float panelH = b - t;
-                const float startX0 = l - panelH;
-                const float endX0   = r;
-                for (float x = startX0; x < endX0; x += kSpacing) {
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t),
-                        D2D1::Point2F(x + panelH, b),
-                        m_brushCarbonHatch.Get(), 0.6f);
-                }
-                rt->PopAxisAlignedClip();
             }
 
             // Outer frame with chamfered (cut) corners. Builds an
@@ -1729,9 +1668,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
             ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
             ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
-            ComPtr<ID2D1SolidColorBrush> m_brushBevelHighlight;
             ComPtr<ID2D1SolidColorBrush> m_brushBevelShadow;
-            ComPtr<ID2D1SolidColorBrush> m_brushCarbonHatch;
             ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             // Histogram bar brushes use linear gradients (top→
