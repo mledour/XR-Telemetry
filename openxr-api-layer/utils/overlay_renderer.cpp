@@ -103,14 +103,16 @@ namespace openxr_api_layer::detail {
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 435, leaving 6 px of bottom slack against the
-        //   441-px texture height. The slack is intentionally small —
-        //   each panel is sized to its content, and `bottomY + kBottomHeight
-        //   ≤ innerB` by construction (asserted via the (void)innerB
-        //   line in paint()). Bumping any of the heights past this
-        //   budget will visually clip the bottom panel.
+        //   Total = 435 = kTexH, leaving zero slack between the last
+        //   panel and the inner bottom edge. Keeping the budget exact
+        //   makes the top and bottom borders read at the same
+        //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
+        //   on each side). `bottomY + kBottomHeight == innerB` by
+        //   construction (asserted via the (void)innerB line in
+        //   paint()). Bumping any of the heights past this budget
+        //   will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 441;
+        constexpr int32_t kTexH = 435;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;

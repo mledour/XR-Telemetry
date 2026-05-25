@@ -276,7 +276,7 @@ namespace openxr_api_layer::detail {
         // so the quad's CORNER (not centre) still lands near the
         // off-axis target.
         constexpr float kBaseWidth  = 0.28f;
-        constexpr float kBaseHeight = 0.171f;
+        constexpr float kBaseHeight = 0.169f;
         constexpr float kZ          = -1.0f;          // 1 m forward
         constexpr float kCornerOffX = 0.22f;
         constexpr float kCornerOffY = 0.14f;
