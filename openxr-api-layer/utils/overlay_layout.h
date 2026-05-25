@@ -250,10 +250,11 @@ namespace openxr_api_layer::detail {
         float pos_x;
         float pos_y;
         float pos_z;  // negative = in front of the user
-        // Quad dimensions in metres at the chosen distance. The 0.28 ×
-        // 0.187 m default at z = -1 m is ~16° × 11° of FOV. Matches
-        // the 720×480 (3:2) texture's native aspect so pixels stay
-        // square in the HMD with no anisotropic stretching.
+        // Quad dimensions in metres at the chosen distance. The
+        // default width / height ratio matches the kTexW / kTexH
+        // texture aspect so pixels stay square in the HMD with no
+        // anisotropic stretching; see kBaseWidth / kBaseHeight in
+        // geometryForPosition below for the concrete values.
         float width_m;
         float height_m;
     };
@@ -266,13 +267,16 @@ namespace openxr_api_layer::detail {
     // [0.5, 2.0] by parseSettings).
     inline OverlayGeometry geometryForPosition(const std::string& position,
                                                 float scale) noexcept {
-        // 3:2 aspect to match the 720×480 texture. 0.28 × 0.187 m at
-        // 1 m view-space distance ≈ 16° × 11° angular size. Pixel
-        // density stays square (720/480 = 0.28/0.187 = 1.5). Corner
-        // offsets bumped proportionally so the quad's CORNER (not
-        // centre) still lands near the previous off-axis target.
+        // Aspect matches the renderer's kTexW × kTexH texture. Quad
+        // dimensions chosen so pixel density stays square in the HMD:
+        // width_m / height_m == kTexW / kTexH. At 1 m view-space
+        // distance the quad covers a fixed horizontal FOV (kBaseWidth);
+        // the vertical FOV tracks the texture aspect each time the
+        // layout's vertical budget changes. Corner offsets are tuned
+        // so the quad's CORNER (not centre) still lands near the
+        // off-axis target.
         constexpr float kBaseWidth  = 0.28f;
-        constexpr float kBaseHeight = 0.187f;
+        constexpr float kBaseHeight = 0.169f;
         constexpr float kZ          = -1.0f;          // 1 m forward
         constexpr float kCornerOffX = 0.22f;
         constexpr float kCornerOffY = 0.14f;

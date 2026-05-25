@@ -68,10 +68,10 @@ namespace openxr_api_layer::detail {
 
     namespace {
 
-        // -------- Layout constants (fpsVR redesign, 720×480) ----------------
+        // -------- Layout constants (fpsVR redesign) -------------------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
-        // QUAD in 3D scales, not the resolution. 720×480 (3:2) packs
+        // QUAD in 3D scales, not the resolution. kTexW × kTexH packs
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
         //   - GPU FRAMETIME MS panel with histogram + current value
@@ -94,27 +94,29 @@ namespace openxr_api_layer::detail {
         //   kFrameStroke         (2)
         //   inner padding        (4)   ← see innerT in paint()
         //   kHeaderHeight       (90)
-        //   kSectionGap         (14)
+        //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — GPU panel
-        //   kSectionGap         (14)
+        //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — CPU panel
-        //   kSectionGap         (14)
-        //   kBottomHeight      (130)
+        //   kSectionGap          (8)
+        //   kBottomHeight      (109)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 474, leaving 6 px of bottom slack against the
-        //   480-px texture height. The slack is intentionally small —
-        //   each panel is sized to its content, and `bottomY + kBottomHeight
-        //   ≤ innerB` by construction (asserted via the (void)innerB
-        //   line in paint()). Bumping any of the heights past this
-        //   budget will visually clip the bottom panel.
+        //   Total = 435 = kTexH, leaving zero slack between the last
+        //   panel and the inner bottom edge. Keeping the budget exact
+        //   makes the top and bottom borders read at the same
+        //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
+        //   on each side). `bottomY + kBottomHeight == innerB` by
+        //   construction (asserted via the (void)innerB line in
+        //   paint()). Bumping any of the heights past this budget
+        //   will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 480;
+        constexpr int32_t kTexH = 435;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
-        constexpr float kSectionGap     = 14.0f;
+        constexpr float kSectionGap     =  8.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
         // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
@@ -128,8 +130,13 @@ namespace openxr_api_layer::detail {
                                                       // of the strip — eliminates the
                                                       // empty top-half users observed
                                                       // in light-load scenarios.
-        constexpr float kBottomHeight     = 130.0f;  // tall enough for the chip + thermo
-                                                      // + 22-px gauge font + label row
+        constexpr float kBottomHeight     = 109.0f;  // 4 + label(22) + ~7 gap +
+                                                      // metric(43) cell-centred +
+                                                      // ~33 bottom margin. Sized
+                                                      // so the centred digit lands
+                                                      // with equal top/bottom space
+                                                      // (33 px each) and the label
+                                                      // sits in the upper region.
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
@@ -147,30 +154,31 @@ namespace openxr_api_layer::detail {
                        "bump both in lockstep if tuning the histogram length");
 
         // Font sizes — calibrated against the design spec's
-        // hierarchy. Sizes in pixels at the 720×480 native texture
-        // resolution; rendered to the head-locked quad they read at
-        // their natural visual weight in the HMD.
+        // hierarchy. Sizes in pixels at the native texture resolution;
+        // rendered to the head-locked quad they read at their natural
+        // visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 22.0f;  // "GPU FRAMETIME MS"
-        // Labels and section titles render in Rajdhani SemiBold (NOT
-        // Barlow), restored to their pre-Barlow-swap sizes. Rajdhani's
-        // narrower glyphs make the original 17 / 22 px the right
-        // calibration; the temporary 14 / 18 px shrink during the
-        // all-Barlow iteration was a compensation for Barlow Medium
-        // being noticeably wider and no longer applies now that the
-        // family flipped back to Rajdhani for labels.
-        constexpr float kFontMs           = 26.0f;  // GPU panel "6.7 ms" current value
+        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
+        // Labels and section titles render in Rajdhani SemiBold.
+        constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
                                                      // ("App X ms / Render Y ms") —
-                                                     // smaller so the longer
-                                                     // string still fits in the
-                                                     // top-right region.
+                                                     // matches kFontMs so the GPU
+                                                     // and CPU read-outs share the
+                                                     // same visual weight.
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
                                                      // single biggest text on
                                                      // the HUD, primary anchor.
         constexpr float kFontAccentNumber = 32.0f;  // "138", "124", "108", "98"
         constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
                                                      // VRAM values
+        constexpr float kFontTempUnit     = 19.0f;  // " °C" / " %" / " GB" unit
+                                                     // suffix in the bottom panel —
+                                                     // a touch larger than the
+                                                     // 17 px tiny label sitting
+                                                     // above it, so the unit reads
+                                                     // as part of the value rather
+                                                     // than fading into the caption.
 
         // Vertical insets for the 1-px column separator lines.
         // Header bar uses a tighter inset (the cells are 90 px tall);
@@ -179,10 +187,6 @@ namespace openxr_api_layer::detail {
         // breathing room above and below.
         constexpr float kHeaderSepInsetY      =  8.0f;
         constexpr float kBottomSepInsetY      = 14.0f;
-        // Bottom margin for the big value text inside each bottom-
-        // panel cell (drawCell's text rect). Keeps the descender of
-        // glyphs like the "9" tail in "99" clear of the panel edge.
-        constexpr float kBottomCellTextBottomPad = 8.0f;
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -295,21 +299,27 @@ namespace openxr_api_layer::detail {
                     customCollection = m_customFontCollection.Get();
                 }
 
-                // Format split — 5 chiffres formats use Barlow Medium
-                // ITALIC, 2 label formats use Rajdhani SemiBold NORMAL.
-                // The compound format (App / Render) anchors to Rajdhani
-                // upright as its BASE and gets per-range Barlow Medium
-                // Italic overrides at draw time via drawMixedStyleAscii
-                // → IDWriteTextLayout::SetFontFamilyName + SetFontWeight
-                // + SetFontStyle on the chiffres ranges.
+                // Format split — Barlow Medium Italic is reserved for
+                // digit characters only; everything else (labels,
+                // titles, unit suffixes like " ms" / "°C" / "%") uses
+                // Rajdhani SemiBold upright. The two pure-digit formats
+                // (m_fmtBigNumber / m_fmtAccentNumber) stay anchored
+                // directly on Barlow Italic because their strings are
+                // always digit-only (FPS / AVG / P95 / …). The mixed
+                // formats (m_fmtTemp, m_fmtMsValue, m_fmtMsCompound)
+                // anchor on Rajdhani upright and get per-range Barlow
+                // Italic overrides at draw time via drawValueAscii /
+                // drawValueWide — those helpers walk the value runs
+                // produced by findValueRuns and apply SetFontFamilyName
+                // + SetFontWeight + SetFontStyle on the digit portion.
                 //
-                //   Chiffres (Barlow Medium Italic, ID 201):
-                //     m_fmtBigNumber, m_fmtAccentNumber, m_fmtTemp,
-                //     m_fmtMsValue
-                //   Labels / titles / compound base (Rajdhani SemiBold
-                //   upright, ID 200):
-                //     m_fmtTinyLabelCenter, m_fmtSectionTitle,
-                //     m_fmtMsCompound
+                //   Pure-digit (Barlow Medium Italic):
+                //     m_fmtBigNumber, m_fmtAccentNumber
+                //   Mixed value (Rajdhani SemiBold upright BASE +
+                //   per-digit Barlow Italic overrides):
+                //     m_fmtTemp, m_fmtMsValue, m_fmtMsCompound
+                //   Labels / titles (Rajdhani SemiBold upright):
+                //     m_fmtTinyLabelCenter, m_fmtSectionTitle
                 constexpr DWRITE_FONT_WEIGHT kChiffresWeight = DWRITE_FONT_WEIGHT_MEDIUM;
                 constexpr DWRITE_FONT_WEIGHT kLabelWeight    = DWRITE_FONT_WEIGHT_SEMI_BOLD;
                 if (!makeFormat(kFamilyChiffres, customCollection, kFontBigNumber,    kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
@@ -318,15 +328,21 @@ namespace openxr_api_layer::detail {
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
                 // m_fmtTemp is CENTER-aligned: the bottom panel
                 // stacks each value (TEMP / LOAD / VRAM) centred
-                // under its column label.
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontTemp,         kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
+                // under its column label. Anchored on Rajdhani
+                // upright so the " °C" / " %" / " GB" unit suffixes
+                // render upright; digit prefixes get Barlow Italic
+                // via drawValueWide / drawValueAscii.
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontTemp,         kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontMs,           kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
+                // m_fmtMsValue anchors on Rajdhani upright too:
+                // the " ms" suffix renders upright and the digit
+                // prefix flips to Barlow Italic via drawValueAscii.
+                if (!makeFormat(kFamilyLabels,   customCollection, kFontMs,           kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
                 // m_fmtMsCompound's BASE is Rajdhani SemiBold upright
-                // (it's the "App" / " / Render " label portions of the
-                // compound). drawMixedStyleAscii applies Barlow Medium
-                // Italic on the chiffres ranges per draw.
+                // (it's the "App" / " / Render " label portions plus
+                // the " ms" unit suffixes). drawValueAscii applies
+                // Barlow Medium Italic on the digit ranges per draw.
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontMsCompound,   kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
                                  DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
                 if (!makeFormat(kFamilyLabels,   customCollection, kFontTinyLabel,    kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
@@ -403,21 +419,16 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.035f, 0.039f, 0.039f, 1.00f), m_brushPanelBg)) return false;    // #090A0A
                 if (!make(D2D1::ColorF(0.122f, 0.133f, 0.133f, 1.00f), m_brushFrameLine)) return false;  // #1F2222 darker frame
                 if (!make(D2D1::ColorF(0.184f, 0.200f, 0.204f, 1.00f), m_brushSeparator)) return false;  // #2F3334
-                // Bevel highlight (lighter, top edge of each panel)
-                // and shadow (darker, bottom edge). 1-px lines at
-                // these colours give the "raised metal" impression
-                // around every panel rim — see drawPanelBg.
-                if (!make(D2D1::ColorF(0.322f, 0.349f, 0.361f, 1.00f), m_brushBevelHighlight)) return false; // #52595C
-                if (!make(D2D1::ColorF(0.110f, 0.122f, 0.125f, 1.00f), m_brushBevelShadow)) return false;    // #1C1F20
-                // Carbon-fibre hatch — drawn as low-alpha diagonal
-                // lines across the panel backgrounds. ~6 % white so
-                // the texture is just visible without becoming
-                // visible stripes.
-                if (!make(D2D1::ColorF(1.000f, 1.000f, 1.000f, 0.06f), m_brushCarbonHatch)) return false;
-                // Text — slightly cooler white than before. Matches
-                // the spec's #EBF0F2 (was #F2F4F5).
-                if (!make(D2D1::ColorF(0.922f, 0.941f, 0.949f, 1.00f), m_brushTextWhite)) return false;  // #EBF0F2
-                if (!make(D2D1::ColorF(0.620f, 0.659f, 0.671f, 1.00f), m_brushTextLabel)) return false;  // #9EA8AB
+                // Text — neutral off-white, #F7F7F7. The HUD's single
+                // text brush: covers header micro-labels (FPS / P95 /
+                // P99 / …), footer captions (GPU TEMP / LOAD / VRAM),
+                // histogram titles (GPU FRAMETIME MS / CPU FRAMETIME
+                // MS), the FPS big number, and the upright "App" /
+                // " / Render " labels in the CPU compound. Earlier
+                // iterations split into a brighter "text" brush and a
+                // dimmer "label" brush, but the design lands on the
+                // same off-white for every text role.
+                if (!make(D2D1::ColorF(0.969f, 0.969f, 0.969f, 1.00f), m_brushTextWhite)) return false;  // #F7F7F7
                 // Cyan accent — the "duller" cyan from the spec
                 // (#19D1D9), reserved for TEXT accents (FPS AVG /
                 // P95 / P99 / P99.9 + healthy LOAD / VRAM). The
@@ -839,63 +850,169 @@ namespace openxr_api_layer::detail {
                 rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
-            // Renders an ASCII string where selected character ranges
-            // are flipped to the chiffres font (Barlow Medium Italic),
-            // while the rest of the string keeps the base format
-            // (Rajdhani SemiBold upright, for labels).
+            // A "value run" inside a rendered string: a value-shaped
+            // prefix (e.g. "67", "4.3", "--", "--.-") followed by an
+            // optional unit suffix (e.g. " ms", " °C", " %", " GB").
+            // Detected by findValueRuns and consumed by drawValueWide /
+            // drawValueAscii to apply per-range font / brush / size
+            // overrides.
             //
-            // Used for the CPU panel's compound "App {x} ms / Render
-            // {y} ms" where labels stay upright Rajdhani and chiffres
-            // are italic Barlow.
+            // Three independently-applied sub-ranges:
+            //   italic[Start,Len]  digits-only sub-range; flips to Barlow
+            //                      Medium Italic. Empty (italicLen == 0)
+            //                      when the prefix is dash/dot-only —
+            //                      e.g. the "--" / "--.-" placeholders.
+            //   unit[Start,Len]    leading-space + unit chars; receives
+            //                      the optional `unitFontSize` override.
+            //                      Empty when the prefix has no unit
+            //                      suffix (pure-digit "142" FPS string).
+            //   brush[Start,Len]   whole value (prefix + unit); receives
+            //                      the optional chiffres brush. This is
+            //                      what lets the CPU compound paint "X.X
+            //                      ms" entirely in cyan including the
+            //                      upright " ms", while "App" / " /
+            //                      Render " labels stay in the base
+            //                      brush (white).
+            struct ValueRun {
+                UINT32 brushStart;
+                UINT32 brushLen;
+                UINT32 italicStart;
+                UINT32 italicLen;
+                UINT32 unitStart;
+                UINT32 unitLen;
+            };
+
+            // Detect value runs inside `s`. A value run's prefix is a
+            // maximal contiguous span of [-0-9.] — digits, the decimal
+            // dot, and the dash used by the "--" / "--.-" placeholders.
+            // The optional unit suffix is " " followed by 1+ unit-shape
+            // characters: letters, '%', or '°' (the latter survives in
+            // wstring; ASCII strings never carry it). A prefix-only
+            // span (no unit) is emitted as a value run only when it
+            // contains at least one digit — otherwise stray dashes or
+            // dots in label copy ("App", " / Render ") would falsely
+            // pull into a value run. A unit-only span never happens
+            // because we walk the prefix first.
             //
-            // IDWriteTextFormat carries exactly one (family, weight,
-            // style) tuple for the whole string — to mix two fonts in
-            // one rendered string, the right DirectWrite primitive is
-            // IDWriteTextLayout, which exposes per-range overrides via
-            // SetFontFamilyName + SetFontWeight + SetFontStyle. This
-            // helper builds a layout from `baseFmt`, applies the
-            // three overrides on each (start, len) range, and draws
-            // via DrawTextLayout.
+            // The italic sub-range is the smallest range covering all
+            // digits inside the prefix (digits + interior dots, but
+            // not surrounding dashes). For "-5.2" the italic range is
+            // "5.2" — the leading dash stays upright Rajdhani.
+            template <typename CharT>
+            static std::vector<ValueRun>
+            findValueRuns(const std::basic_string<CharT>& s) {
+                auto isDigit = [](CharT c) {
+                    return c >= CharT('0') && c <= CharT('9');
+                };
+                auto isValuePrefix = [&](CharT c) {
+                    return isDigit(c)
+                        || c == CharT('.')
+                        || c == CharT('-');
+                };
+                auto isUnitChar = [](CharT c) {
+                    return (c >= CharT('a') && c <= CharT('z'))
+                        || (c >= CharT('A') && c <= CharT('Z'))
+                        ||  c == CharT('%')
+                        ||  c == static_cast<CharT>(0xB0); // °
+                };
+
+                std::vector<ValueRun> runs;
+                const UINT32 n = static_cast<UINT32>(s.size());
+                UINT32 i = 0;
+                while (i < n) {
+                    while (i < n && !isValuePrefix(s[i])) ++i;
+                    if (i >= n) break;
+
+                    const UINT32 prefixStart = i;
+                    UINT32 firstDigit = 0;
+                    UINT32 lastDigit  = 0;
+                    bool hasDigit = false;
+                    while (i < n && isValuePrefix(s[i])) {
+                        if (isDigit(s[i])) {
+                            if (!hasDigit) firstDigit = i;
+                            lastDigit = i;
+                            hasDigit = true;
+                        }
+                        ++i;
+                    }
+                    const UINT32 prefixEnd = i;
+
+                    // Optional unit: " " + 1+ unit chars.
+                    UINT32 unitStart = prefixEnd;
+                    UINT32 unitLen   = 0;
+                    if (i < n && s[i] == CharT(' ')) {
+                        UINT32 j = i + 1;
+                        while (j < n && isUnitChar(s[j])) ++j;
+                        if (j > i + 1) {
+                            unitStart = i;
+                            unitLen   = j - i;
+                            i = j;
+                        }
+                    }
+
+                    if (hasDigit || unitLen > 0) {
+                        ValueRun run{};
+                        run.brushStart  = prefixStart;
+                        run.brushLen    = (unitStart + unitLen) - prefixStart;
+                        run.italicStart = hasDigit ? firstDigit : prefixStart;
+                        run.italicLen   = hasDigit ? (lastDigit - firstDigit + 1) : 0;
+                        run.unitStart   = unitStart;
+                        run.unitLen     = unitLen;
+                        runs.push_back(run);
+                    }
+                }
+                return runs;
+            }
+
+            // Render a value string with mixed per-range styling.
+            //
+            // Digit characters flip to Barlow Medium Italic; the rest
+            // (including unit suffixes like " ms" / " °C" / " %") stays
+            // in `baseFmt`'s family + style — typically Rajdhani
+            // SemiBold upright. Auto-detects digit and unit ranges from
+            // the string content via findValueRuns.
+            //
+            // `brush` paints non-value characters. When `chiffresBrush`
+            // is non-null, BOTH the digit and unit portions of every
+            // value run flip to that brush — used by the CPU compound
+            // so "X.X ms" reads in cyan while "App" / " / Render "
+            // labels stay in white. When `unitFontSize > 0`, the unit
+            // portion of every value run shrinks to that size while
+            // the digit portion stays at the base size — used by the
+            // bottom panel to render " °C" / " %" at the small label
+            // size next to the big-number digit prefix.
             //
             // NOTE on tabular figures (`tnum`): an earlier iteration
             // attached an IDWriteTypography with DWRITE_FONT_FEATURE_TAG
-            // _TABULAR_FIGURES via layout->SetTypography here AND on
-            // every drawAscii / drawWide path. A diagnostic CI run
-            // (see PR #21 commits e453b52 / b067bdc) confirmed the
-            // typography object was created successfully and SetTypography
-            // returned S_OK, yet the rendered output was bit-identical
-            // to the no-tnum baseline — chiffres "1" stayed at 318
-            // width units instead of widening to 494 like the font's
-            // tnum lookup specifies.
+            // _TABULAR_FIGURES via layout->SetTypography in this code
+            // path AND on every drawAscii / drawWide path. A diagnostic
+            // CI run (see PR #21 commits e453b52 / b067bdc) confirmed
+            // the typography object was created successfully and
+            // SetTypography returned S_OK, yet the rendered output was
+            // bit-identical to the no-tnum baseline — chiffres "1"
+            // stayed at 318 width units instead of widening to 494
+            // like the font's tnum lookup specifies.
             //
             // Root cause hypothesis: DirectWrite's shape engine ignores
             // IDWriteTypography feature overrides when the resolved font
             // face comes from a custom IDWriteFontCollection populated
             // via IDWriteInMemoryFontFileLoader (the path used by
-            // loadBundledFontCollection above). The same code wired
-            // against a system font collection would likely apply the
-            // feature.
-            //
-            // The chiffres-jitter cosmetic issue stays unaddressed until
-            // we either find a working DirectWrite path (different
-            // font loader, manual IDWriteTextAnalyzer pipeline, …) or
-            // accept the jitter as a known footnote. The hook point if
-            // we ever revisit is exactly here — applied per-layout, not
-            // per-format, so this helper would gain a SetTypography
-            // call without further refactor.
-            void drawMixedStyleAscii(
+            // loadBundledFontCollection above). The chiffres-jitter
+            // cosmetic issue stays unaddressed until we either find a
+            // working DirectWrite path or accept the jitter as a known
+            // footnote. The hook point if we ever revisit is exactly
+            // here — applied per-layout, not per-format, so this
+            // helper would gain a SetTypography call without further
+            // refactor.
+            void drawValueWide(
                 ID2D1RenderTarget* rt,
-                const std::string& s,
+                const std::wstring& wide,
                 IDWriteTextFormat* baseFmt,
-                std::initializer_list<std::pair<UINT32, UINT32>> chiffresRanges,
                 const D2D1_RECT_F& rect,
-                ID2D1Brush* brush) const {
-                if (s.empty() || !baseFmt) return;
-                // ASCII → wide byte-for-byte. Same contract as drawAscii:
-                // caller guarantees s contains only ASCII codepoints
-                // (which matches the compound's "App / Render / digits /
-                // space / slash / ms" character set).
-                std::wstring wide(s.begin(), s.end());
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr,
+                float unitFontSize = 0.0f) const {
+                if (wide.empty() || !baseFmt) return;
 
                 ComPtr<IDWriteTextLayout> layout;
                 if (FAILED(m_dwriteFactory->CreateTextLayout(
@@ -908,27 +1025,90 @@ namespace openxr_api_layer::detail {
                     // Fall back to the simple single-style path so the
                     // panel still shows something readable. The whole
                     // string renders in the BASE format (upright
-                    // Rajdhani for the compound case) — chiffres lose
+                    // Rajdhani for the value cases) — digit runs lose
                     // their italic Barlow flavour for this frame.
-                    drawAscii(rt, s, baseFmt, rect, brush);
+                    drawWide(rt, wide.c_str(), baseFmt, rect, brush);
                     return;
                 }
-                // Per-range overrides: family (Barlow), weight (Medium),
-                // style (Italic) — three SetFont* calls per range. The
-                // font resolution happens against m_customFontCollection
-                // attached to baseFmt at CreateTextFormat time; that
-                // collection holds both "Rajdhani" and "Barlow" so the
-                // family swap resolves without falling back to system
-                // fonts.
-                for (const auto& [start, len] : chiffresRanges) {
-                    const DWRITE_TEXT_RANGE range{start, len};
-                    layout->SetFontFamilyName(L"Barlow", range);
-                    layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, range);
-                    layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+
+                // Lock the layout's line spacing to the base format's
+                // natural metrics BEFORE applying any per-range font
+                // overrides. Without this, swapping the digit ranges to
+                // Barlow Medium Italic widens the line (DirectWrite
+                // takes max ascent/descent across the line's fonts),
+                // which shifts the paragraph-centred baseline a couple
+                // of pixels relative to the histogram title rendered
+                // via DrawTextW (which stays on pure-base-format line
+                // metrics). GetLineMetrics here reads the natural
+                // Rajdhani-only line because no overrides have been
+                // applied yet; piping those values through
+                // SetLineSpacing(UNIFORM, …) freezes them so the later
+                // Barlow per-range swap can't shift them.
+                {
+                    DWRITE_LINE_METRICS lm{};
+                    UINT32 lineCount = 0;
+                    if (SUCCEEDED(layout->GetLineMetrics(&lm, 1, &lineCount))
+                        && lineCount > 0) {
+                        layout->SetLineSpacing(
+                            DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                            lm.height, lm.baseline);
+                    }
+                }
+
+                for (const ValueRun& run : findValueRuns(wide)) {
+                    // Italic sub-range → Barlow Medium Italic. Skipped
+                    // when the prefix is dash/dot-only (italicLen == 0
+                    // for "-- °C" / "--.- ms" placeholders). Font
+                    // resolution happens against m_customFontCollection
+                    // attached to baseFmt; that collection holds both
+                    // "Rajdhani" and "Barlow", so SetFontFamilyName
+                    // resolves without falling back to system fonts.
+                    if (run.italicLen > 0) {
+                        const DWRITE_TEXT_RANGE italicRange{
+                            run.italicStart, run.italicLen};
+                        layout->SetFontFamilyName(L"Barlow", italicRange);
+                        layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, italicRange);
+                        layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, italicRange);
+                    }
+
+                    // Unit sub-range → smaller size if requested
+                    // (bottom-panel " °C" / " %" at the label size).
+                    if (run.unitLen > 0 && unitFontSize > 0.0f) {
+                        layout->SetFontSize(unitFontSize,
+                            DWRITE_TEXT_RANGE{run.unitStart, run.unitLen});
+                    }
+
+                    // Whole value range (prefix + unit) → chiffres
+                    // brush via SetDrawingEffect, so D2D's default
+                    // text renderer paints both portions with that
+                    // brush instead of the base `brush`. Placeholder
+                    // dashes ride along with the digit + unit even
+                    // when italicLen == 0.
+                    if (chiffresBrush) {
+                        layout->SetDrawingEffect(chiffresBrush,
+                            DWRITE_TEXT_RANGE{
+                                run.brushStart, run.brushLen});
+                    }
                 }
                 rt->DrawTextLayout(
                     D2D1::Point2F(rect.left, rect.top),
                     layout.Get(), brush);
+            }
+
+            // ASCII overload — byte-widens to wstring and forwards.
+            // Caller contract: `s` is ASCII-only (same as drawAscii).
+            void drawValueAscii(
+                ID2D1RenderTarget* rt,
+                const std::string& s,
+                IDWriteTextFormat* baseFmt,
+                const D2D1_RECT_F& rect,
+                ID2D1Brush* brush,
+                ID2D1Brush* chiffresBrush = nullptr,
+                float unitFontSize = 0.0f) const {
+                if (s.empty()) return;
+                std::wstring wide(s.begin(), s.end());
+                drawValueWide(rt, wide, baseFmt, rect, brush,
+                               chiffresBrush, unitFontSize);
             }
 
             // -------- Header bar --------------------------------------------
@@ -1004,7 +1184,7 @@ namespace openxr_api_layer::detail {
                                  ID2D1Brush* valueBrush) const {
                 const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
                 drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                          labelRect, m_brushTextLabel.Get());
+                          labelRect, m_brushTextWhite.Get());
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     l, valueY - 2.0f, r,
                     valueY + kFontBigNumber + 6.0f);
@@ -1035,7 +1215,7 @@ namespace openxr_api_layer::detail {
                     l + kSectionInnerPad, titleT,
                     r - kSectionInnerPad, titleB);
                 drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
-                          m_brushTextLabel.Get());
+                          m_brushTextWhite.Get());
 
                 // Current value (top-right). Two shapes depending on
                 // whether `secondaryValue` is empty:
@@ -1043,60 +1223,47 @@ namespace openxr_api_layer::detail {
                 //   GPU panel (secondaryValue == "")   : "6.7 ms"
                 //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
                 //
-                // GPU panel is a single right-aligned string in
-                // m_fmtMsValue (Barlow Medium Italic kFontMs=26 px).
-                // CPU panel goes through IDWriteTextLayout with
-                // mixed styles: upright "App" / " / Render " labels
-                // (matching the section-title weight) + italic
-                // chiffres+unit ("4.3 ms" / "7.4 ms") matching the
-                // rest of the HUD's chiffres.
+                // Both panels go through drawValueAscii: digit runs
+                // flip to Barlow Medium Italic and the rest stays in
+                // the base format (Rajdhani SemiBold upright). The GPU
+                // panel uses a single cyan brush — "6.7" italic Barlow
+                // cyan + " ms" upright Rajdhani cyan. The CPU compound
+                // passes two brushes so only the "App" / " / Render "
+                // label copy renders in white; each "X.X ms" value run
+                // (digit + unit) picks up the chiffres brush in cyan.
+                // Value rect shares the title rect's vertical bounds
+                // (titleT → titleB) so paragraph CENTER places the
+                // value baseline at the same line as the title — both
+                // fonts are now at kFontMs / kFontMsCompound /
+                // kFontSectionTitle = 18 px so the line metrics match.
                 if (secondaryValue.empty()) {
-                    // GPU panel: short "6.7 ms" at the larger
-                    // kFontMs (26 px) — primary frametime read-out.
-                    // Single-style italic from m_fmtMsValue, plain
-                    // drawAscii call.
+                    // GPU panel: short "6.7 ms" primary frametime
+                    // read-out. drawValueAscii auto-detects the "6.7
+                    // ms" value run; digit prefix italic Barlow, " ms"
+                    // upright Rajdhani, both cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 160.0f, titleT - 4.0f,
-                        r - kSectionInnerPad,          titleB + 6.0f);
-                    drawAscii(rt, s, m_fmtMsValue.Get(), valueRect,
-                               m_brushAccentCyan.Get());
+                        r - kSectionInnerPad - 160.0f, titleT,
+                        r - kSectionInnerPad,          titleB);
+                    drawValueAscii(rt, s, m_fmtMsValue.Get(), valueRect,
+                                    m_brushAccentCyan.Get());
                 } else {
-                    // CPU panel: compound "App {x} ms / Render {y} ms"
-                    // at the smaller kFontMsCompound — labels upright
-                    // (matching the section title weight), chiffres +
-                    // unit italic (matching the rest of the HUD
-                    // chiffres). Per-range styles via
-                    // drawMixedStyleAscii → IDWriteTextLayout +
-                    // SetFontStyle.
-                    //
-                    // String layout (character offsets):
-                    //   "App "            offset  0, length 4         (upright)
-                    //   secondaryValue    offset  4, length sec.size()
-                    //   " ms"             follows, length 3            ← italic with sec
-                    //   " / Render "      length 10                    (upright)
-                    //   currentValue      length cur.size()
-                    //   " ms"             length 3                     ← italic with cur
-                    const std::string& sec = secondaryValue;
-                    const std::string& cur = currentValue;
+                    // CPU panel: compound "App {x} ms / Render {y} ms".
+                    // drawValueAscii finds the two "X.X ms" value runs
+                    // and paints them in cyan (digits italic Barlow,
+                    // " ms" upright Rajdhani — same colour, different
+                    // font). "App" and " / Render " stay upright
+                    // Rajdhani in white via the base brush.
                     const std::string compound =
-                        "App " + sec + " ms / Render " + cur + " ms";
-                    const UINT32 italicAStart =
-                        4;                                      // after "App "
-                    const UINT32 italicALen   =
-                        static_cast<UINT32>(sec.size()) + 3;     // sec + " ms"
-                    const UINT32 italicBStart =
-                        italicAStart + italicALen + 10;          // + " / Render "
-                    const UINT32 italicBLen   =
-                        static_cast<UINT32>(cur.size()) + 3;     // cur + " ms"
+                        "App " + secondaryValue + " ms / Render "
+                        + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 320.0f, titleT - 4.0f,
-                        r - kSectionInnerPad,          titleB + 6.0f);
-                    drawMixedStyleAscii(
-                        rt, compound, m_fmtMsCompound.Get(),
-                        {{italicAStart, italicALen},
-                         {italicBStart, italicBLen}},
-                        valueRect, m_brushAccentCyan.Get());
+                        r - kSectionInnerPad - 320.0f, titleT,
+                        r - kSectionInnerPad,          titleB);
+                    drawValueAscii(rt, compound, m_fmtMsCompound.Get(),
+                                    valueRect,
+                                    m_brushTextWhite.Get(),    // "App" / "/ Render"
+                                    m_brushAccentCyan.Get());  // value runs
                 }
 
                 // Histogram region — below the title row, with inner
@@ -1293,16 +1460,18 @@ namespace openxr_api_layer::detail {
                 // because that would be redundant and use a full
                 // extra word of horizontal space.
 
-                // Vertical positions inside the panel:
-                //   labelY : small label (m_fmtTinyLabelCenter,
-                //            kFontTinyLabel = 17 px SemiBold)
-                //   valueY : big value (m_fmtTemp, kFontTemp = 43 px
-                //            Bold) — extends down to the panel bottom
-                //            and paragraph-centres for the "label
-                //            above / value below" stack the design
-                //            asks for.
-                const float labelY = t + (b - t) * 0.18f;
-                const float valueY = t + (b - t) * 0.40f;
+                // Cell layout — label anchored near the top, metric
+                // paragraph-centred in the whole cell. The value rect
+                // spans the full cell height so paragraph CENTER
+                // (inherited from m_fmtTemp) puts the 43-px digit on
+                // the cell's vertical centre — equal blank space
+                // above (cell top → digit top) and below (digit
+                // bottom → cell bottom). The label sits in the upper
+                // region without overlapping (digit centre ≈ cellH/2,
+                // label rect = 22 px from t+4 → t+26 stays well above
+                // the digit at t+33 → t+76 for the current
+                // kBottomHeight = 109).
+                const float labelY = t + 4.0f;
 
                 auto drawCell = [&](float cellL, float cellR,
                                       const wchar_t* label,
@@ -1313,7 +1482,20 @@ namespace openxr_api_layer::detail {
                     drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
                               D2D1::RectF(cellL, labelY, cellR,
                                            labelY + 22.0f),
-                              m_brushTextLabel.Get());
+                              m_brushTextWhite.Get());
+                    // m_fmtTemp's BASE is Rajdhani upright; the digit
+                    // prefix flips to Barlow Italic via drawValueWide /
+                    // drawValueAscii's auto-detected ranges, while the
+                    // unit suffix (" °C" / " %" / " GB") keeps the base
+                    // family/style AND shrinks to kFontTempUnit — a
+                    // touch larger than the "GPU TEMP" / "LOAD" / "VRAM"
+                    // caption sitting just above it, so the unit reads
+                    // as an annotation on the big-number digit without
+                    // disappearing into the caption row. Single brush —
+                    // the whole value shares the per-tier colour (white
+                    // / cyan / orange / red), only the font face and
+                    // size change between digit and unit.
+                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, t, cellR, b);
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
@@ -1321,12 +1503,14 @@ namespace openxr_api_layer::detail {
                         std::wstring wide(asciiValue.begin(),
                                            asciiValue.end());
                         wide += unitSuffix;
-                        drawWide(rt, wide.c_str(), m_fmtTemp.Get(),
-                                  D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                  valueBrush);
+                        drawValueWide(rt, wide, m_fmtTemp.Get(),
+                                       valueRect,
+                                       valueBrush,
+                                       /*chiffresBrush=*/nullptr,
+                                       /*unitFontSize=*/kFontTempUnit);
                     } else {
                         // % and other ASCII-safe suffixes — single
-                        // ASCII drawAscii call, no wide conversion.
+                        // ASCII drawValueAscii call, no wide conversion.
                         std::string full = asciiValue;
                         // Append the suffix as narrow chars. Caller
                         // contract: !useWideValue means unitSuffix is
@@ -1344,9 +1528,11 @@ namespace openxr_api_layer::detail {
                                    "!useWideValue path");
                             full.push_back(static_cast<char>(*p));
                         }
-                        drawAscii(rt, full, m_fmtTemp.Get(),
-                                   D2D1::RectF(cellL, valueY, cellR, b - kBottomCellTextBottomPad),
-                                   valueBrush);
+                        drawValueAscii(rt, full, m_fmtTemp.Get(),
+                                        valueRect,
+                                        valueBrush,
+                                        /*chiffresBrush=*/nullptr,
+                                        /*unitFontSize=*/kFontTempUnit);
                     }
                 };
 
@@ -1378,83 +1564,19 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // Panel background — slightly raised dark-blue panel with
-            // a 1-px separator stroke on the inside. Used for the
-            // header, both frametime panels, and the bottom row pair.
-            // Adds a top-edge bevel highlight (lighter) and a
-            // bottom-edge bevel shadow (darker) so each panel reads
-            // as a slightly raised metal surface, matching the
-            // design spec's industrial-HUD look. The corner-radius
-            // strokes are subtle enough that a straight horizontal
-            // line crossing the panel doesn't break visually.
+            // Panel background — flat dark-blue panel with a 1-px
+            // separator stroke on the inside. Used for the header,
+            // both frametime panels, and the bottom row pair.
+            // Earlier iterations added top-edge bevel highlight,
+            // bottom-edge bevel shadow, and a low-alpha diagonal
+            // carbon-fibre hatch for a "raised metal" industrial
+            // look; all three were dropped in favour of a flat panel.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
                 const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
-
-                // Subtle carbon-fibre-ish diagonal hatch: thin
-                // diagonal lines at ~6 % alpha across the panel
-                // body. Spaced 6 px apart; at the design's
-                // resolution they read as a very faint texture
-                // hint, never as actual stripes. Drawn BEFORE the
-                // panel separator stroke so the stroke covers the
-                // line ends at the panel edge.
-                drawCarbonHatch(rt, l, t, r, b);
-
                 rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
-                // Bevel highlight (top edge) and shadow (bottom
-                // edge). Inset by 1.5 px from the panel border so
-                // the bevel lines sit JUST inside the separator
-                // stroke without overlapping it.
-                const float bevelInset = 1.5f;
-                rt->DrawLine(
-                    D2D1::Point2F(l + 6.0f, t + bevelInset),
-                    D2D1::Point2F(r - 6.0f, t + bevelInset),
-                    m_brushBevelHighlight.Get(), 1.0f);
-                rt->DrawLine(
-                    D2D1::Point2F(l + 6.0f, b - bevelInset),
-                    D2D1::Point2F(r - 6.0f, b - bevelInset),
-                    m_brushBevelShadow.Get(), 1.0f);
-            }
-
-            // Carbon-fibre hatch — diagonal 45° lines spanning the
-            // panel, at very low alpha so they read as a subtle
-            // texture rather than as visible stripes. The lines are
-            // clipped to the panel's rounded-rect bounds by axis-
-            // aligned clipping — close enough for the visual intent
-            // at this opacity.
-            //
-            // Cost: ~(w + h) / spacing DrawLine calls per panel.
-            // For a 280-px-wide × 90-px-tall frametime panel at
-            // 6 px spacing that's ~62 lines. At 4-5 panels per
-            // frame and 144 Hz that's ~45k DrawLine/s — well within
-            // D2D's budget for a 720×480 target. Could be cached to
-            // an offscreen bitmap brush later if it ever shows up
-            // in a profile.
-            void drawCarbonHatch(ID2D1RenderTarget* rt, float l, float t,
-                                   float r, float b) const {
-                constexpr float kSpacing = 6.0f;
-                // Clip rect: panel inner area. Slight inset so the
-                // hatch doesn't bleed into the rounded corners.
-                D2D1_RECT_F clip = D2D1::RectF(l + 1.0f, t + 1.0f,
-                                                r - 1.0f, b - 1.0f);
-                rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                // Diagonal lines going down-right. We need to cover
-                // the panel from its top-right corner to its bottom-
-                // left corner, so the start positions range from
-                // (l - panel_h, t) to (r, t). The diagonal length is
-                // bounded by the panel diagonal.
-                const float panelH = b - t;
-                const float startX0 = l - panelH;
-                const float endX0   = r;
-                for (float x = startX0; x < endX0; x += kSpacing) {
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t),
-                        D2D1::Point2F(x + panelH, b),
-                        m_brushCarbonHatch.Get(), 0.6f);
-                }
-                rt->PopAxisAlignedClip();
             }
 
             // Outer frame with chamfered (cut) corners. Builds an
@@ -1524,8 +1646,8 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
             ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
             ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
-            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU, 26 px)
-            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, 18 px, mixed style)
+            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU)
+            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, mixed style)
             ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
             ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
@@ -1534,11 +1656,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
             ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
             ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
-            ComPtr<ID2D1SolidColorBrush> m_brushBevelHighlight;
-            ComPtr<ID2D1SolidColorBrush> m_brushBevelShadow;
-            ComPtr<ID2D1SolidColorBrush> m_brushCarbonHatch;
             ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
-            ComPtr<ID2D1SolidColorBrush> m_brushTextLabel;
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             // Histogram bar brushes use linear gradients (top→
             // bottom) rather than solid colours, matching the design
