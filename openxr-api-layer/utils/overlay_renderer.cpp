@@ -519,17 +519,25 @@ namespace openxr_api_layer::detail {
             //       CPU panel = TEMP / LOAD (2 cells). TEMP shows
             //         "-- °C" until PawnIO support lands.
             //
-            // The cached display values are re-formatted only when the
-            // snapshot's `version` changes (the aggregator publishes
-            // ~10×/s; paint() runs at the host's 90-144 Hz frame rate,
-            // so the cache saves ~13 redundant snprintf passes per
-            // frame in the steady state).
+            // Skip D2D entirely when the snapshot version hasn't ticked
+            // since the last successful paint. The aggregator publishes
+            // ~10×/s while the host renders at 90-144 Hz, so 9 frames
+            // out of 10 the shim texture we'd paint into already holds
+            // pixel-identical content. The caller still does the
+            // per-frame CopyResource into the runtime-cycled swapchain
+            // image, so the HUD stays visible — we just don't redraw
+            // identical pixels. Returns `true` on the skip so callers
+            // treat the shim as valid and proceed to compose.
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
                        const HistogramRing<kRingSize>& cpuRing,
                        const HistogramRing<kRingSize>& gpuRing) {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
+
+                if (snap.version == m_lastPaintedVersion) {
+                    return true;  // shim still holds the previously painted frame
+                }
 
                 rt->BeginDraw();
                 // Fully transparent clear — we paint our own opaque
@@ -538,11 +546,8 @@ namespace openxr_api_layer::detail {
                 // transparent pixels.
                 rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
-                // Re-format display values on snapshot version change.
-                if (snap.version != m_cachedSnapshotVersion) {
-                    m_cachedValues = formatOverlayDisplayValues(snap);
-                    m_cachedSnapshotVersion = snap.version;
-                }
+                // Version changed — refresh formatted display strings.
+                m_cachedValues = formatOverlayDisplayValues(snap);
                 const auto& v = m_cachedValues;
 
                 const float texW = static_cast<float>(kTexW);
@@ -639,7 +644,9 @@ namespace openxr_api_layer::detail {
                                  /*vramValue=*/std::string{},
                                  /*vramFraction=*/0.0f);
 
-                return SUCCEEDED(rt->EndDraw());
+                const bool ok = SUCCEEDED(rt->EndDraw());
+                if (ok) m_lastPaintedVersion = snap.version;
+                return ok;
             }
 
           private:
@@ -1674,13 +1681,14 @@ namespace openxr_api_layer::detail {
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 
-            // Formatting cache. paint() refreshes the strings only
-            // when m_cachedSnapshotVersion != snap.version — typically
-            // ~10× per second on a 144 Hz HMD, not 144×. Not `mutable`
-            // because paint() is already non-const (it mutates this
-            // cache by design).
+            // Last snapshot version we painted into the shim. paint()
+            // bails out early when snap.version matches — the shim
+            // still holds pixel-identical content, so we skip every
+            // D2D call between frames where the aggregator hasn't
+            // republished. UINT64_MAX as sentinel forces the first
+            // paint regardless of the aggregator's starting version.
             OverlayDisplayValues m_cachedValues;
-            uint64_t             m_cachedSnapshotVersion = 0;
+            uint64_t             m_lastPaintedVersion = UINT64_MAX;
         };
 
         // -------- D3D11 native renderer --------------------------------------
