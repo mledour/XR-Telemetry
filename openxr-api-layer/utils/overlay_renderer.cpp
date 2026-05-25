@@ -417,11 +417,6 @@ namespace openxr_api_layer::detail {
                 if (!make(D2D1::ColorF(0.035f, 0.039f, 0.039f, 1.00f), m_brushPanelBg)) return false;    // #090A0A
                 if (!make(D2D1::ColorF(0.122f, 0.133f, 0.133f, 1.00f), m_brushFrameLine)) return false;  // #1F2222 darker frame
                 if (!make(D2D1::ColorF(0.184f, 0.200f, 0.204f, 1.00f), m_brushSeparator)) return false;  // #2F3334
-                // Bevel shadow (darker, bottom edge). 1-px line that
-                // anchors each panel's lower rim — see drawPanelBg.
-                // The matching top-edge highlight was dropped per
-                // design ask for a flatter panel look.
-                if (!make(D2D1::ColorF(0.110f, 0.122f, 0.125f, 1.00f), m_brushBevelShadow)) return false;    // #1C1F20
                 // Text — neutral off-white, #F7F7F7. The HUD's single
                 // text brush: covers header micro-labels (FPS / P95 /
                 // P99 / …), footer captions (GPU TEMP / LOAD / VRAM),
@@ -1568,27 +1563,18 @@ namespace openxr_api_layer::detail {
             }
 
             // Panel background — flat dark-blue panel with a 1-px
-            // separator stroke on the inside and a faint bottom-edge
-            // bevel shadow. Used for the header, both frametime
-            // panels, and the bottom row pair. Earlier iterations
-            // added a top-edge bevel highlight and a low-alpha
-            // diagonal carbon-fibre hatch for a "raised metal"
-            // industrial look; both were dropped in favour of a
-            // flatter design.
+            // separator stroke on the inside. Used for the header,
+            // both frametime panels, and the bottom row pair.
+            // Earlier iterations added top-edge bevel highlight,
+            // bottom-edge bevel shadow, and a low-alpha diagonal
+            // carbon-fibre hatch for a "raised metal" industrial
+            // look; all three were dropped in favour of a flat panel.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
                 const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
-
                 rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
-                // Bevel shadow on the bottom edge only. Inset by
-                // 1.5 px from the panel border so the line sits just
-                // inside the separator stroke without overlapping it.
-                rt->DrawLine(
-                    D2D1::Point2F(l + 6.0f, b - 1.5f),
-                    D2D1::Point2F(r - 6.0f, b - 1.5f),
-                    m_brushBevelShadow.Get(), 1.0f);
             }
 
             // Outer frame with chamfered (cut) corners. Builds an
@@ -1668,7 +1654,6 @@ namespace openxr_api_layer::detail {
             ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
             ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
             ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
-            ComPtr<ID2D1SolidColorBrush> m_brushBevelShadow;
             ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
             ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
             // Histogram bar brushes use linear gradients (top→
