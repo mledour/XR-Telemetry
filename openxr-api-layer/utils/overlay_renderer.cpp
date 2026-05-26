@@ -668,13 +668,26 @@ namespace openxr_api_layer::detail {
                                  m_brushCpuBlueGrad.Get());
 
                 const bool ok = SUCCEEDED(rt->EndDraw());
-                if (ok) {
-                    if (needStatic) {
+                if (needStatic) {
+                    // Only commit the version + reset the counter on
+                    // a successful static paint — on failure, leave
+                    // m_lastPaintedVersion alone so the next frame
+                    // retries the static branch (needStatic stays
+                    // true because version is still ahead of the
+                    // last successfully painted one).
+                    if (ok) {
                         m_lastPaintedVersion = snap.version;
                         m_framesSincePaint = 0;
-                    } else {
-                        ++m_framesSincePaint;
                     }
+                } else {
+                    // Dynamic-only frame: always advance the counter,
+                    // even on EndDraw failure. Otherwise repeated D2D
+                    // failures would freeze m_framesSincePaint and
+                    // the K=30 watchdog would never fire to force a
+                    // recovery static paint (the only thing left
+                    // that could escape the stuck state without a
+                    // snap.version tick).
+                    ++m_framesSincePaint;
                 }
                 return ok;
             }
