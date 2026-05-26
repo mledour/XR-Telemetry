@@ -92,7 +92,7 @@ namespace openxr_api_layer::detail {
         // for whoever tweaks the constants next:
         //   kOuterPad           (10)
         //   kFrameStroke         (2)
-        //   inner padding        (4)   ← see innerT in paint()
+        //   inner padding        (4)   ← see kInnerT below
         //   kHeaderHeight       (90)
         //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — GPU panel
@@ -107,8 +107,8 @@ namespace openxr_api_layer::detail {
         //   panel and the inner bottom edge. Keeping the budget exact
         //   makes the top and bottom borders read at the same
         //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
-        //   on each side). `bottomY + kBottomHeight == innerB` by
-        //   construction (asserted via the (void)innerB line in
+        //   on each side). `bottomY + kBottomHeight == kInnerB` by
+        //   construction (asserted via the (void)kInnerB line in
         //   paint()). Bumping any of the heights past this budget
         //   will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
@@ -118,6 +118,22 @@ namespace openxr_api_layer::detail {
         constexpr float kFrameStroke    = 2.0f;
         constexpr float kSectionGap     =  8.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
+
+        // Inner content rectangle — single source of truth for the
+        // layout inset. Both paint() and drawHistoRegion() derive
+        // their left/right bounds from these; previously each
+        // function recomputed (kOuterPad + kFrameStroke + 4.0f),
+        // which was a drift risk if one site got tweaked and the
+        // other didn't. The 4.0f is the extra inner padding that
+        // separates the chamfered frame stroke from the content.
+        constexpr float kInnerL =
+            kOuterPad + kFrameStroke + 4.0f;
+        constexpr float kInnerT =
+            kOuterPad + kFrameStroke + 4.0f;
+        constexpr float kInnerR =
+            static_cast<float>(kTexW) - kOuterPad - kFrameStroke - 4.0f;
+        constexpr float kInnerB =
+            static_cast<float>(kTexH) - kOuterPad - kFrameStroke - 4.0f;
 
         // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
         // FPS value AND the kFontTinyLabel (17 px) label above it,
@@ -141,6 +157,17 @@ namespace openxr_api_layer::detail {
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
         constexpr float kHistoTitleH     = 24.0f;
+        // Vertical paddings around the title row inside a frametime
+        // panel. drawFrametimePanel() positions the title at
+        // (t + kPanelTitleTopPad) and drawHistoRegion() positions
+        // the histogram strip at (titleB + kHistoTitleGap). Sharing
+        // the constants keeps the histogram aligned under the
+        // title — historically these were duplicated 6.0f magic
+        // numbers in two functions, with the second one's "any
+        // drift here would silently misalign the grid" comment
+        // documenting the fragility.
+        constexpr float kPanelTitleTopPad = 6.0f;
+        constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
         // 120 bars × (~3.6 px each + 2 px gap) ≈ 670 px of strip width.
         // Roughly half the bar width of the previous version (~7 px) —
@@ -552,19 +579,15 @@ namespace openxr_api_layer::detail {
 
                 // Layout — used by both tiers (static draws into the
                 // panel rects, dynamic addresses the histogram rect
-                // inside each panel). All values derive from compile-
-                // time constants so the two tiers can't drift.
-                const float texW = static_cast<float>(kTexW);
-                const float texH = static_cast<float>(kTexH);
-                const float innerL = kOuterPad + kFrameStroke + 4.0f;
-                const float innerR = texW - kOuterPad - kFrameStroke - 4.0f;
-                const float innerT = kOuterPad + kFrameStroke + 4.0f;
-                const float innerB = texH - kOuterPad - kFrameStroke - 4.0f;
-                const float headerY    = innerT;
+                // inside each panel). Inner bounds come from the
+                // namespace-scope constexpr kInner{L,R,T,B} so the
+                // two tiers can't drift from each other or from
+                // drawHistoRegion.
+                const float headerY    = kInnerT;
                 const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
                 const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
                 const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
-                (void)innerB;  // bottomY + kBottomHeight ≤ innerB by construction
+                (void)kInnerB;  // bottomY + kBottomHeight ≤ kInnerB by construction
 
                 if (needStatic) {
                     // Fully transparent clear — we paint our own
@@ -587,12 +610,13 @@ namespace openxr_api_layer::detail {
                     // fill and the metal-line stroke.
                     const D2D1_RECT_F frameOuter = D2D1::RectF(
                         kOuterPad, kOuterPad,
-                        texW - kOuterPad, texH - kOuterPad);
+                        static_cast<float>(kTexW) - kOuterPad,
+                        static_cast<float>(kTexH) - kOuterPad);
                     drawChamferedRect(rt, frameOuter, 12.0f,
                                        m_brushBg.Get(),
                                        m_brushFrameLine.Get(), kFrameStroke);
 
-                    drawHeaderBar(rt, innerL, headerY, innerR,
+                    drawHeaderBar(rt, kInnerL, headerY, kInnerR,
                                    headerY + kHeaderHeight, v);
                     // GPU panel: single value top-right ("6.7 ms").
                     // CPU panel: dual value "App X.X ms / Render Y.Y
@@ -606,12 +630,12 @@ namespace openxr_api_layer::detail {
                     //
                     // Histogram content (grid + bars + budget line)
                     // is owned by drawHistoRegion() below.
-                    drawFrametimePanel(rt, innerL, gpuPanelY, innerR,
+                    drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
                                         gpuPanelY + kFrametimeHeight,
                                         L"GPU FRAMETIME MS",
                                         v.gpu_frametime_ms,
                                         /*secondaryValue=*/std::string{});
-                    drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
+                    drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
                                         cpuPanelY + kFrametimeHeight,
                                         L"CPU FRAMETIME MS",
                                         v.cpu_frametime_ms,
@@ -633,11 +657,11 @@ namespace openxr_api_layer::detail {
                     // orange / red = headroom problem" without per-
                     // cell legends.
                     const float bottomCellW =
-                        (innerR - innerL - kSectionGap) / 5.0f;
-                    const float gpuPanelL   = innerL;
+                        (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                    const float gpuPanelL   = kInnerL;
                     const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
                     const float cpuPanelL   = gpuPanelR + kSectionGap;
-                    const float cpuPanelR   = innerR;
+                    const float cpuPanelR   = kInnerR;
                     // Labels are passed as full wide string literals
                     // ("GPU TEMP", "CPU LOAD", …) rather than a prefix
                     // + concat at draw time. Saves 4 std::wstring
@@ -1170,7 +1194,7 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (innerR - innerL). Barlow Medium Italic kFontBigNumber=52 px
+            // (kInnerR - kInnerL). Barlow Medium Italic kFontBigNumber=52 px
             // on "142" measures ~95-100 px (Barlow is wider than the
             // previous Rajdhani Bold ~78 px, italic slant adds a few
             // px more). kFontTinyLabel=17 px upright Medium labels
@@ -1262,7 +1286,10 @@ namespace openxr_api_layer::detail {
                 drawPanelBg(rt, l, t, r, b);
 
                 // Title bar — top inner padding.
-                const float titleT = t + 6.0f;
+                // Title row paddings shared with drawHistoRegion()
+                // — see kPanelTitleTopPad / kHistoTitleGap at the
+                // layout-constants block.
+                const float titleT = t + kPanelTitleTopPad;
                 const float titleB = titleT + kHistoTitleH;
                 const D2D1_RECT_F titleRect = D2D1::RectF(
                     l + kSectionInnerPad, titleT,
@@ -1342,13 +1369,14 @@ namespace openxr_api_layer::detail {
                                   const HistogramRing<kRingSize>& ring,
                                   float targetFps,
                                   ID2D1LinearGradientBrush* barBrush) const {
-                const float innerL = kOuterPad + kFrameStroke + 4.0f;
-                const float innerR = static_cast<float>(kTexW) -
-                                      kOuterPad - kFrameStroke - 4.0f;
-                const float titleB = panelY + 6.0f + kHistoTitleH;
-                const float histoL = innerL + kSectionInnerPad;
-                const float histoR = innerR - kSectionInnerPad;
-                const float histoT = titleB + 6.0f;
+                // Inner bounds + title paddings come from namespace-
+                // scope constexpr so this rect matches drawFrametime
+                // Panel()'s title row by construction. The previous
+                // 6.0f / kOuterPad-based duplication was a drift risk.
+                const float titleB = panelY + kPanelTitleTopPad + kHistoTitleH;
+                const float histoL = kInnerL + kSectionInnerPad;
+                const float histoR = kInnerR - kSectionInnerPad;
+                const float histoT = titleB + kHistoTitleGap;
                 const float histoB = panelY + kFrametimeHeight -
                                       kSectionInnerPad;
 
