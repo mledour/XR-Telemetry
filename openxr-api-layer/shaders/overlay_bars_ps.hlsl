@@ -50,18 +50,20 @@ float4 PSMain(VSOutput i) : SV_TARGET
             break;
     }
 
-    // Analytic 1-px box-filter edge coverage. i.pos.xy is the pixel
-    // centre (SV_Position); rectPx is (left, top, right, bottom). A
-    // pixel fully inside the rect gets coverage 1; an edge pixel gets
-    // its fractional overlap. This softens the left/right/top/bottom
-    // edges so fractional bar widths and positions read as uniform —
-    // the same effect D2D's anti-aliased FillRectangle produced. The
-    // shim region is opaque (the bg fill underneath), so the reduced
-    // alpha here blends the bar colour with that background.
+    // Analytic 1-px box-filter coverage on the LEFT/RIGHT edges only.
+    // i.pos.x is the pixel centre (SV_Position); rectPx.x/.z are the
+    // bar's left/right in pixels. A pixel fully inside gets coverage 1,
+    // an edge pixel its fractional overlap — softening the vertical
+    // edges so fractional bar widths/positions read as uniform width.
+    //
+    // The top/bottom are deliberately left CRISP (no covY). Anti-
+    // aliasing them too multiplied the corner pixels by both factors
+    // (covX·covY ≈ 0.25), dimming the top corners so short bars looked
+    // "thinner at the top". A flat pixel-snapped top reads cleaner for
+    // a bar chart and removes that artifact; the shared baseline at the
+    // strip floor stays crisp for the same reason.
     const float covX = saturate(min(i.pos.x - i.rectPx.x,
                                      i.rectPx.z - i.pos.x) + 0.5f);
-    const float covY = saturate(min(i.pos.y - i.rectPx.y,
-                                     i.rectPx.w - i.pos.y) + 0.5f);
-    col.a *= covX * covY;
+    col.a *= covX;
     return col;
 }
