@@ -399,6 +399,36 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</DeploymentContent>
     </None>
   </ItemGroup>
+  <ItemGroup>
+    <!-- Histogram-bar shaders. Compiled offline by FxCompile (no runtime
+         D3DCompile / d3dcompiler dependency) into embedded bytecode headers
+         under $(IntDir): overlay_bars_vs.h / overlay_bars_ps.h, each exposing
+         a `const BYTE g_<filename>[]` array (VariableName below). The C++
+         HistogramBarRenderer includes those headers to create the shaders;
+         $(IntDir) is added to the C++ include path once the renderer lands.
+         Shader Model 4.0 = feature level 10_0, the broadest target that still
+         supports the input-layout instancing we use (no 5.0 features needed)
+         — keeps the layer loadable on the widest range of OpenXR hosts. -->
+    <FxCompile Include="shaders\overlay_bars_vs.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>VSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_bars_ps.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>PSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <None Include="shaders\overlay_bars.hlsli" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="..\packages\fmt.7.0.1\build\fmt.targets" Condition="Exists('..\packages\fmt.7.0.1\build\fmt.targets')" />
