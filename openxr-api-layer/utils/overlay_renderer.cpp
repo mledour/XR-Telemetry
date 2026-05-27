@@ -1959,17 +1959,20 @@ namespace openxr_api_layer::detail {
                 if (fullW <= 0.0f || stripH <= 0.0f || budgetNs <= 0) return;
 
                 const std::size_t n = ring.size();
-                const float barW = (n > 0)
-                    ? (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
-                          static_cast<float>(n)
-                    : 0.0f;
-                // Fractional barW + positions are kept as-is (no pixel
-                // snapping): the pixel shader anti-aliases the bar edges
-                // analytically, so the sub-pixel widths/positions read as
-                // uniform — both the bars AND the gaps — the way D2D's
-                // anti-aliased FillRectangle looked. Snapping the width to
-                // an integer instead just moved the unevenness from the
-                // bars into the gaps.
+                // Fixed integer bar geometry: 4-px bars + 1-px gaps
+                // (step 5). Integer width AND integer positions make every
+                // bar pixel-identical — no sub-pixel width/gap variation,
+                // no AA needed. kRingSize bars span n*5 - 1 px; the histo
+                // region is wider, so the run is centred and the slack
+                // splits into equal left/right margins. (The strip width
+                // can be adapted later if the bars should sit flush to the
+                // panel edges.)
+                constexpr float kBarPx  = 4.0f;
+                constexpr float kStepPx = 5.0f;   // 4-px bar + 1-px gap
+                const float usedW = static_cast<float>(n) * kStepPx - 1.0f;
+                const float slack = fullW - usedW;
+                const float startX = histoL +
+                    (slack > 0.0f ? std::floor(slack * 0.5f + 0.5f) : 0.0f);
 
                 // --- refill bar instances from the ring ---
                 UINT barCount = 0;
@@ -1978,10 +1981,9 @@ namespace openxr_api_layer::detail {
                     if (SUCCEEDED(m_ctx->Map(m_barInstances.Get(), 0,
                             D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                         auto* inst = static_cast<BarInstance*>(map.pData);
-                        for (std::size_t i = 0; i < n && barW > 0.0f; ++i) {
+                        for (std::size_t i = 0; i < n; ++i) {
                             const float x =
-                                histoL + static_cast<float>(i) *
-                                          (barW + kHistoBarGap);
+                                startX + static_cast<float>(i) * kStepPx;
                             const int64_t sample = ring.at(i);
                             if (sample <= 0) {
                                 inst[barCount++] = {x, 0.0f, 3u};  // empty dash
@@ -2026,7 +2028,7 @@ namespace openxr_api_layer::detail {
                     bc.texSize[1] = static_cast<float>(kTexH);
                     bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
-                    bc.barWidth = barW;     // fractional; PS anti-aliases edges
+                    bc.barWidth = kBarPx;   // fixed 4-px integer width
                     bc.dashHeight = 2.0f;
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
                     copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
