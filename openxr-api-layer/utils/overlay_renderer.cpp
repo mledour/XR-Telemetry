@@ -587,17 +587,14 @@ namespace openxr_api_layer::detail {
 
                 rt->BeginDraw();
 
-                // Layout — used by both tiers (static draws into the
-                // panel rects, dynamic addresses the histogram rect
-                // inside each panel). Inner bounds come from the
-                // namespace-scope constexpr kInner{L,R,T,B} so the
-                // two tiers can't drift from each other or from
-                // drawHistoRegion.
+                // Panel Ys for the dynamic histo tier below. The chrome
+                // (incl. the bottom row) is drawn by drawChrome(), which
+                // recomputes its own Ys from the same constants — they
+                // can't drift since both derive from kInner{T} + the
+                // section heights.
                 const float headerY    = kInnerT;
                 const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
                 const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
-                const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
-                (void)kInnerB;  // bottomY + kBottomHeight ≤ kInnerB by construction
 
                 if (needStatic) {
                     // Fully transparent clear — we paint our own
@@ -607,89 +604,7 @@ namespace openxr_api_layer::detail {
                     rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
                     m_cachedValues = formatOverlayDisplayValues(snap);
-                    const auto& v = m_cachedValues;
-
-                    // Outer frame: octagonal-ish shape with chamfered
-                    // corners — matches the design spec's "cut
-                    // corners" industrial-HUD look. 12-px diagonal
-                    // cut at each corner; the 4 sides connect with
-                    // straight edges. Built once per static paint
-                    // via ID2D1PathGeometry (8 line segments). The
-                    // geometry is closed so a single FillGeometry /
-                    // DrawGeometry pair handles both the background
-                    // fill and the metal-line stroke.
-                    const D2D1_RECT_F frameOuter = D2D1::RectF(
-                        kOuterPad, kOuterPad,
-                        static_cast<float>(kTexW) - kOuterPad,
-                        static_cast<float>(kTexH) - kOuterPad);
-                    drawChamferedRect(rt, frameOuter, 12.0f,
-                                       m_brushBg.Get(),
-                                       m_brushFrameLine.Get(), kFrameStroke);
-
-                    drawHeaderBar(rt, kInnerL, headerY, kInnerR,
-                                   headerY + kHeaderHeight, v);
-                    // GPU panel: single value top-right ("6.7 ms").
-                    // CPU panel: dual value "App X.X ms / Render Y.Y
-                    // ms" — the App / Render split is the diagnostic
-                    // value of the design (see comment in
-                    // overlay_aggregator.h for what each metric
-                    // covers). An empty secondary string suppresses
-                    // the App / Render composition and falls back to
-                    // the single-value rendering — same code path as
-                    // the GPU panel.
-                    //
-                    // Histogram content (grid + bars + budget line)
-                    // is owned by drawHistoRegion() below.
-                    drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
-                                        gpuPanelY + kFrametimeHeight,
-                                        L"GPU FRAMETIME MS",
-                                        v.gpu_frametime_ms,
-                                        /*secondaryValue=*/std::string{});
-                    drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
-                                        cpuPanelY + kFrametimeHeight,
-                                        L"CPU FRAMETIME MS",
-                                        v.cpu_frametime_ms,
-                                        v.cpu_app_ms);
-
-                    // Bottom row: 60/40 split between the GPU and
-                    // CPU panels — GPU gets 3 cells (TEMP / LOAD /
-                    // VRAM), CPU gets 2 cells (TEMP / LOAD). With 5
-                    // equal cells across the row this gives every
-                    // cell the same pixel width (≈ 135 px), so the
-                    // labels and values align perfectly across both
-                    // panels.
-                    //
-                    // VRAM-cell tier-colour (cyan / orange / red)
-                    // follows the same gaugeTierForUtilisation
-                    // thresholds as GPU LOAD / CPU LOAD: < 80 % =
-                    // cyan default, 80–89 % = orange, ≥ 90 % = red.
-                    // Coherent palette = the user reads "anything
-                    // orange / red = headroom problem" without per-
-                    // cell legends.
-                    const float bottomCellW =
-                        (kInnerR - kInnerL - kSectionGap) / 5.0f;
-                    const float gpuPanelL   = kInnerL;
-                    const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
-                    const float cpuPanelL   = gpuPanelR + kSectionGap;
-                    const float cpuPanelR   = kInnerR;
-                    // Labels are passed as full wide string literals
-                    // ("GPU TEMP", "CPU LOAD", …) rather than a prefix
-                    // + concat at draw time. Saves 4 std::wstring
-                    // allocations per static paint.
-                    drawBottomPanel(rt, gpuPanelL, bottomY,
-                                     gpuPanelR, bottomY + kBottomHeight,
-                                     L"GPU TEMP", L"GPU LOAD",
-                                     v.gpu_temp_c, v.gpu_util_pct,
-                                     v.gpu_util_fraction,
-                                     /*vramValue=*/v.vram_pct,
-                                     /*vramFraction=*/v.vram_fraction);
-                    drawBottomPanel(rt, cpuPanelL, bottomY,
-                                     cpuPanelR, bottomY + kBottomHeight,
-                                     L"CPU TEMP", L"CPU LOAD",
-                                     v.cpu_temp_c, v.cpu_util_pct,
-                                     v.cpu_util_fraction,
-                                     /*vramValue=*/std::string{},
-                                     /*vramFraction=*/0.0f);
+                    drawChrome(rt, m_cachedValues);
                 }
 
                 // Dynamic tier — runs every frame so the histogram
@@ -710,6 +625,96 @@ namespace openxr_api_layer::detail {
                 commitPaint(m_cadence, needStatic, ok, snap.version);
                 return ok;
             }
+
+            // Paint ONLY the static chrome (outer frame, header, panel
+            // titles + current values, bottom row) into `rt` — no
+            // histogram region, no cadence bookkeeping. Used by the
+            // D3D11 path, which draws the histogram on the GPU
+            // (HistogramBarRenderer) and drives its own cadence; the
+            // caller decides when chrome is stale and calls this only
+            // then. Wraps its own BeginDraw/EndDraw and clears first
+            // (the shim is fully repainted on a chrome refresh).
+            // Returns EndDraw success.
+            bool paintChromeOnly(ID2D1RenderTarget* rt,
+                                  const OverlaySnapshot& snap) {
+                if (!rt) return false;
+                if (!m_brushBg || !m_strokeDashed) return false;
+                rt->BeginDraw();
+                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+                m_cachedValues = formatOverlayDisplayValues(snap);
+                drawChrome(rt, m_cachedValues);
+                return SUCCEEDED(rt->EndDraw());
+            }
+
+          private:
+            // The static-tier drawing shared by paint() and
+            // paintChromeOnly(): outer chamfered frame, header bar,
+            // both frametime-panel chromes (background + title +
+            // current value, NO histogram), and the bottom TEMP/LOAD/
+            // VRAM row. Caller owns BeginDraw/Clear/EndDraw. Panel Ys
+            // derive from the namespace-scope layout constants so they
+            // can't drift from drawHistoRegion / the bar renderer.
+            void drawChrome(ID2D1RenderTarget* rt,
+                             const OverlayDisplayValues& v) {
+                const float headerY   = kInnerT;
+                const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
+                const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomY   = cpuPanelY + kFrametimeHeight + kSectionGap;
+
+                // Outer frame: octagonal-ish chamfered shape (12-px
+                // diagonal corner cuts), one FillGeometry/DrawGeometry
+                // pair for fill + metal-line stroke.
+                const D2D1_RECT_F frameOuter = D2D1::RectF(
+                    kOuterPad, kOuterPad,
+                    static_cast<float>(kTexW) - kOuterPad,
+                    static_cast<float>(kTexH) - kOuterPad);
+                drawChamferedRect(rt, frameOuter, 12.0f,
+                                   m_brushBg.Get(),
+                                   m_brushFrameLine.Get(), kFrameStroke);
+
+                drawHeaderBar(rt, kInnerL, headerY, kInnerR,
+                               headerY + kHeaderHeight, v);
+                // Histogram content is owned by drawHistoRegion() (D2D
+                // path) or HistogramBarRenderer (D3D11 path); these
+                // panel calls only paint the chrome (bg + title +
+                // current value).
+                drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
+                                    gpuPanelY + kFrametimeHeight,
+                                    L"GPU FRAMETIME MS",
+                                    v.gpu_frametime_ms,
+                                    /*secondaryValue=*/std::string{});
+                drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
+                                    cpuPanelY + kFrametimeHeight,
+                                    L"CPU FRAMETIME MS",
+                                    v.cpu_frametime_ms,
+                                    v.cpu_app_ms);
+
+                // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
+                // CPU TEMP/LOAD), 60/40 split. Tier colours follow
+                // gaugeTierForUtilisation.
+                const float bottomCellW =
+                    (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                const float gpuPanelL = kInnerL;
+                const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
+                const float cpuPanelL = gpuPanelR + kSectionGap;
+                const float cpuPanelR = kInnerR;
+                drawBottomPanel(rt, gpuPanelL, bottomY,
+                                 gpuPanelR, bottomY + kBottomHeight,
+                                 L"GPU TEMP", L"GPU LOAD",
+                                 v.gpu_temp_c, v.gpu_util_pct,
+                                 v.gpu_util_fraction,
+                                 /*vramValue=*/v.vram_pct,
+                                 /*vramFraction=*/v.vram_fraction);
+                drawBottomPanel(rt, cpuPanelL, bottomY,
+                                 cpuPanelR, bottomY + kBottomHeight,
+                                 L"CPU TEMP", L"CPU LOAD",
+                                 v.cpu_temp_c, v.cpu_util_pct,
+                                 v.cpu_util_fraction,
+                                 /*vramValue=*/std::string{},
+                                 /*vramFraction=*/0.0f);
+            }
+
+            // -------- end static-tier helpers --------
 
           private:
             // -------- Format / brush helpers --------------------------------
@@ -2278,8 +2283,10 @@ namespace openxr_api_layer::detail {
                     // cost on the previous frame.
                     HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
                     if (hr == S_OK) {
-                        painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
-                                                m_cpuRing, m_gpuRing);
+                        painted = m_useShaderBars
+                            ? paintShim(snap)
+                            : m_core.paint(m_myShimRenderTarget.Get(), snap,
+                                            m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
                         weHaveKey1 = true;
                     } else {
@@ -2618,6 +2625,23 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
+                // GPU histogram path. Capture m_myDevice's immediate
+                // context (D2D doesn't expose it) and init the bar
+                // renderer against the same shim the D2D RT paints
+                // into. If anything here fails we DON'T disable the
+                // overlay — m_useShaderBars stays false and the paint
+                // path falls back to the full D2D paint(), so the HUD
+                // still works, just without the GPU fast path.
+                m_myDevice->GetImmediateContext(m_myContext.GetAddressOf());
+                m_useShaderBars =
+                    m_myContext &&
+                    m_bars.init(m_myDevice.Get(), m_myContext.Get(),
+                                 m_myShim.Get());
+                if (!m_useShaderBars) {
+                    Log("xr_telemetry: overlay GPU histogram path "
+                        "unavailable — falling back to D2D bar rendering\n");
+                }
+
                 // Fill the immutable XrCompositionLayerQuad fields
                 // now that m_swapchain is alive. SOURCE_ALPHA blending
                 // + identity orientation are documented in the long
@@ -2630,6 +2654,67 @@ namespace openxr_api_layer::detail {
                     "images, private-device shim BGRA8 RT, feature_level={:#x})\n",
                     imgCount, static_cast<unsigned int>(outLevel)));
                 return true;
+            }
+
+            // Shader path (m_useShaderBars): paint the shim with D2D
+            // chrome (static tier, only when snap.version ticks or the
+            // watchdog fires) plus the GPU histogram bars (dynamic tier,
+            // every frame). Mirrors CoreRenderer::paint()'s static/
+            // dynamic split, but the dynamic tier is HistogramBar
+            // Renderer's instanced draw instead of D2D FillRectangle.
+            //
+            // Ordering: the D2D chrome EndDraw commits before the GPU
+            // bars (same device → same immediate context → ordered),
+            // and the caller's ReleaseSync(1) signals after both, so
+            // the copy side sees a complete frame. On a dynamic-only
+            // frame no D2D runs at all — the shim keeps last static
+            // paint's chrome and the bars overwrite just their scissored
+            // rects.
+            //
+            // Returns false only when a needed chrome repaint failed
+            // (its EndDraw errored): the cadence then retries next
+            // frame and the caller suppresses this frame's layer.
+            bool paintShim(const OverlaySnapshot& snap) {
+                const bool needStatic = needStaticPaint(
+                    m_barsCadence, snap.version, kChromeWatchdogFrames);
+
+                bool ok = true;
+                if (needStatic) {
+                    ok = m_core.paintChromeOnly(
+                        m_myShimRenderTarget.Get(), snap);
+                }
+
+                if (ok) {
+                    // Panel Ys + histo rects from the shared layout
+                    // constants — identical geometry to drawHistoRegion
+                    // / drawChrome so the GPU bars line up under the
+                    // D2D titles.
+                    const float headerY   = kInnerT;
+                    const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
+                    const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
+                    const float histoL = kInnerL + kSectionInnerPad;
+                    const float histoR = kInnerR - kSectionInnerPad;
+                    const int64_t budgetNs = snap.target_fps > 0.0f
+                        ? static_cast<int64_t>(1.0e9f / snap.target_fps)
+                        : 0;
+                    const float gpuT = gpuPanelY + kPanelTitleTopPad +
+                                        kHistoTitleH + kHistoTitleGap;
+                    const float gpuB = gpuPanelY + kFrametimeHeight -
+                                        kSectionInnerPad;
+                    const float cpuT = cpuPanelY + kPanelTitleTopPad +
+                                        kHistoTitleH + kHistoTitleGap;
+                    const float cpuB = cpuPanelY + kFrametimeHeight -
+                                        kSectionInnerPad;
+                    m_bars.drawPanel(m_gpuRing, budgetNs,
+                                      histoL, gpuT, histoR, gpuB,
+                                      /*isGpu=*/true);
+                    m_bars.drawPanel(m_cpuRing, budgetNs,
+                                      histoL, cpuT, histoR, cpuB,
+                                      /*isGpu=*/false);
+                }
+
+                commitPaint(m_barsCadence, needStatic, ok, snap.version);
+                return ok;
             }
 
             // One-time fill of the XrCompositionLayerQuad fields that
@@ -2687,8 +2772,26 @@ namespace openxr_api_layer::detail {
             ComPtr<IDXGIKeyedMutex>     m_myShimMutex;
             ComPtr<IDXGIKeyedMutex>     m_appShimMutex;
             HANDLE                      m_sharedHandle = nullptr;
-            // D2D render target on m_myShim — the actual paint surface.
+            // D2D render target on m_myShim — the actual paint surface
+            // for the static chrome.
             ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
+            // m_myDevice's immediate context. D2D drives its own RT
+            // internally, but HistogramBarRenderer needs a raw context
+            // to issue the instanced bar/quad draws into the shim after
+            // the D2D chrome lands.
+            ComPtr<ID3D11DeviceContext> m_myContext;
+            // GPU histogram renderer: paints the histo region (bg +
+            // grid + bars + budget) into m_myShim via instanced draws,
+            // replacing the per-bar D2D FillRectangle loop. m_useShader
+            // Bars gates whether it initialised; on failure the path
+            // falls back to the full D2D paint().
+            HistogramBarRenderer        m_bars;
+            bool                        m_useShaderBars = false;
+            // Chrome cadence for the shader path: the bars redraw every
+            // frame on the GPU, the D2D chrome only when snap.version
+            // ticks or the watchdog fires.
+            PaintCadence                m_barsCadence;
+            static constexpr int        kChromeWatchdogFrames = 30;
 
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_cpuRing;
