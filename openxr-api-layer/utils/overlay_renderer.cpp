@@ -182,14 +182,15 @@ namespace openxr_api_layer::detail {
         constexpr float kPanelTitleTopPad = 6.0f;
         constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
-        // 120 bars × (~3.6 px each + 2 px gap) ≈ 670 px of strip width.
-        // Roughly half the bar width of the previous version (~7 px) —
-        // matches the denser, thinner-bar visual of the reference
-        // design. Window covered = 120 samples ≈ 1.3 s @ 90 Hz / 1 s @
-        // 120 Hz, still long enough to catch a stutter spike but short
-        // enough that the histogram reacts within the same second.
+        // 133 bars fill the GPU histogram strip exactly at the fixed
+        // 4-px-bar / 1-px-gap layout (133×4 + 132×1 = 664 px = strip
+        // inner width) — flush, zero margin, every bar pixel-aligned.
+        // Window covered ≈ 1.5 s @ 90 Hz / 0.9 s @ 144 Hz, still short
+        // enough that the histogram reacts within ~a second. The D2D
+        // fallback path (D3D12 + snapshot) recomputes its bar width from
+        // this count, so it stays consistent.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
-        static_assert(kRingSize == 120,
+        static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
                        "bump both in lockstep if tuning the histogram length");
 

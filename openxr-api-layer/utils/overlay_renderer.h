@@ -146,7 +146,12 @@ namespace openxr_api_layer::detail {
     // kRingSize. We expose that as kOverlayHistoRingSize here so test
     // code can declare matching rings without hard-coding the value
     // (and the cpp's static_assert below guards against drift).
-    constexpr std::size_t kOverlayHistoRingSize = 120;
+    //
+    // 133 = the bar count that fills the GPU histogram strip exactly
+    // with the fixed 4-px-bar / 1-px-gap layout: 133×4 + 132×1 = 664 px
+    // (the strip's inner width). Picking it leaves zero margin and keeps
+    // every bar pixel-aligned. ~133 samples ≈ 1.5 s @ 90 Hz.
+    constexpr std::size_t kOverlayHistoRingSize = 133;
 
     // errOut: optional. On false return, populated with a short string
     // identifying which step failed (init / initBrushes / paint). Used
