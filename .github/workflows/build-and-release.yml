@@ -353,8 +353,19 @@ jobs:
       # of the PR timeline). The green CI status check on each
       # commit already provides the per-run proof a reviewer would
       # have clicked through this comment for.
+      # continue-on-error: updating this cosmetic "now passing" comment
+      # must never fail the build. marocchino v3.0.4 with only_update:true
+      # errors (rather than no-oping) when no prior sticky comment exists
+      # — which is exactly the first time the snapshot test passes on a
+      # PR that never had a failure comment. Without this guard, that
+      # error flips the job to failed, which in turn fires every
+      # `if: failure()` step below (they'd post a misleading "snapshot
+      # test failed" comment even though the test passed). Swallowing the
+      # step's failure keeps failure() false so the failure-path steps
+      # stay correctly skipped.
       - name: Update sticky PR comment if snapshot test now passes
         if: success() && env.INLINE_ELIGIBLE == 'true'
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
         with:
           header: ${{ env.STICKY_HEADER }}
