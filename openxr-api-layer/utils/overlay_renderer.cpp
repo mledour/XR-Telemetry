@@ -1963,6 +1963,16 @@ namespace openxr_api_layer::detail {
                     ? (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
                           static_cast<float>(n)
                     : 0.0f;
+                // Pixel-snapped uniform width. The shader rasterises with
+                // no anti-aliasing, so a fractional barW (≈3.55 px at
+                // 120 bars) would snap each bar's edges to the grid
+                // independently — some 3 px, some 4 px (what looked like
+                // "uneven widths"). Rounding the width to an integer AND
+                // snapping each left edge below makes every bar cover
+                // exactly barWpx pixels; the ≤1 px slack lands in the
+                // gaps, which is imperceptible. (D2D hid this with edge
+                // anti-aliasing; we trade that for crisp uniform bars.)
+                const float barWpx = std::floor(barW + 0.5f);
 
                 // --- refill bar instances from the ring ---
                 UINT barCount = 0;
@@ -1971,10 +1981,10 @@ namespace openxr_api_layer::detail {
                     if (SUCCEEDED(m_ctx->Map(m_barInstances.Get(), 0,
                             D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                         auto* inst = static_cast<BarInstance*>(map.pData);
-                        for (std::size_t i = 0; i < n && barW > 0.0f; ++i) {
-                            const float x =
+                        for (std::size_t i = 0; i < n && barWpx > 0.0f; ++i) {
+                            const float x = std::floor(
                                 histoL + static_cast<float>(i) *
-                                          (barW + kHistoBarGap);
+                                          (barW + kHistoBarGap) + 0.5f);
                             const int64_t sample = ring.at(i);
                             if (sample <= 0) {
                                 inst[barCount++] = {x, 0.0f, 3u};  // empty dash
@@ -2019,7 +2029,7 @@ namespace openxr_api_layer::detail {
                     bc.texSize[1] = static_cast<float>(kTexH);
                     bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
-                    bc.barWidth = barW;
+                    bc.barWidth = barWpx;   // integer width → uniform bars
                     bc.dashHeight = 2.0f;
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
                     copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
