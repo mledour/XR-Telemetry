@@ -33,15 +33,35 @@
 
 float4 PSMain(VSOutput i) : SV_TARGET
 {
+    float4 col;
     switch (i.tier)
     {
         case 0u:  // Green → vertical gradient (top → bottom of strip)
-            return lerp(gradTop, gradBottom, i.stripY);
+            col = lerp(gradTop, gradBottom, i.stripY);
+            break;
         case 1u:  // Orange
-            return orangeColor;
+            col = orangeColor;
+            break;
         case 2u:  // Red
-            return redColor;
+            col = redColor;
+            break;
         default:  // 3u Empty → dash placeholder
-            return dashColor;
+            col = dashColor;
+            break;
     }
+
+    // Analytic 1-px box-filter edge coverage. i.pos.xy is the pixel
+    // centre (SV_Position); rectPx is (left, top, right, bottom). A
+    // pixel fully inside the rect gets coverage 1; an edge pixel gets
+    // its fractional overlap. This softens the left/right/top/bottom
+    // edges so fractional bar widths and positions read as uniform —
+    // the same effect D2D's anti-aliased FillRectangle produced. The
+    // shim region is opaque (the bg fill underneath), so the reduced
+    // alpha here blends the bar colour with that background.
+    const float covX = saturate(min(i.pos.x - i.rectPx.x,
+                                     i.rectPx.z - i.pos.x) + 0.5f);
+    const float covY = saturate(min(i.pos.y - i.rectPx.y,
+                                     i.rectPx.w - i.pos.y) + 0.5f);
+    col.a *= covX * covY;
+    return col;
 }

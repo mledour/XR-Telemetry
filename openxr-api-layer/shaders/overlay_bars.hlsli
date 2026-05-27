@@ -81,5 +81,12 @@ struct VSOutput
 {
     float4 pos    : SV_POSITION;
     float  stripY : STRIPY;       // 0 = strip top, 1 = strip bottom (for gradient)
-    nointerpolation uint tier : BAR_TIER;
+    nointerpolation uint   tier  : BAR_TIER;
+    // The bar's pixel-space rect (left, top, right, bottom), flat across
+    // the quad. The pixel shader uses it with SV_Position to compute
+    // analytic edge coverage — soft 1-px box-filter edges, the same look
+    // D2D's anti-aliased FillRectangle gave. Without it, fractional bar
+    // widths / positions snap hard to the pixel grid and the bars (or the
+    // gaps between them) read as uneven.
+    nointerpolation float4 rectPx : RECTPX;
 };

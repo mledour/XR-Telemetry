@@ -59,5 +59,8 @@ VSOutput VSMain(VSInput v)
     // gradient per-pixel — matching D2D's strip-spanning linear brush.
     o.stripY = saturate((py - histoT) / max(stripH, 1.0f));
     o.tier = v.tier;
+    // Pixel-space rect (left, top, right, bottom) for the PS's analytic
+    // edge anti-aliasing. top = bar tip (smaller Y), bottom = strip floor.
+    o.rectPx = float4(left, top, right, bottom);
     return o;
 }
