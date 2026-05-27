@@ -81,7 +81,7 @@
            without needing the separate Create/Use pch.cpp dance. Slower to
            compile than the layer project, but simpler and self-contained. -->
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\obj\$(Platform)\$(Configuration)\;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -109,7 +109,7 @@
       <PreprocessorDefinitions>LAYER_NAME="XR_APILAYER_MLEDOUR_xr_telemetry";NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\obj\$(Platform)\$(Configuration)\;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>

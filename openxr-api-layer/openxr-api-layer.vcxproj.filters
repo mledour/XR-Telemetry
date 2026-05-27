@@ -116,12 +116,21 @@
     <None Include="shaders\overlay_bars.hlsli">
       <Filter>Assets</Filter>
     </None>
+    <None Include="shaders\overlay_quad.hlsli">
+      <Filter>Assets</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <FxCompile Include="shaders\overlay_bars_vs.hlsl">
       <Filter>Assets</Filter>
     </FxCompile>
     <FxCompile Include="shaders\overlay_bars_ps.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_vs.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_ps.hlsl">
       <Filter>Assets</Filter>
     </FxCompile>
   </ItemGroup>

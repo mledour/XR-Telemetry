@@ -43,20 +43,25 @@
 // the same linear values initBrushes() feeds D2D (the bars are opaque, so
 // straight == premultiplied for the BGRA8 shim; only the dash carries alpha,
 // and it lands on the already-opaque panel background).
+// Packing note: members are ordered so each maps cleanly onto HLSL's
+// 16-byte constant registers with no implicit padding — the two float2
+// pairs fill reg0, (histoBotRight, barWidth, dashHeight) fills reg1, and
+// each float4 colour gets its own register from offset 32 on. The C++
+// BarConstants mirror struct must match byte-for-byte (see
+// HistogramBarRenderer); do NOT insert an explicit pad float2 here — that
+// would bump gradTop off its natural 16-byte boundary.
 cbuffer BarConstants : register(b0)
 {
-    float2 texSize;        // (kTexW, kTexH)
-    float2 histoTopLeft;   // (histoL, histoT)
-    float2 histoBotRight;  // (histoR, histoB)
-    float  barWidth;       // barW in pixels
-    float  dashHeight;     // kDashPlaceholderH (2.0)
-    float2 _padA;          // 16-byte alignment
-
-    float4 gradTop;        // healthy gradient, strip-top colour
-    float4 gradBottom;     // healthy gradient, strip-bottom colour
-    float4 orangeColor;    // BarTier::Orange
-    float4 redColor;       // BarTier::Red
-    float4 dashColor;      // empty-slot placeholder (grid-dash colour)
+    float2 texSize;        // (kTexW, kTexH)            reg0.xy
+    float2 histoTopLeft;   // (histoL, histoT)          reg0.zw
+    float2 histoBotRight;  // (histoR, histoB)          reg1.xy
+    float  barWidth;       // barW in pixels            reg1.z
+    float  dashHeight;     // kDashPlaceholderH (2.0)    reg1.w
+    float4 gradTop;        // healthy gradient top      reg2
+    float4 gradBottom;     // healthy gradient bottom   reg3
+    float4 orangeColor;    // BarTier::Orange           reg4
+    float4 redColor;       // BarTier::Red              reg5
+    float4 dashColor;      // empty-slot placeholder    reg6
 };
 
 // Per-vertex: the four corners of a unit quad (0,0)-(1,1), fed as a

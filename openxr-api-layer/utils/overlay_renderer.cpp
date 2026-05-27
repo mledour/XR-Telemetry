@@ -45,10 +45,22 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>     // std::memcpy for constant-buffer uploads
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
 #include <iterator>    // std::size for the dash-style array
 #include <string>
 #include <vector>
+
+// Offline-compiled shader bytecode (FxCompile → $(IntDir), on the C++
+// include path in both the layer and test vcxproj). Each header declares a
+// `const BYTE g_<filename>[]` (internal linkage, so including them in this
+// one TU is ODR-safe). HistogramBarRenderer builds the instanced-bar and
+// solid-quad pipelines from these to paint the histogram region on the GPU
+// instead of via the per-bar D2D FillRectangle loop.
+#include "overlay_bars_vs.h"
+#include "overlay_bars_ps.h"
+#include "overlay_quad_vs.h"
+#include "overlay_quad_ps.h"
 
 // Pragma-link D2D + DirectWrite so we don't have to add them to the
 // vcxproj's Link section. d2d1.lib and dwrite.lib ship with the Windows
@@ -1790,6 +1802,369 @@ namespace openxr_api_layer::detail {
             static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
             PaintCadence         m_cadence;
+        };
+
+        // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
+        //
+        // Replaces drawHistoRegion()'s D2D work (one FillRectangle per bar,
+        // ×kRingSize ×2 panels every frame) with a handful of instanced GPU
+        // draws into the shim. Owns two pipelines — solid-colour quads for the
+        // background / grid / budget line, and gradient bars for the samples —
+        // plus an RTV on the shim and the dynamic instance + constant buffers
+        // refilled per panel per frame.
+        //
+        // Lives on the SAME D3D11 device as the shim's D2D render target, so
+        // both share one immediate context. Contract for the caller:
+        //   1. Flush() the D2D RT before drawPanel() — D2D batches commands;
+        //      flushing commits the chrome so our draws land on top of it.
+        //   2. Treat the D3D11 pipeline state as clobbered after drawPanel()
+        //      (and D2D clobbers ours), so each drawPanel() sets ALL state.
+        //
+        // Colours mirror initBrushes() exactly so the GPU output matches the
+        // old D2D look (modulo edge anti-aliasing). The histogram rect is
+        // fully opaque after the background fill, so premultiplied == straight
+        // there and the runtime composites the quad layer correctly.
+        class HistogramBarRenderer {
+          public:
+            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx,
+                       ID3D11Texture2D* shim) {
+                if (!device || !ctx || !shim) return false;
+                m_device = device;
+                m_ctx = ctx;
+
+                if (FAILED(m_device->CreateRenderTargetView(
+                        shim, nullptr, m_rtv.GetAddressOf())))
+                    return false;
+
+                // Shaders from embedded bytecode.
+                if (FAILED(m_device->CreateVertexShader(
+                        g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
+                        nullptr, m_barsVS.GetAddressOf())) ||
+                    FAILED(m_device->CreatePixelShader(
+                        g_overlay_bars_ps, sizeof(g_overlay_bars_ps),
+                        nullptr, m_barsPS.GetAddressOf())) ||
+                    FAILED(m_device->CreateVertexShader(
+                        g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
+                        nullptr, m_quadVS.GetAddressOf())) ||
+                    FAILED(m_device->CreatePixelShader(
+                        g_overlay_quad_ps, sizeof(g_overlay_quad_ps),
+                        nullptr, m_quadPS.GetAddressOf())))
+                    return false;
+
+                // Input layouts. Slot 0 = per-vertex unit-quad corner;
+                // slot 1 = per-instance data. Offsets match the structs
+                // below and the HLSL semantic names exactly.
+                const D3D11_INPUT_ELEMENT_DESC barsIL[] = {
+                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                     D3D11_INPUT_PER_VERTEX_DATA,   0},
+                    {"BAR_XLEFT",  0, DXGI_FORMAT_R32_FLOAT,    1, 0,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"BAR_HEIGHT", 0, DXGI_FORMAT_R32_FLOAT,    1, 4,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"BAR_TIER",   0, DXGI_FORMAT_R32_UINT,     1, 8,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                };
+                if (FAILED(m_device->CreateInputLayout(
+                        barsIL, _countof(barsIL),
+                        g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
+                        m_barsLayout.GetAddressOf())))
+                    return false;
+
+                const D3D11_INPUT_ELEMENT_DESC quadIL[] = {
+                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
+                     D3D11_INPUT_PER_VERTEX_DATA,   0},
+                    {"QUAD_RECT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"QUAD_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                };
+                if (FAILED(m_device->CreateInputLayout(
+                        quadIL, _countof(quadIL),
+                        g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
+                        m_quadLayout.GetAddressOf())))
+                    return false;
+
+                // Static unit-quad vertex buffer: 4 corners for a triangle
+                // strip. corner.x ∈ {0,1} → left/right, corner.y ∈ {0,1} →
+                // top/bottom (each VS applies its own lerp).
+                const float quadVerts[] = {
+                    0.0f, 0.0f,  1.0f, 0.0f,
+                    0.0f, 1.0f,  1.0f, 1.0f,
+                };
+                if (!createBuffer(quadVerts, sizeof(quadVerts),
+                                   D3D11_BIND_VERTEX_BUFFER,
+                                   D3D11_USAGE_IMMUTABLE,
+                                   m_quadVB))
+                    return false;
+
+                // Dynamic instance + constant buffers.
+                if (!createDynamic(kRingSize * sizeof(BarInstance),
+                                    D3D11_BIND_VERTEX_BUFFER, m_barInstances) ||
+                    !createDynamic(kQuadSlots * sizeof(QuadInstance),
+                                    D3D11_BIND_VERTEX_BUFFER, m_quadInstances) ||
+                    !createDynamic(sizeof(BarConstants),
+                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB) ||
+                    !createDynamic(sizeof(QuadConstants),
+                                    D3D11_BIND_CONSTANT_BUFFER, m_quadCB))
+                    return false;
+
+                // Straight alpha-over blend.
+                D3D11_BLEND_DESC bd{};
+                bd.RenderTarget[0].BlendEnable = TRUE;
+                bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+                bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+                bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].RenderTargetWriteMask =
+                    D3D11_COLOR_WRITE_ENABLE_ALL;
+                if (FAILED(m_device->CreateBlendState(
+                        &bd, m_blend.GetAddressOf())))
+                    return false;
+
+                // No culling, scissor ON (confines every draw to the panel's
+                // histo rect so nothing bleeds into the chrome).
+                D3D11_RASTERIZER_DESC rd{};
+                rd.FillMode = D3D11_FILL_SOLID;
+                rd.CullMode = D3D11_CULL_NONE;
+                rd.ScissorEnable = TRUE;
+                rd.DepthClipEnable = TRUE;
+                if (FAILED(m_device->CreateRasterizerState(
+                        &rd, m_raster.GetAddressOf())))
+                    return false;
+
+                m_ready = true;
+                return true;
+            }
+
+            bool isReady() const noexcept { return m_ready; }
+
+            // Paint one panel's histogram region (bg + grid + bars + budget)
+            // into the shim. Rect is in shim pixels; isGpu picks the teal vs
+            // blue gradient. budgetNs <= 0 → nothing meaningful to draw.
+            void drawPanel(const HistogramRing<kRingSize>& ring,
+                            int64_t budgetNs,
+                            float histoL, float histoT,
+                            float histoR, float histoB,
+                            bool isGpu) {
+                if (!m_ready) return;
+                const float fullW = histoR - histoL;
+                const float stripH = histoB - histoT;
+                if (fullW <= 0.0f || stripH <= 0.0f || budgetNs <= 0) return;
+
+                const std::size_t n = ring.size();
+                const float barW = (n > 0)
+                    ? (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
+                          static_cast<float>(n)
+                    : 0.0f;
+
+                // --- refill bar instances from the ring ---
+                UINT barCount = 0;
+                {
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (SUCCEEDED(m_ctx->Map(m_barInstances.Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                        auto* inst = static_cast<BarInstance*>(map.pData);
+                        for (std::size_t i = 0; i < n && barW > 0.0f; ++i) {
+                            const float x =
+                                histoL + static_cast<float>(i) *
+                                          (barW + kHistoBarGap);
+                            const int64_t sample = ring.at(i);
+                            if (sample <= 0) {
+                                inst[barCount++] = {x, 0.0f, 3u};  // empty dash
+                                continue;
+                            }
+                            const auto vis =
+                                barVisualForSample(sample, budgetNs);
+                            if (vis.heightFraction <= 0.0f) continue;
+                            uint32_t tier = 0;  // Green → gradient
+                            if (vis.tier == BarTier::Red)         tier = 2;
+                            else if (vis.tier == BarTier::Orange) tier = 1;
+                            inst[barCount++] =
+                                {x, vis.heightFraction, tier};
+                        }
+                        m_ctx->Unmap(m_barInstances.Get(), 0);
+                    }
+                }
+
+                // --- refill quad instances: [0]=bg, [1..4]=grid, [5]=budget ---
+                {
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (SUCCEEDED(m_ctx->Map(m_quadInstances.Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                        auto* q = static_cast<QuadInstance*>(map.pData);
+                        q[0] = makeQuad(histoL, histoT, fullW, stripH, kPanelBg);
+                        for (int i = 1; i <= 4; ++i) {
+                            const float y = histoT + stripH *
+                                static_cast<float>(i) / 5.0f;
+                            q[i] = makeQuad(histoL, y, fullW, 1.0f, kGridDash);
+                        }
+                        const float by =
+                            histoT + stripH * (1.0f / 6.0f);  // budgetLineFraction
+                        q[5] = makeQuad(histoL, by, fullW, 1.0f, kBudgetLine);
+                        m_ctx->Unmap(m_quadInstances.Get(), 0);
+                    }
+                }
+
+                // --- constant buffers ---
+                {
+                    BarConstants bc{};
+                    bc.texSize[0] = static_cast<float>(kTexW);
+                    bc.texSize[1] = static_cast<float>(kTexH);
+                    bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
+                    bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
+                    bc.barWidth = barW;
+                    bc.dashHeight = 2.0f;
+                    copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
+                    copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
+                    copyColor(bc.orange, kOrange);
+                    copyColor(bc.red,    kRed);
+                    copyColor(bc.dash,   kGridDash);
+                    upload(m_barCB, &bc, sizeof(bc));
+
+                    QuadConstants qc{};
+                    qc.texSize[0] = static_cast<float>(kTexW);
+                    qc.texSize[1] = static_cast<float>(kTexH);
+                    upload(m_quadCB, &qc, sizeof(qc));
+                }
+
+                // --- pipeline state (D2D clobbered it; set everything) ---
+                m_ctx->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+                D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
+                                  static_cast<float>(kTexH), 0.0f, 1.0f};
+                m_ctx->RSSetViewports(1, &vp);
+                const D3D11_RECT sc{
+                    static_cast<LONG>(std::floor(histoL)),
+                    static_cast<LONG>(std::floor(histoT)),
+                    static_cast<LONG>(std::ceil(histoR)),
+                    static_cast<LONG>(std::ceil(histoB))};
+                m_ctx->RSSetScissorRects(1, &sc);
+                m_ctx->RSSetState(m_raster.Get());
+                const float bf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                m_ctx->OMSetBlendState(m_blend.Get(), bf, 0xffffffffu);
+                m_ctx->IASetPrimitiveTopology(
+                    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+                // quad pass 1 — bg + 4 grid lines (instances 0..4)
+                bindQuadPipeline();
+                m_ctx->DrawInstanced(4, 5, 0, 0);
+
+                // bar pass — samples on top of bg/grid (instances 0..barCount)
+                if (barCount > 0) {
+                    bindBarPipeline();
+                    m_ctx->DrawInstanced(4, barCount, 0, 0);
+                }
+
+                // quad pass 2 — budget line on top of the bars (instance 5)
+                bindQuadPipeline();
+                m_ctx->DrawInstanced(4, 1, 0, 5);
+            }
+
+          private:
+            // Per-instance / constant layouts — must match the HLSL byte for
+            // byte (see overlay_bars.hlsli / overlay_quad.hlsli).
+            struct BarInstance  { float xLeft; float height; uint32_t tier; };
+            struct QuadInstance { float rect[4]; float color[4]; };
+            struct BarConstants {
+                float texSize[2]; float histoTL[2]; float histoBR[2];
+                float barWidth; float dashHeight;
+                float gradTop[4]; float gradBottom[4];
+                float orange[4]; float red[4]; float dash[4];
+            };
+            struct QuadConstants { float texSize[2]; float pad[2]; };
+
+            static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
+
+            // Colours (linear RGBA), copied from initBrushes().
+            static constexpr float kPanelBg[4]    = {0.035f, 0.039f, 0.039f, 1.00f};
+            static constexpr float kGridDash[4]   = {0.353f, 0.431f, 0.451f, 0.30f};
+            static constexpr float kBudgetLine[4] = {0.949f, 0.957f, 0.961f, 0.45f};
+            static constexpr float kGpuGradTop[4] = {0.157f, 0.878f, 0.898f, 1.00f};
+            static constexpr float kGpuGradBot[4] = {0.075f, 0.682f, 0.710f, 1.00f};
+            static constexpr float kCpuGradTop[4] = {0.157f, 0.686f, 1.000f, 1.00f};
+            static constexpr float kCpuGradBot[4] = {0.047f, 0.561f, 0.847f, 1.00f};
+            static constexpr float kOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};
+            static constexpr float kRed[4]        = {1.000f, 0.196f, 0.235f, 1.00f};
+
+            static void copyColor(float dst[4], const float src[4]) noexcept {
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+            }
+            static QuadInstance makeQuad(float x, float y, float w, float h,
+                                          const float c[4]) noexcept {
+                QuadInstance q{};
+                q.rect[0] = x; q.rect[1] = y; q.rect[2] = w; q.rect[3] = h;
+                copyColor(q.color, c);
+                return q;
+            }
+
+            bool createBuffer(const void* data, UINT bytes, UINT bind,
+                               D3D11_USAGE usage, ComPtr<ID3D11Buffer>& out) {
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = bytes;
+                bd.Usage = usage;
+                bd.BindFlags = bind;
+                D3D11_SUBRESOURCE_DATA srd{};
+                srd.pSysMem = data;
+                return SUCCEEDED(m_device->CreateBuffer(
+                    &bd, data ? &srd : nullptr, out.GetAddressOf()));
+            }
+            bool createDynamic(UINT bytes, UINT bind,
+                                ComPtr<ID3D11Buffer>& out) {
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = bytes;
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = bind;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                return SUCCEEDED(m_device->CreateBuffer(
+                    &bd, nullptr, out.GetAddressOf()));
+            }
+            void upload(ComPtr<ID3D11Buffer>& cb, const void* src, UINT bytes) {
+                D3D11_MAPPED_SUBRESOURCE map{};
+                if (SUCCEEDED(m_ctx->Map(cb.Get(), 0,
+                        D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                    std::memcpy(map.pData, src, bytes);
+                    m_ctx->Unmap(cb.Get(), 0);
+                }
+            }
+            void bindQuadPipeline() {
+                ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_quadInstances.Get()};
+                const UINT strides[2] = {sizeof(float) * 2, sizeof(QuadInstance)};
+                const UINT offsets[2] = {0, 0};
+                m_ctx->IASetInputLayout(m_quadLayout.Get());
+                m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+                m_ctx->VSSetShader(m_quadVS.Get(), nullptr, 0);
+                m_ctx->PSSetShader(m_quadPS.Get(), nullptr, 0);
+                m_ctx->VSSetConstantBuffers(0, 1, m_quadCB.GetAddressOf());
+            }
+            void bindBarPipeline() {
+                ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_barInstances.Get()};
+                const UINT strides[2] = {sizeof(float) * 2, sizeof(BarInstance)};
+                const UINT offsets[2] = {0, 0};
+                m_ctx->IASetInputLayout(m_barsLayout.Get());
+                m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+                m_ctx->VSSetShader(m_barsVS.Get(), nullptr, 0);
+                m_ctx->PSSetShader(m_barsPS.Get(), nullptr, 0);
+                m_ctx->VSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
+            }
+
+            bool m_ready = false;
+            ComPtr<ID3D11Device>           m_device;
+            ComPtr<ID3D11DeviceContext>    m_ctx;
+            ComPtr<ID3D11RenderTargetView> m_rtv;
+            ComPtr<ID3D11VertexShader>     m_barsVS;
+            ComPtr<ID3D11PixelShader>      m_barsPS;
+            ComPtr<ID3D11VertexShader>     m_quadVS;
+            ComPtr<ID3D11PixelShader>      m_quadPS;
+            ComPtr<ID3D11InputLayout>      m_barsLayout;
+            ComPtr<ID3D11InputLayout>      m_quadLayout;
+            ComPtr<ID3D11Buffer>           m_quadVB;
+            ComPtr<ID3D11Buffer>           m_barInstances;
+            ComPtr<ID3D11Buffer>           m_quadInstances;
+            ComPtr<ID3D11Buffer>           m_barCB;
+            ComPtr<ID3D11Buffer>           m_quadCB;
+            ComPtr<ID3D11BlendState>       m_blend;
+            ComPtr<ID3D11RasterizerState>  m_raster;
         };
 
         // -------- D3D11 native renderer --------------------------------------
