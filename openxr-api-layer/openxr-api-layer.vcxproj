@@ -353,6 +353,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="utils\hotkey.h" />
     <ClInclude Include="utils\name_utils.h" />
     <ClInclude Include="utils\overlay_aggregator.h" />
+    <ClInclude Include="utils\overlay_cadence.h" />
     <ClInclude Include="utils\overlay_layout.h" />
     <ClInclude Include="utils\overlay_renderer.h" />
     <ClInclude Include="utils\settings.h" />

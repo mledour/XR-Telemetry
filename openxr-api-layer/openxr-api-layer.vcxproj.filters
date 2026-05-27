@@ -56,6 +56,9 @@
     <ClInclude Include="utils\overlay_aggregator.h">
       <Filter>Utilities</Filter>
     </ClInclude>
+    <ClInclude Include="utils\overlay_cadence.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
     <ClInclude Include="utils\overlay_layout.h">
       <Filter>Utilities</Filter>
     </ClInclude>

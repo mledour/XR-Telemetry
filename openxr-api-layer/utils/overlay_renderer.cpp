@@ -25,6 +25,7 @@
 #include "overlay_renderer.h"
 
 #include "histogram_ring.h"
+#include "overlay_cadence.h"
 #include "overlay_layout.h"
 
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
@@ -569,11 +570,8 @@ namespace openxr_api_layer::detail {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
 
-                const bool versionChanged =
-                    snap.version != m_lastPaintedVersion;
-                const bool staticTimedOut =
-                    m_framesSincePaint + 1 >= kMaxFramesBetweenPaints;
-                const bool needStatic = versionChanged || staticTimedOut;
+                const bool needStatic = needStaticPaint(
+                    m_cadence, snap.version, kMaxFramesBetweenPaints);
 
                 rt->BeginDraw();
 
@@ -692,27 +690,12 @@ namespace openxr_api_layer::detail {
                                  m_brushCpuBlueGrad.Get());
 
                 const bool ok = SUCCEEDED(rt->EndDraw());
-                if (needStatic) {
-                    // Only commit the version + reset the counter on
-                    // a successful static paint — on failure, leave
-                    // m_lastPaintedVersion alone so the next frame
-                    // retries the static branch (needStatic stays
-                    // true because version is still ahead of the
-                    // last successfully painted one).
-                    if (ok) {
-                        m_lastPaintedVersion = snap.version;
-                        m_framesSincePaint = 0;
-                    }
-                } else {
-                    // Dynamic-only frame: always advance the counter,
-                    // even on EndDraw failure. Otherwise repeated D2D
-                    // failures would freeze m_framesSincePaint and
-                    // the K=30 watchdog would never fire to force a
-                    // recovery static paint (the only thing left
-                    // that could escape the stuck state without a
-                    // snap.version tick).
-                    ++m_framesSincePaint;
-                }
+                // Fold the result back into the cadence — see
+                // commitPaint() in overlay_cadence.h for the
+                // static-success / static-failure / dynamic rules
+                // (the dynamic branch advances the watchdog even on
+                // failure so a stuck dynamic tier can still recover).
+                commitPaint(m_cadence, needStatic, ok, snap.version);
                 return ok;
             }
 
@@ -1786,9 +1769,9 @@ namespace openxr_api_layer::detail {
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 
-            // Static-tier cadence state. The static tier (frame
-            // chrome, header text, panel titles+values, bottom row)
-            // repaints on either:
+            // Static-tier cadence. The static tier (frame chrome,
+            // header text, panel titles+values, bottom row) repaints
+            // on either:
             //   - `snap.version` changing, or
             //   - kMaxFramesBetweenPaints frames having elapsed since
             //     the last static paint (defensive timeout against
@@ -1799,15 +1782,14 @@ namespace openxr_api_layer::detail {
             // K=30 (~333 ms at 90 Hz, ~208 ms at 144 Hz) only kicks
             // in if the aggregator stops ticking. The dynamic tier
             // (histogram region) runs every frame regardless and is
-            // independent of this counter.
+            // independent of the counter.
             //
-            // UINT64_MAX as sentinel for m_lastPaintedVersion forces
-            // a static paint on the first frame regardless of the
-            // aggregator's starting version.
+            // The decision/update logic lives in overlay_cadence.h
+            // (needStaticPaint / commitPaint) so it's unit-testable
+            // without a render target — see test_overlay_cadence.cpp.
             static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
-            uint64_t             m_lastPaintedVersion = UINT64_MAX;
-            int                  m_framesSincePaint = 0;
+            PaintCadence         m_cadence;
         };
 
         // -------- D3D11 native renderer --------------------------------------

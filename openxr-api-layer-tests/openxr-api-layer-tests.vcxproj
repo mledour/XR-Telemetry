@@ -155,6 +155,7 @@
     <ClCompile Include="test_hotkey.cpp" />
     <ClCompile Include="test_name_utils.cpp" />
     <ClCompile Include="test_overlay_aggregator.cpp" />
+    <ClCompile Include="test_overlay_cadence.cpp" />
     <ClCompile Include="test_overlay_layout.cpp" />
     <ClCompile Include="test_overlay_snapshot.cpp" />
     <ClCompile Include="test_settings.cpp" />
