@@ -2150,7 +2150,13 @@ namespace openxr_api_layer::detail {
                 m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
                 m_ctx->VSSetShader(m_barsVS.Get(), nullptr, 0);
                 m_ctx->PSSetShader(m_barsPS.Get(), nullptr, 0);
+                // BarConstants (b0) feeds BOTH stages: the VS reads the
+                // rect/barWidth, the PS reads the tier colours + gradient
+                // stops. Binding it only to the VS left the PS's b0 null,
+                // so every bar shaded as (0,0,0,0) — transparent, hence
+                // "no bars" despite the geometry drawing correctly.
                 m_ctx->VSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
+                m_ctx->PSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
             }
 
             bool m_ready = false;
