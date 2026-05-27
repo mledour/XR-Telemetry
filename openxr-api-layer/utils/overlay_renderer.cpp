@@ -25,6 +25,7 @@
 #include "overlay_renderer.h"
 
 #include "histogram_ring.h"
+#include "overlay_cadence.h"
 #include "overlay_layout.h"
 
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
@@ -92,7 +93,7 @@ namespace openxr_api_layer::detail {
         // for whoever tweaks the constants next:
         //   kOuterPad           (10)
         //   kFrameStroke         (2)
-        //   inner padding        (4)   ← see innerT in paint()
+        //   inner padding        (4)   ← see kInnerT below
         //   kHeaderHeight       (90)
         //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — GPU panel
@@ -107,8 +108,8 @@ namespace openxr_api_layer::detail {
         //   panel and the inner bottom edge. Keeping the budget exact
         //   makes the top and bottom borders read at the same
         //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
-        //   on each side). `bottomY + kBottomHeight == innerB` by
-        //   construction (asserted via the (void)innerB line in
+        //   on each side). `bottomY + kBottomHeight == kInnerB` by
+        //   construction (asserted via the (void)kInnerB line in
         //   paint()). Bumping any of the heights past this budget
         //   will visually clip the bottom panel.
         constexpr int32_t kTexW = 720;
@@ -118,6 +119,22 @@ namespace openxr_api_layer::detail {
         constexpr float kFrameStroke    = 2.0f;
         constexpr float kSectionGap     =  8.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
+
+        // Inner content rectangle — single source of truth for the
+        // layout inset. Both paint() and drawHistoRegion() derive
+        // their left/right bounds from these; previously each
+        // function recomputed (kOuterPad + kFrameStroke + 4.0f),
+        // which was a drift risk if one site got tweaked and the
+        // other didn't. The 4.0f is the extra inner padding that
+        // separates the chamfered frame stroke from the content.
+        constexpr float kInnerL =
+            kOuterPad + kFrameStroke + 4.0f;
+        constexpr float kInnerT =
+            kOuterPad + kFrameStroke + 4.0f;
+        constexpr float kInnerR =
+            static_cast<float>(kTexW) - kOuterPad - kFrameStroke - 4.0f;
+        constexpr float kInnerB =
+            static_cast<float>(kTexH) - kOuterPad - kFrameStroke - 4.0f;
 
         // Bumped from 66 → 90 to fit the new kFontBigNumber (52 px)
         // FPS value AND the kFontTinyLabel (17 px) label above it,
@@ -141,6 +158,17 @@ namespace openxr_api_layer::detail {
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
         constexpr float kHistoTitleH     = 24.0f;
+        // Vertical paddings around the title row inside a frametime
+        // panel. drawFrametimePanel() positions the title at
+        // (t + kPanelTitleTopPad) and drawHistoRegion() positions
+        // the histogram strip at (titleB + kHistoTitleGap). Sharing
+        // the constants keeps the histogram aligned under the
+        // title — historically these were duplicated 6.0f magic
+        // numbers in two functions, with the second one's "any
+        // drift here would silently misalign the grid" comment
+        // documenting the fragility.
+        constexpr float kPanelTitleTopPad = 6.0f;
+        constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
         // 120 bars × (~3.6 px each + 2 px gap) ≈ 670 px of strip width.
         // Roughly half the bar width of the previous version (~7 px) —
@@ -519,11 +547,22 @@ namespace openxr_api_layer::detail {
             //       CPU panel = TEMP / LOAD (2 cells). TEMP shows
             //         "-- °C" until PawnIO support lands.
             //
-            // The cached display values are re-formatted only when the
-            // snapshot's `version` changes (the aggregator publishes
-            // ~10×/s; paint() runs at the host's 90-144 Hz frame rate,
-            // so the cache saves ~13 redundant snprintf passes per
-            // frame in the steady state).
+            // Two-tier paint:
+            //   - Static tier (~10 Hz): outer frame, header, panel
+            //     chrome, bottom row. Triggered by `snap.version`
+            //     ticking, with kMaxFramesBetweenStaticPaints as a
+            //     defensive timeout in case the aggregator stalls.
+            //   - Dynamic tier (every frame): the two histogram
+            //     regions. The ring buffer is fed by pushFrameSample()
+            //     at the host frame rate, so refreshing the bars at
+            //     90-144 Hz is what makes the scroll look smooth.
+            //
+            // The shim texture is persistent between paint() calls.
+            // On dynamic-only frames we skip rt->Clear() so the
+            // static chrome from the last static paint stays in
+            // place — drawHistoRegion() opaquely overwrites the
+            // histogram rectangles, leaving the surrounding chrome
+            // untouched.
             bool paint(ID2D1RenderTarget* rt,
                        const OverlaySnapshot& snap,
                        const HistogramRing<kRingSize>& cpuRing,
@@ -531,115 +570,133 @@ namespace openxr_api_layer::detail {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
 
+                const bool needStatic = needStaticPaint(
+                    m_cadence, snap.version, kMaxFramesBetweenPaints);
+
                 rt->BeginDraw();
-                // Fully transparent clear — we paint our own opaque
-                // panel backgrounds, so the corners outside the frame
-                // composite through to the game underneath as
-                // transparent pixels.
-                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
-                // Re-format display values on snapshot version change.
-                if (snap.version != m_cachedSnapshotVersion) {
-                    m_cachedValues = formatOverlayDisplayValues(snap);
-                    m_cachedSnapshotVersion = snap.version;
-                }
-                const auto& v = m_cachedValues;
-
-                const float texW = static_cast<float>(kTexW);
-                const float texH = static_cast<float>(kTexH);
-
-                // Outer frame: octagonal-ish shape with chamfered
-                // corners — matches the design spec's "cut corners"
-                // industrial-HUD look. 12-px diagonal cut at each
-                // corner; the 4 sides connect with straight edges.
-                // Built once per paint via ID2D1PathGeometry (8
-                // line segments). The geometry is closed so a single
-                // FillGeometry / DrawGeometry pair handles both the
-                // background fill and the metal-line stroke.
-                const D2D1_RECT_F frameOuter = D2D1::RectF(
-                    kOuterPad, kOuterPad,
-                    texW - kOuterPad, texH - kOuterPad);
-                drawChamferedRect(rt, frameOuter, 12.0f,
-                                   m_brushBg.Get(),
-                                   m_brushFrameLine.Get(), kFrameStroke);
-
-                // Inner content rectangle (everything sits inside this).
-                const float innerL = kOuterPad + kFrameStroke + 4.0f;
-                const float innerR = texW - kOuterPad - kFrameStroke - 4.0f;
-                const float innerT = kOuterPad + kFrameStroke + 4.0f;
-                const float innerB = texH - kOuterPad - kFrameStroke - 4.0f;
-
-                // Section Y positions, top → bottom.
-                const float headerY    = innerT;
+                // Layout — used by both tiers (static draws into the
+                // panel rects, dynamic addresses the histogram rect
+                // inside each panel). Inner bounds come from the
+                // namespace-scope constexpr kInner{L,R,T,B} so the
+                // two tiers can't drift from each other or from
+                // drawHistoRegion.
+                const float headerY    = kInnerT;
                 const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
                 const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
                 const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
-                (void)innerB;  // bottomY + kBottomHeight ≤ innerB by construction
+                (void)kInnerB;  // bottomY + kBottomHeight ≤ kInnerB by construction
 
-                drawHeaderBar(rt, innerL, headerY, innerR,
-                               headerY + kHeaderHeight, v);
-                // GPU panel: single value top-right ("6.7 ms").
-                // CPU panel: dual value "App X.X ms / Render Y.Y
-                // ms" — the App / Render split is the diagnostic
-                // value of the design (see comment in
-                // overlay_aggregator.h for what each metric covers).
-                // An empty secondary string suppresses the App / Render
-                // composition and falls back to the single-value
-                // rendering — same code path as the GPU panel.
-                drawFrametimePanel(rt, innerL, gpuPanelY, innerR,
-                                    gpuPanelY + kFrametimeHeight,
-                                    L"GPU FRAMETIME MS",
-                                    v.gpu_frametime_ms,
-                                    /*secondaryValue=*/std::string{},
-                                    gpuRing, snap.target_fps,
-                                    m_brushGpuTealGrad.Get());
-                drawFrametimePanel(rt, innerL, cpuPanelY, innerR,
-                                    cpuPanelY + kFrametimeHeight,
-                                    L"CPU FRAMETIME MS",
-                                    v.cpu_frametime_ms,
-                                    v.cpu_app_ms,
-                                    cpuRing, snap.target_fps,
-                                    m_brushCpuBlueGrad.Get());
+                if (needStatic) {
+                    // Fully transparent clear — we paint our own
+                    // opaque panel backgrounds, so the corners
+                    // outside the frame composite through to the
+                    // game underneath as transparent pixels.
+                    rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
-                // Bottom row: 60/40 split between the GPU and CPU
-                // panels — GPU gets 3 cells (TEMP / LOAD / VRAM),
-                // CPU gets 2 cells (TEMP / LOAD). With 5 equal cells
-                // across the row this gives every cell the same
-                // pixel width (≈ 135 px), so the labels and values
-                // align perfectly across both panels.
-                //
-                // VRAM-cell tier-colour (cyan / orange / red) follows
-                // the same gaugeTierForUtilisation thresholds as
-                // GPU LOAD / CPU LOAD: < 80 % = cyan default, 80–89 %
-                // = orange, ≥ 90 % = red. Coherent palette = the
-                // user reads "anything orange / red = headroom
-                // problem" without per-cell legends.
-                const float bottomCellW = (innerR - innerL - kSectionGap) / 5.0f;
-                const float gpuPanelL   = innerL;
-                const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
-                const float cpuPanelL   = gpuPanelR + kSectionGap;
-                const float cpuPanelR   = innerR;
-                // Labels are passed as full wide string literals
-                // ("GPU TEMP", "CPU LOAD", …) rather than a prefix +
-                // concat at draw time. Saves 4 std::wstring
-                // allocations per frame × 144 Hz = ~576 useless
-                // allocs/s in the host's hot path.
-                drawBottomPanel(rt, gpuPanelL, bottomY,
-                                 gpuPanelR, bottomY + kBottomHeight,
-                                 L"GPU TEMP", L"GPU LOAD",
-                                 v.gpu_temp_c, v.gpu_util_pct,
-                                 v.gpu_util_fraction,
-                                 /*vramValue=*/v.vram_pct,
-                                 /*vramFraction=*/v.vram_fraction);
-                drawBottomPanel(rt, cpuPanelL, bottomY,
-                                 cpuPanelR, bottomY + kBottomHeight,
-                                 L"CPU TEMP", L"CPU LOAD",
-                                 v.cpu_temp_c, v.cpu_util_pct,
-                                 v.cpu_util_fraction,
-                                 /*vramValue=*/std::string{},
-                                 /*vramFraction=*/0.0f);
+                    m_cachedValues = formatOverlayDisplayValues(snap);
+                    const auto& v = m_cachedValues;
 
-                return SUCCEEDED(rt->EndDraw());
+                    // Outer frame: octagonal-ish shape with chamfered
+                    // corners — matches the design spec's "cut
+                    // corners" industrial-HUD look. 12-px diagonal
+                    // cut at each corner; the 4 sides connect with
+                    // straight edges. Built once per static paint
+                    // via ID2D1PathGeometry (8 line segments). The
+                    // geometry is closed so a single FillGeometry /
+                    // DrawGeometry pair handles both the background
+                    // fill and the metal-line stroke.
+                    const D2D1_RECT_F frameOuter = D2D1::RectF(
+                        kOuterPad, kOuterPad,
+                        static_cast<float>(kTexW) - kOuterPad,
+                        static_cast<float>(kTexH) - kOuterPad);
+                    drawChamferedRect(rt, frameOuter, 12.0f,
+                                       m_brushBg.Get(),
+                                       m_brushFrameLine.Get(), kFrameStroke);
+
+                    drawHeaderBar(rt, kInnerL, headerY, kInnerR,
+                                   headerY + kHeaderHeight, v);
+                    // GPU panel: single value top-right ("6.7 ms").
+                    // CPU panel: dual value "App X.X ms / Render Y.Y
+                    // ms" — the App / Render split is the diagnostic
+                    // value of the design (see comment in
+                    // overlay_aggregator.h for what each metric
+                    // covers). An empty secondary string suppresses
+                    // the App / Render composition and falls back to
+                    // the single-value rendering — same code path as
+                    // the GPU panel.
+                    //
+                    // Histogram content (grid + bars + budget line)
+                    // is owned by drawHistoRegion() below.
+                    drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
+                                        gpuPanelY + kFrametimeHeight,
+                                        L"GPU FRAMETIME MS",
+                                        v.gpu_frametime_ms,
+                                        /*secondaryValue=*/std::string{});
+                    drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
+                                        cpuPanelY + kFrametimeHeight,
+                                        L"CPU FRAMETIME MS",
+                                        v.cpu_frametime_ms,
+                                        v.cpu_app_ms);
+
+                    // Bottom row: 60/40 split between the GPU and
+                    // CPU panels — GPU gets 3 cells (TEMP / LOAD /
+                    // VRAM), CPU gets 2 cells (TEMP / LOAD). With 5
+                    // equal cells across the row this gives every
+                    // cell the same pixel width (≈ 135 px), so the
+                    // labels and values align perfectly across both
+                    // panels.
+                    //
+                    // VRAM-cell tier-colour (cyan / orange / red)
+                    // follows the same gaugeTierForUtilisation
+                    // thresholds as GPU LOAD / CPU LOAD: < 80 % =
+                    // cyan default, 80–89 % = orange, ≥ 90 % = red.
+                    // Coherent palette = the user reads "anything
+                    // orange / red = headroom problem" without per-
+                    // cell legends.
+                    const float bottomCellW =
+                        (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                    const float gpuPanelL   = kInnerL;
+                    const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
+                    const float cpuPanelL   = gpuPanelR + kSectionGap;
+                    const float cpuPanelR   = kInnerR;
+                    // Labels are passed as full wide string literals
+                    // ("GPU TEMP", "CPU LOAD", …) rather than a prefix
+                    // + concat at draw time. Saves 4 std::wstring
+                    // allocations per static paint.
+                    drawBottomPanel(rt, gpuPanelL, bottomY,
+                                     gpuPanelR, bottomY + kBottomHeight,
+                                     L"GPU TEMP", L"GPU LOAD",
+                                     v.gpu_temp_c, v.gpu_util_pct,
+                                     v.gpu_util_fraction,
+                                     /*vramValue=*/v.vram_pct,
+                                     /*vramFraction=*/v.vram_fraction);
+                    drawBottomPanel(rt, cpuPanelL, bottomY,
+                                     cpuPanelR, bottomY + kBottomHeight,
+                                     L"CPU TEMP", L"CPU LOAD",
+                                     v.cpu_temp_c, v.cpu_util_pct,
+                                     v.cpu_util_fraction,
+                                     /*vramValue=*/std::string{},
+                                     /*vramFraction=*/0.0f);
+                }
+
+                // Dynamic tier — runs every frame so the histogram
+                // scrolls smoothly. Cheap relative to the static
+                // tier: ~2 FillRect + ~8 DrawLine + ~240 bar
+                // FillRect, no DirectWrite, no path geometry.
+                drawHistoRegion(rt, gpuPanelY, gpuRing, snap.target_fps,
+                                 m_brushGpuTealGrad.Get());
+                drawHistoRegion(rt, cpuPanelY, cpuRing, snap.target_fps,
+                                 m_brushCpuBlueGrad.Get());
+
+                const bool ok = SUCCEEDED(rt->EndDraw());
+                // Fold the result back into the cadence — see
+                // commitPaint() in overlay_cadence.h for the
+                // static-success / static-failure / dynamic rules
+                // (the dynamic branch advances the watchdog even on
+                // failure so a stuck dynamic tier can still recover).
+                commitPaint(m_cadence, needStatic, ok, snap.version);
+                return ok;
             }
 
           private:
@@ -1120,7 +1177,7 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (innerR - innerL). Barlow Medium Italic kFontBigNumber=52 px
+            // (kInnerR - kInnerL). Barlow Medium Italic kFontBigNumber=52 px
             // on "142" measures ~95-100 px (Barlow is wider than the
             // previous Rajdhani Bold ~78 px, italic slant adds a few
             // px more). kFontTinyLabel=17 px upright Medium labels
@@ -1198,18 +1255,24 @@ namespace openxr_api_layer::detail {
             //   - current value "6.7" + cyan "ms" suffix (top-right)
             //   - 4 horizontal dashed grid lines
             //   - histogram bars filling the remaining vertical space
+            // Draws only the "chrome" of a frametime panel: panel
+            // background, title, and the top-right current value. The
+            // histogram region itself (background fill, dashed grid,
+            // bars, budget line) is owned by drawHistoRegion() and is
+            // refreshed every frame so the ring buffer's scroll stays
+            // smooth — see paint()'s static/dynamic dispatch.
             void drawFrametimePanel(ID2D1RenderTarget* rt, float l, float t,
                                      float r, float b,
                                      const wchar_t* title,
                                      const std::string& currentValue,
-                                     const std::string& secondaryValue,
-                                     const HistogramRing<kRingSize>& ring,
-                                     float targetFps,
-                                     ID2D1LinearGradientBrush* barBrush) const {
+                                     const std::string& secondaryValue) const {
                 drawPanelBg(rt, l, t, r, b);
 
                 // Title bar — top inner padding.
-                const float titleT = t + 6.0f;
+                // Title row paddings shared with drawHistoRegion()
+                // — see kPanelTitleTopPad / kHistoTitleGap at the
+                // layout-constants block.
+                const float titleT = t + kPanelTitleTopPad;
                 const float titleB = titleT + kHistoTitleH;
                 const D2D1_RECT_F titleRect = D2D1::RectF(
                     l + kSectionInnerPad, titleT,
@@ -1266,12 +1329,47 @@ namespace openxr_api_layer::detail {
                                     m_brushAccentCyan.Get());  // value runs
                 }
 
-                // Histogram region — below the title row, with inner
-                // padding on all sides.
-                const float histoL = l + kSectionInnerPad;
-                const float histoR = r - kSectionInnerPad;
-                const float histoT = titleB + 6.0f;
-                const float histoB = b - kSectionInnerPad;
+                // Histogram region is intentionally left untouched
+                // here — drawHistoRegion() fills it every frame so the
+                // bars scroll at the host rate while the chrome above
+                // only repaints on snap.version ticks.
+            }
+
+            // Histogram region: filled every frame with the panel's
+            // background, dashed grid, current ring contents, and the
+            // budget reference line. Repainting just this rectangle
+            // each frame keeps the histogram scrolling smoothly at
+            // 90-144 Hz while the surrounding chrome (panel title,
+            // current numeric value, outer frame, header, bottom row)
+            // is only redrawn when the aggregator ticks (~10 Hz).
+            //
+            // `panelY` is the panel's outer top in shim-pixel space;
+            // the region's geometry is derived from layout constants
+            // so the rect matches drawFrametimePanel's title row by
+            // construction (any drift here would silently misalign
+            // the grid under the title).
+            void drawHistoRegion(ID2D1RenderTarget* rt, float panelY,
+                                  const HistogramRing<kRingSize>& ring,
+                                  float targetFps,
+                                  ID2D1LinearGradientBrush* barBrush) const {
+                // Inner bounds + title paddings come from namespace-
+                // scope constexpr so this rect matches drawFrametime
+                // Panel()'s title row by construction. The previous
+                // 6.0f / kOuterPad-based duplication was a drift risk.
+                const float titleB = panelY + kPanelTitleTopPad + kHistoTitleH;
+                const float histoL = kInnerL + kSectionInnerPad;
+                const float histoR = kInnerR - kSectionInnerPad;
+                const float histoT = titleB + kHistoTitleGap;
+                const float histoB = panelY + kFrametimeHeight -
+                                      kSectionInnerPad;
+
+                // Opaque erase of the previous frame's bars+grid.
+                // Panel-bg brush is the same dark carbon used by
+                // drawPanelBg, so the seam under the title is
+                // invisible.
+                rt->FillRectangle(
+                    D2D1::RectF(histoL, histoT, histoR, histoB),
+                    m_brushPanelBg.Get());
 
                 drawDashedGrid(rt, histoL, histoT, histoR, histoB,
                                 /*lineCount=*/4);
@@ -1283,13 +1381,10 @@ namespace openxr_api_layer::detail {
                                    histoL, histoT, histoR, histoB,
                                    barBrush);
 
-                // Budget reference line — drawn AFTER the bars so
-                // bars that cross it (overruns ≥ budget) visually
-                // overlap the line and the user sees the breach.
-                // Position from the top: budgetLineFraction (= 1/6).
-                // Brighter than the dashed grid so it reads as the
-                // "this is your budget" marker rather than just one
-                // more grid line.
+                // Budget line drawn AFTER bars so overruns visually
+                // pierce it (the user reads "bar crosses line ⇒
+                // budget breach"). Same brush/stroke as the static
+                // version used to do.
                 drawBudgetLine(rt, histoL, histoT, histoR, histoB);
             }
 
@@ -1674,13 +1769,27 @@ namespace openxr_api_layer::detail {
             // Dashed stroke style for the grid lines.
             ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
 
-            // Formatting cache. paint() refreshes the strings only
-            // when m_cachedSnapshotVersion != snap.version — typically
-            // ~10× per second on a 144 Hz HMD, not 144×. Not `mutable`
-            // because paint() is already non-const (it mutates this
-            // cache by design).
+            // Static-tier cadence. The static tier (frame chrome,
+            // header text, panel titles+values, bottom row) repaints
+            // on either:
+            //   - `snap.version` changing, or
+            //   - kMaxFramesBetweenPaints frames having elapsed since
+            //     the last static paint (defensive timeout against
+            //     a stalled aggregator).
+            //
+            // The aggregator publishes at ~10 Hz so the version
+            // trigger fires every ~9 frames at 90 Hz host rate;
+            // K=30 (~333 ms at 90 Hz, ~208 ms at 144 Hz) only kicks
+            // in if the aggregator stops ticking. The dynamic tier
+            // (histogram region) runs every frame regardless and is
+            // independent of the counter.
+            //
+            // The decision/update logic lives in overlay_cadence.h
+            // (needStaticPaint / commitPaint) so it's unit-testable
+            // without a render target — see test_overlay_cadence.cpp.
+            static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
-            uint64_t             m_cachedSnapshotVersion = 0;
+            PaintCadence         m_cadence;
         };
 
         // -------- D3D11 native renderer --------------------------------------
