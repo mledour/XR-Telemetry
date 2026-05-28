@@ -641,9 +641,28 @@ namespace openxr_api_layer::detail {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;
                 rt->BeginDraw();
-                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
                 m_cachedValues = formatOverlayDisplayValues(snap);
-                drawChrome(rt, m_cachedValues);
+                if (!m_chromeStaticPainted) {
+                    // First chrome paint (or post-reset): full
+                    // chrome — chamfered frame + panel BGs + labels +
+                    // titles + separators + values. Latches the
+                    // "static is in the shim" invariant for every
+                    // subsequent call.
+                    rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+                    drawChrome(rt, m_cachedValues);
+                    m_chromeStaticPainted = true;
+                } else {
+                    // Subsequent chrome paints (every ~10 Hz snap.
+                    // version tick): the static chrome is already in
+                    // the shim — only the numeric values change. Skip
+                    // the Clear and skip the full drawChrome; just
+                    // erase each value rect to the panel BG and
+                    // redraw the new value. Cuts ~half the chrome
+                    // spike cost (the bulk was the DirectWrite labels
+                    // + frame geometry, both unchanged frame-to-
+                    // frame). See drawValuesIntoChrome().
+                    drawValuesIntoChrome(rt, m_cachedValues);
+                }
                 return SUCCEEDED(rt->EndDraw());
             }
 
@@ -713,6 +732,196 @@ namespace openxr_api_layer::detail {
                                  v.cpu_util_fraction,
                                  /*vramValue=*/std::string{},
                                  /*vramFraction=*/0.0f);
+            }
+
+            // Invalidate-and-redraw the variable values only. Assumes
+            // the surrounding chrome (frame, panel BGs, labels, titles,
+            // separators) is already in the shim from a previous
+            // drawChrome() — that's the contract paintChromeOnly()
+            // enforces via m_chromeStaticPainted.
+            //
+            // For each value: FillRectangle(rect, panelBg) to opaquely
+            // erase the previous value's pixels, then drawValue* to
+            // render the new value. Erase rects are scoped to the
+            // value region only — the label above the value, the title
+            // on the panel's left, the separators and panel borders
+            // stay untouched.
+            //
+            // Cell math mirrors drawHeaderBar / drawHeaderCell,
+            // drawFrametimePanel, and drawBottomPanel exactly so the
+            // values land in the same pixel positions they would after
+            // a full drawChrome().
+            void drawValuesIntoChrome(ID2D1RenderTarget* rt,
+                                       const OverlayDisplayValues& v) const {
+                // Panel Ys mirror drawChrome / paint() exactly.
+                const float headerY    = kInnerT;
+                const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
+                const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomB    = bottomY + kBottomHeight;
+
+                // ----- Header bar: 5 cells, value rect under the label.
+                {
+                    const float cellW        = (kInnerR - kInnerL) / 5.0f;
+                    const float labelY       = headerY + 4.0f;
+                    const float labelH       = 22.0f;
+                    const float valueY       = labelY + labelH;
+                    const float valueBottom  = valueY + kFontBigNumber + 6.0f;
+                    auto cell = [&](int col, const std::string& val,
+                                      IDWriteTextFormat* fmt,
+                                      ID2D1Brush* brush) {
+                        const float cl = kInnerL + cellW * static_cast<float>(col);
+                        const float cr = kInnerL + cellW * static_cast<float>(col + 1);
+                        // Erase only the value region (label above
+                        // valueY stays intact).
+                        rt->FillRectangle(
+                            D2D1::RectF(cl, valueY, cr, valueBottom),
+                            m_brushPanelBg.Get());
+                        // Re-draw the value — same rect math as
+                        // drawHeaderCell.
+                        const D2D1_RECT_F valueRect = D2D1::RectF(
+                            cl, valueY - 2.0f, cr,
+                            valueY + kFontBigNumber + 6.0f);
+                        drawAscii(rt, val, fmt, valueRect, brush);
+                    };
+                    cell(0, v.fps_instant, m_fmtBigNumber.Get(),
+                         m_brushTextWhite.Get());
+                    cell(1, v.fps_avg,     m_fmtAccentNumber.Get(),
+                         m_brushAccentCyan.Get());
+                    cell(2, v.fps_p95,     m_fmtAccentNumber.Get(),
+                         m_brushAccentCyan.Get());
+                    cell(3, v.fps_p99,     m_fmtAccentNumber.Get(),
+                         m_brushAccentCyan.Get());
+                    cell(4, v.fps_p99_9,   m_fmtAccentNumber.Get(),
+                         m_brushAccentCyan.Get());
+                }
+
+                // ----- Frametime panels: top-right "X.X ms" /
+                // "App X / Render Y" value runs. Title on the left
+                // stays untouched (different rect).
+                auto frametimeValue = [&](float panelTop,
+                                            const std::string& currentValue,
+                                            const std::string& secondaryValue) {
+                    const float titleT = panelTop + kPanelTitleTopPad;
+                    const float titleB = titleT + kHistoTitleH;
+                    if (secondaryValue.empty()) {
+                        const D2D1_RECT_F rect = D2D1::RectF(
+                            kInnerR - kSectionInnerPad - 160.0f, titleT,
+                            kInnerR - kSectionInnerPad,          titleB);
+                        rt->FillRectangle(rect, m_brushPanelBg.Get());
+                        const std::string s = currentValue + " ms";
+                        drawValueAscii(rt, s, m_fmtMsValue.Get(), rect,
+                                        m_brushAccentCyan.Get());
+                    } else {
+                        const D2D1_RECT_F rect = D2D1::RectF(
+                            kInnerR - kSectionInnerPad - 320.0f, titleT,
+                            kInnerR - kSectionInnerPad,          titleB);
+                        rt->FillRectangle(rect, m_brushPanelBg.Get());
+                        const std::string compound =
+                            "App " + secondaryValue + " ms / Render "
+                            + currentValue + " ms";
+                        drawValueAscii(rt, compound, m_fmtMsCompound.Get(),
+                                        rect,
+                                        m_brushTextWhite.Get(),
+                                        m_brushAccentCyan.Get());
+                    }
+                };
+                frametimeValue(gpuPanelY, v.gpu_frametime_ms, std::string{});
+                frametimeValue(cpuPanelY, v.cpu_frametime_ms, v.cpu_app_ms);
+
+                // ----- Bottom row: GPU (3 cells) + CPU (2 cells).
+                // Value occupies the lower portion of each cell below
+                // the 22-px label. Erase from labelBottom to cellB —
+                // the label (and the panel's separator strokes drawn
+                // earlier) stay intact.
+                {
+                    const float bottomCellW =
+                        (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                    const float gpuPanelL = kInnerL;
+                    const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
+                    const float cpuPanelL = gpuPanelR + kSectionGap;
+                    const float cpuPanelR = kInnerR;
+                    const float labelBottom = bottomY + 4.0f + 22.0f;
+
+                    auto tierBrush = [&](float fraction) -> ID2D1Brush* {
+                        const BarTier tier = gaugeTierForUtilisation(fraction);
+                        if (tier == BarTier::Red)    return m_brushGaugeRed.Get();
+                        if (tier == BarTier::Orange) return m_brushOrange.Get();
+                        return m_brushAccentCyan.Get();
+                    };
+
+                    auto bottomCell = [&](float cellL, float cellR,
+                                            const std::string& asciiValue,
+                                            const wchar_t* unitSuffix,
+                                            ID2D1Brush* valueBrush,
+                                            bool useWideValue) {
+                        // Erase below the label only.
+                        rt->FillRectangle(
+                            D2D1::RectF(cellL, labelBottom, cellR, bottomB),
+                            m_brushPanelBg.Get());
+                        // Re-draw paragraph-centred in the full cell
+                        // rect — matches drawBottomPanel's drawCell.
+                        const D2D1_RECT_F valueRect = D2D1::RectF(
+                            cellL, bottomY, cellR, bottomB);
+                        if (useWideValue) {
+                            std::wstring wide(asciiValue.begin(),
+                                               asciiValue.end());
+                            wide += unitSuffix;
+                            drawValueWide(rt, wide, m_fmtTemp.Get(),
+                                           valueRect, valueBrush,
+                                           /*chiffresBrush=*/nullptr,
+                                           /*unitFontSize=*/kFontTempUnit);
+                        } else {
+                            // ASCII-safe suffix concat — same contract
+                            // as drawBottomPanel's drawCell lambda.
+                            std::string full = asciiValue;
+                            for (const wchar_t* p = unitSuffix; *p; ++p) {
+                                full.push_back(static_cast<char>(*p));
+                            }
+                            drawValueAscii(rt, full, m_fmtTemp.Get(),
+                                            valueRect,
+                                            valueBrush,
+                                            /*chiffresBrush=*/nullptr,
+                                            /*unitFontSize=*/kFontTempUnit);
+                        }
+                    };
+
+                    // GPU panel (3 cells: TEMP / LOAD / VRAM).
+                    const float gpuColW =
+                        (gpuPanelR - gpuPanelL) / 3.0f;
+                    // L" \u00B0C" — see drawBottomPanel's identical
+                    // comment block on why we escape (MSVC without
+                    // /utf-8 mishandles literal ° as CP1252).
+                    bottomCell(gpuPanelL + gpuColW * 0.0f,
+                                gpuPanelL + gpuColW * 1.0f,
+                                v.gpu_temp_c, L" \u00B0C",
+                                m_brushTextWhite.Get(),
+                                /*useWideValue=*/true);
+                    bottomCell(gpuPanelL + gpuColW * 1.0f,
+                                gpuPanelL + gpuColW * 2.0f,
+                                v.gpu_util_pct, L" %",
+                                tierBrush(v.gpu_util_fraction),
+                                /*useWideValue=*/false);
+                    bottomCell(gpuPanelL + gpuColW * 2.0f,
+                                gpuPanelR,
+                                v.vram_pct, L" %",
+                                tierBrush(v.vram_fraction),
+                                /*useWideValue=*/false);
+
+                    // CPU panel (2 cells: TEMP / LOAD).
+                    const float cpuColW =
+                        (cpuPanelR - cpuPanelL) / 2.0f;
+                    bottomCell(cpuPanelL + cpuColW * 0.0f,
+                                cpuPanelL + cpuColW * 1.0f,
+                                v.cpu_temp_c, L" \u00B0C",
+                                m_brushTextWhite.Get(),
+                                /*useWideValue=*/true);
+                    bottomCell(cpuPanelL + cpuColW * 1.0f,
+                                cpuPanelR,
+                                v.cpu_util_pct, L" %",
+                                tierBrush(v.cpu_util_fraction),
+                                /*useWideValue=*/false);
+                }
             }
 
             // -------- end static-tier helpers --------
@@ -1613,7 +1822,7 @@ namespace openxr_api_layer::detail {
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening
-                        // it and concatenating L" °C" works.
+                        // it and concatenating L" \u00B0C" works.
                         std::wstring wide(asciiValue.begin(),
                                            asciiValue.end());
                         wide += unitSuffix;
@@ -1809,6 +2018,17 @@ namespace openxr_api_layer::detail {
             static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
             PaintCadence         m_cadence;
+            // Chrome-cache flag used by paintChromeOnly() (the shader
+            // path's static-tier entry). First call does a full
+            // drawChrome() and latches this to true; subsequent calls
+            // assume the labels/frame/panel-BGs are still in the shim
+            // and re-render only the variable values — cuts the bulk
+            // of the chrome cost on every snap.version tick. The flag
+            // starts false on construction so a fresh shim gets the
+            // full chrome paint; paint() (the D2D fallback path) does
+            // its own Clear+full-redraw so it never observes this
+            // flag and the two paths can't interfere.
+            bool                 m_chromeStaticPainted = false;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
