@@ -45,10 +45,22 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>     // std::memcpy for constant-buffer uploads
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
 #include <iterator>    // std::size for the dash-style array
 #include <string>
 #include <vector>
+
+// Offline-compiled shader bytecode (FxCompile → $(IntDir), on the C++
+// include path in both the layer and test vcxproj). Each header declares a
+// `const BYTE g_<filename>[]` (internal linkage, so including them in this
+// one TU is ODR-safe). HistogramBarRenderer builds the instanced-bar and
+// solid-quad pipelines from these to paint the histogram region on the GPU
+// instead of via the per-bar D2D FillRectangle loop.
+#include "overlay_bars_vs.h"
+#include "overlay_bars_ps.h"
+#include "overlay_quad_vs.h"
+#include "overlay_quad_ps.h"
 
 // Pragma-link D2D + DirectWrite so we don't have to add them to the
 // vcxproj's Link section. d2d1.lib and dwrite.lib ship with the Windows
@@ -170,14 +182,15 @@ namespace openxr_api_layer::detail {
         constexpr float kPanelTitleTopPad = 6.0f;
         constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
-        // 120 bars × (~3.6 px each + 2 px gap) ≈ 670 px of strip width.
-        // Roughly half the bar width of the previous version (~7 px) —
-        // matches the denser, thinner-bar visual of the reference
-        // design. Window covered = 120 samples ≈ 1.3 s @ 90 Hz / 1 s @
-        // 120 Hz, still long enough to catch a stutter spike but short
-        // enough that the histogram reacts within the same second.
+        // 133 bars fill the GPU histogram strip exactly at the fixed
+        // 4-px-bar / 1-px-gap layout (133×4 + 132×1 = 664 px = strip
+        // inner width) — flush, zero margin, every bar pixel-aligned.
+        // Window covered ≈ 1.5 s @ 90 Hz / 0.9 s @ 144 Hz, still short
+        // enough that the histogram reacts within ~a second. The D2D
+        // fallback path (D3D12 + snapshot) recomputes its bar width from
+        // this count, so it stays consistent.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
-        static_assert(kRingSize == 120,
+        static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
                        "bump both in lockstep if tuning the histogram length");
 
@@ -575,17 +588,14 @@ namespace openxr_api_layer::detail {
 
                 rt->BeginDraw();
 
-                // Layout — used by both tiers (static draws into the
-                // panel rects, dynamic addresses the histogram rect
-                // inside each panel). Inner bounds come from the
-                // namespace-scope constexpr kInner{L,R,T,B} so the
-                // two tiers can't drift from each other or from
-                // drawHistoRegion.
+                // Panel Ys for the dynamic histo tier below. The chrome
+                // (incl. the bottom row) is drawn by drawChrome(), which
+                // recomputes its own Ys from the same constants — they
+                // can't drift since both derive from kInner{T} + the
+                // section heights.
                 const float headerY    = kInnerT;
                 const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
                 const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
-                const float bottomY    = cpuPanelY + kFrametimeHeight + kSectionGap;
-                (void)kInnerB;  // bottomY + kBottomHeight ≤ kInnerB by construction
 
                 if (needStatic) {
                     // Fully transparent clear — we paint our own
@@ -595,89 +605,7 @@ namespace openxr_api_layer::detail {
                     rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
                     m_cachedValues = formatOverlayDisplayValues(snap);
-                    const auto& v = m_cachedValues;
-
-                    // Outer frame: octagonal-ish shape with chamfered
-                    // corners — matches the design spec's "cut
-                    // corners" industrial-HUD look. 12-px diagonal
-                    // cut at each corner; the 4 sides connect with
-                    // straight edges. Built once per static paint
-                    // via ID2D1PathGeometry (8 line segments). The
-                    // geometry is closed so a single FillGeometry /
-                    // DrawGeometry pair handles both the background
-                    // fill and the metal-line stroke.
-                    const D2D1_RECT_F frameOuter = D2D1::RectF(
-                        kOuterPad, kOuterPad,
-                        static_cast<float>(kTexW) - kOuterPad,
-                        static_cast<float>(kTexH) - kOuterPad);
-                    drawChamferedRect(rt, frameOuter, 12.0f,
-                                       m_brushBg.Get(),
-                                       m_brushFrameLine.Get(), kFrameStroke);
-
-                    drawHeaderBar(rt, kInnerL, headerY, kInnerR,
-                                   headerY + kHeaderHeight, v);
-                    // GPU panel: single value top-right ("6.7 ms").
-                    // CPU panel: dual value "App X.X ms / Render Y.Y
-                    // ms" — the App / Render split is the diagnostic
-                    // value of the design (see comment in
-                    // overlay_aggregator.h for what each metric
-                    // covers). An empty secondary string suppresses
-                    // the App / Render composition and falls back to
-                    // the single-value rendering — same code path as
-                    // the GPU panel.
-                    //
-                    // Histogram content (grid + bars + budget line)
-                    // is owned by drawHistoRegion() below.
-                    drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
-                                        gpuPanelY + kFrametimeHeight,
-                                        L"GPU FRAMETIME MS",
-                                        v.gpu_frametime_ms,
-                                        /*secondaryValue=*/std::string{});
-                    drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
-                                        cpuPanelY + kFrametimeHeight,
-                                        L"CPU FRAMETIME MS",
-                                        v.cpu_frametime_ms,
-                                        v.cpu_app_ms);
-
-                    // Bottom row: 60/40 split between the GPU and
-                    // CPU panels — GPU gets 3 cells (TEMP / LOAD /
-                    // VRAM), CPU gets 2 cells (TEMP / LOAD). With 5
-                    // equal cells across the row this gives every
-                    // cell the same pixel width (≈ 135 px), so the
-                    // labels and values align perfectly across both
-                    // panels.
-                    //
-                    // VRAM-cell tier-colour (cyan / orange / red)
-                    // follows the same gaugeTierForUtilisation
-                    // thresholds as GPU LOAD / CPU LOAD: < 80 % =
-                    // cyan default, 80–89 % = orange, ≥ 90 % = red.
-                    // Coherent palette = the user reads "anything
-                    // orange / red = headroom problem" without per-
-                    // cell legends.
-                    const float bottomCellW =
-                        (kInnerR - kInnerL - kSectionGap) / 5.0f;
-                    const float gpuPanelL   = kInnerL;
-                    const float gpuPanelR   = gpuPanelL + 3.0f * bottomCellW;
-                    const float cpuPanelL   = gpuPanelR + kSectionGap;
-                    const float cpuPanelR   = kInnerR;
-                    // Labels are passed as full wide string literals
-                    // ("GPU TEMP", "CPU LOAD", …) rather than a prefix
-                    // + concat at draw time. Saves 4 std::wstring
-                    // allocations per static paint.
-                    drawBottomPanel(rt, gpuPanelL, bottomY,
-                                     gpuPanelR, bottomY + kBottomHeight,
-                                     L"GPU TEMP", L"GPU LOAD",
-                                     v.gpu_temp_c, v.gpu_util_pct,
-                                     v.gpu_util_fraction,
-                                     /*vramValue=*/v.vram_pct,
-                                     /*vramFraction=*/v.vram_fraction);
-                    drawBottomPanel(rt, cpuPanelL, bottomY,
-                                     cpuPanelR, bottomY + kBottomHeight,
-                                     L"CPU TEMP", L"CPU LOAD",
-                                     v.cpu_temp_c, v.cpu_util_pct,
-                                     v.cpu_util_fraction,
-                                     /*vramValue=*/std::string{},
-                                     /*vramFraction=*/0.0f);
+                    drawChrome(rt, m_cachedValues);
                 }
 
                 // Dynamic tier — runs every frame so the histogram
@@ -698,6 +626,96 @@ namespace openxr_api_layer::detail {
                 commitPaint(m_cadence, needStatic, ok, snap.version);
                 return ok;
             }
+
+            // Paint ONLY the static chrome (outer frame, header, panel
+            // titles + current values, bottom row) into `rt` — no
+            // histogram region, no cadence bookkeeping. Used by the
+            // D3D11 path, which draws the histogram on the GPU
+            // (HistogramBarRenderer) and drives its own cadence; the
+            // caller decides when chrome is stale and calls this only
+            // then. Wraps its own BeginDraw/EndDraw and clears first
+            // (the shim is fully repainted on a chrome refresh).
+            // Returns EndDraw success.
+            bool paintChromeOnly(ID2D1RenderTarget* rt,
+                                  const OverlaySnapshot& snap) {
+                if (!rt) return false;
+                if (!m_brushBg || !m_strokeDashed) return false;
+                rt->BeginDraw();
+                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+                m_cachedValues = formatOverlayDisplayValues(snap);
+                drawChrome(rt, m_cachedValues);
+                return SUCCEEDED(rt->EndDraw());
+            }
+
+          private:
+            // The static-tier drawing shared by paint() and
+            // paintChromeOnly(): outer chamfered frame, header bar,
+            // both frametime-panel chromes (background + title +
+            // current value, NO histogram), and the bottom TEMP/LOAD/
+            // VRAM row. Caller owns BeginDraw/Clear/EndDraw. Panel Ys
+            // derive from the namespace-scope layout constants so they
+            // can't drift from drawHistoRegion / the bar renderer.
+            void drawChrome(ID2D1RenderTarget* rt,
+                             const OverlayDisplayValues& v) {
+                const float headerY   = kInnerT;
+                const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
+                const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomY   = cpuPanelY + kFrametimeHeight + kSectionGap;
+
+                // Outer frame: octagonal-ish chamfered shape (12-px
+                // diagonal corner cuts), one FillGeometry/DrawGeometry
+                // pair for fill + metal-line stroke.
+                const D2D1_RECT_F frameOuter = D2D1::RectF(
+                    kOuterPad, kOuterPad,
+                    static_cast<float>(kTexW) - kOuterPad,
+                    static_cast<float>(kTexH) - kOuterPad);
+                drawChamferedRect(rt, frameOuter, 12.0f,
+                                   m_brushBg.Get(),
+                                   m_brushFrameLine.Get(), kFrameStroke);
+
+                drawHeaderBar(rt, kInnerL, headerY, kInnerR,
+                               headerY + kHeaderHeight, v);
+                // Histogram content is owned by drawHistoRegion() (D2D
+                // path) or HistogramBarRenderer (D3D11 path); these
+                // panel calls only paint the chrome (bg + title +
+                // current value).
+                drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
+                                    gpuPanelY + kFrametimeHeight,
+                                    L"GPU FRAMETIME MS",
+                                    v.gpu_frametime_ms,
+                                    /*secondaryValue=*/std::string{});
+                drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
+                                    cpuPanelY + kFrametimeHeight,
+                                    L"CPU FRAMETIME MS",
+                                    v.cpu_frametime_ms,
+                                    v.cpu_app_ms);
+
+                // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
+                // CPU TEMP/LOAD), 60/40 split. Tier colours follow
+                // gaugeTierForUtilisation.
+                const float bottomCellW =
+                    (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                const float gpuPanelL = kInnerL;
+                const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
+                const float cpuPanelL = gpuPanelR + kSectionGap;
+                const float cpuPanelR = kInnerR;
+                drawBottomPanel(rt, gpuPanelL, bottomY,
+                                 gpuPanelR, bottomY + kBottomHeight,
+                                 L"GPU TEMP", L"GPU LOAD",
+                                 v.gpu_temp_c, v.gpu_util_pct,
+                                 v.gpu_util_fraction,
+                                 /*vramValue=*/v.vram_pct,
+                                 /*vramFraction=*/v.vram_fraction);
+                drawBottomPanel(rt, cpuPanelL, bottomY,
+                                 cpuPanelR, bottomY + kBottomHeight,
+                                 L"CPU TEMP", L"CPU LOAD",
+                                 v.cpu_temp_c, v.cpu_util_pct,
+                                 v.cpu_util_fraction,
+                                 /*vramValue=*/std::string{},
+                                 /*vramFraction=*/0.0f);
+            }
+
+            // -------- end static-tier helpers --------
 
           private:
             // -------- Format / brush helpers --------------------------------
@@ -1448,7 +1466,8 @@ namespace openxr_api_layer::detail {
                 accentBrush->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
                 accentBrush->SetEndPoint  (D2D1::Point2F((l + r) * 0.5f, b));
 
-                constexpr float kDashPlaceholderH = 2.0f;
+                // kDashPlaceholderH from overlay_layout.h — shared with the
+                // GPU path so the empty-slot dash height can't drift.
                 for (std::size_t i = 0; i < n; ++i) {
                     const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
                     const int64_t sample = ring.at(i);
@@ -1792,6 +1811,443 @@ namespace openxr_api_layer::detail {
             PaintCadence         m_cadence;
         };
 
+        // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
+        //
+        // Replaces drawHistoRegion()'s D2D work (one FillRectangle per bar,
+        // ×kRingSize ×2 panels every frame) with a handful of instanced GPU
+        // draws into the shim. Owns two pipelines — solid-colour quads for the
+        // background / grid / budget line, and gradient bars for the samples —
+        // plus an RTV on the shim and the dynamic instance + constant buffers
+        // refilled per panel per frame.
+        //
+        // Lives on the SAME D3D11 device as the shim's D2D render target, so
+        // both share one immediate context. Contract for the caller:
+        //   1. Flush() the D2D RT before drawPanel() — D2D batches commands;
+        //      flushing commits the chrome so our draws land on top of it.
+        //   2. Treat the D3D11 pipeline state as clobbered after drawPanel()
+        //      (and D2D clobbers ours), so each drawPanel() sets ALL state.
+        //
+        // Colours mirror initBrushes() exactly so the GPU output matches the
+        // old D2D look (modulo edge anti-aliasing). The histogram rect is
+        // fully opaque after the background fill, so premultiplied == straight
+        // there and the runtime composites the quad layer correctly.
+        class HistogramBarRenderer {
+          public:
+            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx,
+                       ID3D11Texture2D* shim) {
+                if (!device || !ctx || !shim) return false;
+                m_device = device;
+                m_ctx = ctx;
+
+                // Per-step failure logging. Without it, an HRESULT lost
+                // somewhere in this chain just disabled the GPU path with
+                // no clue about which API call broke — making "the bars
+                // don't render in GPU mode" reports hard to triage.
+                auto fail = [](const char* step) {
+                    Log(fmt::format(
+                        "xr_telemetry: HistogramBarRenderer init failed "
+                        "at step: {}\n",
+                        step));
+                    return false;
+                };
+
+                if (FAILED(m_device->CreateRenderTargetView(
+                        shim, nullptr, m_rtv.GetAddressOf())))
+                    return fail("CreateRenderTargetView (shim)");
+
+                // Shaders from embedded bytecode.
+                if (FAILED(m_device->CreateVertexShader(
+                        g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
+                        nullptr, m_barsVS.GetAddressOf())))
+                    return fail("CreateVertexShader (bars)");
+                if (FAILED(m_device->CreatePixelShader(
+                        g_overlay_bars_ps, sizeof(g_overlay_bars_ps),
+                        nullptr, m_barsPS.GetAddressOf())))
+                    return fail("CreatePixelShader (bars)");
+                if (FAILED(m_device->CreateVertexShader(
+                        g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
+                        nullptr, m_quadVS.GetAddressOf())))
+                    return fail("CreateVertexShader (quad)");
+                if (FAILED(m_device->CreatePixelShader(
+                        g_overlay_quad_ps, sizeof(g_overlay_quad_ps),
+                        nullptr, m_quadPS.GetAddressOf())))
+                    return fail("CreatePixelShader (quad)");
+
+                // Input layouts. Slot 0 = per-vertex unit-quad corner;
+                // slot 1 = per-instance data. Offsets match the structs
+                // below and the HLSL semantic names exactly.
+                const D3D11_INPUT_ELEMENT_DESC barsIL[] = {
+                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                     D3D11_INPUT_PER_VERTEX_DATA,   0},
+                    {"BAR_XLEFT",  0, DXGI_FORMAT_R32_FLOAT,    1, 0,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"BAR_HEIGHT", 0, DXGI_FORMAT_R32_FLOAT,    1, 4,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"BAR_TIER",   0, DXGI_FORMAT_R32_UINT,     1, 8,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                };
+                if (FAILED(m_device->CreateInputLayout(
+                        barsIL, _countof(barsIL),
+                        g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
+                        m_barsLayout.GetAddressOf())))
+                    return fail("CreateInputLayout (bars)");
+
+                const D3D11_INPUT_ELEMENT_DESC quadIL[] = {
+                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
+                     D3D11_INPUT_PER_VERTEX_DATA,   0},
+                    {"QUAD_RECT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"QUAD_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                };
+                if (FAILED(m_device->CreateInputLayout(
+                        quadIL, _countof(quadIL),
+                        g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
+                        m_quadLayout.GetAddressOf())))
+                    return fail("CreateInputLayout (quad)");
+
+                // Static unit-quad vertex buffer: 4 corners for a triangle
+                // strip. corner.x ∈ {0,1} → left/right, corner.y ∈ {0,1} →
+                // top/bottom (each VS applies its own lerp).
+                const float quadVerts[] = {
+                    0.0f, 0.0f,  1.0f, 0.0f,
+                    0.0f, 1.0f,  1.0f, 1.0f,
+                };
+                if (!createBuffer(quadVerts, sizeof(quadVerts),
+                                   D3D11_BIND_VERTEX_BUFFER,
+                                   D3D11_USAGE_IMMUTABLE,
+                                   m_quadVB))
+                    return fail("CreateBuffer (unit quad VB)");
+
+                // Dynamic instance buffers + the bars constant buffer
+                // (refilled per panel per frame).
+                if (!createDynamic(kRingSize * sizeof(BarInstance),
+                                    D3D11_BIND_VERTEX_BUFFER, m_barInstances))
+                    return fail("CreateBuffer (bar instances)");
+                if (!createDynamic(kQuadSlots * sizeof(QuadInstance),
+                                    D3D11_BIND_VERTEX_BUFFER, m_quadInstances))
+                    return fail("CreateBuffer (quad instances)");
+                if (!createDynamic(sizeof(BarConstants),
+                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB))
+                    return fail("CreateBuffer (bar constants)");
+
+                // The quad constant buffer carries only texSize, which is
+                // invariant — initialise it IMMUTABLE so drawPanel doesn't
+                // re-map+memcpy 16 bytes per panel per frame (2× per frame
+                // total in the host's hot path).
+                const QuadConstants quadCBInit{
+                    { static_cast<float>(kTexW), static_cast<float>(kTexH) },
+                    { 0.0f, 0.0f }
+                };
+                if (!createBuffer(&quadCBInit, sizeof(quadCBInit),
+                                   D3D11_BIND_CONSTANT_BUFFER,
+                                   D3D11_USAGE_IMMUTABLE,
+                                   m_quadCB))
+                    return fail("CreateBuffer (quad constants, immutable)");
+
+                // Straight alpha-over blend.
+                D3D11_BLEND_DESC bd{};
+                bd.RenderTarget[0].BlendEnable = TRUE;
+                bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+                bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+                bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+                bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+                bd.RenderTarget[0].RenderTargetWriteMask =
+                    D3D11_COLOR_WRITE_ENABLE_ALL;
+                if (FAILED(m_device->CreateBlendState(
+                        &bd, m_blend.GetAddressOf())))
+                    return fail("CreateBlendState");
+
+                // No culling, scissor ON (confines every draw to the panel's
+                // histo rect so nothing bleeds into the chrome).
+                D3D11_RASTERIZER_DESC rd{};
+                rd.FillMode = D3D11_FILL_SOLID;
+                rd.CullMode = D3D11_CULL_NONE;
+                rd.ScissorEnable = TRUE;
+                rd.DepthClipEnable = TRUE;
+                if (FAILED(m_device->CreateRasterizerState(
+                        &rd, m_raster.GetAddressOf())))
+                    return fail("CreateRasterizerState");
+
+                m_ready = true;
+                return true;
+            }
+
+            bool isReady() const noexcept { return m_ready; }
+
+            // Paint one panel's histogram region (bg + grid + bars + budget)
+            // into the shim. Rect is in shim pixels; isGpu picks the teal vs
+            // blue gradient. budgetNs <= 0 (no display-period info yet
+            // from the runtime — the first few frames before
+            // xrWaitFrame's predicted period lands) still paints the
+            // bg/grid/budget chrome; only the bars themselves are
+            // skipped (each one has no reference height, so
+            // barVisualForSample returns heightFraction 0 and the loop
+            // emits no instances). That keeps the histo region from
+            // freezing on stale shim content during the warm-up.
+            void drawPanel(const HistogramRing<kRingSize>& ring,
+                            int64_t budgetNs,
+                            float histoL, float histoT,
+                            float histoR, float histoB,
+                            bool isGpu) {
+                if (!m_ready) return;
+                const float fullW = histoR - histoL;
+                const float stripH = histoB - histoT;
+                if (fullW <= 0.0f || stripH <= 0.0f) return;
+
+                const std::size_t n = ring.size();
+                // Fixed integer bar geometry: 4-px bars + 1-px gaps
+                // (step 5). Integer width AND integer positions make every
+                // bar pixel-identical — no sub-pixel width/gap variation,
+                // no AA needed. kRingSize bars span n*5 - 1 px; the histo
+                // region is wider, so the run is centred and the slack
+                // splits into equal left/right margins. (The strip width
+                // can be adapted later if the bars should sit flush to the
+                // panel edges.)
+                constexpr float kBarPx  = 4.0f;
+                constexpr float kStepPx = 5.0f;   // 4-px bar + 1-px gap
+                const float usedW = static_cast<float>(n) * kStepPx - 1.0f;
+                const float slack = fullW - usedW;
+                // Positive slack → centre the run (equal L/R margins).
+                // Negative slack (strip narrower than the run, e.g. if a
+                // future layout tweak shrinks fullW): shift the start
+                // LEFT by the deficit so the rightmost bars stay flush
+                // with histoR. The scissor then clips the leftmost
+                // (oldest) bars rather than the rightmost (newest) —
+                // the newest sample carries the most signal.
+                const float startX = histoL + (slack >= 0.0f
+                    ? std::floor(slack * 0.5f + 0.5f)
+                    : slack);
+
+                // --- refill bar instances from the ring ---
+                UINT barCount = 0;
+                {
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (SUCCEEDED(m_ctx->Map(m_barInstances.Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                        auto* inst = static_cast<BarInstance*>(map.pData);
+                        for (std::size_t i = 0; i < n; ++i) {
+                            const float x =
+                                startX + static_cast<float>(i) * kStepPx;
+                            const int64_t sample = ring.at(i);
+                            if (sample <= 0) {
+                                inst[barCount++] = {x, 0.0f, 3u};  // empty dash
+                                continue;
+                            }
+                            const auto vis =
+                                barVisualForSample(sample, budgetNs);
+                            if (vis.heightFraction <= 0.0f) continue;
+                            uint32_t tier = 0;  // Green → gradient
+                            if (vis.tier == BarTier::Red)         tier = 2;
+                            else if (vis.tier == BarTier::Orange) tier = 1;
+                            inst[barCount++] =
+                                {x, vis.heightFraction, tier};
+                        }
+                        m_ctx->Unmap(m_barInstances.Get(), 0);
+                    }
+                }
+
+                // --- refill quad instances: [0]=bg, [1..4]=grid, [5]=budget ---
+                {
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (SUCCEEDED(m_ctx->Map(m_quadInstances.Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                        auto* q = static_cast<QuadInstance*>(map.pData);
+                        q[0] = makeQuad(histoL, histoT, fullW, stripH, kPanelBg);
+                        for (int i = 1; i <= 4; ++i) {
+                            const float y = histoT + stripH *
+                                static_cast<float>(i) / 5.0f;
+                            q[i] = makeQuad(histoL, y, fullW, 1.0f, kGridDash);
+                        }
+                        const float by =
+                            histoT + stripH * budgetLineFraction();
+                        q[5] = makeQuad(histoL, by, fullW, 1.0f, kBudgetLine);
+                        m_ctx->Unmap(m_quadInstances.Get(), 0);
+                    }
+                }
+
+                // --- constant buffers ---
+                {
+                    BarConstants bc{};
+                    bc.texSize[0] = static_cast<float>(kTexW);
+                    bc.texSize[1] = static_cast<float>(kTexH);
+                    bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
+                    bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
+                    bc.barWidth = kBarPx;   // fixed 4-px integer width
+                    bc.dashHeight = kDashPlaceholderH;  // shared with D2D path
+                    copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
+                    copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
+                    copyColor(bc.orange, kOrange);
+                    copyColor(bc.red,    kRed);
+                    copyColor(bc.dash,   kGridDash);
+                    upload(m_barCB, &bc, sizeof(bc));
+                    // m_quadCB is IMMUTABLE (texSize is invariant — see
+                    // init()), so no re-upload here.
+                }
+
+                // --- pipeline state (D2D clobbered it; set everything) ---
+                m_ctx->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+                D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
+                                  static_cast<float>(kTexH), 0.0f, 1.0f};
+                m_ctx->RSSetViewports(1, &vp);
+                const D3D11_RECT sc{
+                    static_cast<LONG>(std::floor(histoL)),
+                    static_cast<LONG>(std::floor(histoT)),
+                    static_cast<LONG>(std::ceil(histoR)),
+                    static_cast<LONG>(std::ceil(histoB))};
+                m_ctx->RSSetScissorRects(1, &sc);
+                m_ctx->RSSetState(m_raster.Get());
+                const float bf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                m_ctx->OMSetBlendState(m_blend.Get(), bf, 0xffffffffu);
+                m_ctx->IASetPrimitiveTopology(
+                    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+                // Three draw passes per panel. Layering relies on D3D11's
+                // documented in-order primitive submission: bg + 4 grid
+                // lines (alpha-over) → opaque bars → budget line (alpha-
+                // over). Without that guarantee the alpha-blended grid and
+                // budget could land on the wrong side of the bars.
+                //
+                // quad pass 1 — bg (instance 0) + 4 grid lines (1..4).
+                bindQuadPipeline();
+                m_ctx->DrawInstanced(4, 5, 0, 0);
+
+                // bar pass — samples on top of bg/grid (instances 0..barCount).
+                if (barCount > 0) {
+                    bindBarPipeline();
+                    m_ctx->DrawInstanced(4, barCount, 0, 0);
+                }
+
+                // quad pass 2 — budget line on top of the bars (instance 5).
+                bindQuadPipeline();
+                m_ctx->DrawInstanced(4, 1, 0, 5);
+            }
+
+          private:
+            // Per-instance / constant layouts — must match the HLSL byte for
+            // byte (see overlay_bars.hlsli / overlay_quad.hlsli). The
+            // static_asserts below freeze the C++ side's sizeof so a future
+            // member insertion (e.g. a stray float between dashHeight and
+            // gradTop) can't silently shift every colour off by 8 bytes.
+            // Mirror cbuffer layout: 7×float4 registers (112 B) for bars,
+            // 1×float4 register (16 B) for quads.
+            struct BarInstance  { float xLeft; float height; uint32_t tier; };
+            struct QuadInstance { float rect[4]; float color[4]; };
+            struct BarConstants {
+                float texSize[2]; float histoTL[2]; float histoBR[2];
+                float barWidth; float dashHeight;
+                float gradTop[4]; float gradBottom[4];
+                float orange[4]; float red[4]; float dash[4];
+            };
+            struct QuadConstants { float texSize[2]; float pad[2]; };
+            static_assert(sizeof(BarConstants)  == 112,
+                          "BarConstants must mirror HLSL cbuffer packing "
+                          "(7 × float4 = 112 B) — see overlay_bars.hlsli");
+            static_assert(sizeof(QuadConstants) == 16,
+                          "QuadConstants must mirror HLSL cbuffer packing "
+                          "(1 × float4 = 16 B) — see overlay_quad.hlsli");
+
+            static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
+
+            // Colours (linear RGBA), copied from initBrushes().
+            static constexpr float kPanelBg[4]    = {0.035f, 0.039f, 0.039f, 1.00f};
+            static constexpr float kGridDash[4]   = {0.353f, 0.431f, 0.451f, 0.30f};
+            static constexpr float kBudgetLine[4] = {0.949f, 0.957f, 0.961f, 0.45f};
+            static constexpr float kGpuGradTop[4] = {0.157f, 0.878f, 0.898f, 1.00f};
+            static constexpr float kGpuGradBot[4] = {0.075f, 0.682f, 0.710f, 1.00f};
+            static constexpr float kCpuGradTop[4] = {0.157f, 0.686f, 1.000f, 1.00f};
+            static constexpr float kCpuGradBot[4] = {0.047f, 0.561f, 0.847f, 1.00f};
+            static constexpr float kOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};
+            static constexpr float kRed[4]        = {1.000f, 0.196f, 0.235f, 1.00f};
+
+            static void copyColor(float dst[4], const float src[4]) noexcept {
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+            }
+            static QuadInstance makeQuad(float x, float y, float w, float h,
+                                          const float c[4]) noexcept {
+                QuadInstance q{};
+                q.rect[0] = x; q.rect[1] = y; q.rect[2] = w; q.rect[3] = h;
+                copyColor(q.color, c);
+                return q;
+            }
+
+            bool createBuffer(const void* data, UINT bytes, UINT bind,
+                               D3D11_USAGE usage, ComPtr<ID3D11Buffer>& out) {
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = bytes;
+                bd.Usage = usage;
+                bd.BindFlags = bind;
+                D3D11_SUBRESOURCE_DATA srd{};
+                srd.pSysMem = data;
+                return SUCCEEDED(m_device->CreateBuffer(
+                    &bd, data ? &srd : nullptr, out.GetAddressOf()));
+            }
+            bool createDynamic(UINT bytes, UINT bind,
+                                ComPtr<ID3D11Buffer>& out) {
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = bytes;
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = bind;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                return SUCCEEDED(m_device->CreateBuffer(
+                    &bd, nullptr, out.GetAddressOf()));
+            }
+            void upload(ComPtr<ID3D11Buffer>& cb, const void* src, UINT bytes) {
+                D3D11_MAPPED_SUBRESOURCE map{};
+                if (SUCCEEDED(m_ctx->Map(cb.Get(), 0,
+                        D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                    std::memcpy(map.pData, src, bytes);
+                    m_ctx->Unmap(cb.Get(), 0);
+                }
+            }
+            void bindQuadPipeline() {
+                ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_quadInstances.Get()};
+                const UINT strides[2] = {sizeof(float) * 2, sizeof(QuadInstance)};
+                const UINT offsets[2] = {0, 0};
+                m_ctx->IASetInputLayout(m_quadLayout.Get());
+                m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+                m_ctx->VSSetShader(m_quadVS.Get(), nullptr, 0);
+                m_ctx->PSSetShader(m_quadPS.Get(), nullptr, 0);
+                m_ctx->VSSetConstantBuffers(0, 1, m_quadCB.GetAddressOf());
+            }
+            void bindBarPipeline() {
+                ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_barInstances.Get()};
+                const UINT strides[2] = {sizeof(float) * 2, sizeof(BarInstance)};
+                const UINT offsets[2] = {0, 0};
+                m_ctx->IASetInputLayout(m_barsLayout.Get());
+                m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+                m_ctx->VSSetShader(m_barsVS.Get(), nullptr, 0);
+                m_ctx->PSSetShader(m_barsPS.Get(), nullptr, 0);
+                // BarConstants (b0) feeds BOTH stages: the VS reads the
+                // rect/barWidth, the PS reads the tier colours + gradient
+                // stops. Binding it only to the VS left the PS's b0 null,
+                // so every bar shaded as (0,0,0,0) — transparent, hence
+                // "no bars" despite the geometry drawing correctly.
+                m_ctx->VSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
+                m_ctx->PSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
+            }
+
+            bool m_ready = false;
+            ComPtr<ID3D11Device>           m_device;
+            ComPtr<ID3D11DeviceContext>    m_ctx;
+            ComPtr<ID3D11RenderTargetView> m_rtv;
+            ComPtr<ID3D11VertexShader>     m_barsVS;
+            ComPtr<ID3D11PixelShader>      m_barsPS;
+            ComPtr<ID3D11VertexShader>     m_quadVS;
+            ComPtr<ID3D11PixelShader>      m_quadPS;
+            ComPtr<ID3D11InputLayout>      m_barsLayout;
+            ComPtr<ID3D11InputLayout>      m_quadLayout;
+            ComPtr<ID3D11Buffer>           m_quadVB;
+            ComPtr<ID3D11Buffer>           m_barInstances;
+            ComPtr<ID3D11Buffer>           m_quadInstances;
+            ComPtr<ID3D11Buffer>           m_barCB;
+            ComPtr<ID3D11Buffer>           m_quadCB;
+            ComPtr<ID3D11BlendState>       m_blend;
+            ComPtr<ID3D11RasterizerState>  m_raster;
+        };
+
         // -------- D3D11 native renderer --------------------------------------
         //
         // App uses D3D11 directly. Each swapchain image is an ID3D11Texture2D
@@ -1903,8 +2359,10 @@ namespace openxr_api_layer::detail {
                     // cost on the previous frame.
                     HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
                     if (hr == S_OK) {
-                        painted = m_core.paint(m_myShimRenderTarget.Get(), snap,
-                                                m_cpuRing, m_gpuRing);
+                        painted = m_useShaderBars
+                            ? paintShim(snap)
+                            : m_core.paint(m_myShimRenderTarget.Get(), snap,
+                                            m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
                         weHaveKey1 = true;
                     } else {
@@ -2243,6 +2701,23 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
+                // GPU histogram path. Capture m_myDevice's immediate
+                // context (D2D doesn't expose it) and init the bar
+                // renderer against the same shim the D2D RT paints
+                // into. If anything here fails we DON'T disable the
+                // overlay — m_useShaderBars stays false and the paint
+                // path falls back to the full D2D paint(), so the HUD
+                // still works, just without the GPU fast path.
+                m_myDevice->GetImmediateContext(m_myContext.GetAddressOf());
+                m_useShaderBars =
+                    m_myContext &&
+                    m_bars.init(m_myDevice.Get(), m_myContext.Get(),
+                                 m_myShim.Get());
+                if (!m_useShaderBars) {
+                    Log("xr_telemetry: overlay GPU histogram path "
+                        "unavailable — falling back to D2D bar rendering\n");
+                }
+
                 // Fill the immutable XrCompositionLayerQuad fields
                 // now that m_swapchain is alive. SOURCE_ALPHA blending
                 // + identity orientation are documented in the long
@@ -2255,6 +2730,67 @@ namespace openxr_api_layer::detail {
                     "images, private-device shim BGRA8 RT, feature_level={:#x})\n",
                     imgCount, static_cast<unsigned int>(outLevel)));
                 return true;
+            }
+
+            // Shader path (m_useShaderBars): paint the shim with D2D
+            // chrome (static tier, only when snap.version ticks or the
+            // watchdog fires) plus the GPU histogram bars (dynamic tier,
+            // every frame). Mirrors CoreRenderer::paint()'s static/
+            // dynamic split, but the dynamic tier is HistogramBar
+            // Renderer's instanced draw instead of D2D FillRectangle.
+            //
+            // Ordering: the D2D chrome EndDraw commits before the GPU
+            // bars (same device → same immediate context → ordered),
+            // and the caller's ReleaseSync(1) signals after both, so
+            // the copy side sees a complete frame. On a dynamic-only
+            // frame no D2D runs at all — the shim keeps last static
+            // paint's chrome and the bars overwrite just their scissored
+            // rects.
+            //
+            // Returns false only when a needed chrome repaint failed
+            // (its EndDraw errored): the cadence then retries next
+            // frame and the caller suppresses this frame's layer.
+            bool paintShim(const OverlaySnapshot& snap) {
+                const bool needStatic = needStaticPaint(
+                    m_barsCadence, snap.version, kChromeWatchdogFrames);
+
+                bool ok = true;
+                if (needStatic) {
+                    ok = m_core.paintChromeOnly(
+                        m_myShimRenderTarget.Get(), snap);
+                }
+
+                if (ok) {
+                    // Panel Ys + histo rects from the shared layout
+                    // constants — identical geometry to drawHistoRegion
+                    // / drawChrome so the GPU bars line up under the
+                    // D2D titles.
+                    const float headerY   = kInnerT;
+                    const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
+                    const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
+                    const float histoL = kInnerL + kSectionInnerPad;
+                    const float histoR = kInnerR - kSectionInnerPad;
+                    const int64_t budgetNs = snap.target_fps > 0.0f
+                        ? static_cast<int64_t>(1.0e9f / snap.target_fps)
+                        : 0;
+                    const float gpuT = gpuPanelY + kPanelTitleTopPad +
+                                        kHistoTitleH + kHistoTitleGap;
+                    const float gpuB = gpuPanelY + kFrametimeHeight -
+                                        kSectionInnerPad;
+                    const float cpuT = cpuPanelY + kPanelTitleTopPad +
+                                        kHistoTitleH + kHistoTitleGap;
+                    const float cpuB = cpuPanelY + kFrametimeHeight -
+                                        kSectionInnerPad;
+                    m_bars.drawPanel(m_gpuRing, budgetNs,
+                                      histoL, gpuT, histoR, gpuB,
+                                      /*isGpu=*/true);
+                    m_bars.drawPanel(m_cpuRing, budgetNs,
+                                      histoL, cpuT, histoR, cpuB,
+                                      /*isGpu=*/false);
+                }
+
+                commitPaint(m_barsCadence, needStatic, ok, snap.version);
+                return ok;
             }
 
             // One-time fill of the XrCompositionLayerQuad fields that
@@ -2312,8 +2848,26 @@ namespace openxr_api_layer::detail {
             ComPtr<IDXGIKeyedMutex>     m_myShimMutex;
             ComPtr<IDXGIKeyedMutex>     m_appShimMutex;
             HANDLE                      m_sharedHandle = nullptr;
-            // D2D render target on m_myShim — the actual paint surface.
+            // D2D render target on m_myShim — the actual paint surface
+            // for the static chrome.
             ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
+            // m_myDevice's immediate context. D2D drives its own RT
+            // internally, but HistogramBarRenderer needs a raw context
+            // to issue the instanced bar/quad draws into the shim after
+            // the D2D chrome lands.
+            ComPtr<ID3D11DeviceContext> m_myContext;
+            // GPU histogram renderer: paints the histo region (bg +
+            // grid + bars + budget) into m_myShim via instanced draws,
+            // replacing the per-bar D2D FillRectangle loop. m_useShader
+            // Bars gates whether it initialised; on failure the path
+            // falls back to the full D2D paint().
+            HistogramBarRenderer        m_bars;
+            bool                        m_useShaderBars = false;
+            // Chrome cadence for the shader path: the bars redraw every
+            // frame on the GPU, the D2D chrome only when snap.version
+            // ticks or the watchdog fires.
+            PaintCadence                m_barsCadence;
+            static constexpr int        kChromeWatchdogFrames = 30;
 
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_cpuRing;
