@@ -264,6 +264,53 @@ namespace openxr_api_layer::detail {
             return 0;
         }
 
+        // -------- GPU text formats ----------------------------------------
+        //
+        // One GpuTextFormat per IDWriteTextFormat the D2D path uses
+        // (face + size + alignment). The atlas builder bakes every
+        // (face, sizePx) pair listed here at session init; the
+        // GPU-text helpers below resolve glyphs through the same
+        // packed key.
+        //
+        // Alignment is resolved at call time inside drawTextGpu /
+        // drawValueTextGpu — the caller passes the rect, the helper
+        // measures the run + anchors the pen accordingly. Matches the
+        // semantics of IDWriteTextFormat::SetTextAlignment so call
+        // sites swap 1:1 once the gpu pointer is wired.
+        struct GpuTextFormat {
+            enum class Alignment : uint8_t {
+                Leading,    // pen anchors at rect.left
+                Center,     // run is centred between rect.left / rect.right
+                Trailing,   // pen anchors so the run ends at rect.right
+            };
+            glyph_atlas::GlyphFace face;
+            uint16_t               sizePx;
+            Alignment              alignment;
+        };
+
+        // Mirror the m_fmt* IDWriteTextFormat lineup from
+        // CoreRenderer::init. Kept at namespace scope (no member-class
+        // qualification needed at the leaf call sites).
+        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::BarlowItalic,    52, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::BarlowItalic,    32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
+        constexpr GpuTextFormat kFmtMsCompoundGpu  {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
+        constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
+
+        // -------- GPU text colours ----------------------------------------
+        //
+        // Pulled from the initBrushes() ColorF table in CoreRenderer so the
+        // GPU output reads identically to the D2D output. RGBA arrays match
+        // the renderer's TextInstance.color packing (straight-alpha).
+        // Pointer-equality on the constant arrays is what lets the GPU text
+        // segmentation merge contiguous same-colour runs into one drawRun.
+        constexpr float kColorTextWhite[4]  = {0.969f, 0.969f, 0.969f, 1.00f};  // m_brushTextWhite
+        constexpr float kColorAccentCyan[4] = {0.098f, 0.820f, 0.851f, 1.00f};  // m_brushAccentCyan
+        constexpr float kColorOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};  // m_brushOrange
+        constexpr float kColorGaugeRed[4]   = {1.000f, 0.196f, 0.235f, 1.00f};  // m_brushGaugeRed
+
         // -------- CoreRenderer: D2D + DirectWrite painting ------------------
         //
         // Shared between the D3D11-native path and the D3D12-via-D3D11On12
@@ -671,16 +718,38 @@ namespace openxr_api_layer::detail {
             // caller decides when chrome is stale and calls this only
             // then. Wraps its own BeginDraw/EndDraw and clears first
             // (the shim is fully repainted on a chrome refresh).
+            //
+            // `gpuText` (optional): when non-null, every text call
+            // routes through the glyph-atlas renderer instead of D2D's
+            // DrawText / DrawTextLayout. The helper brackets the chrome
+            // paint with beginBatch / flush so all queued glyphs land
+            // as one DrawInstanced AFTER the D2D EndDraw has committed
+            // the shape work below the text. Bars layer is unchanged
+            // — they paint on top of both via the bar renderer's own
+            // pass after this returns.
+            //
             // Returns EndDraw success.
             bool paintChromeOnly(ID2D1RenderTarget* rt,
+                                  glyph_atlas::Renderer* gpuText,
                                   const OverlaySnapshot& snap) {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;
+                m_textRenderer = gpuText;
+                if (m_textRenderer) m_textRenderer->beginBatch();
+
                 rt->BeginDraw();
                 rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
                 m_cachedValues = formatOverlayDisplayValues(snap);
                 drawChrome(rt, m_cachedValues);
-                return SUCCEEDED(rt->EndDraw());
+                const bool d2dOk = SUCCEEDED(rt->EndDraw());
+
+                // Flush the GPU text batch AFTER the D2D EndDraw so
+                // text composites on top of the shapes D2D just
+                // committed. flush() is a no-op if no drawRun calls
+                // were emitted (gpuText was null at the leaves).
+                if (m_textRenderer) m_textRenderer->flush();
+                m_textRenderer = nullptr;
+                return d2dOk;
             }
 
           private:
@@ -811,14 +880,19 @@ namespace openxr_api_layer::detail {
             //
             // Sizes are the union of every kFont* constant used in
             // makeFormat() above: 17 (tiny label), 18 (ms / section title),
-            // 32 (accent number), 43 (temp), 52 (big FPS). kFontTempUnit
-            // (19 px) is documented as the unit-suffix size but no
-            // IDWriteTextFormat actually carries it today, so it's
-            // intentionally omitted from the atlas.
+            // 32 (accent number), 43 (temp), 52 (big FPS) — plus 19
+            // (kFontTempUnit) for the GPU-text path. The D2D path
+            // pulls 19 via an IDWriteTextLayout::SetFontSize override
+            // on the unit range, but the GPU renderer can't override
+            // size per-glyph: each (face, sizePx) lives in the atlas
+            // as its own raster, so the unit suffix run draws at 19
+            // through a separate drawRun call. Baking the size adds
+            // ~3 KB of atlas pixels and removes a layout-divergence
+            // gotcha between paths.
             bool buildGlyphAtlas(const wchar_t*         familyChiffres,
                                   const wchar_t*         familyLabels,
                                   IDWriteFontCollection* collection) {
-                static constexpr uint16_t kSizes[] = {17, 18, 32, 43, 52};
+                static constexpr uint16_t kSizes[] = {17, 18, 19, 32, 43, 52};
 
                 std::vector<wchar_t> rajdhaniSet;
                 rajdhaniSet.reserve(97 + 1);
@@ -1007,16 +1081,60 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
+            // -------- D2D format / brush → GPU equivalents -------------
+            //
+            // Constant-time lookups. The set is small (7 formats,
+            // 4 brushes) and identity-stable for the lifetime of the
+            // CoreRenderer instance, so a linear scan over raw pointer
+            // comparisons is the simplest fit. Called only on the
+            // chrome paint cadence, not per frame.
+            const GpuTextFormat* gpuFmtFor(IDWriteTextFormat* fmt) const noexcept {
+                if (!fmt) return nullptr;
+                if (fmt == m_fmtBigNumber.Get())        return &kFmtBigNumberGpu;
+                if (fmt == m_fmtAccentNumber.Get())     return &kFmtAccentNumberGpu;
+                if (fmt == m_fmtTemp.Get())             return &kFmtTempGpu;
+                if (fmt == m_fmtMsValue.Get())          return &kFmtMsValueGpu;
+                if (fmt == m_fmtMsCompound.Get())       return &kFmtMsCompoundGpu;
+                if (fmt == m_fmtTinyLabelCenter.Get())  return &kFmtTinyLabelGpu;
+                if (fmt == m_fmtSectionTitle.Get())     return &kFmtSectionTitleGpu;
+                return nullptr;
+            }
+
+            const float* gpuColorFor(ID2D1Brush* brush) const noexcept {
+                if (!brush) return nullptr;
+                if (brush == m_brushTextWhite.Get())  return kColorTextWhite;
+                if (brush == m_brushAccentCyan.Get()) return kColorAccentCyan;
+                if (brush == m_brushOrange.Get())     return kColorOrange;
+                if (brush == m_brushGaugeRed.Get())   return kColorGaugeRed;
+                return nullptr;
+            }
+
             // ASCII-only DrawTextW shortcut. The redesign emits only
             // ASCII digits + uppercase labels — except for the °C
             // suffix, which we draw via the dedicated wide-literal
             // path drawWide().
+            //
+            // When m_textRenderer is set (GPU text path active for the
+            // current chrome paint), we route through drawTextGpu using
+            // the GpuTextFormat + colour the IDWriteTextFormat / brush
+            // map to. Lookups are constant-time and cover every format
+            // / brush the call sites pass. Unknown args fall through
+            // to the D2D path so an unexpected caller still renders.
             void drawAscii(ID2D1RenderTarget* rt, const std::string& s,
                             IDWriteTextFormat* fmt,
                             const D2D1_RECT_F& rect,
                             ID2D1Brush* brush) const {
                 if (s.empty()) return;
                 std::wstring wide(s.begin(), s.end());
+                if (m_textRenderer) {
+                    const auto* gfmt = gpuFmtFor(fmt);
+                    const auto* gcol = gpuColorFor(brush);
+                    if (gfmt && gcol) {
+                        drawTextGpu(m_textRenderer, *gfmt,
+                                     wide.c_str(), wide.size(), rect, gcol);
+                        return;
+                    }
+                }
                 rt->DrawTextW(wide.c_str(),
                               static_cast<UINT32>(wide.length()),
                               fmt, rect, brush);
@@ -1028,6 +1146,14 @@ namespace openxr_api_layer::detail {
                            ID2D1Brush* brush) const {
                 if (!s) return;
                 const std::size_t len = std::wcslen(s);
+                if (m_textRenderer) {
+                    const auto* gfmt = gpuFmtFor(fmt);
+                    const auto* gcol = gpuColorFor(brush);
+                    if (gfmt && gcol) {
+                        drawTextGpu(m_textRenderer, *gfmt, s, len, rect, gcol);
+                        return;
+                    }
+                }
                 rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
             }
 
@@ -1195,6 +1321,30 @@ namespace openxr_api_layer::detail {
                 float unitFontSize = 0.0f) const {
                 if (wide.empty() || !baseFmt) return;
 
+                // GPU text branch — route through drawValueTextGpu when
+                // m_textRenderer is set (chrome paint inside the shader
+                // path). The GPU helper handles mixed face / colour /
+                // size segmentation in one pass; lookups translate the
+                // IDWriteTextFormat / brushes the D2D path was already
+                // passing into the GpuTextFormat + colour the renderer
+                // wants. unitFontSize is float on the D2D side because
+                // SetFontSize takes float; the atlas is keyed on
+                // uint16_t pixel sizes so we round-trip through that.
+                if (m_textRenderer) {
+                    const auto* gfmt = gpuFmtFor(baseFmt);
+                    const auto* gcol = gpuColorFor(brush);
+                    if (gfmt && gcol) {
+                        const float* gchif =
+                            chiffresBrush ? gpuColorFor(chiffresBrush) : nullptr;
+                        const uint16_t usize =
+                            static_cast<uint16_t>(unitFontSize + 0.5f);
+                        drawValueTextGpu(m_textRenderer, *gfmt,
+                                          wide.c_str(), wide.size(),
+                                          rect, gcol, gchif, usize);
+                        return;
+                    }
+                }
+
                 ComPtr<IDWriteTextLayout> layout;
                 if (FAILED(m_dwriteFactory->CreateTextLayout(
                         wide.c_str(),
@@ -1290,6 +1440,161 @@ namespace openxr_api_layer::detail {
                 std::wstring wide(s.begin(), s.end());
                 drawValueWide(rt, wide, baseFmt, rect, brush,
                                chiffresBrush, unitFontSize);
+            }
+
+            // -------- GPU-text equivalents of drawWide / drawValueWide ----
+            //
+            // Anchor + baseline-positioning math matches D2D's
+            // ParagraphAlignment(CENTER) + TextAlignment(LEADING/CENTER/
+            // TRAILING) so the GPU and D2D paths render the same string
+            // at the same screen position (modulo subpixel AA). The
+            // single-face helper is a special case of the value helper
+            // (zero value runs); they share the baseline math.
+            //
+            // Baseline derivation: D2D positions a 1-line block so the
+            // block's vertical centre aligns with the rect's centre.
+            // Block extends from (baseline - ascent) to (baseline +
+            // descent), so the centre is at baseline + (descent -
+            // ascent)/2. Setting that equal to rect_centre_y gives
+            // baseline = rect_centre + (ascent - descent)/2.
+            void drawTextGpu(glyph_atlas::Renderer* r,
+                              const GpuTextFormat& fmt,
+                              const wchar_t* s, std::size_t n,
+                              const D2D1_RECT_F& rect,
+                              const float color[4]) const {
+                if (!r || n == 0 || !s) return;
+                const float totalW = r->measure(fmt.face, fmt.sizePx, s, n);
+                float penX = rect.left;
+                switch (fmt.alignment) {
+                case GpuTextFormat::Alignment::Leading:
+                    penX = rect.left; break;
+                case GpuTextFormat::Alignment::Center:
+                    penX = (rect.left + rect.right - totalW) * 0.5f; break;
+                case GpuTextFormat::Alignment::Trailing:
+                    penX = rect.right - totalW; break;
+                }
+                const auto* m = r->metrics(fmt.face, fmt.sizePx);
+                const float ascent  = m ? m->ascent  : static_cast<float>(fmt.sizePx) * 0.75f;
+                const float descent = m ? m->descent : static_cast<float>(fmt.sizePx) * 0.25f;
+                const float baselineY = (rect.top + rect.bottom + ascent - descent) * 0.5f;
+                r->drawRun(fmt.face, fmt.sizePx, penX, baselineY, s, n, color);
+            }
+
+            // Mixed-style value rendering — the GPU equivalent of
+            // drawValueWide. Walks findValueRuns to identify italic
+            // (digit) and unit ranges per value run, then segments the
+            // string into maximal runs of constant (face, sizePx,
+            // color) attributes. One drawRun call per segment.
+            //
+            // `chiffresColor` (optional): when non-null, every value
+            // run's brush range (italic + unit) flips to this colour.
+            // Used by the CPU compound "App {x} ms / Render {y} ms"
+            // so labels stay white and values render cyan.
+            //
+            // `unitSizePx` (optional): when > 0, the unit range of
+            // every value run renders at this size; the italic and
+            // surrounding base text stay at baseFmt.sizePx. Used by
+            // the bottom panel to render "67 °C" / "92 %" with a
+            // smaller °C / % than the digit prefix.
+            //
+            // Baseline uses the BASE size's ascent/descent so all
+            // sub-segments sit on the same line (matches D2D's
+            // SetFontSize-on-range behaviour where the per-range
+            // size changes the glyph rasters but the layout
+            // baseline stays put).
+            void drawValueTextGpu(glyph_atlas::Renderer* r,
+                                   const GpuTextFormat& baseFmt,
+                                   const wchar_t* s, std::size_t n,
+                                   const D2D1_RECT_F& rect,
+                                   const float baseColor[4],
+                                   const float* chiffresColor = nullptr,
+                                   uint16_t unitSizePx = 0) const {
+                if (!r || n == 0 || !s) return;
+                const std::wstring wide(s, n);
+                const auto runs = findValueRuns(wide);
+
+                // Per-character attribute: (face, sizePx, colorPtr).
+                struct Attr {
+                    glyph_atlas::GlyphFace face;
+                    uint16_t               size;
+                    const float*           color;
+                    bool operator==(const Attr& o) const noexcept {
+                        return face == o.face && size == o.size && color == o.color;
+                    }
+                };
+                auto attrAt = [&](UINT32 i) {
+                    Attr a{baseFmt.face, baseFmt.sizePx, baseColor};
+                    for (const auto& run : runs) {
+                        if (i < run.brushStart) continue;
+                        if (i >= run.brushStart + run.brushLen) continue;
+                        if (chiffresColor) a.color = chiffresColor;
+                        if (i >= run.italicStart &&
+                            i <  run.italicStart + run.italicLen) {
+                            a.face = glyph_atlas::GlyphFace::BarlowItalic;
+                        }
+                        if (unitSizePx &&
+                            i >= run.unitStart &&
+                            i <  run.unitStart + run.unitLen) {
+                            a.size = unitSizePx;
+                        }
+                        break;  // value runs don't overlap, first hit wins
+                    }
+                    return a;
+                };
+
+                // Build maximal segments.
+                struct Segment {
+                    Attr        attr;
+                    UINT32      start;
+                    UINT32      len;
+                };
+                std::vector<Segment> segs;
+                segs.reserve(8);
+                const UINT32 N = static_cast<UINT32>(n);
+                UINT32 i = 0;
+                while (i < N) {
+                    const Attr a = attrAt(i);
+                    UINT32 j = i + 1;
+                    while (j < N && attrAt(j) == a) ++j;
+                    segs.push_back({a, i, j - i});
+                    i = j;
+                }
+
+                // Total advance width — sum of measure() across segments.
+                float totalW = 0.0f;
+                for (const auto& seg : segs) {
+                    totalW += r->measure(seg.attr.face, seg.attr.size,
+                                          wide.c_str() + seg.start, seg.len);
+                }
+
+                // Anchor.
+                float penX = rect.left;
+                switch (baseFmt.alignment) {
+                case GpuTextFormat::Alignment::Leading:
+                    penX = rect.left; break;
+                case GpuTextFormat::Alignment::Center:
+                    penX = (rect.left + rect.right - totalW) * 0.5f; break;
+                case GpuTextFormat::Alignment::Trailing:
+                    penX = rect.right - totalW; break;
+                }
+
+                // Baseline — anchored on the BASE size so the smaller
+                // unit suffix sits on the same line as the bigger
+                // digits (mimics D2D's per-range size override which
+                // doesn't shift the baseline).
+                const auto* m = r->metrics(baseFmt.face, baseFmt.sizePx);
+                const float ascent  = m ? m->ascent  : static_cast<float>(baseFmt.sizePx) * 0.75f;
+                const float descent = m ? m->descent : static_cast<float>(baseFmt.sizePx) * 0.25f;
+                const float baselineY = (rect.top + rect.bottom + ascent - descent) * 0.5f;
+
+                // Emit.
+                float pen = penX;
+                for (const auto& seg : segs) {
+                    pen = r->drawRun(seg.attr.face, seg.attr.size,
+                                      pen, baselineY,
+                                      wide.c_str() + seg.start, seg.len,
+                                      seg.attr.color);
+                }
             }
 
             // -------- Header bar --------------------------------------------
@@ -1924,6 +2229,15 @@ namespace openxr_api_layer::detail {
             // lifetime so the renderers don't have to clone the bitmap.
             glyph_atlas::BuildResult m_atlas;
             bool                     m_atlasReady = false;
+
+            // GPU text renderer, stashed transiently by paintChromeOnly
+            // for the duration of one chrome paint. drawWide / drawAscii /
+            // drawValueWide / drawValueAscii consult this — when non-null
+            // they emit drawRun calls onto the renderer's batch; when
+            // null they fall through to the D2D path. paintChromeOnly
+            // clears the pointer on exit so a stray frame after the paint
+            // doesn't touch a stale renderer.
+            glyph_atlas::Renderer*   m_textRenderer = nullptr;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
@@ -2398,6 +2712,7 @@ namespace openxr_api_layer::detail {
                 HistogramBarRenderer&               bars,
                 PaintCadence&                       cadence,
                 ID2D1RenderTarget*                  shimRT,
+                glyph_atlas::Renderer*              gpuText,
                 const HistogramRing<kRingSize>&     cpuRing,
                 const HistogramRing<kRingSize>&     gpuRing,
                 const OverlaySnapshot&              snap) {
@@ -2406,7 +2721,7 @@ namespace openxr_api_layer::detail {
 
             bool ok = true;
             if (needStatic) {
-                ok = core.paintChromeOnly(shimRT, snap);
+                ok = core.paintChromeOnly(shimRT, gpuText, snap);
             }
 
             if (ok) {
@@ -2556,6 +2871,7 @@ namespace openxr_api_layer::detail {
                         painted = m_useShaderBars
                             ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                                   m_myShimRenderTarget.Get(),
+                                                  m_useGlyphAtlas ? &m_glyphRenderer : nullptr,
                                                   m_cpuRing, m_gpuRing, snap)
                             : m_core.paint(m_myShimRenderTarget.Get(), snap,
                                             m_cpuRing, m_gpuRing);
@@ -3137,6 +3453,7 @@ namespace openxr_api_layer::detail {
                 const bool painted = m_useShaderBars
                     ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                           m_shimRenderTarget.Get(),
+                                          m_useGlyphAtlas ? &m_glyphRenderer : nullptr,
                                           m_cpuRing, m_gpuRing, snap)
                     : m_core.paint(m_shimRenderTarget.Get(), snap,
                                     m_cpuRing, m_gpuRing);
