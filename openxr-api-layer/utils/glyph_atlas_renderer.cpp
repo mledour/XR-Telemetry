@@ -35,6 +35,12 @@
 
 namespace openxr_api_layer::utils::glyph_atlas {
 
+    // Log() lives in openxr_api_layer::log. EXPLICIT using-declaration
+    // (not a using-directive) — matches the pattern in overlay_renderer.cpp
+    // which uses the same form to dodge an MSVC name-lookup quirk inside
+    // nested namespaces.
+    using ::openxr_api_layer::log::Log;
+
     using Microsoft::WRL::ComPtr;
 
     // ===================================================================
