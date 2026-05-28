@@ -752,7 +752,7 @@ namespace openxr_api_layer::detail {
             // values land in the same pixel positions they would after
             // a full drawChrome().
             void drawValuesIntoChrome(ID2D1RenderTarget* rt,
-                                       const OverlayDisplayValues& v) const {
+                                       const OverlayDisplayValues& v) {
                 // Panel Ys mirror drawChrome / paint() exactly.
                 const float headerY    = kInnerT;
                 const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
@@ -834,6 +834,17 @@ namespace openxr_api_layer::detail {
                 // the 22-px label. Erase from labelBottom to cellB —
                 // the label (and the panel's separator strokes drawn
                 // earlier) stay intact.
+                //
+                // Refresh cadence: 2 Hz (every 5th values-only call)
+                // instead of 10 Hz. Temperatures and util-% don't
+                // change fast enough to merit a redraw on every
+                // aggregator tick, and skipping their ~5 DirectWrite
+                // calls on 4 of every 5 ticks knocks ~25-30% off the
+                // typical chrome-paint spike. The values stay correct
+                // because the aggregator's snapshot still updates
+                // m_cachedValues at the usual 10 Hz — we just don't
+                // repaint them every time.
+                if (m_valueOnlyTick++ % 5 == 0)
                 {
                     const float bottomCellW =
                         (kInnerR - kInnerL - kSectionGap) / 5.0f;
@@ -2029,6 +2040,14 @@ namespace openxr_api_layer::detail {
             // its own Clear+full-redraw so it never observes this
             // flag and the two paths can't interfere.
             bool                 m_chromeStaticPainted = false;
+            // Values-only paint counter. drawValuesIntoChrome()
+            // redraws the bottom row (TEMP / LOAD / VRAM) only every
+            // 5th call — temps and util-% don't move fast enough to
+            // need the aggregator's full 10 Hz cadence, so we drop
+            // them to ~2 Hz and skip ~5 DirectWrite calls on 4 of
+            // every 5 ticks. The header (FPS / P95 / P99…) and
+            // frametime values stay at 10 Hz.
+            int                  m_valueOnlyTick = 0;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
