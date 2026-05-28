@@ -24,6 +24,7 @@
 
 #include "overlay_renderer.h"
 
+#include "chrome_shape_renderer.h"
 #include "glyph_atlas.h"
 #include "glyph_atlas_renderer.h"
 #include "histogram_ring.h"
@@ -81,12 +82,13 @@ namespace openxr_api_layer::detail {
     using ::openxr_api_layer::log::Log;
     using ::openxr_api_layer::log::ErrorLog;
 
-    // Local alias for the atlas namespace. Without it, unqualified
-    // `glyph_atlas::Renderer` / `glyph_atlas::BuildResult` references
-    // inside the anonymous namespace below resolve as if `glyph_atlas`
-    // were a sibling sub-namespace of `detail`, which it isn't — the
-    // module lives at openxr_api_layer::utils::glyph_atlas.
-    namespace glyph_atlas = ::openxr_api_layer::utils::glyph_atlas;
+    // Local aliases for the utils sub-namespaces. Without these,
+    // unqualified `glyph_atlas::Renderer` / `chrome_shapes::Renderer`
+    // references inside the anonymous namespace below resolve as if
+    // those names were sibling sub-namespaces of `detail`, which they
+    // aren't — both modules live under openxr_api_layer::utils.
+    namespace glyph_atlas   = ::openxr_api_layer::utils::glyph_atlas;
+    namespace chrome_shapes = ::openxr_api_layer::utils::chrome_shapes;
 
     namespace {
 
@@ -310,6 +312,15 @@ namespace openxr_api_layer::detail {
         constexpr float kColorAccentCyan[4] = {0.098f, 0.820f, 0.851f, 1.00f};  // m_brushAccentCyan
         constexpr float kColorOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};  // m_brushOrange
         constexpr float kColorGaugeRed[4]   = {1.000f, 0.196f, 0.235f, 1.00f};  // m_brushGaugeRed
+
+        // -------- GPU chrome-shape colours ---------------------------------
+        //
+        // Same source-of-truth as the brush colours in initBrushes(); the
+        // ChromeShapeRenderer reads these as straight-alpha RGBA.
+        constexpr float kColorBg[4]        = {0.020f, 0.024f, 0.024f, 0.94f};  // m_brushBg (frame fill)
+        constexpr float kColorPanelBg[4]   = {0.035f, 0.039f, 0.039f, 1.00f};  // m_brushPanelBg
+        constexpr float kColorFrameLine[4] = {0.122f, 0.133f, 0.133f, 1.00f};  // m_brushFrameLine (frame stroke)
+        constexpr float kColorSeparator[4] = {0.184f, 0.200f, 0.204f, 1.00f};  // m_brushSeparator (panel & cell strokes)
 
         // -------- CoreRenderer: D2D + DirectWrite painting ------------------
         //
@@ -719,23 +730,34 @@ namespace openxr_api_layer::detail {
             // then. Wraps its own BeginDraw/EndDraw and clears first
             // (the shim is fully repainted on a chrome refresh).
             //
-            // `gpuText` (optional): when non-null, every text call
-            // routes through the glyph-atlas renderer instead of D2D's
-            // DrawText / DrawTextLayout. The helper brackets the chrome
-            // paint with beginBatch / flush so all queued glyphs land
-            // as one DrawInstanced AFTER the D2D EndDraw has committed
-            // the shape work below the text. Bars layer is unchanged
-            // — they paint on top of both via the bar renderer's own
-            // pass after this returns.
+            // `gpuText` / `gpuShapes` (both optional): when non-null,
+            // text and shape calls route through their respective
+            // GPU renderers instead of D2D's DrawText / FillRectangle
+            // / FillGeometry. The helper brackets the chrome paint
+            // with beginBatch / flush on each so all queued instances
+            // land as one DrawInstanced per pass. Order at flush time:
+            //   shape pass → text pass → bars pass (caller-driven)
+            // so the layering reads bottom-to-top correctly:
+            //   chrome shapes (under) → glyphs → bars.
+            //
+            // Either renderer being null causes its calls to fall
+            // through to the D2D path inside the leaf helpers
+            // (drawWide, drawPanelBg, ...). Both null + the D2D
+            // EndDraw still committing the shape work is the
+            // historical behaviour, kept as the bottom-of-stack
+            // fallback.
             //
             // Returns EndDraw success.
             bool paintChromeOnly(ID2D1RenderTarget* rt,
-                                  glyph_atlas::Renderer* gpuText,
+                                  glyph_atlas::Renderer*       gpuText,
+                                  chrome_shapes::Renderer*     gpuShapes,
                                   const OverlaySnapshot& snap) {
                 if (!rt) return false;
                 if (!m_brushBg || !m_strokeDashed) return false;
-                m_textRenderer = gpuText;
+                m_textRenderer  = gpuText;
+                m_chromeShapes  = gpuShapes;
                 if (m_textRenderer) m_textRenderer->beginBatch();
+                if (m_chromeShapes) m_chromeShapes->beginBatch();
 
                 rt->BeginDraw();
                 rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -743,12 +765,14 @@ namespace openxr_api_layer::detail {
                 drawChrome(rt, m_cachedValues);
                 const bool d2dOk = SUCCEEDED(rt->EndDraw());
 
-                // Flush the GPU text batch AFTER the D2D EndDraw so
-                // text composites on top of the shapes D2D just
-                // committed. flush() is a no-op if no drawRun calls
-                // were emitted (gpuText was null at the leaves).
+                // Flush the GPU passes AFTER the D2D EndDraw so they
+                // composite on top of whatever D2D just committed.
+                // Shapes first so glyphs land on top of the chrome
+                // panels they sit inside.
+                if (m_chromeShapes) m_chromeShapes->flush();
                 if (m_textRenderer) m_textRenderer->flush();
                 m_textRenderer = nullptr;
+                m_chromeShapes = nullptr;
                 return d2dOk;
             }
 
@@ -1623,12 +1647,20 @@ namespace openxr_api_layer::detail {
                 const float cellW = w / 5.0f;
 
                 // Vertical separators between cells (4 of them now).
+                // GPU branch renders each as a 1-px wide thin rect.
                 for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kHeaderSepInsetY),
-                        D2D1::Point2F(x, b - kHeaderSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    if (m_chromeShapes) {
+                        m_chromeShapes->addRect(
+                            x, t + kHeaderSepInsetY,
+                            1.0f, (b - kHeaderSepInsetY) - (t + kHeaderSepInsetY),
+                            kColorSeparator);
+                    } else {
+                        rt->DrawLine(
+                            D2D1::Point2F(x, t + kHeaderSepInsetY),
+                            D2D1::Point2F(x, b - kHeaderSepInsetY),
+                            m_brushSeparator.Get(), 1.0f);
+                    }
                 }
 
                 const float labelH = 22.0f;
@@ -1968,13 +2000,21 @@ namespace openxr_api_layer::detail {
 
                 // Vertical separators between cells. Same brush as
                 // the panel inner stroke so they read as subtle
-                // column dividers, not hard borders.
+                // column dividers, not hard borders. GPU branch
+                // renders each as a 1-px wide thin rect.
                 for (int i = 1; i < numCols; ++i) {
                     const float x = l + colW * static_cast<float>(i);
-                    rt->DrawLine(
-                        D2D1::Point2F(x, t + kBottomSepInsetY),
-                        D2D1::Point2F(x, b - kBottomSepInsetY),
-                        m_brushSeparator.Get(), 1.0f);
+                    if (m_chromeShapes) {
+                        m_chromeShapes->addRect(
+                            x, t + kBottomSepInsetY,
+                            1.0f, (b - kBottomSepInsetY) - (t + kBottomSepInsetY),
+                            kColorSeparator);
+                    } else {
+                        rt->DrawLine(
+                            D2D1::Point2F(x, t + kBottomSepInsetY),
+                            D2D1::Point2F(x, b - kBottomSepInsetY),
+                            m_brushSeparator.Get(), 1.0f);
+                    }
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -2096,8 +2136,19 @@ namespace openxr_api_layer::detail {
             // bottom-edge bevel shadow, and a low-alpha diagonal
             // carbon-fibre hatch for a "raised metal" industrial
             // look; all three were dropped in favour of a flat panel.
+            //
+            // GPU branch: sharp corners (the 4-px D2D rounding has no
+            // exact GPU equivalent in our quad shader; tradeoff is
+            // documented + accepted in the chrome-shape migration
+            // task). One fill rect + one 1-px outline = 5 quads per
+            // panel. D2D fallback path still does the rounded rect.
             void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
                               float r, float b) const {
+                if (m_chromeShapes) {
+                    m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
+                    m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
+                    return;
+                }
                 const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
                     D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
                 rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
@@ -2110,12 +2161,30 @@ namespace openxr_api_layer::detail {
             // diagonal cut length in pixels (12 px matches the
             // design's industrial-HUD look). Single fill + stroke
             // pair, no per-corner arc geometry needed.
+            //
+            // GPU branch: sharp corners (the 12-px chamfer has no
+            // exact GPU equivalent without a custom polygon shader;
+            // tradeoff is documented + accepted in the chrome-shape
+            // migration task). One fill rect + one 1-px outline.
+            // D2D fallback path still does the chamfered geometry.
             void drawChamferedRect(ID2D1RenderTarget* rt,
                                      const D2D1_RECT_F& rect,
                                      float chamfer,
                                      ID2D1Brush* fillBrush,
                                      ID2D1Brush* strokeBrush,
                                      float strokeWidth) const {
+                if (m_chromeShapes) {
+                    m_chromeShapes->addRect(rect.left, rect.top,
+                                              rect.right - rect.left,
+                                              rect.bottom - rect.top,
+                                              kColorBg);
+                    m_chromeShapes->addOutline(rect.left, rect.top,
+                                                rect.right - rect.left,
+                                                rect.bottom - rect.top,
+                                                strokeWidth,
+                                                kColorFrameLine);
+                    return;
+                }
                 ComPtr<ID2D1PathGeometry> path;
                 if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
                     // Fallback to a plain rounded-rect if path
@@ -2238,6 +2307,13 @@ namespace openxr_api_layer::detail {
             // clears the pointer on exit so a stray frame after the paint
             // doesn't touch a stale renderer.
             glyph_atlas::Renderer*   m_textRenderer = nullptr;
+
+            // GPU chrome-shape renderer, stashed the same way. drawPanelBg /
+            // drawChamferedRect / the column-separator inline DrawLine
+            // calls in drawHeaderBar / drawBottomPanel branch on it: when
+            // non-null they append rects to the renderer's batch; when
+            // null they fall through to the existing D2D shape calls.
+            chrome_shapes::Renderer* m_chromeShapes = nullptr;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
@@ -2713,6 +2789,7 @@ namespace openxr_api_layer::detail {
                 PaintCadence&                       cadence,
                 ID2D1RenderTarget*                  shimRT,
                 glyph_atlas::Renderer*              gpuText,
+                chrome_shapes::Renderer*            gpuShapes,
                 const HistogramRing<kRingSize>&     cpuRing,
                 const HistogramRing<kRingSize>&     gpuRing,
                 const OverlaySnapshot&              snap) {
@@ -2721,7 +2798,7 @@ namespace openxr_api_layer::detail {
 
             bool ok = true;
             if (needStatic) {
-                ok = core.paintChromeOnly(shimRT, gpuText, snap);
+                ok = core.paintChromeOnly(shimRT, gpuText, gpuShapes, snap);
             }
 
             if (ok) {
@@ -2871,7 +2948,8 @@ namespace openxr_api_layer::detail {
                         painted = m_useShaderBars
                             ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                                   m_myShimRenderTarget.Get(),
-                                                  m_useGlyphAtlas ? &m_glyphRenderer : nullptr,
+                                                  m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
+                                                  m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
                                                   m_cpuRing, m_gpuRing, snap)
                             : m_core.paint(m_myShimRenderTarget.Get(), snap,
                                             m_cpuRing, m_gpuRing);
@@ -3236,9 +3314,7 @@ namespace openxr_api_layer::detail {
                 // non-fatal too: m_useGlyphAtlas stays false and the
                 // D2D text path keeps painting chrome / values for as
                 // long as CoreRenderer's IDWriteTextFormat objects are
-                // alive. (Phase A: renderer constructed but not yet
-                // invoked from the paint path — that wiring lands in
-                // Phase B.)
+                // alive.
                 m_useGlyphAtlas =
                     m_useShaderBars &&
                     m_core.atlasReady() &&
@@ -3247,6 +3323,20 @@ namespace openxr_api_layer::detail {
                 if (!m_useGlyphAtlas) {
                     Log("xr_telemetry: overlay GPU text path "
                         "unavailable — falling back to D2D text rendering\n");
+                }
+
+                // GPU chrome shapes path. Same device / context / shim
+                // as the bars + text renderers. Soft-fails identically:
+                // m_useChromeShapes stays false and the D2D chrome
+                // shape calls (FillRoundedRectangle / FillGeometry /
+                // DrawLine) keep painting from CoreRenderer.
+                m_useChromeShapes =
+                    m_useShaderBars &&
+                    m_chromeShapeRenderer.init(
+                        m_myDevice, m_myContext, m_myShim);
+                if (!m_useChromeShapes) {
+                    Log("xr_telemetry: overlay GPU chrome shapes path "
+                        "unavailable — falling back to D2D chrome shapes\n");
                 }
 
                 // Fill the immutable XrCompositionLayerQuad fields
@@ -3347,6 +3437,12 @@ namespace openxr_api_layer::detail {
             // text and never crash the host.
             glyph_atlas::Renderer       m_glyphRenderer;
             bool                        m_useGlyphAtlas = false;
+            // GPU chrome-shape renderer: replaces the D2D shape calls
+            // (FillRoundedRectangle / FillGeometry / DrawLine) inside
+            // drawPanelBg / drawChamferedRect / column separators with
+            // one DrawInstanced over the shared overlay_quad shader.
+            chrome_shapes::Renderer     m_chromeShapeRenderer;
+            bool                        m_useChromeShapes = false;
             // Chrome cadence for the shader path: the bars redraw every
             // frame on the GPU, the D2D chrome only when snap.version
             // ticks or the watchdog fires (kChromeWatchdogFrames lives
@@ -3453,7 +3549,8 @@ namespace openxr_api_layer::detail {
                 const bool painted = m_useShaderBars
                     ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                           m_shimRenderTarget.Get(),
-                                          m_useGlyphAtlas ? &m_glyphRenderer : nullptr,
+                                          m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
+                                          m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
                                           m_cpuRing, m_gpuRing, snap)
                     : m_core.paint(m_shimRenderTarget.Get(), snap,
                                     m_cpuRing, m_gpuRing);
@@ -3677,8 +3774,6 @@ namespace openxr_api_layer::detail {
                 // device) than the D3D11 path's atlas, but both copy
                 // from the same CoreRenderer-owned BuildResult bitmap
                 // so the glyphs are pixel-identical across paths.
-                // (Phase A: constructed but not yet invoked from the
-                // paint path — wiring lands in Phase B.)
                 m_useGlyphAtlas =
                     m_useShaderBars &&
                     m_core.atlasReady() &&
@@ -3687,6 +3782,18 @@ namespace openxr_api_layer::detail {
                 if (!m_useGlyphAtlas) {
                     Log("xr_telemetry: D3D12 overlay GPU text path "
                         "unavailable — falling back to D2D text rendering\n");
+                }
+
+                // GPU chrome shapes on the D3D11On12 bridge. Mirror of
+                // the D3D11 path's init: same shim target, same
+                // device, soft-fail down to the D2D shape calls.
+                m_useChromeShapes =
+                    m_useShaderBars &&
+                    m_chromeShapeRenderer.init(
+                        m_d3d11Device, m_d3d11Context, m_shimTexture);
+                if (!m_useChromeShapes) {
+                    Log("xr_telemetry: D3D12 overlay GPU chrome shapes path "
+                        "unavailable — falling back to D2D chrome shapes\n");
                 }
 
                 // One-time fill of the immutable quad-layer fields;
@@ -3755,6 +3862,10 @@ namespace openxr_api_layer::detail {
             // the fallback while wiring is in progress.
             glyph_atlas::Renderer                 m_glyphRenderer;
             bool                                  m_useGlyphAtlas = false;
+            // GPU chrome shapes on the D3D11On12 bridge. Same
+            // pattern as the D3D11 path's m_chromeShapeRenderer.
+            chrome_shapes::Renderer               m_chromeShapeRenderer;
+            bool                                  m_useChromeShapes = false;
             // Chrome cadence for the shader path — paints D2D only on
             // snap.version ticks or the watchdog. Same kChromeWatchdog
             // Frames constant as the D3D11 path, hoisted to namespace
