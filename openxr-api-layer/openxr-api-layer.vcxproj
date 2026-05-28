@@ -349,6 +349,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="telemetry_internals.h" />
     <ClInclude Include="utils\default_settings_template.h" />
     <ClInclude Include="utils\glyph_atlas.h" />
+    <ClInclude Include="utils\glyph_atlas_renderer.h" />
     <ClInclude Include="utils\gpu_telemetry.h" />
     <ClInclude Include="utils\histogram_ring.h" />
     <ClInclude Include="utils\hotkey.h" />
@@ -366,6 +367,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="layer.cpp" />
     <ClCompile Include="utils\glyph_atlas.cpp" />
+    <ClCompile Include="utils\glyph_atlas_renderer.cpp" />
     <ClCompile Include="utils\gpu_telemetry.cpp" />
     <ClCompile Include="utils\overlay_renderer.cpp" />
     <!-- Place your layer-specific .cpp files under utils\ and register them
