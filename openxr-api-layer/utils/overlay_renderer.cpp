@@ -2248,6 +2248,85 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11RasterizerState>  m_raster;
         };
 
+        // Watchdog: max frames between forced chrome repaints on the
+        // shader path. K=30 (~0.33 s @ 90 Hz, ~0.21 s @ 144 Hz) only
+        // fires if the aggregator's snap.version stops ticking — purely
+        // defensive. Shared by both renderers so a tweak lands once.
+        constexpr int kChromeWatchdogFrames = 30;
+
+        // -------- Shared shader-path paint -----------------------------------
+        //
+        // D2D chrome (only when snap.version ticks or the watchdog fires)
+        // + GPU instanced bars (every frame) into the shim. Used by both
+        // D3D11OverlayRenderer and D3D12OverlayRenderer — the only piece
+        // that differs across paths is the shim's render target, which
+        // the caller passes in. `bars` already owns the matching D3D11
+        // immediate context (captured at init() time on the same device
+        // backing `shimRT`), so the two stages talk to one another
+        // through that context with no extra plumbing here.
+        //
+        // Ordering across the D2D ↔ D3D11 boundary is the load-bearing
+        // detail: CoreRenderer::paintChromeOnly's EndDraw flushes the D2D
+        // command batch onto the SAME immediate context that bars.draw
+        // Panel() submits its instanced draws to, so the GPU executes
+        // [chrome → bars] in submission order — no fence, no flush, no
+        // extra sync needed. On the D3D12 path the D3D11On12 wrapped-
+        // resource Acquire/Release dance happens AFTER this returns (in
+        // renderAndCompose) and ferries the shim into the D3D12 swapchain
+        // image without disturbing this ordering.
+        //
+        // Returns false only when a needed chrome repaint failed; the
+        // cadence then leaves lastPaintedVersion alone so the next frame
+        // retries the static branch until it lands.
+        inline bool paintShimViaShader(
+                CoreRenderer&                       core,
+                HistogramBarRenderer&               bars,
+                PaintCadence&                       cadence,
+                ID2D1RenderTarget*                  shimRT,
+                const HistogramRing<kRingSize>&     cpuRing,
+                const HistogramRing<kRingSize>&     gpuRing,
+                const OverlaySnapshot&              snap) {
+            const bool needStatic = needStaticPaint(
+                cadence, snap.version, kChromeWatchdogFrames);
+
+            bool ok = true;
+            if (needStatic) {
+                ok = core.paintChromeOnly(shimRT, snap);
+            }
+
+            if (ok) {
+                // Panel Ys + histo rects from the shared layout constants;
+                // identical geometry to drawHistoRegion / drawChrome so
+                // the GPU bars line up under the D2D titles.
+                const float gpuPanelY =
+                    kInnerT + kHeaderHeight + kSectionGap;
+                const float cpuPanelY =
+                    gpuPanelY + kFrametimeHeight + kSectionGap;
+                const float histoL = kInnerL + kSectionInnerPad;
+                const float histoR = kInnerR - kSectionInnerPad;
+                const int64_t budgetNs = snap.target_fps > 0.0f
+                    ? static_cast<int64_t>(1.0e9f / snap.target_fps)
+                    : 0;
+                const float gpuT = gpuPanelY + kPanelTitleTopPad +
+                                    kHistoTitleH + kHistoTitleGap;
+                const float gpuB = gpuPanelY + kFrametimeHeight -
+                                    kSectionInnerPad;
+                const float cpuT = cpuPanelY + kPanelTitleTopPad +
+                                    kHistoTitleH + kHistoTitleGap;
+                const float cpuB = cpuPanelY + kFrametimeHeight -
+                                    kSectionInnerPad;
+                bars.drawPanel(gpuRing, budgetNs,
+                                histoL, gpuT, histoR, gpuB,
+                                /*isGpu=*/true);
+                bars.drawPanel(cpuRing, budgetNs,
+                                histoL, cpuT, histoR, cpuB,
+                                /*isGpu=*/false);
+            }
+
+            commitPaint(cadence, needStatic, ok, snap.version);
+            return ok;
+        }
+
         // -------- D3D11 native renderer --------------------------------------
         //
         // App uses D3D11 directly. Each swapchain image is an ID3D11Texture2D
@@ -2360,7 +2439,9 @@ namespace openxr_api_layer::detail {
                     HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
                     if (hr == S_OK) {
                         painted = m_useShaderBars
-                            ? paintShim(snap)
+                            ? paintShimViaShader(m_core, m_bars, m_barsCadence,
+                                                  m_myShimRenderTarget.Get(),
+                                                  m_cpuRing, m_gpuRing, snap)
                             : m_core.paint(m_myShimRenderTarget.Get(), snap,
                                             m_cpuRing, m_gpuRing);
                         m_myShimMutex->ReleaseSync(1);
@@ -2732,66 +2813,10 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Shader path (m_useShaderBars): paint the shim with D2D
-            // chrome (static tier, only when snap.version ticks or the
-            // watchdog fires) plus the GPU histogram bars (dynamic tier,
-            // every frame). Mirrors CoreRenderer::paint()'s static/
-            // dynamic split, but the dynamic tier is HistogramBar
-            // Renderer's instanced draw instead of D2D FillRectangle.
-            //
-            // Ordering: the D2D chrome EndDraw commits before the GPU
-            // bars (same device → same immediate context → ordered),
-            // and the caller's ReleaseSync(1) signals after both, so
-            // the copy side sees a complete frame. On a dynamic-only
-            // frame no D2D runs at all — the shim keeps last static
-            // paint's chrome and the bars overwrite just their scissored
-            // rects.
-            //
-            // Returns false only when a needed chrome repaint failed
-            // (its EndDraw errored): the cadence then retries next
-            // frame and the caller suppresses this frame's layer.
-            bool paintShim(const OverlaySnapshot& snap) {
-                const bool needStatic = needStaticPaint(
-                    m_barsCadence, snap.version, kChromeWatchdogFrames);
-
-                bool ok = true;
-                if (needStatic) {
-                    ok = m_core.paintChromeOnly(
-                        m_myShimRenderTarget.Get(), snap);
-                }
-
-                if (ok) {
-                    // Panel Ys + histo rects from the shared layout
-                    // constants — identical geometry to drawHistoRegion
-                    // / drawChrome so the GPU bars line up under the
-                    // D2D titles.
-                    const float headerY   = kInnerT;
-                    const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
-                    const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
-                    const float histoL = kInnerL + kSectionInnerPad;
-                    const float histoR = kInnerR - kSectionInnerPad;
-                    const int64_t budgetNs = snap.target_fps > 0.0f
-                        ? static_cast<int64_t>(1.0e9f / snap.target_fps)
-                        : 0;
-                    const float gpuT = gpuPanelY + kPanelTitleTopPad +
-                                        kHistoTitleH + kHistoTitleGap;
-                    const float gpuB = gpuPanelY + kFrametimeHeight -
-                                        kSectionInnerPad;
-                    const float cpuT = cpuPanelY + kPanelTitleTopPad +
-                                        kHistoTitleH + kHistoTitleGap;
-                    const float cpuB = cpuPanelY + kFrametimeHeight -
-                                        kSectionInnerPad;
-                    m_bars.drawPanel(m_gpuRing, budgetNs,
-                                      histoL, gpuT, histoR, gpuB,
-                                      /*isGpu=*/true);
-                    m_bars.drawPanel(m_cpuRing, budgetNs,
-                                      histoL, cpuT, histoR, cpuB,
-                                      /*isGpu=*/false);
-                }
-
-                commitPaint(m_barsCadence, needStatic, ok, snap.version);
-                return ok;
-            }
+            // Shader-path paint is the free function paintShimViaShader()
+            // declared above the class — same body served both
+            // D3D11OverlayRenderer and D3D12OverlayRenderer, so the
+            // duplicate per-class definitions are gone.
 
             // One-time fill of the XrCompositionLayerQuad fields that
             // never change frame-to-frame. SOURCE_ALPHA without
@@ -2865,9 +2890,9 @@ namespace openxr_api_layer::detail {
             bool                        m_useShaderBars = false;
             // Chrome cadence for the shader path: the bars redraw every
             // frame on the GPU, the D2D chrome only when snap.version
-            // ticks or the watchdog fires.
+            // ticks or the watchdog fires (kChromeWatchdogFrames lives
+            // at namespace scope, shared with the D3D12 renderer).
             PaintCadence                m_barsCadence;
-            static constexpr int        kChromeWatchdogFrames = 30;
 
             CoreRenderer                m_core;
             HistogramRing<kRingSize>    m_cpuRing;
@@ -2961,13 +2986,15 @@ namespace openxr_api_layer::detail {
                 // back to the runtime's compositor.
                 //
                 // Shader path (m_useShaderBars): D2D chrome only when
-                // stale + HistogramBarRenderer.drawPanel every frame —
-                // mirror of the D3D11 path's paintShim(). The Acquire
-                // Wrapped/CopyResource/Flush dance below is unchanged;
-                // it ferries whatever the shim ended up with into the
-                // D3D12 swapchain image.
+                // stale + HistogramBarRenderer.drawPanel every frame,
+                // both via the shared paintShimViaShader() helper. The
+                // AcquireWrapped/CopyResource/Flush dance below is
+                // unchanged; it ferries whatever the shim ended up with
+                // into the D3D12 swapchain image.
                 const bool painted = m_useShaderBars
-                    ? paintShim(snap)
+                    ? paintShimViaShader(m_core, m_bars, m_barsCadence,
+                                          m_shimRenderTarget.Get(),
+                                          m_cpuRing, m_gpuRing, snap)
                     : m_core.paint(m_shimRenderTarget.Get(), snap,
                                     m_cpuRing, m_gpuRing);
                 ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
@@ -3196,58 +3223,10 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Shader path (m_useShaderBars): D2D chrome only when stale
-            // + HistogramBarRenderer.drawPanel every frame, into the
-            // shim. Mirror of D3D11OverlayRenderer::paintShim(); the
-            // D3D12 path is actually simpler — no keyed-mutex bracket
-            // (the D3D11On12 wrapped-resource dance in renderAndCompose
-            // handles cross-API sync), so this just splits the static
-            // and dynamic tiers on the same shim render target /
-            // immediate context. Returns false only when a needed
-            // chrome repaint failed; the cadence then retries next
-            // frame and the caller suppresses this frame's layer.
-            bool paintShim(const OverlaySnapshot& snap) {
-                const bool needStatic = needStaticPaint(
-                    m_barsCadence, snap.version, kChromeWatchdogFrames);
-
-                bool ok = true;
-                if (needStatic) {
-                    ok = m_core.paintChromeOnly(
-                        m_shimRenderTarget.Get(), snap);
-                }
-
-                if (ok) {
-                    // Same panel geometry the D3D11 path's paintShim
-                    // uses — derived from the namespace layout
-                    // constants so the GPU bars sit under the D2D
-                    // titles by construction.
-                    const float headerY   = kInnerT;
-                    const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
-                    const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
-                    const float histoL = kInnerL + kSectionInnerPad;
-                    const float histoR = kInnerR - kSectionInnerPad;
-                    const int64_t budgetNs = snap.target_fps > 0.0f
-                        ? static_cast<int64_t>(1.0e9f / snap.target_fps)
-                        : 0;
-                    const float gpuT = gpuPanelY + kPanelTitleTopPad +
-                                        kHistoTitleH + kHistoTitleGap;
-                    const float gpuB = gpuPanelY + kFrametimeHeight -
-                                        kSectionInnerPad;
-                    const float cpuT = cpuPanelY + kPanelTitleTopPad +
-                                        kHistoTitleH + kHistoTitleGap;
-                    const float cpuB = cpuPanelY + kFrametimeHeight -
-                                        kSectionInnerPad;
-                    m_bars.drawPanel(m_gpuRing, budgetNs,
-                                      histoL, gpuT, histoR, gpuB,
-                                      /*isGpu=*/true);
-                    m_bars.drawPanel(m_cpuRing, budgetNs,
-                                      histoL, cpuT, histoR, cpuB,
-                                      /*isGpu=*/false);
-                }
-
-                commitPaint(m_barsCadence, needStatic, ok, snap.version);
-                return ok;
-            }
+            // Shader-path paint is the free function paintShimViaShader()
+            // declared above the class bodies — same body served both
+            // D3D11OverlayRenderer and D3D12OverlayRenderer, so the
+            // duplicate per-class definitions are gone.
 
             void initQuadLayerConstants() {
                 m_quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -3291,11 +3270,10 @@ namespace openxr_api_layer::detail {
             HistogramBarRenderer                  m_bars;
             bool                                  m_useShaderBars = false;
             // Chrome cadence for the shader path — paints D2D only on
-            // snap.version ticks or the watchdog. Mirrors the D3D11
-            // renderer's m_barsCadence. K = 30 frames at 90 Hz =
-            // ~0.33 s; same defensive value as the D3D11 path.
+            // snap.version ticks or the watchdog. Same kChromeWatchdog
+            // Frames constant as the D3D11 path, hoisted to namespace
+            // scope so a tweak lands once.
             PaintCadence                          m_barsCadence;
-            static constexpr int                  kChromeWatchdogFrames = 30;
             CoreRenderer                          m_core;
             HistogramRing<kRingSize>              m_cpuRing;
             HistogramRing<kRingSize>              m_gpuRing;
