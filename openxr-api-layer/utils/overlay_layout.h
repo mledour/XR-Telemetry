@@ -409,4 +409,11 @@ namespace openxr_api_layer::detail {
         return 1.0f / 6.0f;
     }
 
+    // Height, in shim pixels, of the placeholder dash drawn at the strip
+    // bottom for an empty (no-sample-yet) histogram slot. 2 px is enough
+    // to read as a "this slot exists" marker without crowding the bar
+    // grid. Both the D2D and GPU bar paths reference this so they can't
+    // drift apart.
+    inline constexpr float kDashPlaceholderH = 2.0f;
+
 } // namespace openxr_api_layer::detail

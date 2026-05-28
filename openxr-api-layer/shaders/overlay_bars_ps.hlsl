@@ -22,7 +22,8 @@
 
 // =============================================================================
 // overlay_bars_ps.hlsl — pixel shader for the instanced histogram bars.
-// Compiled offline (ps_5_0) by the FxCompile build step. Picks the bar's
+// Compiled offline (ps_4_0, ShaderModel 4.0 = feature level 10_0) by the
+// FxCompile build step. Picks the bar's
 // fill from its tier: a vertical gradient for healthy bars (sampled per-
 // pixel via stripY so a short bar shows only the gradient's lower span,
 // matching the D2D strip-spanning linear brush), solid orange/red for the
@@ -62,6 +63,15 @@ float4 PSMain(VSOutput i) : SV_TARGET
     // "thinner at the top". A flat pixel-snapped top reads cleaner for
     // a bar chart and removes that artifact; the shared baseline at the
     // strip floor stays crisp for the same reason.
+    //
+    // CONTRACT: bar geometry stays integer-aligned (4-px width, integer
+    // xLeft — see HistogramBarRenderer::drawPanel). With that, covX
+    // collapses to 1 everywhere and the sides ALSO render crisp — the
+    // bars look pixel-perfect uniform. If a future layout reintroduces
+    // fractional widths or positions, covX comes back to life and the
+    // sides soften; the top/bottom would alias visibly and need their
+    // own treatment (re-enable covY, or AA only the top and accept the
+    // corner-dim trade-off).
     const float covX = saturate(min(i.pos.x - i.rectPx.x,
                                      i.rectPx.z - i.pos.x) + 0.5f);
     col.a *= covX;

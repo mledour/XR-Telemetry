@@ -1466,7 +1466,8 @@ namespace openxr_api_layer::detail {
                 accentBrush->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
                 accentBrush->SetEndPoint  (D2D1::Point2F((l + r) * 0.5f, b));
 
-                constexpr float kDashPlaceholderH = 2.0f;
+                // kDashPlaceholderH from overlay_layout.h — shared with the
+                // GPU path so the empty-slot dash height can't drift.
                 for (std::size_t i = 0; i < n; ++i) {
                     const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
                     const int64_t sample = ring.at(i);
@@ -1838,24 +1839,39 @@ namespace openxr_api_layer::detail {
                 m_device = device;
                 m_ctx = ctx;
 
+                // Per-step failure logging. Without it, an HRESULT lost
+                // somewhere in this chain just disabled the GPU path with
+                // no clue about which API call broke — making "the bars
+                // don't render in GPU mode" reports hard to triage.
+                auto fail = [](const char* step) {
+                    Log(fmt::format(
+                        "xr_telemetry: HistogramBarRenderer init failed "
+                        "at step: {}\n",
+                        step));
+                    return false;
+                };
+
                 if (FAILED(m_device->CreateRenderTargetView(
                         shim, nullptr, m_rtv.GetAddressOf())))
-                    return false;
+                    return fail("CreateRenderTargetView (shim)");
 
                 // Shaders from embedded bytecode.
                 if (FAILED(m_device->CreateVertexShader(
                         g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
-                        nullptr, m_barsVS.GetAddressOf())) ||
-                    FAILED(m_device->CreatePixelShader(
+                        nullptr, m_barsVS.GetAddressOf())))
+                    return fail("CreateVertexShader (bars)");
+                if (FAILED(m_device->CreatePixelShader(
                         g_overlay_bars_ps, sizeof(g_overlay_bars_ps),
-                        nullptr, m_barsPS.GetAddressOf())) ||
-                    FAILED(m_device->CreateVertexShader(
+                        nullptr, m_barsPS.GetAddressOf())))
+                    return fail("CreatePixelShader (bars)");
+                if (FAILED(m_device->CreateVertexShader(
                         g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
-                        nullptr, m_quadVS.GetAddressOf())) ||
-                    FAILED(m_device->CreatePixelShader(
+                        nullptr, m_quadVS.GetAddressOf())))
+                    return fail("CreateVertexShader (quad)");
+                if (FAILED(m_device->CreatePixelShader(
                         g_overlay_quad_ps, sizeof(g_overlay_quad_ps),
                         nullptr, m_quadPS.GetAddressOf())))
-                    return false;
+                    return fail("CreatePixelShader (quad)");
 
                 // Input layouts. Slot 0 = per-vertex unit-quad corner;
                 // slot 1 = per-instance data. Offsets match the structs
@@ -1874,7 +1890,7 @@ namespace openxr_api_layer::detail {
                         barsIL, _countof(barsIL),
                         g_overlay_bars_vs, sizeof(g_overlay_bars_vs),
                         m_barsLayout.GetAddressOf())))
-                    return false;
+                    return fail("CreateInputLayout (bars)");
 
                 const D3D11_INPUT_ELEMENT_DESC quadIL[] = {
                     {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
@@ -1888,7 +1904,7 @@ namespace openxr_api_layer::detail {
                         quadIL, _countof(quadIL),
                         g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
                         m_quadLayout.GetAddressOf())))
-                    return false;
+                    return fail("CreateInputLayout (quad)");
 
                 // Static unit-quad vertex buffer: 4 corners for a triangle
                 // strip. corner.x ∈ {0,1} → left/right, corner.y ∈ {0,1} →
@@ -1901,18 +1917,33 @@ namespace openxr_api_layer::detail {
                                    D3D11_BIND_VERTEX_BUFFER,
                                    D3D11_USAGE_IMMUTABLE,
                                    m_quadVB))
-                    return false;
+                    return fail("CreateBuffer (unit quad VB)");
 
-                // Dynamic instance + constant buffers.
+                // Dynamic instance buffers + the bars constant buffer
+                // (refilled per panel per frame).
                 if (!createDynamic(kRingSize * sizeof(BarInstance),
-                                    D3D11_BIND_VERTEX_BUFFER, m_barInstances) ||
-                    !createDynamic(kQuadSlots * sizeof(QuadInstance),
-                                    D3D11_BIND_VERTEX_BUFFER, m_quadInstances) ||
-                    !createDynamic(sizeof(BarConstants),
-                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB) ||
-                    !createDynamic(sizeof(QuadConstants),
-                                    D3D11_BIND_CONSTANT_BUFFER, m_quadCB))
-                    return false;
+                                    D3D11_BIND_VERTEX_BUFFER, m_barInstances))
+                    return fail("CreateBuffer (bar instances)");
+                if (!createDynamic(kQuadSlots * sizeof(QuadInstance),
+                                    D3D11_BIND_VERTEX_BUFFER, m_quadInstances))
+                    return fail("CreateBuffer (quad instances)");
+                if (!createDynamic(sizeof(BarConstants),
+                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB))
+                    return fail("CreateBuffer (bar constants)");
+
+                // The quad constant buffer carries only texSize, which is
+                // invariant — initialise it IMMUTABLE so drawPanel doesn't
+                // re-map+memcpy 16 bytes per panel per frame (2× per frame
+                // total in the host's hot path).
+                const QuadConstants quadCBInit{
+                    { static_cast<float>(kTexW), static_cast<float>(kTexH) },
+                    { 0.0f, 0.0f }
+                };
+                if (!createBuffer(&quadCBInit, sizeof(quadCBInit),
+                                   D3D11_BIND_CONSTANT_BUFFER,
+                                   D3D11_USAGE_IMMUTABLE,
+                                   m_quadCB))
+                    return fail("CreateBuffer (quad constants, immutable)");
 
                 // Straight alpha-over blend.
                 D3D11_BLEND_DESC bd{};
@@ -1927,7 +1958,7 @@ namespace openxr_api_layer::detail {
                     D3D11_COLOR_WRITE_ENABLE_ALL;
                 if (FAILED(m_device->CreateBlendState(
                         &bd, m_blend.GetAddressOf())))
-                    return false;
+                    return fail("CreateBlendState");
 
                 // No culling, scissor ON (confines every draw to the panel's
                 // histo rect so nothing bleeds into the chrome).
@@ -1938,7 +1969,7 @@ namespace openxr_api_layer::detail {
                 rd.DepthClipEnable = TRUE;
                 if (FAILED(m_device->CreateRasterizerState(
                         &rd, m_raster.GetAddressOf())))
-                    return false;
+                    return fail("CreateRasterizerState");
 
                 m_ready = true;
                 return true;
@@ -1948,7 +1979,14 @@ namespace openxr_api_layer::detail {
 
             // Paint one panel's histogram region (bg + grid + bars + budget)
             // into the shim. Rect is in shim pixels; isGpu picks the teal vs
-            // blue gradient. budgetNs <= 0 → nothing meaningful to draw.
+            // blue gradient. budgetNs <= 0 (no display-period info yet
+            // from the runtime — the first few frames before
+            // xrWaitFrame's predicted period lands) still paints the
+            // bg/grid/budget chrome; only the bars themselves are
+            // skipped (each one has no reference height, so
+            // barVisualForSample returns heightFraction 0 and the loop
+            // emits no instances). That keeps the histo region from
+            // freezing on stale shim content during the warm-up.
             void drawPanel(const HistogramRing<kRingSize>& ring,
                             int64_t budgetNs,
                             float histoL, float histoT,
@@ -1957,7 +1995,7 @@ namespace openxr_api_layer::detail {
                 if (!m_ready) return;
                 const float fullW = histoR - histoL;
                 const float stripH = histoB - histoT;
-                if (fullW <= 0.0f || stripH <= 0.0f || budgetNs <= 0) return;
+                if (fullW <= 0.0f || stripH <= 0.0f) return;
 
                 const std::size_t n = ring.size();
                 // Fixed integer bar geometry: 4-px bars + 1-px gaps
@@ -1972,8 +2010,16 @@ namespace openxr_api_layer::detail {
                 constexpr float kStepPx = 5.0f;   // 4-px bar + 1-px gap
                 const float usedW = static_cast<float>(n) * kStepPx - 1.0f;
                 const float slack = fullW - usedW;
-                const float startX = histoL +
-                    (slack > 0.0f ? std::floor(slack * 0.5f + 0.5f) : 0.0f);
+                // Positive slack → centre the run (equal L/R margins).
+                // Negative slack (strip narrower than the run, e.g. if a
+                // future layout tweak shrinks fullW): shift the start
+                // LEFT by the deficit so the rightmost bars stay flush
+                // with histoR. The scissor then clips the leftmost
+                // (oldest) bars rather than the rightmost (newest) —
+                // the newest sample carries the most signal.
+                const float startX = histoL + (slack >= 0.0f
+                    ? std::floor(slack * 0.5f + 0.5f)
+                    : slack);
 
                 // --- refill bar instances from the ring ---
                 UINT barCount = 0;
@@ -2016,7 +2062,7 @@ namespace openxr_api_layer::detail {
                             q[i] = makeQuad(histoL, y, fullW, 1.0f, kGridDash);
                         }
                         const float by =
-                            histoT + stripH * (1.0f / 6.0f);  // budgetLineFraction
+                            histoT + stripH * budgetLineFraction();
                         q[5] = makeQuad(histoL, by, fullW, 1.0f, kBudgetLine);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
                     }
@@ -2030,18 +2076,15 @@ namespace openxr_api_layer::detail {
                     bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
                     bc.barWidth = kBarPx;   // fixed 4-px integer width
-                    bc.dashHeight = 2.0f;
+                    bc.dashHeight = kDashPlaceholderH;  // shared with D2D path
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
                     copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
                     copyColor(bc.orange, kOrange);
                     copyColor(bc.red,    kRed);
                     copyColor(bc.dash,   kGridDash);
                     upload(m_barCB, &bc, sizeof(bc));
-
-                    QuadConstants qc{};
-                    qc.texSize[0] = static_cast<float>(kTexW);
-                    qc.texSize[1] = static_cast<float>(kTexH);
-                    upload(m_quadCB, &qc, sizeof(qc));
+                    // m_quadCB is IMMUTABLE (texSize is invariant — see
+                    // init()), so no re-upload here.
                 }
 
                 // --- pipeline state (D2D clobbered it; set everything) ---
@@ -2061,24 +2104,35 @@ namespace openxr_api_layer::detail {
                 m_ctx->IASetPrimitiveTopology(
                     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-                // quad pass 1 — bg + 4 grid lines (instances 0..4)
+                // Three draw passes per panel. Layering relies on D3D11's
+                // documented in-order primitive submission: bg + 4 grid
+                // lines (alpha-over) → opaque bars → budget line (alpha-
+                // over). Without that guarantee the alpha-blended grid and
+                // budget could land on the wrong side of the bars.
+                //
+                // quad pass 1 — bg (instance 0) + 4 grid lines (1..4).
                 bindQuadPipeline();
                 m_ctx->DrawInstanced(4, 5, 0, 0);
 
-                // bar pass — samples on top of bg/grid (instances 0..barCount)
+                // bar pass — samples on top of bg/grid (instances 0..barCount).
                 if (barCount > 0) {
                     bindBarPipeline();
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
                 }
 
-                // quad pass 2 — budget line on top of the bars (instance 5)
+                // quad pass 2 — budget line on top of the bars (instance 5).
                 bindQuadPipeline();
                 m_ctx->DrawInstanced(4, 1, 0, 5);
             }
 
           private:
             // Per-instance / constant layouts — must match the HLSL byte for
-            // byte (see overlay_bars.hlsli / overlay_quad.hlsli).
+            // byte (see overlay_bars.hlsli / overlay_quad.hlsli). The
+            // static_asserts below freeze the C++ side's sizeof so a future
+            // member insertion (e.g. a stray float between dashHeight and
+            // gradTop) can't silently shift every colour off by 8 bytes.
+            // Mirror cbuffer layout: 7×float4 registers (112 B) for bars,
+            // 1×float4 register (16 B) for quads.
             struct BarInstance  { float xLeft; float height; uint32_t tier; };
             struct QuadInstance { float rect[4]; float color[4]; };
             struct BarConstants {
@@ -2088,6 +2142,12 @@ namespace openxr_api_layer::detail {
                 float orange[4]; float red[4]; float dash[4];
             };
             struct QuadConstants { float texSize[2]; float pad[2]; };
+            static_assert(sizeof(BarConstants)  == 112,
+                          "BarConstants must mirror HLSL cbuffer packing "
+                          "(7 × float4 = 112 B) — see overlay_bars.hlsli");
+            static_assert(sizeof(QuadConstants) == 16,
+                          "QuadConstants must mirror HLSL cbuffer packing "
+                          "(1 × float4 = 16 B) — see overlay_quad.hlsli");
 
             static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
 

@@ -22,8 +22,9 @@
 
 // =============================================================================
 // overlay_bars_vs.hlsl — vertex shader for the instanced histogram bars.
-// Compiled offline (vs_5_0) by the FxCompile build step into an embedded
-// bytecode header; see openxr-api-layer.vcxproj.
+// Compiled offline (vs_4_0, ShaderModel 4.0 = feature level 10_0) by the
+// FxCompile build step into an embedded bytecode header; see the
+// FxCompile items in openxr-api-layer.vcxproj.
 // =============================================================================
 
 #include "overlay_bars.hlsli"
