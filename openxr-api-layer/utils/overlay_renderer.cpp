@@ -666,6 +666,17 @@ namespace openxr_api_layer::detail {
                 return SUCCEEDED(rt->EndDraw());
             }
 
+            // Accessors for the shader-path orchestrator (paintShim
+            // ViaShader). It uses these to decide whether to issue
+            // the GPU chrome-erase pass before paintChromeOnly:
+            // skipped on the very first call (drawChrome already
+            // writes the values), and the bottom-row erase is only
+            // included on the 2 Hz tick.
+            bool chromeStaticPainted() const noexcept {
+                return m_chromeStaticPainted;
+            }
+            int valueOnlyTick() const noexcept { return m_valueOnlyTick; }
+
           private:
             // The static-tier drawing shared by paint() and
             // paintChromeOnly(): outer chamfered frame, header bar,
@@ -772,13 +783,14 @@ namespace openxr_api_layer::detail {
                                       ID2D1Brush* brush) {
                         const float cl = kInnerL + cellW * static_cast<float>(col);
                         const float cr = kInnerL + cellW * static_cast<float>(col + 1);
-                        // Erase only the value region (label above
-                        // valueY stays intact).
-                        rt->FillRectangle(
-                            D2D1::RectF(cl, valueY, cr, valueBottom),
-                            m_brushPanelBg.Get());
-                        // Re-draw the value — same rect math as
-                        // drawHeaderCell.
+                        // The value region's erase was done before
+                        // BeginDraw by HistogramBarRenderer::erase
+                        // ChromeRects (one instanced GPU draw for all
+                        // 7-12 value rects), so we only need to
+                        // re-draw the text here. See paintShimVia
+                        // Shader for the orchestration and
+                        // computeChromeValueRects for the matching
+                        // rect math.
                         const D2D1_RECT_F valueRect = D2D1::RectF(
                             cl, valueY - 2.0f, cr,
                             valueY + kFontBigNumber + 6.0f);
@@ -805,10 +817,10 @@ namespace openxr_api_layer::detail {
                     const float titleT = panelTop + kPanelTitleTopPad;
                     const float titleB = titleT + kHistoTitleH;
                     if (secondaryValue.empty()) {
+                        // Erase pre-done on GPU — see header comment.
                         const D2D1_RECT_F rect = D2D1::RectF(
                             kInnerR - kSectionInnerPad - 160.0f, titleT,
                             kInnerR - kSectionInnerPad,          titleB);
-                        rt->FillRectangle(rect, m_brushPanelBg.Get());
                         const std::string s = currentValue + " ms";
                         drawValueAscii(rt, s, m_fmtMsValue.Get(), rect,
                                         m_brushAccentCyan.Get());
@@ -816,7 +828,6 @@ namespace openxr_api_layer::detail {
                         const D2D1_RECT_F rect = D2D1::RectF(
                             kInnerR - kSectionInnerPad - 320.0f, titleT,
                             kInnerR - kSectionInnerPad,          titleB);
-                        rt->FillRectangle(rect, m_brushPanelBg.Get());
                         const std::string compound =
                             "App " + secondaryValue + " ms / Render "
                             + currentValue + " ms";
@@ -866,12 +877,11 @@ namespace openxr_api_layer::detail {
                                             const wchar_t* unitSuffix,
                                             ID2D1Brush* valueBrush,
                                             bool useWideValue) {
-                        // Erase below the label only.
-                        rt->FillRectangle(
-                            D2D1::RectF(cellL, labelBottom, cellR, bottomB),
-                            m_brushPanelBg.Get());
-                        // Re-draw paragraph-centred in the full cell
-                        // rect — matches drawBottomPanel's drawCell.
+                        // Erase pre-done on GPU when this tick is on
+                        // the bottom-row 2 Hz cadence — see paintShim
+                        // ViaShader. Re-draw paragraph-centred in the
+                        // full cell rect — matches drawBottomPanel's
+                        // drawCell.
                         const D2D1_RECT_F valueRect = D2D1::RectF(
                             cellL, bottomY, cellR, bottomB);
                         if (useWideValue) {
@@ -2216,6 +2226,63 @@ namespace openxr_api_layer::detail {
 
             bool isReady() const noexcept { return m_ready; }
 
+            // Erase up to kQuadSlots chrome value rects to a single
+            // colour via the quad shader. Used by the shader-path
+            // orchestrator (paintShimViaShader) to fold the per-value
+            // D2D FillRectangle erases that paintChromeOnly used to do
+            // into ONE instanced GPU draw — runs BEFORE the D2D values
+            // pass, so the D2D RT sees an already-erased background
+            // when drawValuesIntoChrome lays the text over it. Caller
+            // is responsible for passing the right rects (and they
+            // must match the rects drawValuesIntoChrome writes into);
+            // computeChromeValueRects() centralises both.
+            void eraseChromeRects(const D2D1_RECT_F* rects, UINT count,
+                                    const float color[4]) {
+                if (!m_ready || count == 0 || count > kQuadSlots) return;
+
+                // Refill m_quadInstances with `count` rects, all the
+                // same colour. Same buffer drawPanel() uses for its
+                // bg/grid/budget batch — they never overlap, each
+                // caller maps with DISCARD so the prior contents are
+                // discarded by the driver.
+                {
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (FAILED(m_ctx->Map(m_quadInstances.Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &map))) return;
+                    auto* q = static_cast<QuadInstance*>(map.pData);
+                    for (UINT i = 0; i < count; ++i) {
+                        q[i].rect[0] = rects[i].left;
+                        q[i].rect[1] = rects[i].top;
+                        q[i].rect[2] = rects[i].right  - rects[i].left;
+                        q[i].rect[3] = rects[i].bottom - rects[i].top;
+                        copyColor(q[i].color, color);
+                    }
+                    m_ctx->Unmap(m_quadInstances.Get(), 0);
+                }
+
+                // Pipeline state. Scissor wide open: the rect data is
+                // already in shim pixels, so we don't want a scissor
+                // box restricting where the erases can land. (Cheaper
+                // than re-setting RSSetState to a no-scissor variant.)
+                m_ctx->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+                const D3D11_VIEWPORT vp{
+                    0.0f, 0.0f,
+                    static_cast<float>(kTexW),
+                    static_cast<float>(kTexH), 0.0f, 1.0f};
+                m_ctx->RSSetViewports(1, &vp);
+                const D3D11_RECT scissor{
+                    0, 0, static_cast<LONG>(kTexW),
+                    static_cast<LONG>(kTexH)};
+                m_ctx->RSSetScissorRects(1, &scissor);
+                m_ctx->RSSetState(m_raster.Get());
+                const float bf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                m_ctx->OMSetBlendState(m_blend.Get(), bf, 0xffffffffu);
+                m_ctx->IASetPrimitiveTopology(
+                    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                bindQuadPipeline();
+                m_ctx->DrawInstanced(4, count, 0, 0);
+            }
+
             // Paint one panel's histogram region (bg + grid + bars + budget)
             // into the shim. Rect is in shim pixels; isGpu picks the teal vs
             // blue gradient. budgetNs <= 0 (no display-period info yet
@@ -2388,7 +2455,16 @@ namespace openxr_api_layer::detail {
                           "QuadConstants must mirror HLSL cbuffer packing "
                           "(1 × float4 = 16 B) — see overlay_quad.hlsli");
 
-            static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
+            // The quad-instance buffer is sized for the LARGER of:
+            //   - drawPanel's per-frame fill (bg + 4 grid + budget = 6)
+            //   - eraseChromeRects()'s max chrome-value erase batch
+            //     (5 header + 2 frametime + 5 bottom = 12)
+            // Same buffer, two callers, neither overlaps: drawPanel
+            // maps with DISCARD on the histogram pass; eraseChromeRects
+            // remaps with DISCARD before its single erase draw. The 12
+            // upper bound is also enforced at the call site in
+            // computeChromeValueRects().
+            static constexpr UINT kQuadSlots = 12;
 
             // Colours (linear RGBA), copied from initBrushes().
             static constexpr float kPanelBg[4]    = {0.035f, 0.039f, 0.039f, 1.00f};
@@ -2493,6 +2569,92 @@ namespace openxr_api_layer::detail {
         // defensive. Shared by both renderers so a tweak lands once.
         constexpr int kChromeWatchdogFrames = 30;
 
+        // -------- Chrome value-rect computation -----------------------------
+        //
+        // Single source of truth for the rectangles the shader path
+        // erases on each values-only chrome refresh. Two callers:
+        //   - paintShimViaShader passes them to HistogramBarRenderer
+        //     ::eraseChromeRects (one instanced GPU draw clears all
+        //     of them to panel-bg before the D2D values pass).
+        //   - drawValuesIntoChrome lays the new text into the same
+        //     coordinates (its inline cell math MUST match what this
+        //     function computes — see the per-block comments here
+        //     and the matching layout comments there; both derive
+        //     from kInner{L,R,T} + kHeaderHeight + kSectionGap +
+        //     kFrametimeHeight + kBottomHeight, no runtime input).
+        //
+        // 5 header + 2 frametime = 7 rects every tick; the 5 bottom
+        // rects are appended only when `includeBottomRow` is true
+        // (the 2 Hz cadence — every 5th values-only paint).
+        constexpr UINT kMaxChromeValueRects = 12;
+        inline UINT computeChromeValueRects(D2D1_RECT_F* out,
+                                             bool includeBottomRow) {
+            UINT count = 0;
+            const float gpuPanelY = kInnerT + kHeaderHeight + kSectionGap;
+            const float cpuPanelY =
+                gpuPanelY + kFrametimeHeight + kSectionGap;
+
+            // Header bar: 5 cells, value rect below the 22-px label.
+            {
+                const float cellW       = (kInnerR - kInnerL) / 5.0f;
+                const float labelY      = kInnerT + 4.0f;
+                const float valueY      = labelY + 22.0f;
+                const float valueBottom = valueY + kFontBigNumber + 6.0f;
+                for (int i = 0; i < 5; ++i) {
+                    const float cl = kInnerL + cellW * static_cast<float>(i);
+                    const float cr = kInnerL + cellW * static_cast<float>(i + 1);
+                    out[count++] = D2D1::RectF(cl, valueY, cr, valueBottom);
+                }
+            }
+
+            // Frametime panels: top-right value rect, 160 px / 320 px
+            // wide for GPU / CPU. titleT/titleB match drawFrametime
+            // Panel().
+            const float gpuTitleT = gpuPanelY + kPanelTitleTopPad;
+            const float gpuTitleB = gpuTitleT + kHistoTitleH;
+            out[count++] = D2D1::RectF(
+                kInnerR - kSectionInnerPad - 160.0f, gpuTitleT,
+                kInnerR - kSectionInnerPad,          gpuTitleB);
+            const float cpuTitleT = cpuPanelY + kPanelTitleTopPad;
+            const float cpuTitleB = cpuTitleT + kHistoTitleH;
+            out[count++] = D2D1::RectF(
+                kInnerR - kSectionInnerPad - 320.0f, cpuTitleT,
+                kInnerR - kSectionInnerPad,          cpuTitleB);
+
+            // Bottom row (GPU 3 cells + CPU 2 cells) only on the 2 Hz
+            // tick — see drawValuesIntoChrome's matching guard.
+            if (includeBottomRow) {
+                const float bottomCellW =
+                    (kInnerR - kInnerL - kSectionGap) / 5.0f;
+                const float gpuPanelL = kInnerL;
+                const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
+                const float cpuPanelL = gpuPanelR + kSectionGap;
+                const float cpuPanelR = kInnerR;
+                const float bottomY   =
+                    cpuPanelY + kFrametimeHeight + kSectionGap;
+                const float bottomB     = bottomY + kBottomHeight;
+                const float labelBottom = bottomY + 4.0f + 22.0f;
+
+                const float gpuColW = (gpuPanelR - gpuPanelL) / 3.0f;
+                for (int i = 0; i < 3; ++i) {
+                    out[count++] = D2D1::RectF(
+                        gpuPanelL + gpuColW * static_cast<float>(i),
+                        labelBottom,
+                        gpuPanelL + gpuColW * static_cast<float>(i + 1),
+                        bottomB);
+                }
+                const float cpuColW = (cpuPanelR - cpuPanelL) / 2.0f;
+                for (int i = 0; i < 2; ++i) {
+                    out[count++] = D2D1::RectF(
+                        cpuPanelL + cpuColW * static_cast<float>(i),
+                        labelBottom,
+                        cpuPanelL + cpuColW * static_cast<float>(i + 1),
+                        bottomB);
+                }
+            }
+            return count;
+        }
+
         // -------- Shared shader-path paint -----------------------------------
         //
         // D2D chrome (only when snap.version ticks or the watchdog fires)
@@ -2530,6 +2692,30 @@ namespace openxr_api_layer::detail {
 
             bool ok = true;
             if (needStatic) {
+                // Values-only refresh path (chrome already in the
+                // shim from a prior full paint): erase the variable
+                // value rects to panel-bg via the GPU quad shader —
+                // one instanced DrawInstanced replaces 7-12 D2D
+                // FillRectangle calls. Then paintChromeOnly's else-
+                // branch redraws the text into the cleared rects.
+                //
+                // First-paint path (chromeStaticPainted == false):
+                // skip the GPU erase — paintChromeOnly will Clear
+                // the whole shim and run a full drawChrome.
+                //
+                // The bottom-row erase rect set is included only on
+                // the 2 Hz cadence tick, matching drawValuesInto
+                // Chrome's own `m_valueOnlyTick % 5 == 0` guard.
+                if (core.chromeStaticPainted()) {
+                    D2D1_RECT_F eraseRects[kMaxChromeValueRects];
+                    const bool includeBottomRow =
+                        (core.valueOnlyTick() % 5 == 0);
+                    const UINT n = computeChromeValueRects(
+                        eraseRects, includeBottomRow);
+                    constexpr float kPanelBgColor[4] =
+                        {0.035f, 0.039f, 0.039f, 1.00f};
+                    bars.eraseChromeRects(eraseRects, n, kPanelBgColor);
+                }
                 ok = core.paintChromeOnly(shimRT, snap);
             }
 
