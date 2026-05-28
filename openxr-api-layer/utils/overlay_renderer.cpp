@@ -24,6 +24,8 @@
 
 #include "overlay_renderer.h"
 
+#include "glyph_atlas.h"
+#include "glyph_atlas_renderer.h"
 #include "histogram_ring.h"
 #include "overlay_cadence.h"
 #include "overlay_layout.h"
@@ -405,8 +407,35 @@ namespace openxr_api_layer::detail {
                 // Barlow (this) have proportional figures by default
                 // — switching fonts doesn't introduce regression on
                 // this axis, both versions of the HUD jitter equally.
+
+                // Bake the glyph atlas. Soft-failure path: if the
+                // build fails (font face unresolvable, atlas too
+                // small), m_atlasReady stays false and the GPU text
+                // renderer skips its init — the D2D text path keeps
+                // working. Never crash the host process for a glyph
+                // miss.
+                if (!buildGlyphAtlas(kFamilyChiffres, kFamilyLabels,
+                                      customCollection)) {
+                    Log("xr_telemetry: glyph atlas build failed — "
+                        "GPU text path disabled, D2D fallback "
+                        "active\n");
+                    m_atlasReady = false;
+                } else {
+                    m_atlasReady = true;
+                }
                 return true;
             }
+
+            // -------- Glyph-atlas accessors ---------------------------------
+            //
+            // The atlas is built once at init from the same
+            // IDWriteFactory + custom collection the IDWriteTextFormat
+            // pipeline uses, so it shares the exact font cuts with the
+            // D2D path. Both overlay renderers (D3D11 + D3D12) copy
+            // from this BuildResult into their own ID3D11Device-bound
+            // atlas texture via glyph_atlas::Renderer::init.
+            const glyph_atlas::BuildResult& atlas() const noexcept { return m_atlas; }
+            bool atlasReady() const noexcept { return m_atlasReady; }
 
             ID2D1Factory* d2d() const noexcept { return m_d2dFactory.Get(); }
 
@@ -752,6 +781,76 @@ namespace openxr_api_layer::detail {
                 }
                 out->SetTextAlignment(alignment);
                 out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                return true;
+            }
+
+            // -------- Glyph-atlas BuildSpec assembly + bake -----------------
+            //
+            // Bakes Barlow Medium Italic + Rajdhani SemiBold (with system
+            // Bahnschrift fallback) at every pixel size any IDWriteTextFormat
+            // above uses. The charset is wide enough to cover everything the
+            // overlay ever renders — see findValueRuns / drawChrome /
+            // drawBottomPanel for the actual call sites:
+            //
+            //   Rajdhani upright (kFamilyLabels): ASCII 0x20..0x7E (the
+            //     97-char printable range, conservatively wide so we don't
+            //     re-bake every time a label string changes) + ° (U+00B0)
+            //     for the temperature unit suffix.
+            //   Barlow italic   (kFamilyChiffres): digits 0-9 plus '.' (the
+            //     period appears between digits in "12.34" / "6.7 ms" and
+            //     stays inside the italic range — see findValueRuns). Minus
+            //     '-' is leading-only today and stays upright Rajdhani, but
+            //     we still bake it as cheap insurance.
+            //
+            // Sizes are the union of every kFont* constant used in
+            // makeFormat() above: 17 (tiny label), 18 (ms / section title),
+            // 32 (accent number), 43 (temp), 52 (big FPS). kFontTempUnit
+            // (19 px) is documented as the unit-suffix size but no
+            // IDWriteTextFormat actually carries it today, so it's
+            // intentionally omitted from the atlas.
+            bool buildGlyphAtlas(const wchar_t*         familyChiffres,
+                                  const wchar_t*         familyLabels,
+                                  IDWriteFontCollection* collection) {
+                static constexpr uint16_t kSizes[] = {17, 18, 32, 43, 52};
+
+                std::vector<wchar_t> rajdhaniSet;
+                rajdhaniSet.reserve(97 + 1);
+                for (wchar_t c = 0x20; c <= 0x7E; ++c) rajdhaniSet.push_back(c);
+                rajdhaniSet.push_back(static_cast<wchar_t>(0x00B0));  // °
+
+                std::vector<wchar_t> barlowItalicSet = {
+                    L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
+                    L'8', L'9', L'.', L'-'
+                };
+
+                glyph_atlas::BuildSpec spec{};
+                spec.dwriteFactory  = m_dwriteFactory;
+                // Custom collection may be null on the system-fallback
+                // path; resolveFace inside glyph_atlas::build handles
+                // both cases.
+                spec.fontCollection = collection;
+                spec.familyChiffres = familyChiffres;
+                spec.familyLabels   = familyLabels;
+                spec.atlasWidthPx   = 1024;
+                spec.atlasHeightPx  = 1024;
+                spec.padding        = 1;
+
+                spec.requests.reserve(_countof(kSizes) * 2);
+                for (uint16_t sz : kSizes) {
+                    spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
+                                              sz, rajdhaniSet});
+                    spec.requests.push_back({glyph_atlas::GlyphFace::BarlowItalic,
+                                              sz, barlowItalicSet});
+                }
+
+                if (!glyph_atlas::build(spec, m_atlas)) return false;
+                if (m_atlas.missingGlyphs > 0) {
+                    Log(fmt::format(
+                        "xr_telemetry: glyph atlas built with {} missing "
+                        "glyphs — those characters will fall back to "
+                        "their face's space advance at draw time\n",
+                        m_atlas.missingGlyphs));
+                }
                 return true;
             }
 
@@ -1809,6 +1908,15 @@ namespace openxr_api_layer::detail {
             static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
             PaintCadence         m_cadence;
+
+            // Glyph atlas — baked once at init from the same DirectWrite
+            // factory + custom collection above. Held as CPU-side data
+            // (bitmap + glyph table + per-face metrics); each overlay
+            // renderer copies what it needs into its own D3D11 atlas
+            // texture during its own init. Stays valid for CoreRenderer's
+            // lifetime so the renderers don't have to clone the bitmap.
+            glyph_atlas::BuildResult m_atlas;
+            bool                     m_atlasReady = false;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
@@ -2799,6 +2907,25 @@ namespace openxr_api_layer::detail {
                         "unavailable — falling back to D2D bar rendering\n");
                 }
 
+                // GPU text path. Initialised against the same private
+                // device + shim that the bars target so all GPU drawing
+                // shares one immediate context. Failure here is
+                // non-fatal too: m_useGlyphAtlas stays false and the
+                // D2D text path keeps painting chrome / values for as
+                // long as CoreRenderer's IDWriteTextFormat objects are
+                // alive. (Phase A: renderer constructed but not yet
+                // invoked from the paint path — that wiring lands in
+                // Phase B.)
+                m_useGlyphAtlas =
+                    m_useShaderBars &&
+                    m_core.atlasReady() &&
+                    m_glyphRenderer.init(m_myDevice, m_myContext,
+                                          m_myShim, m_core.atlas());
+                if (!m_useGlyphAtlas) {
+                    Log("xr_telemetry: overlay GPU text path "
+                        "unavailable — falling back to D2D text rendering\n");
+                }
+
                 // Fill the immutable XrCompositionLayerQuad fields
                 // now that m_swapchain is alive. SOURCE_ALPHA blending
                 // + identity orientation are documented in the long
@@ -2888,6 +3015,15 @@ namespace openxr_api_layer::detail {
             // falls back to the full D2D paint().
             HistogramBarRenderer        m_bars;
             bool                        m_useShaderBars = false;
+            // GPU text renderer: samples the pre-baked glyph atlas
+            // (built once on CoreRenderer's DirectWrite factory) to
+            // emit one instanced quad per glyph. Replaces the per-call
+            // D2D DrawText / DrawTextLayout work for chrome labels +
+            // mixed value strings. m_useGlyphAtlas gates wiring just
+            // like m_useShaderBars — on failure we fall back to D2D
+            // text and never crash the host.
+            glyph_atlas::Renderer       m_glyphRenderer;
+            bool                        m_useGlyphAtlas = false;
             // Chrome cadence for the shader path: the bars redraw every
             // frame on the GPU, the D2D chrome only when snap.version
             // ticks or the watchdog fires (kChromeWatchdogFrames lives
@@ -3211,6 +3347,24 @@ namespace openxr_api_layer::detail {
                         "unavailable — falling back to D2D bar rendering\n");
                 }
 
+                // GPU text path on the D3D11On12 bridge. Same shim, same
+                // private D3D11 device/context as the bars — the atlas
+                // texture is a different ID3D11Texture2D (separate
+                // device) than the D3D11 path's atlas, but both copy
+                // from the same CoreRenderer-owned BuildResult bitmap
+                // so the glyphs are pixel-identical across paths.
+                // (Phase A: constructed but not yet invoked from the
+                // paint path — wiring lands in Phase B.)
+                m_useGlyphAtlas =
+                    m_useShaderBars &&
+                    m_core.atlasReady() &&
+                    m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
+                                          m_shimTexture, m_core.atlas());
+                if (!m_useGlyphAtlas) {
+                    Log("xr_telemetry: D3D12 overlay GPU text path "
+                        "unavailable — falling back to D2D text rendering\n");
+                }
+
                 // One-time fill of the immutable quad-layer fields;
                 // mirror of the D3D11 path's helper (no need to share
                 // since each renderer owns its own m_swapchain and
@@ -3269,6 +3423,14 @@ namespace openxr_api_layer::detail {
             // bridge overhead is unchanged.
             HistogramBarRenderer                  m_bars;
             bool                                  m_useShaderBars = false;
+            // GPU text renderer on the D3D11On12 bridge. Atlas texture
+            // lives on the private D3D11 device; the atlas bitmap is
+            // copied from CoreRenderer's BuildResult, so glyph cuts
+            // match the D3D11 path's renderer bit-for-bit. Soft-fails
+            // the same way m_useShaderBars does — D2D text path is
+            // the fallback while wiring is in progress.
+            glyph_atlas::Renderer                 m_glyphRenderer;
+            bool                                  m_useGlyphAtlas = false;
             // Chrome cadence for the shader path — paints D2D only on
             // snap.version ticks or the watchdog. Same kChromeWatchdog
             // Frames constant as the D3D11 path, hoisted to namespace

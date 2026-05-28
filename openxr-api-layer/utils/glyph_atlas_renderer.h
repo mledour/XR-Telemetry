@@ -82,16 +82,22 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // today the cross-device shim, eventually the D3D11-wrapped
         // swapchain image directly (Task 15 in the migration plan).
         //
-        // `atlas` is moved in: the bitmap memory is uploaded into the
-        // GPU texture and then dropped; the glyph + metrics tables stay
-        // and are queried per drawRun.
+        // `atlas` is taken by const-ref: each renderer creates its own
+        // ID3D11Texture2D from the bitmap (the bitmap copy happens via
+        // CreateTexture2D's SUBRESOURCE_DATA — D3D11 reads it once and
+        // owns the GPU copy), and copies the glyph + metrics tables.
+        // This lets a single BuildResult (typically built once on
+        // CoreRenderer's DirectWrite factory) feed multiple renderers
+        // sitting on different ID3D11Devices — today the app-D3D11
+        // device and the D3D11-on-12 shim device, tomorrow potentially
+        // additional debug viewers.
         //
         // Returns false on any pipeline-creation failure. Caller logs +
         // degrades to bypass — never crashes the host.
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>          device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext>   ctx,
                   Microsoft::WRL::ComPtr<ID3D11Texture2D>       renderTarget,
-                  BuildResult&&                                 atlas);
+                  const BuildResult&                            atlas);
 
         bool isReady() const noexcept { return m_ready; }
 
@@ -170,7 +176,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
 
         bool createPipeline();              // shaders + input layout + states
         bool createBuffers();               // VB + IB + CB
-        bool createAtlasTexture(BuildResult& atlas);
+        bool createAtlasTexture(const BuildResult& atlas);
         bool growInstanceBuffer(UINT desired);
 
         // Map a fallback advance for a missing glyph: use ' ' at the same

@@ -49,7 +49,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
     bool Renderer::init(ComPtr<ID3D11Device>        device,
                         ComPtr<ID3D11DeviceContext> ctx,
                         ComPtr<ID3D11Texture2D>     renderTarget,
-                        BuildResult&&               atlas) {
+                        const BuildResult&          atlas) {
         if (!device || !ctx || !renderTarget) return false;
         if (atlas.atlasWidth == 0 || atlas.atlasHeight == 0) return false;
         if (atlas.bitmap.empty()) return false;
@@ -80,11 +80,13 @@ namespace openxr_api_layer::utils::glyph_atlas {
         if (!createBuffers())        return fail("createBuffers");
         if (!createAtlasTexture(atlas)) return fail("createAtlasTexture");
 
-        // Move the atlas tables onto our long-lived storage. The bitmap
-        // itself is now uploaded into the GPU texture, so we drop the
-        // CPU copy by letting `atlas` go out of scope at the caller.
-        m_glyphs       = std::move(atlas.glyphs);
-        m_faceMetrics  = std::move(atlas.faceMetrics);
+        // Copy the atlas tables onto our long-lived storage. The bitmap
+        // itself was already pushed into the GPU texture by
+        // createAtlasTexture (CreateTexture2D + SUBRESOURCE_DATA), so the
+        // CPU-side bitmap can stay shared with whatever the caller's
+        // BuildResult holder owns.
+        m_glyphs       = atlas.glyphs;
+        m_faceMetrics  = atlas.faceMetrics;
         m_atlasW       = atlas.atlasWidth;
         m_atlasH       = atlas.atlasHeight;
 
@@ -241,7 +243,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // ===================================================================
     // createAtlasTexture() — upload R8 bitmap into a Texture2D + SRV.
     // ===================================================================
-    bool Renderer::createAtlasTexture(BuildResult& atlas) {
+    bool Renderer::createAtlasTexture(const BuildResult& atlas) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width            = atlas.atlasWidth;
         td.Height           = atlas.atlasHeight;
