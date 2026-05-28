@@ -81,6 +81,13 @@ namespace openxr_api_layer::detail {
     using ::openxr_api_layer::log::Log;
     using ::openxr_api_layer::log::ErrorLog;
 
+    // Local alias for the atlas namespace. Without it, unqualified
+    // `glyph_atlas::Renderer` / `glyph_atlas::BuildResult` references
+    // inside the anonymous namespace below resolve as if `glyph_atlas`
+    // were a sibling sub-namespace of `detail`, which it isn't — the
+    // module lives at openxr_api_layer::utils::glyph_atlas.
+    namespace glyph_atlas = ::openxr_api_layer::utils::glyph_atlas;
+
     namespace {
 
         // -------- Layout constants (fpsVR redesign) -------------------------
