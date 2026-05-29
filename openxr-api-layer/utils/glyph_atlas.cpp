@@ -24,10 +24,16 @@
 
 #include "glyph_atlas.h"
 
+#include "framework/log.h"   // Log()
+
 #include <algorithm>
 #include <array>
 
 namespace openxr_api_layer::utils::glyph_atlas {
+
+    // Pull Log into this namespace so diagnostic logs in build() can
+    // use it unqualified. Same pattern as overlay_renderer.cpp.
+    using ::openxr_api_layer::log::Log;
 
     namespace {
 
@@ -382,11 +388,22 @@ namespace openxr_api_layer::utils::glyph_atlas {
     }   // namespace
 
     bool build(const BuildSpec& spec, BuildResult& out) {
-        if (!spec.dwriteFactory) return false;
-        if (spec.atlasWidthPx == 0 || spec.atlasHeightPx == 0) return false;
+        if (!spec.dwriteFactory) {
+            Log("xr_telemetry: atlas build aborted — null dwriteFactory\n");
+            return false;
+        }
+        if (spec.atlasWidthPx == 0 || spec.atlasHeightPx == 0) {
+            Log("xr_telemetry: atlas build aborted — zero atlas dims\n");
+            return false;
+        }
 
         IDWriteFactory* factory = spec.dwriteFactory.Get();
         IDWriteFontCollection* collection = spec.fontCollection.Get();
+        Log(fmt::format(
+            "xr_telemetry: atlas build start — atlas={}x{}, requests={}, "
+            "customCollection={}\n",
+            spec.atlasWidthPx, spec.atlasHeightPx, spec.requests.size(),
+            collection ? "non-null" : "null"));
 
         // -------- Phase 1: resolve faces + read metrics ---------------
         //
@@ -408,6 +425,22 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 // Hard failure: a requested face couldn't be resolved
                 // even via system fallback. The renderer cannot draw
                 // anything, so we abort the build.
+                const wchar_t* fam = familyFor(req.face, spec);
+                Log(fmt::format(
+                    "xr_telemetry: atlas resolveFace failed — "
+                    "face={} size={} family=L\"{}\" weight={} style={}\n",
+                    static_cast<int>(req.face), req.sizePx,
+                    // Family name is wchar_t* — narrow it for the log via
+                    // a quick ASCII coercion (the names we use are pure
+                    // ASCII: Barlow / Rajdhani / Bahnschrift).
+                    [&]{
+                        std::string s;
+                        if (fam) for (const wchar_t* p = fam; *p; ++p)
+                            s.push_back(static_cast<char>(*p & 0x7F));
+                        return s;
+                    }(),
+                    static_cast<int>(style.weight),
+                    static_cast<int>(style.style)));
                 return false;
             }
             FaceMetrics fm{};
@@ -501,6 +534,14 @@ namespace openxr_api_layer::utils::glyph_atlas {
                     // sized for the working set; running out means the
                     // working set grew without the atlas growing with
                     // it. Bail and let the caller log + degrade.
+                    Log(fmt::format(
+                        "xr_telemetry: atlas shelf-pack overflow — "
+                        "atlas={}x{}, glyph={}x{}, shelfBaseY={}, "
+                        "shelfHeight={}, packed={}/{}\n",
+                        spec.atlasWidthPx, spec.atlasHeightPx,
+                        gw, gh,
+                        shelf.baseY, shelf.height,
+                        out.glyphs.size(), pending.size()));
                     return false;
                 }
                 blit(out.bitmap.data(), spec.atlasWidthPx, dstX, dstY, pg.raster);
