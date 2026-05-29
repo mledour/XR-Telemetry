@@ -24,16 +24,10 @@
 
 #include "glyph_atlas.h"
 
-#include "framework/log.h"   // Log()
-
 #include <algorithm>
 #include <array>
 
 namespace openxr_api_layer::utils::glyph_atlas {
-
-    // Pull Log into this namespace so diagnostic logs in build() can
-    // use it unqualified. Same pattern as overlay_renderer.cpp.
-    using ::openxr_api_layer::log::Log;
 
     namespace {
 
@@ -60,25 +54,67 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // Walks the custom collection first (Barlow / Rajdhani live
         // there) and falls back to the system collection. Returns null
         // ComPtr on miss — caller logs and continues.
+        //
+        // Lookup strategy: exact match first, then case-sensitive
+        // prefix match. The prefix fallback handles the case where
+        // DirectWrite enumerates a bundled font under its WWS / legacy
+        // family name (e.g. "Barlow Medium") rather than the
+        // typographic family ("Barlow") declared by the TTF's `name`
+        // table. The D2D CreateTextFormat path is more forgiving and
+        // tolerates the mismatch silently, but FindFamilyName is exact;
+        // without the prefix fallback the atlas build silently fails
+        // for any weight/style-suffixed bundled font.
+        ComPtr<IDWriteFontFamily> resolveFamilyIn(
+            IDWriteFontCollection* coll,
+            const wchar_t*         familyName)
+        {
+            if (!coll || !familyName) return {};
+            // Exact match.
+            {
+                UINT32 idx = 0;
+                BOOL   exists = FALSE;
+                if (SUCCEEDED(coll->FindFamilyName(familyName, &idx, &exists)) && exists) {
+                    ComPtr<IDWriteFontFamily> family;
+                    if (SUCCEEDED(coll->GetFontFamily(idx, family.GetAddressOf()))) {
+                        return family;
+                    }
+                }
+            }
+            // Prefix match. Walks the family list and picks the first
+            // entry whose locale-0 name starts with `familyName` + ' '.
+            // The trailing space avoids spurious matches (e.g. "Bar"
+            // accidentally matching "Barlow Medium"). Cheap — both the
+            // custom collection and our requested names stay tiny.
+            const std::size_t reqLen = std::wcslen(familyName);
+            const UINT32 famCount = coll->GetFontFamilyCount();
+            for (UINT32 fi = 0; fi < famCount; ++fi) {
+                ComPtr<IDWriteFontFamily> fam;
+                if (FAILED(coll->GetFontFamily(fi, fam.GetAddressOf()))) continue;
+                ComPtr<IDWriteLocalizedStrings> names;
+                if (FAILED(fam->GetFamilyNames(names.GetAddressOf()))) continue;
+                UINT32 nameLen = 0;
+                if (FAILED(names->GetStringLength(0, &nameLen))) continue;
+                if (nameLen < reqLen + 1) continue;   // need at least " <suffix>"
+                std::wstring wname(nameLen + 1, L'\0');
+                if (FAILED(names->GetString(0, wname.data(), nameLen + 1))) continue;
+                wname.resize(nameLen);
+                if (std::wcsncmp(wname.c_str(), familyName, reqLen) == 0 &&
+                    wname[reqLen] == L' ') {
+                    return fam;
+                }
+            }
+            return {};
+        }
+
         ComPtr<IDWriteFontFamily> resolveFamily(
             IDWriteFactory*          factory,
             IDWriteFontCollection*   customCollection,
             const wchar_t*           familyName)
         {
-            // Try the custom collection first. familyExists out-param
-            // tells us if the family is present without forcing a
-            // fallback decision here.
-            if (customCollection) {
-                UINT32 idx = 0;
-                BOOL   exists = FALSE;
-                if (SUCCEEDED(customCollection->FindFamilyName(familyName, &idx, &exists)) && exists) {
-                    ComPtr<IDWriteFontFamily> family;
-                    if (SUCCEEDED(customCollection->GetFontFamily(idx, family.GetAddressOf()))) {
-                        return family;
-                    }
-                }
+            // Try the custom collection first (exact + prefix).
+            if (auto fam = resolveFamilyIn(customCollection, familyName)) {
+                return fam;
             }
-
             // Fallback to system fonts. Bahnschrift is the documented
             // fallback when bundled-font loading fails (see
             // CoreRenderer::init() in overlay_renderer.cpp).
@@ -86,16 +122,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
             if (FAILED(factory->GetSystemFontCollection(systemColl.GetAddressOf(), FALSE))) {
                 return {};
             }
-            UINT32 idx = 0;
-            BOOL   exists = FALSE;
-            if (FAILED(systemColl->FindFamilyName(familyName, &idx, &exists)) || !exists) {
-                return {};
-            }
-            ComPtr<IDWriteFontFamily> family;
-            if (FAILED(systemColl->GetFontFamily(idx, family.GetAddressOf()))) {
-                return {};
-            }
-            return family;
+            return resolveFamilyIn(systemColl.Get(), familyName);
         }
 
         // -------- Build a ResolvedFace -------------------------------------
@@ -388,53 +415,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
     }   // namespace
 
     bool build(const BuildSpec& spec, BuildResult& out) {
-        if (!spec.dwriteFactory) {
-            Log("xr_telemetry: atlas build aborted — null dwriteFactory\n");
-            return false;
-        }
-        if (spec.atlasWidthPx == 0 || spec.atlasHeightPx == 0) {
-            Log("xr_telemetry: atlas build aborted — zero atlas dims\n");
-            return false;
-        }
+        if (!spec.dwriteFactory) return false;
+        if (spec.atlasWidthPx == 0 || spec.atlasHeightPx == 0) return false;
 
         IDWriteFactory* factory = spec.dwriteFactory.Get();
         IDWriteFontCollection* collection = spec.fontCollection.Get();
-        Log(fmt::format(
-            "xr_telemetry: atlas build start — atlas={}x{}, requests={}, "
-            "customCollection={}\n",
-            spec.atlasWidthPx, spec.atlasHeightPx, spec.requests.size(),
-            collection ? "non-null" : "null"));
-
-        // Diagnostic: enumerate every family in the custom collection so
-        // we can see EXACTLY what name DirectWrite is using for our
-        // bundled fonts. The TTF's `name` table declares both a
-        // typographic family ("Barlow") and a legacy/WWS family
-        // ("Barlow Medium"); DirectWrite may surface either. If
-        // FindFamilyName("Barlow") returns exists=FALSE while the
-        // collection actually has "Barlow Medium", that's the mismatch.
-        if (collection) {
-            const UINT32 famCount = collection->GetFontFamilyCount();
-            Log(fmt::format(
-                "xr_telemetry: atlas custom-collection family count={}\n",
-                famCount));
-            for (UINT32 fi = 0; fi < famCount; ++fi) {
-                Microsoft::WRL::ComPtr<IDWriteFontFamily> fam;
-                if (FAILED(collection->GetFontFamily(fi, fam.GetAddressOf()))) continue;
-                Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
-                if (FAILED(fam->GetFamilyNames(names.GetAddressOf()))) continue;
-                UINT32 nameLen = 0;
-                if (FAILED(names->GetStringLength(0, &nameLen))) continue;
-                std::wstring wname(nameLen + 1, L'\0');
-                if (FAILED(names->GetString(0, wname.data(), nameLen + 1))) continue;
-                wname.resize(nameLen);
-                std::string sname;
-                sname.reserve(wname.size());
-                for (wchar_t c : wname) sname.push_back(static_cast<char>(c & 0x7F));
-                Log(fmt::format(
-                    "xr_telemetry: atlas custom family[{}]=\"{}\"\n",
-                    fi, sname));
-            }
-        }
 
         // -------- Phase 1: resolve faces + read metrics ---------------
         //
@@ -456,22 +441,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 // Hard failure: a requested face couldn't be resolved
                 // even via system fallback. The renderer cannot draw
                 // anything, so we abort the build.
-                const wchar_t* fam = familyFor(req.face, spec);
-                Log(fmt::format(
-                    "xr_telemetry: atlas resolveFace failed — "
-                    "face={} size={} family=L\"{}\" weight={} style={}\n",
-                    static_cast<int>(req.face), req.sizePx,
-                    // Family name is wchar_t* — narrow it for the log via
-                    // a quick ASCII coercion (the names we use are pure
-                    // ASCII: Barlow / Rajdhani / Bahnschrift).
-                    [&]{
-                        std::string s;
-                        if (fam) for (const wchar_t* p = fam; *p; ++p)
-                            s.push_back(static_cast<char>(*p & 0x7F));
-                        return s;
-                    }(),
-                    static_cast<int>(style.weight),
-                    static_cast<int>(style.style)));
                 return false;
             }
             FaceMetrics fm{};
@@ -565,14 +534,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
                     // sized for the working set; running out means the
                     // working set grew without the atlas growing with
                     // it. Bail and let the caller log + degrade.
-                    Log(fmt::format(
-                        "xr_telemetry: atlas shelf-pack overflow — "
-                        "atlas={}x{}, glyph={}x{}, shelfBaseY={}, "
-                        "shelfHeight={}, packed={}/{}\n",
-                        spec.atlasWidthPx, spec.atlasHeightPx,
-                        gw, gh,
-                        shelf.baseY, shelf.height,
-                        out.glyphs.size(), pending.size()));
                     return false;
                 }
                 blit(out.bitmap.data(), spec.atlasWidthPx, dstX, dstY, pg.raster);
