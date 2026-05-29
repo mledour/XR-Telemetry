@@ -405,6 +405,37 @@ namespace openxr_api_layer::utils::glyph_atlas {
             spec.atlasWidthPx, spec.atlasHeightPx, spec.requests.size(),
             collection ? "non-null" : "null"));
 
+        // Diagnostic: enumerate every family in the custom collection so
+        // we can see EXACTLY what name DirectWrite is using for our
+        // bundled fonts. The TTF's `name` table declares both a
+        // typographic family ("Barlow") and a legacy/WWS family
+        // ("Barlow Medium"); DirectWrite may surface either. If
+        // FindFamilyName("Barlow") returns exists=FALSE while the
+        // collection actually has "Barlow Medium", that's the mismatch.
+        if (collection) {
+            const UINT32 famCount = collection->GetFontFamilyCount();
+            Log(fmt::format(
+                "xr_telemetry: atlas custom-collection family count={}\n",
+                famCount));
+            for (UINT32 fi = 0; fi < famCount; ++fi) {
+                Microsoft::WRL::ComPtr<IDWriteFontFamily> fam;
+                if (FAILED(collection->GetFontFamily(fi, fam.GetAddressOf()))) continue;
+                Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
+                if (FAILED(fam->GetFamilyNames(names.GetAddressOf()))) continue;
+                UINT32 nameLen = 0;
+                if (FAILED(names->GetStringLength(0, &nameLen))) continue;
+                std::wstring wname(nameLen + 1, L'\0');
+                if (FAILED(names->GetString(0, wname.data(), nameLen + 1))) continue;
+                wname.resize(nameLen);
+                std::string sname;
+                sname.reserve(wname.size());
+                for (wchar_t c : wname) sname.push_back(static_cast<char>(c & 0x7F));
+                Log(fmt::format(
+                    "xr_telemetry: atlas custom family[{}]=\"{}\"\n",
+                    fi, sname));
+            }
+        }
+
         // -------- Phase 1: resolve faces + read metrics ---------------
         //
         // One entry per (face, sizePx) — same key the renderer will use
