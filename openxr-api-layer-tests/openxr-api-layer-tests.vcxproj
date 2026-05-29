@@ -174,6 +174,9 @@
          Add ..\openxr-api-layer\utils\*.cpp entries below as you grow
          your layer with more .cpp files. -->
     <ClCompile Include="..\openxr-api-layer\layer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\chrome_shape_renderer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas_renderer.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\gpu_telemetry.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\overlay_renderer.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\dispatch.gen.cpp" />
