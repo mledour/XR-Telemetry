@@ -39,10 +39,12 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // DrawTextLayout path inside the overlay's hot frame.
     //
     // Lifecycle:
-    //   * init(device, ctx, renderTarget, atlas) — takes ownership of the
-    //     atlas BuildResult, creates the GPU texture from the R8 bitmap,
-    //     and primes the pipeline state (VS/PS, input layout, sampler,
-    //     blend, RTV from the supplied target texture).
+    //   * init(device, ctx, renderTarget, atlas) — reads the atlas
+    //     BuildResult by const-ref: creates a GPU texture from the R8
+    //     bitmap, copies the glyph + metrics tables, and primes the
+    //     pipeline state (VS/PS, input layout, sampler, blend, RTV
+    //     from the supplied target texture). The atlas can be shared
+    //     across multiple renderers on different D3D11 devices.
     //   * One frame is:
     //         beginBatch();
     //         drawRun(...); drawRun(...); ...      // any number

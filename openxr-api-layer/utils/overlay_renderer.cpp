@@ -3883,8 +3883,9 @@ namespace openxr_api_layer::detail {
             // lives on the private D3D11 device; the atlas bitmap is
             // copied from CoreRenderer's BuildResult, so glyph cuts
             // match the D3D11 path's renderer bit-for-bit. Soft-fails
-            // the same way m_useShaderBars does — D2D text path is
-            // the fallback while wiring is in progress.
+            // the same way m_useShaderBars does — D2D text path is the
+            // documented fallback when the atlas fails to build or the
+            // D3D11 pipeline init returns false.
             glyph_atlas::Renderer                 m_glyphRenderer;
             bool                                  m_useGlyphAtlas = false;
             // GPU chrome shapes on the D3D11On12 bridge. Same
