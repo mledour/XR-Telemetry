@@ -2945,11 +2945,24 @@ namespace openxr_api_layer::detail {
                     // cost on the previous frame.
                     HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
                     if (hr == S_OK) {
+                        // Diagnostic: env override `XR_TELEMETRY_NO_GPU_SHAPES=1`
+                        // forces gpuShapes to null at the paint boundary so the
+                        // chrome shape D2D fallback runs. Used to isolate
+                        // whether the text-disappear bug is a state hazard
+                        // between the shape and text passes.
+                        static const bool kDisableGpuShapes = []{
+                            char buf[16]{};
+                            DWORD n = GetEnvironmentVariableA(
+                                "XR_TELEMETRY_NO_GPU_SHAPES",
+                                buf, sizeof(buf));
+                            return n > 0 && buf[0] == '1';
+                        }();
                         painted = m_useShaderBars
                             ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                                   m_myShimRenderTarget.Get(),
                                                   m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
-                                                  m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
+                                                  (m_useChromeShapes && !kDisableGpuShapes)
+                                                      ? &m_chromeShapeRenderer : nullptr,
                                                   m_cpuRing, m_gpuRing, snap)
                             : m_core.paint(m_myShimRenderTarget.Get(), snap,
                                             m_cpuRing, m_gpuRing);
@@ -3546,11 +3559,20 @@ namespace openxr_api_layer::detail {
                 // AcquireWrapped/CopyResource/Flush dance below is
                 // unchanged; it ferries whatever the shim ended up with
                 // into the D3D12 swapchain image.
+                // Diagnostic: same env override as the D3D11 path.
+                static const bool kDisableGpuShapes = []{
+                    char buf[16]{};
+                    DWORD n = GetEnvironmentVariableA(
+                        "XR_TELEMETRY_NO_GPU_SHAPES",
+                        buf, sizeof(buf));
+                    return n > 0 && buf[0] == '1';
+                }();
                 const bool painted = m_useShaderBars
                     ? paintShimViaShader(m_core, m_bars, m_barsCadence,
                                           m_shimRenderTarget.Get(),
                                           m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
-                                          m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
+                                          (m_useChromeShapes && !kDisableGpuShapes)
+                                              ? &m_chromeShapeRenderer : nullptr,
                                           m_cpuRing, m_gpuRing, snap)
                     : m_core.paint(m_shimRenderTarget.Get(), snap,
                                     m_cpuRing, m_gpuRing);
