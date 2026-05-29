@@ -208,17 +208,6 @@ namespace openxr_api_layer::utils::chrome_shapes {
     }
 
     void Renderer::flush() {
-        // Diagnostic: one-shot log on first flush. Removed once the
-        // chrome-shapes / text interaction bug is root-caused.
-        static bool s_loggedOnce = false;
-        if (!s_loggedOnce) {
-            s_loggedOnce = true;
-            Log(fmt::format(
-                "xr_telemetry: ChromeShapeRenderer::flush first call — "
-                "ready={}, scratch.size={}\n",
-                m_ready, m_scratch.size()));
-        }
-
         if (!m_ready || m_scratch.empty()) return;
 
         const UINT count = static_cast<UINT>(m_scratch.size());

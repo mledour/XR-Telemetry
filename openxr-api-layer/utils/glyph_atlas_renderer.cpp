@@ -368,19 +368,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // flush() — single DrawInstanced for all queued glyphs.
     // ===================================================================
     void Renderer::flush() {
-        // Diagnostic: one-shot log on first flush so we can confirm
-        // from a session capture that the text path is reaching the
-        // GPU draw. Removed once the chrome-shapes interaction bug is
-        // root-caused.
-        static bool s_loggedOnce = false;
-        if (!s_loggedOnce) {
-            s_loggedOnce = true;
-            Log(fmt::format(
-                "xr_telemetry: GlyphAtlasRenderer::flush first call — "
-                "ready={}, scratch.size={}\n",
-                m_ready, m_scratch.size()));
-        }
-
         if (!m_ready || m_scratch.empty()) return;
 
         // Grow if the batch outsizes the current GPU buffer. Bails (and
