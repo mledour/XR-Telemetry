@@ -2982,14 +2982,18 @@ namespace openxr_api_layer::detail {
                 // 3. Drop the RTV binding before the CopyResource +
                 //    Release dance so D3D11 doesn't carry the bind
                 //    state into the next pass. CopyResource on the
-                //    same context handles its own ordering; the
-                //    swapchain image inherits the painted bits, the
-                //    runtime sees them at release time.
+                //    same context handles its own ordering with our
+                //    paint writes; the trailing Flush pushes the
+                //    whole batch to the GPU so the runtime's
+                //    compositor reads finalised pixels (Pimax may
+                //    composite on a separate context — implicit
+                //    same-context ordering wouldn't be enough).
                 if (painted && imageIdx < m_images.size()) {
                     ID3D11RenderTargetView* nullRtv = nullptr;
                     m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
                     m_context->CopyResource(m_images[imageIdx].Get(),
                                              m_paintTexture.Get());
+                    m_context->Flush();
                 }
 
                 // 4. Release regardless of paint success — the runtime
