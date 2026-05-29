@@ -2980,6 +2980,24 @@ namespace openxr_api_layer::detail {
                                   m_chromeShapeRenderer,
                                   m_cpuRing, m_gpuRing, snap);
 
+                // 3. Drop the RTV binding + flush the queued GPU
+                //    writes BEFORE xrReleaseSwapchainImage. The
+                //    runtime's compositor reads the image as an SRV
+                //    on its own command list; leaving the swapchain
+                //    image bound as our RTV creates a read/write
+                //    hazard the driver resolves by either skipping
+                //    the read (compositor sees stale pixels — what
+                //    the user saw: overlay covers the game because
+                //    the runtime never observed the alpha=0 clear)
+                //    or silently unbinding. Explicit unbind + Flush
+                //    is the documented handover for D3D11 swapchain
+                //    images. Cost: one Flush per frame (~10-30 µs)
+                //    — still cheaper than the keyed-mutex /
+                //    CopyResource pair the shim was paying.
+                ID3D11RenderTargetView* nullRtv = nullptr;
+                m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
+                m_context->Flush();
+
                 // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
                 //    cycling.
