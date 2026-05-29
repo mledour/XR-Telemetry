@@ -401,6 +401,23 @@ namespace openxr_api_layer::detail {
                     // chiffres will be synthesised oblique on the
                     // fallback face since system Bahnschrift has no
                     // true italic face.
+                    //
+                    // KNOWN DIVERGENCE on this path: D2D's
+                    // CreateTextFormat keeps DWRITE_FONT_STYLE_ITALIC
+                    // and DirectWrite synthesises the oblique glyphs
+                    // by shearing the upright face. The GPU atlas
+                    // path resolves via IDWriteFontFamily::
+                    // GetFirstMatchingFont(... ITALIC ...), which
+                    // does NOT synthesise — it returns the closest
+                    // existing face (upright). So when the bundled
+                    // fonts fail to load AND the GPU text path
+                    // succeeds, the big FPS digits render upright
+                    // on the GPU vs sheared on the D2D fallback.
+                    // Cosmetic, narrow trigger; flagged here so a
+                    // future tweak (e.g. shader-side shear, or
+                    // CreateGlyphRunAnalysis with a 2D oblique
+                    // transform in glyph_atlas.cpp) lands with the
+                    // context.
                     kFamilyChiffres = L"Bahnschrift";
                     kFamilyLabels   = L"Bahnschrift";
                 } else {
@@ -756,6 +773,26 @@ namespace openxr_api_layer::detail {
                 if (!m_brushBg || !m_strokeDashed) return false;
                 m_textRenderer  = gpuText;
                 m_chromeShapes  = gpuShapes;
+
+                // RAII guard: nulls the transient renderer pointers on
+                // every exit path, including stack unwind through a
+                // std::bad_alloc inside drawChrome (drawValueTextGpu
+                // allocates a vector<Segment>, drawValueWide allocates
+                // a wide-string, etc.). Without the guard a throw
+                // would leave the pointers dangling at member values
+                // until the next paint reassigned them — not a UAF
+                // since the pointed-to objects outlive the paint, but
+                // sloppy in a "never crash the host" layer.
+                struct PaintGuard {
+                    CoreRenderer* core;
+                    ~PaintGuard() {
+                        if (core) {
+                            core->m_textRenderer = nullptr;
+                            core->m_chromeShapes = nullptr;
+                        }
+                    }
+                } _guard{this};
+
                 if (m_textRenderer) m_textRenderer->beginBatch();
                 if (m_chromeShapes) m_chromeShapes->beginBatch();
 
@@ -771,8 +808,6 @@ namespace openxr_api_layer::detail {
                 // panels they sit inside.
                 if (m_chromeShapes) m_chromeShapes->flush();
                 if (m_textRenderer) m_textRenderer->flush();
-                m_textRenderer = nullptr;
-                m_chromeShapes = nullptr;
                 return d2dOk;
             }
 
@@ -924,6 +959,15 @@ namespace openxr_api_layer::detail {
                 rajdhaniSet.push_back(static_cast<wchar_t>(0x00B0));  // °
 
                 std::vector<wchar_t> barlowItalicSet = {
+                    // Space is included on purpose: fallbackAdvance()
+                    // in glyph_atlas_renderer.cpp resolves the missing-
+                    // glyph fallback by looking up ' ' at the same
+                    // (face, sizePx). Without it any out-of-set glyph
+                    // collapses to advance 0 instead of leaving a clean
+                    // gap. Today the BarlowItalic-base formats only
+                    // draw digits / '.' / '-', so out-of-set glyphs
+                    // don't occur — defensive only.
+                    L' ',
                     L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
                     L'8', L'9', L'.', L'-'
                 };
@@ -1544,6 +1588,31 @@ namespace openxr_api_layer::detail {
                 if (!r || n == 0 || !s) return;
                 const std::wstring wide(s, n);
                 const auto runs = findValueRuns(wide);
+
+                // Sanity-check the caller's unitSizePx against the
+                // atlas — only sizes that were baked at init have
+                // glyphs to sample. Today the bottom-panel call sites
+                // pass 19 (which IS baked alongside the chiffres sizes),
+                // but if a future caller hands in an unbaked size every
+                // glyph in the unit range misses m_glyphs and silently
+                // collapses to fallbackAdvance(). Clamp to the base
+                // size so the unit suffix at least renders — same
+                // visual class as the digits, just no size-shrink.
+                // One-shot log so the divergence is visible if it
+                // ever happens.
+                if (unitSizePx != 0 &&
+                    r->metrics(baseFmt.face, unitSizePx) == nullptr) {
+                    static bool s_loggedOnce = false;
+                    if (!s_loggedOnce) {
+                        s_loggedOnce = true;
+                        Log(fmt::format(
+                            "xr_telemetry: drawValueTextGpu unit size {} "
+                            "not baked in atlas — clamping to base {}\n",
+                            unitSizePx, baseFmt.sizePx));
+                    }
+                    unitSizePx = 0;   // falls through to baseFmt.sizePx
+                                       // in the attrAt() body below
+                }
 
                 // Per-character attribute: (face, sizePx, colorPtr).
                 struct Attr {

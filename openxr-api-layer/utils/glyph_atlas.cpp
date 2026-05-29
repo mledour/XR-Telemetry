@@ -374,6 +374,19 @@ namespace openxr_api_layer::utils::glyph_atlas {
             const uint16_t cellW = static_cast<uint16_t>(gw + padding);
             const uint16_t cellH = static_cast<uint16_t>(gh + padding);
 
+            // Hard rejection up front: a single glyph that doesn't fit
+            // either atlas axis can never be placed. Without this gate
+            // the "current shelf" branch silently misplaces a too-wide
+            // glyph (outX=0 + memcpy with gw > atlasStride → row-by-row
+            // overflow), and the "new shelf" branch never checks the
+            // height of the very first glyph on a baseY=0 shelf — a
+            // glyph taller than the atlas writes past the buffer end.
+            // Unreachable today (max glyph ~52px on a 1024×2048 atlas),
+            // but the system-font fallback (corrupted / atypical face)
+            // could turn this latent into host-process heap corruption,
+            // which the "never crash the host" rule forbids.
+            if (cellW > atlasW || cellH > atlasH) return false;
+
             if (shelf.cursorX + cellW <= atlasW) {
                 // Fits on current shelf.
                 outX = shelf.cursorX;
