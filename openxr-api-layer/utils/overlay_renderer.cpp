@@ -2963,40 +2963,34 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // 2. Paint directly into the swapchain image RTV. The
-                //    runtime's images are BGRA8 (typeless on Pimax;
-                //    UNORM-viewable via the typed RTV we allocated at
-                //    init), so the app's device — even when created
-                //    without BGRA_SUPPORT — can write to them just
-                //    fine through plain D3D11. No second device, no
-                //    shared handle, no keyed mutex, no CopyResource:
-                //    paintOverlay clears + flushes chrome + flushes
-                //    text + draws bars straight onto m_imageRtvs[idx].
-                const bool painted = (imageIdx < m_imageRtvs.size()) &&
+                // 2. Paint chrome + text + bars into our intermediate
+                //    paint target. We then CopyResource it into the
+                //    current swapchain image — see the long comment
+                //    in init() for why an intermediate is needed
+                //    (direct-to-swapchain didn't honour alpha on
+                //    Pimax's compositor; landing the image via a
+                //    CopyResource leaves it in the state the runtime
+                //    expects).
+                const bool painted =
                     paintOverlay(m_core, m_bars, m_barsCadence,
                                   m_context.Get(),
-                                  m_imageRtvs[imageIdx].Get(),
+                                  m_paintRtv.Get(),
                                   m_glyphRenderer,
                                   m_chromeShapeRenderer,
                                   m_cpuRing, m_gpuRing, snap);
 
-                // 3. Drop the RTV binding + flush the queued GPU
-                //    writes BEFORE xrReleaseSwapchainImage. The
-                //    runtime's compositor reads the image as an SRV
-                //    on its own command list; leaving the swapchain
-                //    image bound as our RTV creates a read/write
-                //    hazard the driver resolves by either skipping
-                //    the read (compositor sees stale pixels — what
-                //    the user saw: overlay covers the game because
-                //    the runtime never observed the alpha=0 clear)
-                //    or silently unbinding. Explicit unbind + Flush
-                //    is the documented handover for D3D11 swapchain
-                //    images. Cost: one Flush per frame (~10-30 µs)
-                //    — still cheaper than the keyed-mutex /
-                //    CopyResource pair the shim was paying.
-                ID3D11RenderTargetView* nullRtv = nullptr;
-                m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
-                m_context->Flush();
+                // 3. Drop the RTV binding before the CopyResource +
+                //    Release dance so D3D11 doesn't carry the bind
+                //    state into the next pass. CopyResource on the
+                //    same context handles its own ordering; the
+                //    swapchain image inherits the painted bits, the
+                //    runtime sees them at release time.
+                if (painted && imageIdx < m_images.size()) {
+                    ID3D11RenderTargetView* nullRtv = nullptr;
+                    m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
+                    m_context->CopyResource(m_images[imageIdx].Get(),
+                                             m_paintTexture.Get());
+                }
 
                 // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
@@ -3118,29 +3112,53 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Per-image RTVs from the OpenXR swapchain. Format
-                // is typed BGRA8_UNORM regardless of whether the
-                // runtime allocated the underlying texture as
-                // BGRA8_UNORM or BGRA8_TYPELESS — typeless requires
-                // an explicit view desc, and an explicit desc also
-                // works fine for typed.
-                m_imageRtvs.resize(m_images.size());
-                for (size_t i = 0; i < m_images.size(); ++i) {
-                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    rtvDesc.Texture2D.MipSlice = 0;
-                    HRESULT rtvHr = m_device->CreateRenderTargetView(
-                        m_images[i].Get(), &rtvDesc,
-                        m_imageRtvs[i].GetAddressOf());
-                    if (FAILED(rtvHr)) {
-                        Log(fmt::format(
-                            "xr_telemetry: overlay disabled — "
-                            "CreateRenderTargetView (swapchain image[{}]) "
-                            "failed (HRESULT={:#x})\n",
-                            i, static_cast<unsigned int>(rtvHr)));
-                        return false;
-                    }
+                // Intermediate paint target on the APP's device. We
+                // paint chrome + text + bars into this single
+                // BGRA8_UNORM texture, then CopyResource it into the
+                // current swapchain image each frame.
+                //
+                // Why an intermediate at all (the direct-to-swapchain
+                // attempt didn't work): Pimax's compositor reads the
+                // swapchain image in a way that doesn't observe the
+                // alpha=0 clear we wrote outside the chrome rect — the
+                // overlay ends up opaque-over-game. The shape we
+                // tested empirically: when the swapchain image
+                // arrives at xrReleaseSwapchainImage via a
+                // CopyResource (its previous state was COPY_DEST,
+                // not RENDER_TARGET), the compositor honours the
+                // alpha channel correctly. Direct RTV writes leave
+                // the image in a state the runtime doesn't expect.
+                //
+                // This is still cheaper than the original cross-device
+                // shim by a wide margin: same device + same context as
+                // everything else, no shared NT handle, no keyed
+                // mutex, no second D3D11 device. The per-frame cost
+                // is one CopyResource of a 720×435 BGRA8 image
+                // (~12 µs on a modern GPU) plus one Flush — vs the
+                // old path's keyed-mutex AcquireSync × 2 + CopyResource
+                // + D2D Begin/Clear/End.
+                D3D11_TEXTURE2D_DESC paintDesc{};
+                paintDesc.Width = static_cast<UINT>(kTexW);
+                paintDesc.Height = static_cast<UINT>(kTexH);
+                paintDesc.MipLevels = 1;
+                paintDesc.ArraySize = 1;
+                paintDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                paintDesc.SampleDesc.Count = 1;
+                paintDesc.Usage = D3D11_USAGE_DEFAULT;
+                paintDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+                if (FAILED(m_device->CreateTexture2D(
+                        &paintDesc, nullptr,
+                        m_paintTexture.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — "
+                        "CreateTexture2D (paint target) failed\n");
+                    return false;
+                }
+                if (FAILED(m_device->CreateRenderTargetView(
+                        m_paintTexture.Get(), nullptr,
+                        m_paintRtv.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — "
+                        "CreateRenderTargetView (paint target) failed\n");
+                    return false;
                 }
 
                 // Brush identity tokens. CoreRenderer's gpuColorFor /
@@ -3315,11 +3333,16 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11DeviceContext> m_context;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
             // OpenXR swapchain images. Typically DXGI_FORMAT_B8G8R8A8_
-            // TYPELESS on Pimax OpenXR 0.1.0; an explicit
-            // BGRA8_UNORM RTV desc gives us a typed view to render
-            // directly into.
+            // TYPELESS on Pimax OpenXR 0.1.0; we CopyResource into
+            // them from the intermediate paint target each frame
+            // rather than rendering directly (the runtime's
+            // compositor doesn't observe alpha=0 on directly-written
+            // BGRA8 RTVs, but does on CopyResource'd images).
             std::vector<ComPtr<ID3D11Texture2D>>          m_images;
-            std::vector<ComPtr<ID3D11RenderTargetView>>   m_imageRtvs;
+            // Intermediate paint target on the app's device. Single
+            // BGRA8_UNORM texture, no shared handle, no keyed mutex.
+            ComPtr<ID3D11Texture2D>                       m_paintTexture;
+            ComPtr<ID3D11RenderTargetView>                m_paintRtv;
 
             // Brush-identity scaffolding. CoreRenderer's gpuColorFor /
             // gpuFmtFor map ID2D1Brush* / IDWriteTextFormat* pointers
