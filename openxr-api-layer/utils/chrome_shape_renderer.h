@@ -68,9 +68,18 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // ===================================================================
     class Renderer {
       public:
+        // RTV is supplied per-flush by the caller (Task 15 — D3D11
+        // path paints directly into one of N swapchain images, so the
+        // pipeline state stays renderer-owned while the actual target
+        // rotates each frame). dstWidth/dstHeight are the fixed pixel
+        // dimensions of every target the renderer will paint into;
+        // they pre-populate the cbuffer's texSize and stay constant
+        // for the renderer's lifetime (overlay swapchain is always
+        // kTexW × kTexH).
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>        device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx,
-                  Microsoft::WRL::ComPtr<ID3D11Texture2D>     renderTarget);
+                  UINT                                        dstWidth,
+                  UINT                                        dstHeight);
 
         bool isReady() const noexcept { return m_ready; }
 
@@ -93,9 +102,10 @@ namespace openxr_api_layer::utils::chrome_shapes {
                         float strokeWidth, const float color[4]);
 
         // Flush: sets full pipeline state on the immediate context
-        // and emits one DrawInstanced for all queued rects. No-op if
-        // the scratch vector is empty.
-        void flush();
+        // (targeting `rtv`) and emits one DrawInstanced for all
+        // queued rects. No-op if the scratch vector is empty or rtv
+        // is null.
+        void flush(ID3D11RenderTargetView* rtv);
 
       private:
         // Must match overlay_quad.hlsli's QuadVSInput per-instance
@@ -130,8 +140,9 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
         Microsoft::WRL::ComPtr<ID3D11Device>           m_device;
         Microsoft::WRL::ComPtr<ID3D11DeviceContext>    m_ctx;
-        Microsoft::WRL::ComPtr<ID3D11Texture2D>        m_target;
-        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_rtv;
+        // Target dimensions snapshotted at init for the cbuffer.
+        UINT                                            m_dstW = 0;
+        UINT                                            m_dstH = 0;
 
         Microsoft::WRL::ComPtr<ID3D11VertexShader>     m_vs;
         Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;
