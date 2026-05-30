@@ -440,18 +440,22 @@ namespace openxr_api_layer::detail {
             const glyph_atlas::BuildResult& atlas() const noexcept { return m_atlas; }
             bool atlasReady() const noexcept { return m_atlasReady; }
 
-            // Rebuild the static chrome instance batches from the
-            // current snapshot. Pure CPU work: populates each
-            // renderer's scratch vector via drawChrome (which
-            // branches every drawWide / drawAscii / drawValueWide /
-            // drawPanelBg call through the GPU emitters). NO GPU
-            // submission happens here — the caller flushes the
-            // scratches into the target RTV later, every frame, even
-            // between chrome-cadence ticks. That's what makes
-            // direct-to-swapchain affordable: the costly drawChrome
-            // rebuild stays cadenced (~10 Hz) while the cheap
-            // map+DrawInstanced fires per frame against whichever of
-            // the N swapchain images the runtime hands us.
+            // Rebuild the chrome instance batches from the current
+            // snapshot. Pure CPU work (NO GPU submission): populates the
+            // renderers' scratch vectors via drawChrome, in up to two
+            // tiers gated by m_tier (see the m_tier member doc):
+            //   * Static  (labels / titles + chrome shapes) — laid out
+            //     once and cached, re-baked only when the structure key
+            //     changes. The costly ~50-glyph label layout + the shape
+            //     emission happen here, off the per-bump path.
+            //   * Dynamic (the changing values) — re-laid-out every call,
+            //     into the glyph renderer's separate dynamic scratch.
+            // The caller flushes the combined scratches into the target
+            // RTV later, every frame, even between chrome-cadence ticks.
+            // That's what makes direct-to-swapchain affordable: the value
+            // rebuild stays cadenced (~10 Hz) and now skips the cached
+            // static work, while the cheap map+DrawInstanced fires per
+            // frame against whichever of the N swapchain images we get.
             //
             // Both gpuText / gpuShapes must be non-null on the D3D11
             // direct-to-swapchain path (Task 15) — D2D fallback was
@@ -483,10 +487,48 @@ namespace openxr_api_layer::detail {
                     }
                 } _guard{this};
 
-                m_textRenderer->beginBatch();
-                m_chromeShapes->beginBatch();
-
+                // Format the display strings once; both tiers read them
+                // (the static tier ignores the values, the dynamic tier
+                // lays them out).
                 m_cachedValues = formatOverlayDisplayValues(snap);
+
+                // Static structure key: anything that changes the chrome's
+                // fixed geometry or label set. Today the only such input is
+                // whether the GPU bottom panel carries a VRAM column
+                // (drawBottomPanel keys its column / separator count on a
+                // non-empty vram value). vram_pct is presently never empty
+                // ("--" placeholder), so in practice this bakes exactly
+                // once; the key is cheap insurance against that changing.
+                const uint64_t structureKey =
+                    m_cachedValues.vram_pct.empty() ? 0u : 1u;
+                const bool rebakeStatic =
+                    !m_staticBaked || structureKey != m_staticStructureKey;
+
+                // ---- Static tier (labels + chrome shapes) ----------------
+                // Laid out once and cached: drawChrome's label / title /
+                // panel-background / separator emitters are gated to this
+                // tier, so re-running the full traversal here populates ONLY
+                // the static scratch of the glyph renderer and (re)builds
+                // the chrome-shape batch. Both then persist untouched across
+                // subsequent version bumps — flush() re-uploads them every
+                // frame for free, with no re-layout.
+                if (rebakeStatic) {
+                    m_tier = PaintTier::Static;
+                    gpuText->beginStaticBatch();
+                    gpuShapes->beginBatch();
+                    drawChrome(m_cachedValues);
+                    m_staticBaked        = true;
+                    m_staticStructureKey = structureKey;
+                }
+
+                // ---- Dynamic tier (the changing values) ------------------
+                // Runs every version bump. Only the value emitters fire
+                // (the static leaves no-op under PaintTier::Dynamic), so we
+                // re-lay-out just the digits — the ~10 Hz spike this split
+                // exists to shrink. The chrome-shape batch is left alone:
+                // its scratch persists from the last bake.
+                m_tier = PaintTier::Dynamic;
+                gpuText->beginDynamicBatch();
                 drawChrome(m_cachedValues);
                 return true;
             }
@@ -814,8 +856,22 @@ namespace openxr_api_layer::detail {
                 drawTextGpu(m_textRenderer, fmt, s, std::wcslen(s), rect, color);
             }
 
+            // Static-tier label / title emitter. Same as drawWide but
+            // fires ONLY during the cached static bake (PaintTier::Static),
+            // never during a per-bump value rebuild. Label strings are
+            // compile-time literals (cell captions, panel titles) that
+            // never change, so their glyph layout is computed once and
+            // reused across version bumps. drawWide itself stays UNGATED:
+            // drawAscii routes VALUE text through it in the dynamic tier.
+            void drawLabel(const GpuTextFormat& fmt, const wchar_t* s,
+                            const D2D1_RECT_F& rect, const float color[4]) const {
+                if (m_tier != PaintTier::Static) return;
+                drawWide(fmt, s, rect, color);
+            }
+
             void drawAscii(const GpuTextFormat& fmt, const std::string& s,
                             const D2D1_RECT_F& rect, const float color[4]) const {
+                if (m_tier != PaintTier::Dynamic) return;   // VALUE text
                 if (s.empty()) return;
                 const std::wstring wide(s.begin(), s.end());
                 drawWide(fmt, wide.c_str(), rect, color);
@@ -966,6 +1022,7 @@ namespace openxr_api_layer::detail {
                                 const float color[4],
                                 const float* chiffresColor = nullptr,
                                 float unitFontSize = 0.0f) const {
+                if (m_tier != PaintTier::Dynamic) return;   // VALUE text
                 if (!m_textRenderer || wide.empty()) return;
                 const uint16_t usize = static_cast<uint16_t>(unitFontSize + 0.5f);
                 drawValueTextGpu(m_textRenderer, fmt, wide.c_str(), wide.size(),
@@ -980,6 +1037,7 @@ namespace openxr_api_layer::detail {
                                  const float color[4],
                                  const float* chiffresColor = nullptr,
                                  float unitFontSize = 0.0f) const {
+                if (m_tier != PaintTier::Dynamic) return;   // VALUE text
                 if (s.empty()) return;
                 drawValueWide(fmt, std::wstring(s.begin(), s.end()), rect,
                                color, chiffresColor, unitFontSize);
@@ -1192,12 +1250,14 @@ namespace openxr_api_layer::detail {
 
                 // Vertical separators between cells (4 of them), each a
                 // 1-px-wide thin rect on the chrome-shapes batch.
-                for (int i = 1; i <= 4; ++i) {
-                    const float x = l + cellW * static_cast<float>(i);
-                    m_chromeShapes->addRect(
-                        x, t + kHeaderSepInsetY,
-                        1.0f, (b - kHeaderSepInsetY) - (t + kHeaderSepInsetY),
-                        kColorSeparator);
+                if (m_tier == PaintTier::Static) {
+                    for (int i = 1; i <= 4; ++i) {
+                        const float x = l + cellW * static_cast<float>(i);
+                        m_chromeShapes->addRect(
+                            x, t + kHeaderSepInsetY,
+                            1.0f, (b - kHeaderSepInsetY) - (t + kHeaderSepInsetY),
+                            kColorSeparator);
+                    }
                 }
 
                 const float labelH = 22.0f;
@@ -1228,7 +1288,7 @@ namespace openxr_api_layer::detail {
                                  const GpuTextFormat& valueFormat,
                                  const float valueColor[4]) const {
                 const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
-                drawWide(kFmtTinyLabelGpu, label, labelRect, kColorTextWhite);
+                drawLabel(kFmtTinyLabelGpu, label, labelRect, kColorTextWhite);
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     l, valueY - 2.0f, r,
                     valueY + kFontBigNumber + 6.0f);
@@ -1263,7 +1323,7 @@ namespace openxr_api_layer::detail {
                 const D2D1_RECT_F titleRect = D2D1::RectF(
                     l + kSectionInnerPad, titleT,
                     r - kSectionInnerPad, titleB);
-                drawWide(kFmtSectionTitleGpu, title, titleRect, kColorTextWhite);
+                drawLabel(kFmtSectionTitleGpu, title, titleRect, kColorTextWhite);
 
                 // Current value (top-right). Two shapes depending on
                 // whether `secondaryValue` is empty:
@@ -1370,12 +1430,14 @@ namespace openxr_api_layer::detail {
 
                 // Vertical separators between cells, each a 1-px-wide
                 // thin rect on the chrome-shapes batch.
-                for (int i = 1; i < numCols; ++i) {
-                    const float x = l + colW * static_cast<float>(i);
-                    m_chromeShapes->addRect(
-                        x, t + kBottomSepInsetY,
-                        1.0f, (b - kBottomSepInsetY) - (t + kBottomSepInsetY),
-                        kColorSeparator);
+                if (m_tier == PaintTier::Static) {
+                    for (int i = 1; i < numCols; ++i) {
+                        const float x = l + colW * static_cast<float>(i);
+                        m_chromeShapes->addRect(
+                            x, t + kBottomSepInsetY,
+                            1.0f, (b - kBottomSepInsetY) - (t + kBottomSepInsetY),
+                            kColorSeparator);
+                    }
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -1405,10 +1467,10 @@ namespace openxr_api_layer::detail {
                                       const wchar_t* unitSuffix,
                                       const float* valueColor,
                                       bool useWideValue) {
-                    drawWide(kFmtTinyLabelGpu, label,
-                              D2D1::RectF(cellL, labelY, cellR,
-                                           labelY + 22.0f),
-                              kColorTextWhite);
+                    drawLabel(kFmtTinyLabelGpu, label,
+                               D2D1::RectF(cellL, labelY, cellR,
+                                            labelY + 22.0f),
+                               kColorTextWhite);
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
                     // prefix flips to Barlow Italic via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
@@ -1502,6 +1564,7 @@ namespace openxr_api_layer::detail {
             // one 1-px outline = 5 quads per panel, on the chrome-
             // shapes batch.
             void drawPanelBg(float l, float t, float r, float b) const {
+                if (m_tier != PaintTier::Static) return;   // chrome shape
                 m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
                 m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
             }
@@ -1514,6 +1577,7 @@ namespace openxr_api_layer::detail {
             // call site in drawChrome reads as "the outer frame".
             void drawChamferedRect(const D2D1_RECT_F& rect,
                                      float strokeWidth) const {
+                if (m_tier != PaintTier::Static) return;   // chrome shape
                 m_chromeShapes->addRect(rect.left, rect.top,
                                           rect.right - rect.left,
                                           rect.bottom - rect.top,
@@ -1562,6 +1626,30 @@ namespace openxr_api_layer::detail {
             // drawChamferedRect / the column-separator loops in
             // drawHeaderBar / drawBottomPanel append rects to its batch.
             chrome_shapes::Renderer* m_chromeShapes = nullptr;
+
+            // -------- Two-tier static/dynamic paint state -----------------
+            //
+            // drawChrome runs once per static bake AND once per value bump;
+            // m_tier selects which leaves actually emit during a traversal:
+            //   * Static  : labels / titles (drawLabel) + chrome shapes
+            //               (drawPanelBg / drawChamferedRect / separators)
+            //   * Dynamic : the changing values (drawAscii / drawValue*)
+            // The static tier is laid out once and cached in the glyph
+            // renderer's static scratch + the chrome-shape renderer's
+            // (persistent) scratch; only the dynamic tier is re-laid-out
+            // each version bump — the whole point of the split, shrinking
+            // the ~10 Hz chrome-rebuild CPU spike.
+            //
+            // m_staticBaked: whether the cached static tier is populated.
+            // m_staticStructureKey: a key over the inputs that change the
+            // STATIC geometry / label set (today: GPU VRAM-column presence,
+            // which drawBottomPanel derives from a non-empty vram value).
+            // A change forces a re-bake so the cached labels / shapes can't
+            // go stale against the live structure.
+            enum class PaintTier { Static, Dynamic };
+            PaintTier m_tier               = PaintTier::Dynamic;
+            bool      m_staticBaked        = false;
+            uint64_t  m_staticStructureKey = 0;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----

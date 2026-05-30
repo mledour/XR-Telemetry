@@ -108,7 +108,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
         bool isReady() const noexcept { return m_ready; }
 
         // -------- Batched draw ----------------------------------------
-        void beginBatch() noexcept;
+        //
+        // Two scratch tiers so static text (labels / titles, laid out
+        // once) survives across version bumps while only the dynamic
+        // text (values) is re-laid-out each bump. flush() uploads both
+        // contiguously in one DrawInstanced. beginStaticBatch clears +
+        // targets the static scratch; beginDynamicBatch clears + targets
+        // the dynamic one. drawRun appends to whichever was last selected
+        // (dynamic by default, so a stray drawRun can't corrupt the
+        // cached static layout).
+        void beginStaticBatch() noexcept;
+        void beginDynamicBatch() noexcept;
 
         // Emit one glyph quad per character. Missing glyphs (no entry in
         // the atlas table) advance the pen by a fallback width but emit
@@ -225,8 +235,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
         uint16_t m_atlasW = 0;
         uint16_t m_atlasH = 0;
 
-        // Scratch storage for queued instances — reused across batches.
-        std::vector<TextInstance> m_scratch;
+        // Scratch storage for queued instances, split into two tiers.
+        // m_staticScratch holds the labels / titles laid out once and
+        // reused across version bumps; m_dynamicScratch holds the values,
+        // cleared + rebuilt each bump. flush() uploads static then dynamic
+        // contiguously in a single DrawInstanced. m_activeStatic selects
+        // which one drawRun appends to (set by beginStaticBatch /
+        // beginDynamicBatch); defaults to the dynamic tier so a stray
+        // drawRun can never corrupt the cached static layout.
+        std::vector<TextInstance> m_staticScratch;
+        std::vector<TextInstance> m_dynamicScratch;
+        bool                      m_activeStatic = false;
     };
 
 }   // namespace openxr_api_layer::utils::glyph_atlas
