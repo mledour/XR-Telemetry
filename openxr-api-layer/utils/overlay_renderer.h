@@ -24,13 +24,14 @@
 
 // =============================================================================
 // overlay_renderer.h — in-headset HUD renderer. Owns the OpenXR swapchain
-// for the overlay quad, the DirectWrite/D2D resources that paint text into
-// it, and the histogram rings that drive the mini bars.
+// for the overlay quad, the glyph atlas + GPU pipelines that paint into it,
+// and the histogram rings that drive the mini bars.
 //
 // Two concrete implementations live in overlay_renderer.cpp:
-//   - D3D11OverlayRenderer: app uses D3D11 → we paint directly with D2D.
-//   - D3D12OverlayRenderer: app uses D3D12 → we bridge via D3D11On12 so
-//     D2D (which is D3D11-only) can still paint into the D3D12 swapchain.
+//   - D3D11OverlayRenderer: app uses D3D11 → we paint directly into the
+//     swapchain image via the chrome-shape / glyph-atlas / bar shaders.
+//   - D3D12OverlayRenderer: app uses D3D12 → we bridge via D3D11On12 and
+//     paint the same shaders into a shim, then CopyResource across.
 //
 // Callers (layer.cpp) get an abstract `OverlayRenderer` back from the
 // matching factory and use it the same way for both paths.
@@ -51,14 +52,6 @@
 namespace openxr_api_layer {
     class OpenXrApi;
 }
-
-// Forward declaration so consumers of this header (layer.cpp etc.) don't
-// have to drag in <d2d1.h> just because the test entry point below takes
-// an ID2D1RenderTarget*. pch.h pulls D3D11/D3D12 but not D2D — D2D only
-// lives in overlay_renderer.cpp and the test TU. A bare struct fwd decl
-// is enough for the pointer-parameter signature; the implementation in
-// the .cpp sees the real definition via <d2d1.h>.
-struct ID2D1RenderTarget;
 
 namespace openxr_api_layer::detail {
 
@@ -130,18 +123,6 @@ namespace openxr_api_layer::detail {
 
     // -------- Snapshot / test entry point ---------------------------------
     //
-    // Renders the overlay HUD to an arbitrary ID2D1RenderTarget — useful
-    // for visual-regression tests (a WIC bitmap RT in a CI tool produces
-    // a PNG that can be diffed against a golden image) and for offline
-    // preview generation.
-    //
-    // Same paint pipeline as the in-game renderers, just decoupled from
-    // OpenXR swapchain plumbing. Caller is responsible for the render
-    // target's lifecycle (Begin/EndDraw not required — this function
-    // handles them internally), but the brushes / text formats are
-    // allocated fresh on every call so the function is suitable only
-    // for one-shot rendering (NOT per-frame). Returns true on success.
-    //
     // The histogram ring template parameter must match the in-engine
     // kRingSize. We expose that as kOverlayHistoRingSize here so test
     // code can declare matching rings without hard-coding the value
@@ -153,17 +134,6 @@ namespace openxr_api_layer::detail {
     // every bar pixel-aligned. ~133 samples ≈ 1.5 s @ 90 Hz.
     constexpr std::size_t kOverlayHistoRingSize = 133;
 
-    // errOut: optional. On false return, populated with a short string
-    // identifying which step failed (init / initBrushes / paint). Used
-    // by the snapshot test to surface a useful failure message via
-    // doctest INFO(); production callers leave it null.
-    bool renderOverlayToTarget(
-        ID2D1RenderTarget* rt,
-        const OverlaySnapshot& snap,
-        const HistogramRing<kOverlayHistoRingSize>& cpuRing,
-        const HistogramRing<kOverlayHistoRingSize>& gpuRing,
-        std::string* errOut = nullptr);
-
     // -------- GPU-path snapshot entry point (Task 18) ---------------------
     //
     // Renders the overlay HUD through the SAME GPU pipeline the in-headset
@@ -172,15 +142,12 @@ namespace openxr_api_layer::detail {
     // BGRA8_UNORM texture sized kTexW × kTexH with D3D11_BIND_RENDER_TARGET.
     // The caller reads `target` back via a staging copy to obtain pixels
     // for the golden comparison. This is the snapshot coverage of the
-    // actual shipping render path (renderOverlayToTarget above covers the
-    // legacy D2D path, retired once Task 17 removes it).
+    // actual shipping render path (the legacy D2D snapshot entry was
+    // retired with the rest of the D2D layer).
     //
-    // `device` must be created with D3D11_CREATE_DEVICE_BGRA_SUPPORT — the
-    // entry point spins up a transient D2D render target on `target` to
-    // allocate the chrome brush-identity tokens the GPU emitters still key
-    // off (that indirection is removed in Task 17, at which point the D2D
-    // RT here goes too). errOut: optional failure-step string, same
-    // contract as renderOverlayToTarget.
+    // `device` may be any D3D11 device (BGRA_SUPPORT not required — the
+    // GPU shaders render BGRA8 regardless). errOut: optional
+    // failure-step string for a useful doctest message on failure.
     bool renderOverlayToTextureD3D11(
         ID3D11Device* device,
         ID3D11DeviceContext* ctx,
