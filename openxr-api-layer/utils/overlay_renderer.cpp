@@ -1699,11 +1699,10 @@ namespace openxr_api_layer::detail {
         // use). This renderer's instance buffers are FIXED-size (no power-
         // of-two growth) and there are several of them (bars + quads), so it
         // would share only the create+upload half, not the growth half the
-        // shared buffer is built around. It also still draws the quad passes
-        // unconditionally on a per-buffer Map failure (rather than
-        // suppressing the frame as the folded renderers do) — adopting the
-        // shared upload and that suppression is a separate follow-up, kept
-        // out of the behavior-preserving shared-base refactor.
+        // shared buffer is built around. Its per-Map-failure handling does
+        // follow the same contract, though: a failed buffer Map suppresses
+        // the affected draw pass rather than drawing over stale /
+        // uninitialized data (see drawPanel's quadOk / barCount gates).
         class HistogramBarRenderer {
           public:
             // RTV is supplied per-draw by the caller (Task 15 — D3D11
@@ -1925,6 +1924,7 @@ namespace openxr_api_layer::detail {
                 }
 
                 // --- refill quad instances: [0]=bg, [1..4]=grid, [5]=budget ---
+                bool quadOk = false;
                 {
                     D3D11_MAPPED_SUBRESOURCE map{};
                     if (SUCCEEDED(m_ctx->Map(m_quadInstances.Get(), 0,
@@ -1940,6 +1940,7 @@ namespace openxr_api_layer::detail {
                             histoT + stripH * budgetLineFraction();
                         q[5] = makeQuad(histoL, by, fullW, 1.0f, kBudgetLine);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
+                        quadOk = true;
                     }
                 }
 
@@ -1985,9 +1986,21 @@ namespace openxr_api_layer::detail {
                 // over). Without that guarantee the alpha-blended grid and
                 // budget could land on the wrong side of the bars.
                 //
+                // Both quad passes are skipped if the quad buffer didn't map
+                // this frame (quadOk == false) — never draw over its stale /
+                // uninitialized instance data. Mirrors the chrome-shape /
+                // glyph-atlas flushes, which suppress on a failed Map rather
+                // than compositing garbage. The bar pass is already gated by
+                // barCount (which stays 0 if the bar Map failed). A failed
+                // DISCARD map of these small fixed buffers is rare (≈ device-
+                // removed), so dropping the panel for that frame is the right
+                // trade.
+                //
                 // quad pass 1 — bg (instance 0) + 4 grid lines (1..4).
-                bindQuadPipeline();
-                m_ctx->DrawInstanced(4, 5, 0, 0);
+                if (quadOk) {
+                    bindQuadPipeline();
+                    m_ctx->DrawInstanced(4, 5, 0, 0);
+                }
 
                 // bar pass — samples on top of bg/grid (instances 0..barCount).
                 if (barCount > 0) {
@@ -1996,8 +2009,10 @@ namespace openxr_api_layer::detail {
                 }
 
                 // quad pass 2 — budget line on top of the bars (instance 5).
-                bindQuadPipeline();
-                m_ctx->DrawInstanced(4, 1, 0, 5);
+                if (quadOk) {
+                    bindQuadPipeline();
+                    m_ctx->DrawInstanced(4, 1, 0, 5);
+                }
             }
 
           private:
