@@ -90,7 +90,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_faceMetrics  = atlas.faceMetrics;
 
         m_dynamicScratch.reserve(kInitialInstances);
-        m_staticScratch.reserve(256);   // labels / titles only — a few dozen glyphs
+        m_staticScratch.reserve(kInitialStaticInstances);
 
         m_ready = true;
         return true;

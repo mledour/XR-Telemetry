@@ -45,15 +45,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
     //     pipeline state (VS/PS, input layout, sampler, blend, RTV
     //     from the supplied target texture). The atlas can be shared
     //     across multiple renderers on different D3D11 devices.
-    //   * One frame is:
-    //         beginBatch();
-    //         drawRun(...); drawRun(...); ...      // any number
+    //   * One frame is up to two batches — static (labels / titles,
+    //     baked once) and dynamic (values, rebuilt each version bump):
+    //         beginStaticBatch();  drawRun(...); ...   // once, cached
+    //         beginDynamicBatch(); drawRun(...); ...   // every bump
     //         flush();
-    //     beginBatch resets the scratch instance vector; drawRun appends
-    //     one TextInstance per glyph; flush uploads the whole vector in
-    //     one DISCARD-mapped write and emits a single DrawInstanced. The
-    //     pipeline state is set inside flush() — the renderer assumes the
-    //     caller (D2D / bars / external paint) has clobbered everything.
+    //     begin*Batch clears + targets that tier's scratch; drawRun
+    //     appends one TextInstance per glyph to the active tier; flush
+    //     uploads static-then-dynamic contiguously in one DISCARD-mapped
+    //     write + a single DrawInstanced. The pipeline state is set inside
+    //     flush() — the renderer assumes the caller (bars / external
+    //     paint) has clobbered everything.
     //
     // Coordinate convention:
     //   * Destination space matches the rest of the overlay: pixel-space
@@ -189,8 +191,9 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // Per-flush growth: if a batch exceeds the current instance-buffer
         // capacity, we recreate the buffer at the next power of two. Cap
         // at kMaxInstances to keep a bug from runaway-growing the buffer.
-        static constexpr UINT kInitialInstances = 1024;   // ~48 KB
-        static constexpr UINT kMaxInstances     = 65536;  // ~3 MB
+        static constexpr UINT kInitialInstances       = 1024;   // ~48 KB (dynamic tier reserve)
+        static constexpr UINT kInitialStaticInstances = 256;    // labels / titles reserve
+        static constexpr UINT kMaxInstances           = 65536;  // ~3 MB
 
         bool createPipeline();              // shaders + input layout + states
         bool createBuffers();               // VB + IB + CB
