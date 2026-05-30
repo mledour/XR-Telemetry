@@ -3925,4 +3925,72 @@ namespace openxr_api_layer::detail {
         return true;
     }
 
+    // -------- GPU-path snapshot entry point -------------------------------
+    //
+    // Mirrors the in-headset D3D11 paint: build the atlas, init the three
+    // GPU renderers against `target`, and run one paintOverlay pass.
+    // Caller reads `target` back afterwards. See the header for the
+    // contract (BGRA8_UNORM target, BGRA-capable device).
+    bool renderOverlayToTextureD3D11(
+        ID3D11Device* device,
+        ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* target,
+        const OverlaySnapshot& snap,
+        const HistogramRing<kOverlayHistoRingSize>& cpuRing,
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing,
+        std::string* errOut) {
+        auto fail = [&](const char* msg) {
+            if (errOut) *errOut = msg;
+            return false;
+        };
+        if (!device || !ctx || !target) return fail("null device/ctx/target");
+
+        CoreRenderer core;
+        if (!core.init()) return fail("core.init() failed (DWrite / atlas)");
+
+        // Brush-identity tokens: the GPU chrome emitters still key off
+        // the CoreRenderer brush / format pointers (gpuColorFor /
+        // gpuFmtFor). Allocate them on a transient D2D RT over `target`
+        // — the test device is BGRA-capable so this succeeds. (Removed
+        // when Task 17 refactors the indirection away.)
+        ComPtr<IDXGISurface> surf;
+        if (FAILED(target->QueryInterface(IID_PPV_ARGS(surf.GetAddressOf()))))
+            return fail("target QI IDXGISurface failed");
+        D2D1_RENDER_TARGET_PROPERTIES props =
+            D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                   D2D1_ALPHA_MODE_PREMULTIPLIED));
+        ComPtr<ID2D1RenderTarget> d2dRt;
+        if (FAILED(core.d2d()->CreateDxgiSurfaceRenderTarget(
+                surf.Get(), &props, d2dRt.GetAddressOf())))
+            return fail("CreateDxgiSurfaceRenderTarget (brush RT) failed");
+        if (!core.initBrushes(d2dRt.Get())) return fail("initBrushes failed");
+        if (!core.atlasReady()) return fail("glyph atlas not built");
+
+        HistogramBarRenderer    bars;
+        glyph_atlas::Renderer   text;
+        chrome_shapes::Renderer shapes;
+        if (!bars.init(device, ctx)) return fail("bars init failed");
+        if (!text.init(device, ctx, static_cast<UINT>(kTexW),
+                        static_cast<UINT>(kTexH), core.atlas()))
+            return fail("glyph renderer init failed");
+        if (!shapes.init(device, ctx, static_cast<UINT>(kTexW),
+                          static_cast<UINT>(kTexH)))
+            return fail("chrome shapes init failed");
+
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(device->CreateRenderTargetView(
+                target, nullptr, rtv.GetAddressOf())))
+            return fail("CreateRenderTargetView (target) failed");
+
+        // Fresh cadence → first paintOverlay does a full static rebuild.
+        PaintCadence cadence;
+        if (!paintOverlay(core, bars, cadence, ctx, rtv.Get(),
+                           text, shapes, cpuRing, gpuRing, snap))
+            return fail("paintOverlay failed");
+        ctx->Flush();
+        return true;
+    }
+
 } // namespace openxr_api_layer::detail

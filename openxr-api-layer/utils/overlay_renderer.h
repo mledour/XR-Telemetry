@@ -164,4 +164,30 @@ namespace openxr_api_layer::detail {
         const HistogramRing<kOverlayHistoRingSize>& gpuRing,
         std::string* errOut = nullptr);
 
+    // -------- GPU-path snapshot entry point (Task 18) ---------------------
+    //
+    // Renders the overlay HUD through the SAME GPU pipeline the in-headset
+    // D3D11 path uses (chrome shapes + glyph atlas + instanced bars,
+    // shaders sampled / blended on the GPU) into `target` — a caller-owned
+    // BGRA8_UNORM texture sized kTexW × kTexH with D3D11_BIND_RENDER_TARGET.
+    // The caller reads `target` back via a staging copy to obtain pixels
+    // for the golden comparison. This is the snapshot coverage of the
+    // actual shipping render path (renderOverlayToTarget above covers the
+    // legacy D2D path, retired once Task 17 removes it).
+    //
+    // `device` must be created with D3D11_CREATE_DEVICE_BGRA_SUPPORT — the
+    // entry point spins up a transient D2D render target on `target` to
+    // allocate the chrome brush-identity tokens the GPU emitters still key
+    // off (that indirection is removed in Task 17, at which point the D2D
+    // RT here goes too). errOut: optional failure-step string, same
+    // contract as renderOverlayToTarget.
+    bool renderOverlayToTextureD3D11(
+        ID3D11Device* device,
+        ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* target,
+        const OverlaySnapshot& snap,
+        const HistogramRing<kOverlayHistoRingSize>& cpuRing,
+        const HistogramRing<kOverlayHistoRingSize>& gpuRing,
+        std::string* errOut = nullptr);
+
 } // namespace openxr_api_layer::detail

@@ -24,11 +24,17 @@
 // test_overlay_snapshot.cpp — visual-regression snapshot of the overlay.
 //
 // Renders the HUD with hard-coded mock data (the same numbers from the
-// design mockup) to a WIC bitmap sized to the renderer's native
-// texture dimensions via the standard D2D CreateWicBitmapRenderTarget
-// path, then encodes the bitmap to overlay_snapshot.png in the test
-// binary's working directory. CI uploads the PNG as a build artifact
-// so a reviewer can eyeball the rendering without spinning up a HMD.
+// design mockup) through the GPU pipeline — the actual shipping path:
+// chrome shapes + glyph atlas + instanced bars, on a WARP D3D11 device
+// rendering into a BGRA8 texture. The texture is read back via a
+// staging copy and encoded to overlay_snapshot.png in the test binary's
+// working directory. CI uploads the PNG as a build artifact so a
+// reviewer can eyeball the rendering without spinning up a HMD.
+//
+// WARP (software rasteriser) is deterministic run-to-run and present on
+// GitHub's GPU-less runners, so the exact-pixel golden comparison stays
+// stable across CI runs. The golden was regenerated from WARP output
+// when the snapshot moved off the legacy D2D path.
 //
 // Why a doctest TEST_CASE rather than a standalone EXE: the existing
 // tests project already pulls in overlay_renderer.cpp (along with its
@@ -49,18 +55,20 @@
 
 #include <doctest/doctest.h>
 
-// Windows + D2D / DirectWrite / WIC stack.
+// Windows + D3D11 / WIC stack. The snapshot now renders through the
+// GPU pipeline (the actual shipping path) rather than D2D, so we need
+// d3d11 here; WIC stays for PNG encode + golden comparison.
 #define NOMINMAX
 #include <windows.h>
 #include <objbase.h>
-#include <d2d1.h>
-#include <dwrite.h>
+#include <d3d11.h>
 #include <wincodec.h>
 
 #include <wrl/client.h>
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -225,30 +233,43 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
         CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(wic.GetAddressOf()))));
 
-    // BGRA-premultiplied bitmap sized to the renderer's native
-    // texture dimensions — matches the D2D render target's default
-    // pixel format so no conversion is needed at commit time. If the
-    // renderer's kTexW / kTexH change, bump these in lockstep so the
-    // snapshot output covers the full painted area.
+    // Native overlay texture dimensions. If the renderer's kTexW /
+    // kTexH change, bump these in lockstep so the snapshot covers the
+    // full painted area.
     constexpr UINT W = 720;
     constexpr UINT H = 435;
-    ComPtr<IWICBitmap> bitmap;
-    REQUIRE(SUCCEEDED(wic->CreateBitmap(
-        W, H, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
-        bitmap.GetAddressOf())));
 
-    // D2D factory + WIC-bitmap render target.
-    ComPtr<ID2D1Factory> d2d;
-    REQUIRE(SUCCEEDED(::D2D1CreateFactory(
-        D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf())));
+    // WARP D3D11 device. WARP (software rasteriser) is deterministic
+    // run-to-run and available on GitHub's GPU-less CI runners, while
+    // fully supporting the overlay's SM 4.0 shaders. BGRA_SUPPORT is
+    // required because renderOverlayToTextureD3D11 spins up a transient
+    // D2D RT over the target for the chrome brush-identity tokens.
+    ComPtr<ID3D11Device>        device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    {
+        const D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL got{};
+        REQUIRE(SUCCEEDED(::D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            want, 1, D3D11_SDK_VERSION,
+            device.GetAddressOf(), &got, ctx.GetAddressOf())));
+    }
 
-    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                           D2D1_ALPHA_MODE_PREMULTIPLIED));
-    ComPtr<ID2D1RenderTarget> rt;
-    REQUIRE(SUCCEEDED(d2d->CreateWicBitmapRenderTarget(
-        bitmap.Get(), rtProps, rt.GetAddressOf())));
+    // Target the GPU pipeline paints into: BGRA8_UNORM render target,
+    // plus a CPU-readable staging copy we map to pull pixels out.
+    auto makeTex = [&](D3D11_USAGE usage, UINT bind, UINT cpu,
+                        ComPtr<ID3D11Texture2D>& out) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = usage; d.BindFlags = bind; d.CPUAccessFlags = cpu;
+        return SUCCEEDED(device->CreateTexture2D(&d, nullptr, out.GetAddressOf()));
+    };
+    ComPtr<ID3D11Texture2D> target, staging;
+    REQUIRE(makeTex(D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, target));
+    REQUIRE(makeTex(D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, staging));
 
     // Mock snapshot + synthetic histograms.
     using namespace openxr_api_layer::detail;
@@ -260,17 +281,37 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     fillSyntheticRing(gpuRing, /*base=*/6.7f, /*amp=*/1.8f,
                        /*stutter=*/11.0f, /*spike_a=*/55, /*spike_b=*/90);
 
-    // Render through the same CoreRenderer the in-engine path uses.
-    // errOut captures which step failed (init / initBrushes / paint /
-    // null rt) — without it the bool return collapses every possible
-    // D2D failure into a single false, which makes CI debugging a
-    // game of guesswork. INFO() attaches the message to the next
-    // REQUIRE so doctest prints it on failure.
+    // Render through the SAME GPU pipeline the in-headset D3D11 path
+    // uses (chrome shapes + glyph atlas + instanced bars). errOut
+    // captures which step failed for a useful doctest message.
     std::string err;
-    const bool ok = openxr_api_layer::detail::renderOverlayToTarget(
-        rt.Get(), snap, cpuRing, gpuRing, &err);
-    INFO("renderOverlayToTarget step: " << err);
+    const bool ok = openxr_api_layer::detail::renderOverlayToTextureD3D11(
+        device.Get(), ctx.Get(), target.Get(), snap, cpuRing, gpuRing, &err);
+    INFO("renderOverlayToTextureD3D11 step: " << err);
     REQUIRE(ok);
+
+    // Pull the rendered pixels back: copy the GPU target into the
+    // staging texture, map it, and pack into a tight W*4 BGRA buffer
+    // (the mapped RowPitch may exceed W*4, so copy row by row), then
+    // wrap as a WIC bitmap for the existing PNG encode + golden path.
+    ctx->CopyResource(staging.Get(), target.Get());
+    std::vector<BYTE> readback(static_cast<std::size_t>(W) * H * 4);
+    {
+        D3D11_MAPPED_SUBRESOURCE map{};
+        REQUIRE(SUCCEEDED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map)));
+        const BYTE* src = static_cast<const BYTE*>(map.pData);
+        for (UINT y = 0; y < H; ++y) {
+            std::memcpy(readback.data() + static_cast<std::size_t>(y) * W * 4,
+                        src + static_cast<std::size_t>(y) * map.RowPitch,
+                        static_cast<std::size_t>(W) * 4);
+        }
+        ctx->Unmap(staging.Get(), 0);
+    }
+    ComPtr<IWICBitmap> bitmap;
+    REQUIRE(SUCCEEDED(wic->CreateBitmapFromMemory(
+        W, H, GUID_WICPixelFormat32bppPBGRA, W * 4,
+        static_cast<UINT>(readback.size()), readback.data(),
+        bitmap.GetAddressOf())));
 
     // Encode to PNG. Filename relative to the test EXE's CWD.
     //
