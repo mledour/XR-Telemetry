@@ -205,24 +205,23 @@ namespace openxr_api_layer::utils::chrome_shapes {
     }
 
     void Renderer::flush(ID3D11RenderTargetView* rtv) {
-        if (!m_ready || !rtv || m_scratch.empty()) {
-            m_scratch.clear();
-            return;
-        }
+        // Scratch is owned by beginBatch() (the ~10 Hz chrome rebuild)
+        // and persists between flushes so every frame can re-upload the
+        // same chrome. So NONE of the bail-outs here clear it — a
+        // transient failure (buffer-grow / Map) must leave the last-good
+        // scratch intact so the next frame's flush retries instead of
+        // dropping the chrome until the next beginBatch.
+        if (!m_ready || !rtv || m_scratch.empty()) return;
 
         const UINT count = static_cast<UINT>(m_scratch.size());
         if (count > m_capacity) {
-            if (!growInstanceBuffer(count)) {
-                m_scratch.clear();
-                return;
-            }
+            if (!growInstanceBuffer(count)) return;
         }
 
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                m_scratch.clear();
                 return;
             }
             std::memcpy(map.pData, m_scratch.data(),

@@ -446,7 +446,6 @@ namespace openxr_api_layer::detail {
             const glyph_atlas::BuildResult& atlas() const noexcept { return m_atlas; }
             bool atlasReady() const noexcept { return m_atlasReady; }
 
-
             // Rebuild the static chrome instance batches from the
             // current snapshot. Pure CPU work: populates each
             // renderer's scratch vector via drawChrome (which
@@ -1568,7 +1567,6 @@ namespace openxr_api_layer::detail {
             std::vector<ComPtr<IDWriteFontFile>>  m_bundledFontFiles;
             ComPtr<IDWriteFontCollection>         m_customFontCollection;
 
-
             OverlayDisplayValues m_cachedValues;
 
             // Glyph atlas — baked once at init from the same DirectWrite
@@ -1596,24 +1594,24 @@ namespace openxr_api_layer::detail {
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
         //
-        // Replaces drawHistoRegion()'s D2D work (one FillRectangle per bar,
-        // ×kRingSize ×2 panels every frame) with a handful of instanced GPU
-        // draws into the shim. Owns two pipelines — solid-colour quads for the
-        // background / grid / budget line, and gradient bars for the samples —
-        // plus an RTV on the shim and the dynamic instance + constant buffers
-        // refilled per panel per frame.
+        // Paints the histogram region (background + grid + bars + budget line)
+        // with a handful of instanced GPU draws. Owns two pipelines —
+        // solid-colour quads for the background / grid / budget line, and
+        // gradient bars for the samples — plus the dynamic instance + constant
+        // buffers refilled per panel per frame. The render target is passed
+        // per drawPanel(rtv, …) call (the D3D11 path's intermediate paint
+        // texture, the D3D12 path's shim).
         //
-        // Lives on the SAME D3D11 device as the shim's D2D render target, so
-        // both share one immediate context. Contract for the caller:
-        //   1. Flush() the D2D RT before drawPanel() — D2D batches commands;
-        //      flushing commits the chrome so our draws land on top of it.
-        //   2. Treat the D3D11 pipeline state as clobbered after drawPanel()
-        //      (and D2D clobbers ours), so each drawPanel() sets ALL state.
+        // Caller contract: the GPU pipeline state is fully owned per draw —
+        // drawPanel() (and the chrome-shape / glyph-atlas flushes that run
+        // alongside it) each set ALL the state they need, since they
+        // clobber each other's bindings on the shared context. Ordering on
+        // that context is chrome shapes → text → bars, so the bars land on
+        // top of the chrome.
         //
-        // Colours mirror initBrushes() exactly so the GPU output matches the
-        // old D2D look (modulo edge anti-aliasing). The histogram rect is
-        // fully opaque after the background fill, so premultiplied == straight
-        // there and the runtime composites the quad layer correctly.
+        // Colours are the same straight-alpha palette as the chrome
+        // constants. The histogram rect is fully opaque after the background
+        // fill, so the runtime composites the quad layer correctly.
         class HistogramBarRenderer {
           public:
             // RTV is supplied per-draw by the caller (Task 15 — D3D11
@@ -1872,7 +1870,7 @@ namespace openxr_api_layer::detail {
                     // init()), so no re-upload here.
                 }
 
-                // --- pipeline state (D2D clobbered it; set everything) ---
+                // --- pipeline state (prior passes clobbered it; set all) ---
                 m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
                 D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
                                   static_cast<float>(kTexH), 0.0f, 1.0f};
@@ -2198,42 +2196,64 @@ namespace openxr_api_layer::detail {
                 //    SwapDeviceContextState swaps in a private,
                 //    default-initialised state block for the duration
                 //    of our rendering and hands back the app's full
-                //    pipeline state, which we restore on the way out.
-                //    This is the documented mechanism for a component
-                //    sharing a device context with another (the old
-                //    shim path sidestepped it by owning a private
-                //    device/context). Atomic — no manual save/restore
-                //    of the ~15 state objects we touch.
-                m_context1->SwapDeviceContextState(
-                    m_overlayState.Get(),
-                    m_savedState.ReleaseAndGetAddressOf());
+                //    pipeline state. Atomic — no manual save/restore of
+                //    the ~15 state objects we touch.
+                //
+                //    The state MUST be handed back on every exit path,
+                //    including a std::bad_alloc thrown from the
+                //    allocations inside paintOverlay
+                //    (formatOverlayDisplayValues, the per-segment
+                //    vectors in the GPU text emitter). A RAII guard
+                //    restores it as the stack unwinds; the catch(...)
+                //    then keeps the throw from crossing the xrEndFrame
+                //    C-ABI boundary (which would terminate the host).
+                //    Both together satisfy "never crash / never corrupt
+                //    the host".
+                bool painted = false;
+                {
+                    m_context1->SwapDeviceContextState(
+                        m_overlayState.Get(),
+                        m_savedState.ReleaseAndGetAddressOf());
+                    struct StateRestoreGuard {
+                        ID3D11DeviceContext1*   ctx;
+                        ID3DDeviceContextState* appState;
+                        ~StateRestoreGuard() {
+                            if (ctx && appState)
+                                ctx->SwapDeviceContextState(appState, nullptr);
+                        }
+                    } stateGuard{m_context1.Get(), m_savedState.Get()};
 
-                const bool painted =
-                    paintOverlay(m_core, m_bars, m_barsCadence,
-                                  m_context.Get(),
-                                  m_paintRtv.Get(),
-                                  m_glyphRenderer,
-                                  m_chromeShapeRenderer,
-                                  m_cpuRing, m_gpuRing, snap);
+                    try {
+                        painted =
+                            paintOverlay(m_core, m_bars, m_barsCadence,
+                                          m_context.Get(),
+                                          m_paintRtv.Get(),
+                                          m_glyphRenderer,
+                                          m_chromeShapeRenderer,
+                                          m_cpuRing, m_gpuRing, snap);
 
-                // 3. CopyResource the painted intermediate into the
-                //    swapchain image (still inside our isolated state
-                //    block). The Flush pushes the batch to the GPU so
-                //    the runtime's compositor — which may read on a
-                //    separate context — sees finalised pixels.
-                if (painted && imageIdx < m_images.size()) {
-                    ID3D11RenderTargetView* nullRtv = nullptr;
-                    m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
-                    m_context->CopyResource(m_images[imageIdx].Get(),
-                                             m_paintTexture.Get());
-                    m_context->Flush();
-                }
-
-                // Restore the app's pipeline state before returning to
-                // xrEndFrame — the app continues rendering on this
-                // context next frame and must see exactly what it left.
-                m_context1->SwapDeviceContextState(
-                    m_savedState.Get(), nullptr);
+                        // 3. CopyResource the painted intermediate into
+                        //    the swapchain image (still inside our
+                        //    isolated state block). Unbind the RTV first
+                        //    so the paint target isn't OM-bound while it
+                        //    serves as the copy source. Flush pushes the
+                        //    batch so the runtime's compositor — which
+                        //    may read on a separate context — sees
+                        //    finalised pixels.
+                        if (painted && imageIdx < m_images.size()) {
+                            ID3D11RenderTargetView* nullRtv = nullptr;
+                            m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
+                            m_context->CopyResource(m_images[imageIdx].Get(),
+                                                     m_paintTexture.Get());
+                            m_context->Flush();
+                        }
+                    } catch (...) {
+                        // Paint-time throw (OOM etc.): skip the overlay
+                        // this frame. stateGuard still restores the
+                        // app's context state on unwind out of this block.
+                        painted = false;
+                    }
+                }   // stateGuard restores the app's pipeline state here
 
                 // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
@@ -2374,10 +2394,21 @@ namespace openxr_api_layer::detail {
                         "QueryInterface ID3D11DeviceContext1 failed\n");
                     return false;
                 }
+                // Mirror the app device's threading mode into the
+                // context-state object. MS docs: if the device was
+                // created with D3D11_CREATE_DEVICE_SINGLETHREADED, every
+                // context-state object created from it MUST carry
+                // D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED —
+                // otherwise CreateDeviceContextState fails (overlay then
+                // silently disabled) or the locking contract is violated.
+                const UINT ctxStateFlags =
+                    (appFlags & D3D11_CREATE_DEVICE_SINGLETHREADED)
+                        ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED
+                        : 0u;
                 const D3D_FEATURE_LEVEL ctxStateLevels[] = { appLevel };
                 D3D_FEATURE_LEVEL chosenLevel{};
                 if (FAILED(m_device1->CreateDeviceContextState(
-                        0,
+                        ctxStateFlags,
                         ctxStateLevels, 1,
                         D3D11_SDK_VERSION,
                         __uuidof(ID3D11Device1),
@@ -2436,15 +2467,12 @@ namespace openxr_api_layer::detail {
                         "CreateRenderTargetView (paint target) failed\n");
                     return false;
                 }
-                // GPU pipelines. All three live on the APP's device +
-                // context now — they paint directly into the swapchain
-                // image RTVs above. Failure of any one disables the
-                // whole overlay (no D2D fallback path on the new flow);
-                // the layer logs and the composition layer is
-                // suppressed each frame.
-                m_useShaderBars =
-                    m_bars.init(m_device.Get(), m_context.Get());
-                if (!m_useShaderBars) {
+                // GPU pipelines. All three run on the APP's device +
+                // context, isolated per-frame via SwapDeviceContextState.
+                // Fail-closed: if any one fails to init, the overlay is
+                // disabled (no D2D fallback) — the layer logs and
+                // makeD3D11OverlayRenderer returns nullptr.
+                if (!m_bars.init(m_device.Get(), m_context.Get())) {
                     Log("xr_telemetry: overlay disabled — bars init failed\n");
                     return false;
                 }
@@ -2453,21 +2481,17 @@ namespace openxr_api_layer::detail {
                         "built (DirectWrite face resolution failed)\n");
                     return false;
                 }
-                m_useGlyphAtlas =
-                    m_glyphRenderer.init(m_device, m_context,
-                                          static_cast<UINT>(kTexW),
-                                          static_cast<UINT>(kTexH),
-                                          m_core.atlas());
-                if (!m_useGlyphAtlas) {
+                if (!m_glyphRenderer.init(m_device, m_context,
+                                           static_cast<UINT>(kTexW),
+                                           static_cast<UINT>(kTexH),
+                                           m_core.atlas())) {
                     Log("xr_telemetry: overlay disabled — glyph renderer "
                         "init failed\n");
                     return false;
                 }
-                m_useChromeShapes =
-                    m_chromeShapeRenderer.init(m_device, m_context,
-                                                static_cast<UINT>(kTexW),
-                                                static_cast<UINT>(kTexH));
-                if (!m_useChromeShapes) {
+                if (!m_chromeShapeRenderer.init(m_device, m_context,
+                                                 static_cast<UINT>(kTexW),
+                                                 static_cast<UINT>(kTexH))) {
                     Log("xr_telemetry: overlay disabled — chrome shapes "
                         "renderer init failed\n");
                     return false;
@@ -2541,21 +2565,17 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11Texture2D>                       m_paintTexture;
             ComPtr<ID3D11RenderTargetView>                m_paintRtv;
 
-
-            // GPU pipelines, all on the APP device. Each fails closed:
-            // if any init returns false the overlay is disabled (no
-            // D2D fallback in the direct-to-swapchain flow).
+            // GPU pipelines, all on the APP device. init() fails closed
+            // on any of them (overlay disabled, no D2D fallback), so by
+            // the time we paint all three are live — no per-renderer
+            // enable flag needed.
             HistogramBarRenderer        m_bars;
-            bool                        m_useShaderBars = false;
             glyph_atlas::Renderer       m_glyphRenderer;
-            bool                        m_useGlyphAtlas = false;
             chrome_shapes::Renderer     m_chromeShapeRenderer;
-            bool                        m_useChromeShapes = false;
-            // Chrome cadence: drawChrome rebuild only when
-            // snap.version ticks or the watchdog fires
-            // (kChromeWatchdogFrames at namespace scope). The
-            // rebuilt scratches re-flush every frame against
-            // whichever swapchain image RTV the runtime hands us.
+            // Chrome cadence: drawChrome rebuild only when snap.version
+            // ticks or the watchdog fires (kChromeWatchdogFrames at
+            // namespace scope). The rebuilt scratches re-flush every
+            // frame into the paint target.
             PaintCadence                m_barsCadence;
 
             CoreRenderer                m_core;
@@ -2567,22 +2587,25 @@ namespace openxr_api_layer::detail {
 
         // -------- D3D12 renderer (via D3D11On12 bridge) ---------------------
         //
-        // App uses D3D12. D2D is D3D11-only, so we wrap the app's D3D12
-        // device into an ID3D11Device via D3D11On12CreateDevice. Each
-        // swapchain image (ID3D12Resource*) is then bridged to an
-        // ID3D11Resource via CreateWrappedResource — the wrapped
-        // resource exposes a DXGI surface D2D can paint into.
+        // App uses D3D12. Our GPU shader pipelines are D3D11, so we wrap
+        // the app's D3D12 device into an ID3D11Device via
+        // D3D11On12CreateDevice. Each swapchain image (ID3D12Resource*) is
+        // bridged to an ID3D11Resource via CreateWrappedResource so the
+        // bridge can CopyResource into it.
         //
-        // Per-frame dance:
+        // We paint the chrome / text / bars shaders into a BGRA8 shim on
+        // the bridge device, then CopyResource the shim into the wrapped
+        // swapchain image. Per-frame dance:
         //   1. Acquire+wait the OpenXR swapchain image.
-        //   2. D3D11On12::AcquireWrappedResources(wrapped) — flips the
+        //   2. paintOverlay → shim RTV (chrome shapes + glyph atlas + bars).
+        //   3. D3D11On12::AcquireWrappedResources(wrapped) — flips the
         //      wrapped resource's state so D3D11 can write to it.
-        //   3. D2D BeginDraw / DrawTextW / FillRectangle / EndDraw.
-        //   4. D3D11On12::ReleaseWrappedResources(wrapped) — flips
-        //      state back so D3D12 can read it for compositing.
-        //   5. ID3D11DeviceContext::Flush() — pumps the D3D11On12
-        //      command list into the underlying D3D12 queue.
-        //   6. xrReleaseSwapchainImage.
+        //   4. CopyResource(wrapped, shim).
+        //   5. D3D11On12::ReleaseWrappedResources(wrapped) — flips state
+        //      back so D3D12 can read it for compositing.
+        //   6. ID3D11DeviceContext::Flush() — pumps the D3D11On12 command
+        //      list into the underlying D3D12 queue.
+        //   7. xrReleaseSwapchainImage.
         class D3D12OverlayRenderer final : public OverlayRenderer {
           public:
             D3D12OverlayRenderer(OpenXrApi* api, XrSession session,
@@ -2627,38 +2650,44 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // Paint into the typed BGRA8 shim we own (D2D refuses
-                // the typeless surface the runtime exposes via the
-                // wrapped resource). After paint, AcquireWrappedResources
-                // around the CopyResource so the underlying D3D12
-                // texture goes through the D3D11On12 state transition
-                // correctly, then ReleaseWrappedResources hands control
-                // back to the runtime's compositor.
+                // paintOverlay clears + flushes chrome / text / bars
+                // into the shim's D3D11 RTV; the AcquireWrapped /
+                // CopyResource / Flush dance below ferries the painted
+                // shim into the wrapped D3D12 swapchain image. The
+                // D3D12 path keeps the shim because the D3D11On12 bridge
+                // runs on a separate D3D11 device — so the app-context
+                // state-leak that bit the D3D11 path can't occur here
+                // (no state isolation needed), and D3D11 shaders can't
+                // target the D3D12 resources directly anyway.
                 //
-                // GPU path only — no D2D fallback. paintOverlay clears
-                // + flushes chrome / text / bars into the shim's D3D11
-                // RTV; the AcquireWrapped/CopyResource/Flush dance
-                // below ferries the painted shim into the D3D12
-                // swapchain image. The D3D12 path keeps the shim (the
-                // D3D11On12 bridge runs on a separate device, so the
-                // app-context state-leak that bit the D3D11 path can't
-                // occur here, and D3D11 shaders can't target D3D12
-                // resources directly anyway). m_useGpuPath is asserted
-                // at init — if any GPU pipeline failed to come up the
-                // overlay was disabled there, so this is always true
-                // when m_ready.
-                const bool painted =
-                    paintOverlay(m_core, m_bars, m_barsCadence,
-                                  m_d3d11Context.Get(),
-                                  m_shimRtv.Get(),
-                                  m_glyphRenderer,
-                                  m_chromeShapeRenderer,
-                                  m_cpuRing, m_gpuRing, snap);
-                ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
-                if (painted && wrapped && m_d3d11Context) {
-                    m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
-                    m_d3d11Context->CopyResource(wrapped, m_shimTexture.Get());
-                    m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                // try/catch: paintOverlay allocates (display-value
+                // strings, per-segment vectors), so an OOM throw is
+                // possible. It can't corrupt app state here (separate
+                // device), but it must not cross the xrEndFrame C-ABI
+                // boundary — catch and skip the overlay this frame.
+                bool painted = false;
+                try {
+                    painted =
+                        paintOverlay(m_core, m_bars, m_barsCadence,
+                                      m_d3d11Context.Get(),
+                                      m_shimRtv.Get(),
+                                      m_glyphRenderer,
+                                      m_chromeShapeRenderer,
+                                      m_cpuRing, m_gpuRing, snap);
+                    ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
+                    if (painted && wrapped && m_d3d11Context) {
+                        // Unbind the shim RTV before the copy so it
+                        // isn't OM-bound while serving as the copy
+                        // source (matches the D3D11 path; silences the
+                        // debug layer's render-target-hazard warning).
+                        ID3D11RenderTargetView* nullRtv = nullptr;
+                        m_d3d11Context->OMSetRenderTargets(1, &nullRtv, nullptr);
+                        m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
+                        m_d3d11Context->CopyResource(wrapped, m_shimTexture.Get());
+                        m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                    }
+                } catch (...) {
+                    painted = false;
                 }
                 // Flush the D3D11On12 command list into the D3D12 queue
                 // so the runtime sees the painted content when it
@@ -2847,7 +2876,6 @@ namespace openxr_api_layer::detail {
                         "init failed\n");
                     return false;
                 }
-                m_useShaderBars = true;
                 if (!m_core.atlasReady()) {
                     Log("xr_telemetry: overlay disabled — D3D12 glyph atlas "
                         "not built\n");
@@ -2861,7 +2889,6 @@ namespace openxr_api_layer::detail {
                         "renderer init failed\n");
                     return false;
                 }
-                m_useGlyphAtlas = true;
                 if (!m_chromeShapeRenderer.init(
                         m_d3d11Device, m_d3d11Context,
                         static_cast<UINT>(kTexW),
@@ -2870,7 +2897,6 @@ namespace openxr_api_layer::detail {
                         "shapes renderer init failed\n");
                     return false;
                 }
-                m_useChromeShapes = true;
 
                 // One-time fill of the immutable quad-layer fields;
                 // mirror of the D3D11 path's helper (no need to share
@@ -2911,42 +2937,25 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11On12Device>              m_d3d11On12;
             XrSwapchain                           m_swapchain = XR_NULL_HANDLE;
             std::vector<ComPtr<ID3D11Resource>>   m_wrappedResources;
-            // Shim — same role as in D3D11OverlayRenderer. Created on
-            // the bridged D3D11 device (not the app's D3D12 device);
-            // D2D paints into it, then CopyResource sends the result
-            // to the wrapped D3D12 swapchain image each frame.
+            // Shim — created on the bridged D3D11 device (not the app's
+            // D3D12 device). The GPU pipelines paint into it via m_shimRtv,
+            // then the wrapped-resource CopyResource sends the result to
+            // the D3D12 swapchain image each frame.
             ComPtr<ID3D11Texture2D>               m_shimTexture;
             ComPtr<ID3D11RenderTargetView>        m_shimRtv;
-            // GPU histogram path. Same HistogramBarRenderer the D3D11
-            // path uses (device-agnostic — it just needs an
-            // ID3D11Device + context + a BIND_RENDER_TARGET texture).
-            // Here the device IS the D3D11On12 bridge: our instanced
-            // bar/quad draws sit on m_d3d11Context alongside the D2D
-            // chrome, and the existing wrapped-resource CopyResource +
-            // Flush dance in renderAndCompose ferries the result into
-            // the D3D12 swapchain image. The D3D11On12 Flush() stays
-            // (incompressible — that's the D3D12 queue handoff), so
-            // the perf win is the D2D bar work moved to the GPU; the
-            // bridge overhead is unchanged.
+            // GPU pipelines on the D3D11On12 bridge — same classes as the
+            // D3D11 path, here targeting the shim RTV. The D3D11On12
+            // Flush() in renderAndCompose is incompressible (the D3D12
+            // queue handoff), so the bridge overhead is the price of the
+            // D3D12 path; the chrome/text/bars themselves are all GPU.
+            // init() fails closed on any of them, so no enable flags.
             HistogramBarRenderer                  m_bars;
-            bool                                  m_useShaderBars = false;
-            // GPU text renderer on the D3D11On12 bridge. Atlas texture
-            // lives on the private D3D11 device; the atlas bitmap is
-            // copied from CoreRenderer's BuildResult, so glyph cuts
-            // match the D3D11 path's renderer bit-for-bit. Soft-fails
-            // the same way m_useShaderBars does — D2D text path is the
-            // documented fallback when the atlas fails to build or the
-            // D3D11 pipeline init returns false.
             glyph_atlas::Renderer                 m_glyphRenderer;
-            bool                                  m_useGlyphAtlas = false;
-            // GPU chrome shapes on the D3D11On12 bridge. Same
-            // pattern as the D3D11 path's m_chromeShapeRenderer.
             chrome_shapes::Renderer               m_chromeShapeRenderer;
-            bool                                  m_useChromeShapes = false;
-            // Chrome cadence for the shader path — paints D2D only on
-            // snap.version ticks or the watchdog. Same kChromeWatchdog
-            // Frames constant as the D3D11 path, hoisted to namespace
-            // scope so a tweak lands once.
+            // Chrome cadence — drawChrome rebuild only on snap.version
+            // ticks or the watchdog. Same kChromeWatchdogFrames constant
+            // as the D3D11 path, hoisted to namespace scope so a tweak
+            // lands once.
             PaintCadence                          m_barsCadence;
             CoreRenderer                          m_core;
             HistogramRing<kRingSize>              m_cpuRing;

@@ -37,18 +37,18 @@
 // when the snapshot moved off the legacy D2D path.
 //
 // Why a doctest TEST_CASE rather than a standalone EXE: the existing
-// tests project already pulls in overlay_renderer.cpp (along with its
-// D2D / DirectWrite stack), so a single binary covers BOTH the unit
-// tests AND the snapshot generation. No new vcxproj, no new solution
-// entry, no order-of-build worries.
+// tests project already pulls in overlay_renderer.cpp (along with the
+// glyph-atlas / chrome-shape renderers + DirectWrite), so a single
+// binary covers BOTH the unit tests AND the snapshot generation. No
+// new vcxproj, no new solution entry, no order-of-build worries.
 //
-// The renderer's bundled-Barlow path uses FindResource against the
-// running module's resource table. The test EXE has its OWN copy of
-// the Barlow resources via openxr-api-layer-tests.rc (see "Snapshot
-// tests" in docs/DEVELOPMENT.md), so the test renders with the same
-// fonts as the in-headset HUD — pixel-for-pixel match modulo the
-// runtime path differences (in-game uses a swapchain D2D RT, the test
-// uses a WIC bitmap RT, both software-rasterised). The shared
+// The atlas builder's bundled-Barlow path uses FindResource against
+// the running module's resource table. The test EXE has its OWN copy
+// of the Barlow resources via openxr-api-layer-tests.rc (see "Snapshot
+// tests" in docs/DEVELOPMENT.md), so the test bakes the same atlas as
+// the in-headset HUD. It renders through the same GPU pipeline too
+// (WARP here vs the user's GPU in-headset), so the snapshot matches
+// the real output modulo rasteriser AA. The shared
 // bundled_fonts.rc.inc include guarantees the test and the production
 // DLL embed byte-identical font tables.
 // =============================================================================
@@ -241,9 +241,10 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
 
     // WARP D3D11 device. WARP (software rasteriser) is deterministic
     // run-to-run and available on GitHub's GPU-less CI runners, while
-    // fully supporting the overlay's SM 4.0 shaders. BGRA_SUPPORT is
-    // required because renderOverlayToTextureD3D11 spins up a transient
-    // D2D RT over the target for the chrome brush-identity tokens.
+    // fully supporting the overlay's SM 4.0 shaders. BGRA_SUPPORT isn't
+    // required by renderOverlayToTextureD3D11 anymore (the GPU shaders
+    // render BGRA8 regardless), but it's harmless to keep and matches
+    // what a real app's D3D11 device usually requests.
     ComPtr<ID3D11Device>        device;
     ComPtr<ID3D11DeviceContext> ctx;
     {

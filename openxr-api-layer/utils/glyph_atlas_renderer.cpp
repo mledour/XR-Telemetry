@@ -364,19 +364,18 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // flush() — single DrawInstanced for all queued glyphs.
     // ===================================================================
     void Renderer::flush(ID3D11RenderTargetView* rtv) {
-        if (!m_ready || !rtv || m_scratch.empty()) {
-            m_scratch.clear();
-            return;
-        }
+        // Scratch is owned by beginBatch() and persists between flushes
+        // so every frame re-uploads the same text. None of the bail-outs
+        // clear it — a transient failure (buffer-grow / Map) must leave
+        // the last-good scratch intact so the next frame retries rather
+        // than blanking the text until the next beginBatch.
+        if (!m_ready || !rtv || m_scratch.empty()) return;
 
         // Grow if the batch outsizes the current GPU buffer. Bails (and
         // skips the draw) on cap hit — graceful degrade.
         const UINT instanceCount = static_cast<UINT>(m_scratch.size());
         if (instanceCount > m_instanceCapacity) {
-            if (!growInstanceBuffer(instanceCount)) {
-                m_scratch.clear();
-                return;
-            }
+            if (!growInstanceBuffer(instanceCount)) return;
         }
 
         // Upload instances via DISCARD-mapped write.
@@ -384,7 +383,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                m_scratch.clear();
                 return;
             }
             std::memcpy(map.pData, m_scratch.data(),

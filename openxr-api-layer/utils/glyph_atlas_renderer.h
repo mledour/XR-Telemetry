@@ -81,10 +81,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // -------- Lifecycle --------------------------------------------
         //
         // `dstWidth` / `dstHeight` are the fixed pixel dimensions of
-        // every render target the renderer will paint into; they
+        // the render target(s) the renderer paints into; they
         // pre-populate the cbuffer's texSize. The actual RTV is
-        // supplied per-flush (Task 15 — D3D11 path paints directly
-        // into one of N swapchain images each frame).
+        // supplied per-flush (not stored), so one pipeline can serve
+        // the in-engine paint texture / shim and the snapshot test's
+        // own texture.
         //
         // `atlas` is taken by const-ref: each renderer creates its own
         // ID3D11Texture2D from the bitmap (the bitmap copy happens via

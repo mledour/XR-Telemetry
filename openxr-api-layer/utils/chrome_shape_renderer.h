@@ -68,14 +68,12 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // ===================================================================
     class Renderer {
       public:
-        // RTV is supplied per-flush by the caller (Task 15 — D3D11
-        // path paints directly into one of N swapchain images, so the
-        // pipeline state stays renderer-owned while the actual target
-        // rotates each frame). dstWidth/dstHeight are the fixed pixel
-        // dimensions of every target the renderer will paint into;
-        // they pre-populate the cbuffer's texSize and stay constant
-        // for the renderer's lifetime (overlay swapchain is always
-        // kTexW × kTexH).
+        // RTV is supplied per-flush by the caller, not stored — so one
+        // pipeline (state + buffers) can serve different targets (the
+        // in-engine paint texture / shim, and the snapshot test's own
+        // texture). dstWidth/dstHeight are the fixed pixel dimensions of
+        // those targets; they pre-populate the cbuffer's texSize and
+        // stay constant for the renderer's lifetime (always kTexW × kTexH).
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>        device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx,
                   UINT                                        dstWidth,
