@@ -154,9 +154,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
         //
         // Sets the full pipeline state on the immediate context
         // (targeting `rtv`) and emits one DrawInstanced for all queued
-        // instances. No-op if the scratch vector is empty or rtv is
-        // null.
-        void flush(ID3D11RenderTargetView* rtv);
+        // instances. Returns true on success (incl. an empty no-op),
+        // false only on a real GPU failure (buffer-grow / Map) — the
+        // caller uses that to suppress a frame that would otherwise
+        // composite over a freshly-cleared target.
+        bool flush(ID3D11RenderTargetView* rtv);
 
       private:
         // CPU-side mirror of the per-instance vertex data — must match

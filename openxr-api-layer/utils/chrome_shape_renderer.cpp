@@ -204,25 +204,31 @@ namespace openxr_api_layer::utils::chrome_shapes {
         addRect(x + w - strokeWidth, y + strokeWidth, strokeWidth, h - 2 * strokeWidth, color); // right
     }
 
-    void Renderer::flush(ID3D11RenderTargetView* rtv) {
+    bool Renderer::flush(ID3D11RenderTargetView* rtv) {
+        // Returns true if the chrome was drawn (or there was nothing to
+        // draw), false only on a real GPU failure (buffer-grow / Map),
+        // so the caller can suppress a frame that would otherwise
+        // composite bars over a freshly-cleared, chrome-less target.
+        //
         // Scratch is owned by beginBatch() (the ~10 Hz chrome rebuild)
         // and persists between flushes so every frame can re-upload the
         // same chrome. So NONE of the bail-outs here clear it — a
-        // transient failure (buffer-grow / Map) must leave the last-good
-        // scratch intact so the next frame's flush retries instead of
-        // dropping the chrome until the next beginBatch.
-        if (!m_ready || !rtv || m_scratch.empty()) return;
+        // transient failure must leave the last-good scratch intact so
+        // the next frame's flush retries instead of dropping the chrome
+        // until the next beginBatch.
+        if (!m_ready || !rtv) return false;
+        if (m_scratch.empty()) return true;
 
         const UINT count = static_cast<UINT>(m_scratch.size());
         if (count > m_capacity) {
-            if (!growInstanceBuffer(count)) return;
+            if (!growInstanceBuffer(count)) return false;
         }
 
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                return;
+                return false;
             }
             std::memcpy(map.pData, m_scratch.data(),
                         count * sizeof(QuadInstance));
@@ -259,6 +265,7 @@ namespace openxr_api_layer::utils::chrome_shapes {
         // caller can re-flush the same chrome onto every swapchain
         // image without paying the drawChrome rebuild cost each frame.
         // beginBatch() is the only way to drop scratch.
+        return true;
     }
 
 }   // namespace openxr_api_layer::utils::chrome_shapes

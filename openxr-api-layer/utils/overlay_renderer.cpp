@@ -34,16 +34,16 @@
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
 #include "framework/log.h"            // Log / ErrorLog
 
+// <d2d1.h> is included ONLY for the header-only D2D1_RECT_F / D2D1::RectF
+// helper used as the layout-rect type — no D2D runtime call remains after
+// the GPU migration, so d2d1.dll is never loaded into the host process.
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
-// Extra DXGI / D3D11 headers required by the cross-device shim
-// path. pch.h's <d3d11.h> + <dxgi.h> only expose the base
-// interfaces; we need:
-//   - IDXGIResource1 (CreateSharedHandle)            from <dxgi1_2.h>
-//   - ID3D11Device1::OpenSharedResource1             from <d3d11_1.h>
-//   - IDXGIKeyedMutex                                from <dxgi.h>  ✓ already there
-#include <dxgi1_2.h>
+// <d3d11_1.h>: ID3D11Device1 / ID3D11DeviceContext1 / ID3DDeviceContextState
+// + CreateDeviceContextState / SwapDeviceContextState — the per-frame
+// pipeline-state isolation on the app's shared immediate context (D3D11
+// path). pch.h's <d3d11.h> only exposes the base interfaces.
 #include <d3d11_1.h>
 
 #include <array>
@@ -58,17 +58,15 @@
 // include path in both the layer and test vcxproj). Each header declares a
 // `const BYTE g_<filename>[]` (internal linkage, so including them in this
 // one TU is ODR-safe). HistogramBarRenderer builds the instanced-bar and
-// solid-quad pipelines from these to paint the histogram region on the GPU
-// instead of via the per-bar D2D FillRectangle loop.
+// solid-quad pipelines from these to paint the histogram region on the GPU.
 #include "overlay_bars_vs.h"
 #include "overlay_bars_ps.h"
 #include "overlay_quad_vs.h"
 #include "overlay_quad_ps.h"
 
-// Pragma-link D2D + DirectWrite so we don't have to add them to the
-// vcxproj's Link section. d2d1.lib and dwrite.lib ship with the Windows
-// SDK; no extra NuGet package needed.
-#pragma comment(lib, "d2d1.lib")
+// Pragma-link DirectWrite (the glyph atlas rasterises through it at init).
+// dwrite.lib ships with the Windows SDK; no extra NuGet package needed.
+// No d2d1.lib — D2D is header-type-only now (see the <d2d1.h> note above).
 #pragma comment(lib, "dwrite.lib")
 
 namespace openxr_api_layer::detail {
@@ -322,12 +320,15 @@ namespace openxr_api_layer::detail {
         constexpr float kColorFrameLine[4] = {0.122f, 0.133f, 0.133f, 1.00f};  // m_brushFrameLine (frame stroke)
         constexpr float kColorSeparator[4] = {0.184f, 0.200f, 0.204f, 1.00f};  // m_brushSeparator (panel & cell strokes)
 
-        // -------- CoreRenderer: D2D + DirectWrite painting ------------------
+        // -------- CoreRenderer: DirectWrite + glyph-atlas owner -------------
         //
-        // Shared between the D3D11-native path and the D3D12-via-D3D11On12
-        // bridge. Owns the D2D / DirectWrite factories + the cached
-        // IDWriteTextFormat. The per-image render targets live on the
-        // outer class because they bind to specific swapchain images.
+        // Shared between the D3D11 and D3D12 paths. Owns the DirectWrite
+        // factory + the bundled-font collection, and bakes the glyph atlas
+        // once at init (the GPU renderers copy from its BuildResult). It
+        // also holds drawChrome + the chrome sub-helpers, which emit onto
+        // the per-frame GPU renderers (m_textRenderer / m_chromeShapes)
+        // the caller stashes around a chrome rebuild. No D2D, no per-frame
+        // GPU resources of its own.
         class CoreRenderer {
           public:
             // -------- Public lifecycle --------------------------------------
@@ -358,11 +359,10 @@ namespace openxr_api_layer::detail {
                 // The TTF files live as RT_BUNDLED_FONT resources in the
                 // DLL (see fonts/bundled_fonts.rc.inc); we feed their
                 // bytes into an IDWriteInMemoryFontFileLoader and build
-                // a custom IDWriteFontCollection around them. The
-                // collection is then referenced by family name ("Barlow")
-                // in every CreateTextFormat call below — DirectWrite
-                // resolves through the custom collection, never falling
-                // back to system fonts.
+                // a custom IDWriteFontCollection around them. The glyph
+                // atlas builder (buildGlyphAtlas below) resolves the
+                // faces through this collection by family name, never
+                // falling back to system fonts.
                 //
                 // Why bundle two families: design lands on a true italic
                 // for the chiffres (Barlow Medium Italic) but keeps the
@@ -379,12 +379,11 @@ namespace openxr_api_layer::detail {
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the
-                // custom collection and let CreateTextFormat fall
-                // back to system default — Bahnschrift on Win10+. The
-                // fallback face is upright-only, so chiffres formats
-                // will render upright instead of italic. Graceful
-                // degrade — never crash the host process for a
-                // cosmetic font.
+                // custom collection and let the atlas builder resolve
+                // against the system default — Bahnschrift on Win10+.
+                // The fallback face is upright-only, so the chiffres
+                // render upright instead of italic. Graceful degrade —
+                // never crash the host process for a cosmetic font.
                 const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
                 const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
                 IDWriteFontCollection* customCollection = nullptr;
@@ -397,22 +396,17 @@ namespace openxr_api_layer::detail {
                     // fallback face since system Bahnschrift has no
                     // true italic face.
                     //
-                    // KNOWN DIVERGENCE on this path: D2D's
-                    // CreateTextFormat keeps DWRITE_FONT_STYLE_ITALIC
-                    // and DirectWrite synthesises the oblique glyphs
-                    // by shearing the upright face. The GPU atlas
-                    // path resolves via IDWriteFontFamily::
-                    // GetFirstMatchingFont(... ITALIC ...), which
-                    // does NOT synthesise — it returns the closest
-                    // existing face (upright). So when the bundled
-                    // fonts fail to load AND the GPU text path
-                    // succeeds, the big FPS digits render upright
-                    // on the GPU vs sheared on the D2D fallback.
-                    // Cosmetic, narrow trigger; flagged here so a
-                    // future tweak (e.g. shader-side shear, or
-                    // CreateGlyphRunAnalysis with a 2D oblique
-                    // transform in glyph_atlas.cpp) lands with the
-                    // context.
+                    // KNOWN LIMITATION on this fallback: the atlas
+                    // resolves the chiffres face via IDWriteFontFamily::
+                    // GetFirstMatchingFont(... ITALIC ...), which does
+                    // NOT synthesise oblique — it returns the closest
+                    // existing face. Bahnschrift has no italic cut, so
+                    // the big FPS digits render upright (not sheared)
+                    // when the bundled fonts fail to load. Cosmetic,
+                    // narrow trigger; flagged so a future fix (shader-
+                    // side shear, or a 2D oblique transform on
+                    // CreateGlyphRunAnalysis in glyph_atlas.cpp) lands
+                    // with the context.
                     kFamilyChiffres = L"Bahnschrift";
                     kFamilyLabels   = L"Bahnschrift";
                 } else {
@@ -949,38 +943,16 @@ namespace openxr_api_layer::detail {
             // SemiBold upright. Auto-detects digit and unit ranges from
             // the string content via findValueRuns.
             //
-            // `brush` paints non-value characters. When `chiffresBrush`
-            // is non-null, BOTH the digit and unit portions of every
-            // value run flip to that brush — used by the CPU compound
-            // so "X.X ms" reads in cyan while "App" / " / Render "
-            // labels stay in white. When `unitFontSize > 0`, the unit
-            // portion of every value run shrinks to that size while
-            // the digit portion stays at the base size — used by the
-            // bottom panel to render " °C" / " %" at the small label
-            // size next to the big-number digit prefix.
+            // The base `color` paints non-value characters. When
+            // `chiffresColor` is non-null, BOTH the digit and unit
+            // portions of every value run flip to it — used by the CPU
+            // compound so "X.X ms" reads in cyan while "App" / " /
+            // Render " labels stay in white. When `unitFontSize > 0`,
+            // the unit portion of every value run shrinks to that size
+            // while the digit portion stays at the base size — used by
+            // the bottom panel to render " °C" / " %" at the small
+            // label size next to the big-number digit prefix.
             //
-            // NOTE on tabular figures (`tnum`): an earlier iteration
-            // attached an IDWriteTypography with DWRITE_FONT_FEATURE_TAG
-            // _TABULAR_FIGURES via layout->SetTypography in this code
-            // path AND on every drawAscii / drawWide path. A diagnostic
-            // CI run (see PR #21 commits e453b52 / b067bdc) confirmed
-            // the typography object was created successfully and
-            // SetTypography returned S_OK, yet the rendered output was
-            // bit-identical to the no-tnum baseline — chiffres "1"
-            // stayed at 318 width units instead of widening to 494
-            // like the font's tnum lookup specifies.
-            //
-            // Root cause hypothesis: DirectWrite's shape engine ignores
-            // IDWriteTypography feature overrides when the resolved font
-            // face comes from a custom IDWriteFontCollection populated
-            // via IDWriteInMemoryFontFileLoader (the path used by
-            // loadBundledFontCollection above). The chiffres-jitter
-            // cosmetic issue stays unaddressed until we either find a
-            // working DirectWrite path or accept the jitter as a known
-            // footnote. The hook point if we ever revisit is exactly
-            // here — applied per-layout, not per-format, so this
-            // helper would gain a SetTypography call without further
-            // refactor.
             // Mixed-style value rendering — thin forwarder onto the GPU
             // value emitter. Walks findValueRuns inside drawValueTextGpu
             // to flip digit ranges to Barlow Italic, optionally shrink
@@ -2113,8 +2085,20 @@ namespace openxr_api_layer::detail {
             if (flushChrome) {
                 const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 ctx->ClearRenderTargetView(rtv, kClear);
-                gpuShapes.flush(rtv);
-                gpuText.flush(rtv);
+                // If a chrome flush fails (transient Map/grow under
+                // memory pressure) AFTER we've cleared the target,
+                // suppress the whole frame — otherwise we'd composite
+                // bars + whatever-drew over a blank background. The
+                // cadence keeps needStatic set so the next frame retries
+                // the rebuild. (Both flushes run; we don't short-circuit
+                // so a partial draw still lands consistently before we
+                // bail.)
+                const bool shapesOk = gpuShapes.flush(rtv);
+                const bool textOk   = gpuText.flush(rtv);
+                if (!shapesOk || !textOk) {
+                    commitPaint(cadence, needStatic, /*ok=*/false, snap.version);
+                    return false;
+                }
             }
 
             // Dynamic tier — bars every frame (the histogram scrolls at
@@ -2232,6 +2216,21 @@ namespace openxr_api_layer::detail {
                 //    chrome is re-flushed every frame (the cheap cached-
                 //    scratch upload; the 10 Hz chrome REBUILD is still
                 //    gated).
+                //
+                //    LIMITATION: this only isolates the app's IMMEDIATE
+                //    context. An app that submits its frame from a
+                //    DEFERRED context, or from another thread racing
+                //    xrEndFrame, isn't serialised by our swap — on such
+                //    an engine the state-leak corruption could resurface.
+                //    Not observed on the tested runtimes (Pimax + Dirt /
+                //    LMU / HelloXR, all immediate-context within the
+                //    xrEndFrame thread), and the overlay's
+                //    disable_environment escape hatch lets a user kill
+                //    the layer if it ever does. The fully-robust
+                //    alternative is a dedicated private device +
+                //    CopyResource (the D3D12 model) — but that's the
+                //    per-frame copy we just removed for a 6x CPU win, so
+                //    we take the immediate-context bet and document it.
                 bool painted = false;
                 {
                     m_context1->SwapDeviceContextState(
@@ -2298,7 +2297,7 @@ namespace openxr_api_layer::detail {
             bool init() {
                 if (!m_device || !m_api || m_session == XR_NULL_HANDLE) return false;
                 if (!m_core.init()) {
-                    Log("xr_telemetry: overlay D2D/DirectWrite init failed; HUD disabled\n");
+                    Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);
@@ -2656,7 +2655,10 @@ namespace openxr_api_layer::detail {
                                       m_chromeShapeRenderer,
                                       m_cpuRing, m_gpuRing, snap,
                                       /*targetRetainsContent=*/true);  // shim persists
-                    ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
+                    ID3D11Resource* wrapped =
+                        imageIdx < m_wrappedResources.size()
+                            ? m_wrappedResources[imageIdx].Get()
+                            : nullptr;
                     if (painted && wrapped && m_d3d11Context) {
                         // Unbind the shim RTV before the copy so it
                         // isn't OM-bound while serving as the copy
@@ -2699,8 +2701,8 @@ namespace openxr_api_layer::detail {
 
                 // 1. Wrap the D3D12 device via D3D11On12CreateDevice.
                 //    The D3D11 device this returns shares the same
-                //    underlying D3D12 device, so D2D's draws end up in
-                //    the D3D12 queue's command stream.
+                //    underlying D3D12 device, so our D3D11 shader draws
+                //    end up in the D3D12 queue's command stream.
                 //
                 //    D3D11On12CreateDevice takes raw `IUnknown*` (not
                 //    ComPtr<>) for both the D3D12 device and the queue
@@ -2730,7 +2732,7 @@ namespace openxr_api_layer::detail {
                 }
 
                 if (!m_core.init()) {
-                    Log("xr_telemetry: overlay D2D/DirectWrite init failed; HUD disabled\n");
+                    Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);

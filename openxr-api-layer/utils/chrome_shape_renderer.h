@@ -100,10 +100,12 @@ namespace openxr_api_layer::utils::chrome_shapes {
                         float strokeWidth, const float color[4]);
 
         // Flush: sets full pipeline state on the immediate context
-        // (targeting `rtv`) and emits one DrawInstanced for all
-        // queued rects. No-op if the scratch vector is empty or rtv
-        // is null.
-        void flush(ID3D11RenderTargetView* rtv);
+        // (targeting `rtv`) and emits one DrawInstanced for all queued
+        // rects. Returns true on success (incl. an empty no-op), false
+        // only on a real GPU failure (buffer-grow / Map) — the caller
+        // uses that to suppress a frame that would otherwise composite
+        // over a freshly-cleared target.
+        bool flush(ID3D11RenderTargetView* rtv);
 
       private:
         // Must match overlay_quad.hlsli's QuadVSInput per-instance

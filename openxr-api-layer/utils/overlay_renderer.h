@@ -56,10 +56,11 @@ namespace openxr_api_layer {
 namespace openxr_api_layer::detail {
 
     // Abstract renderer interface. Holds the lifecycle the layer drives:
-    //   1. ctor: creates D2D / DirectWrite + the OpenXR swapchain.
-    //            If init fails (BGRA8 unsupported, D3D resource fail),
-    //            isReady() returns false and the rest of the API is a
-    //            no-op. The caller logs and degrades.
+    //   1. ctor: bakes the glyph atlas (DirectWrite), creates the GPU
+    //            pipelines (chrome shapes / glyph atlas / bars) + the
+    //            OpenXR swapchain. If init fails (atlas bake or a
+    //            pipeline init), isReady() returns false and the rest of
+    //            the API is a no-op. The caller logs and degrades.
     //   2. pushFrameSample: per-frame, fed from fanoutRecord — adds
     //                       samples to the per-cycle CPU and GPU time
     //                       histogram rings (one per column of the
@@ -77,9 +78,9 @@ namespace openxr_api_layer::detail {
       public:
         virtual ~OverlayRenderer() = default;
 
-        // True once the constructor succeeded — D2D, DirectWrite, the
-        // OpenXR swapchain, and all the brushes are alive. False if
-        // init failed (e.g. BGRA8 unsupported by the runtime). Caller
+        // True once the constructor succeeded — the glyph atlas, the
+        // three GPU pipelines, and the OpenXR swapchain are alive.
+        // False if init failed (atlas bake or a pipeline init). Caller
         // skips render calls in that case.
         virtual bool isReady() const noexcept = 0;
 
@@ -114,8 +115,9 @@ namespace openxr_api_layer::detail {
         OpenXrApi* api, XrSession session, ID3D11Device* device);
 
     // Factory: app uses D3D12. We bridge via D3D11On12 (the wrapper that
-    // exposes the D3D12 device as an ID3D11Device so D2D can paint into
-    // its textures). `device` + `queue` come from XrGraphicsBinding
+    // exposes the D3D12 device as an ID3D11Device so our D3D11 shader
+    // pipelines can paint into its textures). `device` + `queue` come from
+    // XrGraphicsBinding
     // D3D12KHR. Returns nullptr if init fails.
     std::unique_ptr<OverlayRenderer> makeD3D12OverlayRenderer(
         OpenXrApi* api, XrSession session,

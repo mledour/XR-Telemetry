@@ -59,6 +59,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_ctx    = std::move(ctx);
         m_dstW   = dstWidth;
         m_dstH   = dstHeight;
+        // Snapshot the atlas dimensions before createBuffers — it bakes
+        // them (with texSize) into an IMMUTABLE constant buffer, so they
+        // must be set first.
+        m_atlasW = atlas.atlasWidth;
+        m_atlasH = atlas.atlasHeight;
 
         // Per-step failure logging — same pattern as HistogramBarRenderer.
         // Loses a tiny amount of code but makes "text rendering disabled"
@@ -83,8 +88,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // BuildResult holder owns.
         m_glyphs       = atlas.glyphs;
         m_faceMetrics  = atlas.faceMetrics;
-        m_atlasW       = atlas.atlasWidth;
-        m_atlasH       = atlas.atlasHeight;
 
         m_scratch.reserve(kInitialInstances);
 
@@ -195,18 +198,23 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // Dynamic instance buffer, initial capacity kInitialInstances.
         if (!growInstanceBuffer(kInitialInstances)) return false;
 
-        // Constant buffer: DYNAMIC because both texSize and atlasSize are
-        // fixed for the renderer's lifetime, but we still upload once at
-        // first flush so the data path is uniform regardless of future
-        // layout / atlas tweaks. (Cost: one DISCARD-mapped 16-byte write
-        // at init — negligible.)
+        // Constant buffer: IMMUTABLE. Both texSize (the target dims) and
+        // atlasSize are fixed for the renderer's lifetime, so we bake
+        // them once here and never touch the cbuffer again — no per-frame
+        // Map/Unmap on the hot path (matches chrome_shapes::Renderer,
+        // which does the same for its texSize cbuffer).
+        const TextConstants tc{
+            { static_cast<float>(m_dstW),   static_cast<float>(m_dstH) },
+            { static_cast<float>(m_atlasW), static_cast<float>(m_atlasH) }
+        };
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth      = sizeof(TextConstants);
-        bd.Usage          = D3D11_USAGE_DYNAMIC;
+        bd.Usage          = D3D11_USAGE_IMMUTABLE;
         bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        D3D11_SUBRESOURCE_DATA srd{};
+        srd.pSysMem = &tc;
         if (FAILED(m_device->CreateBuffer(
-                &bd, nullptr, m_cb.GetAddressOf())))
+                &bd, &srd, m_cb.GetAddressOf())))
             return false;
 
         return true;
@@ -363,19 +371,25 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // ===================================================================
     // flush() — single DrawInstanced for all queued glyphs.
     // ===================================================================
-    void Renderer::flush(ID3D11RenderTargetView* rtv) {
+    bool Renderer::flush(ID3D11RenderTargetView* rtv) {
+        // Returns true if the text was drawn (or there was nothing to
+        // draw — a successful no-op), false only on a real GPU failure
+        // (buffer-grow / Map) so the caller can suppress a frame that
+        // would otherwise composite over a freshly-cleared target.
+        //
         // Scratch is owned by beginBatch() and persists between flushes
         // so every frame re-uploads the same text. None of the bail-outs
-        // clear it — a transient failure (buffer-grow / Map) must leave
-        // the last-good scratch intact so the next frame retries rather
-        // than blanking the text until the next beginBatch.
-        if (!m_ready || !rtv || m_scratch.empty()) return;
+        // clear it — a transient failure must leave the last-good scratch
+        // intact so the next frame retries rather than blanking the text
+        // until the next beginBatch.
+        if (!m_ready || !rtv) return false;
+        if (m_scratch.empty()) return true;
 
         // Grow if the batch outsizes the current GPU buffer. Bails (and
         // skips the draw) on cap hit — graceful degrade.
         const UINT instanceCount = static_cast<UINT>(m_scratch.size());
         if (instanceCount > m_instanceCapacity) {
-            if (!growInstanceBuffer(instanceCount)) return;
+            if (!growInstanceBuffer(instanceCount)) return false;
         }
 
         // Upload instances via DISCARD-mapped write.
@@ -383,33 +397,19 @@ namespace openxr_api_layer::utils::glyph_atlas {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                return;
+                return false;
             }
             std::memcpy(map.pData, m_scratch.data(),
                         instanceCount * sizeof(TextInstance));
             m_ctx->Unmap(m_instanceVB.Get(), 0);
         }
 
-        // Refresh cbuffer — texSize comes from the init-time dimensions
-        // (constant for the renderer's lifetime), atlasSize from the
-        // baked atlas texture.
-        {
-            D3D11_MAPPED_SUBRESOURCE map{};
-            if (SUCCEEDED(m_ctx->Map(m_cb.Get(), 0,
-                    D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                TextConstants tc{};
-                tc.texSize[0]   = static_cast<float>(m_dstW);
-                tc.texSize[1]   = static_cast<float>(m_dstH);
-                tc.atlasSize[0] = static_cast<float>(m_atlasW);
-                tc.atlasSize[1] = static_cast<float>(m_atlasH);
-                std::memcpy(map.pData, &tc, sizeof(tc));
-                m_ctx->Unmap(m_cb.Get(), 0);
-            }
-        }
+        // The cbuffer (texSize + atlasSize) is IMMUTABLE — baked once in
+        // createBuffers, no per-frame upload.
 
         // Set the full pipeline state — same posture as the bars
         // renderer's drawPanel, the caller is assumed to have left the
-        // state in an unknown configuration (D2D, bars, app code).
+        // state in an unknown configuration (chrome shapes, bars, app).
         m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
 
         D3D11_VIEWPORT vp{
@@ -446,6 +446,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // caller can re-flush the same text onto every swapchain image
         // without paying the drawChrome rebuild cost each frame.
         // beginBatch() is the only way to drop scratch.
+        return true;
     }
 
 }   // namespace openxr_api_layer::utils::glyph_atlas
