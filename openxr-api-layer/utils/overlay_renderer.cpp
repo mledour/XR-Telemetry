@@ -2080,25 +2080,39 @@ namespace openxr_api_layer::detail {
                 chrome_shapes::Renderer&            gpuShapes,
                 const HistogramRing<kRingSize>&     cpuRing,
                 const HistogramRing<kRingSize>&     gpuRing,
-                const OverlaySnapshot&              snap) {
+                const OverlaySnapshot&              snap,
+                bool                                targetRetainsContent) {
             if (!ctx || !rtv) return false;
 
             const bool needStatic = needStaticPaint(
                 cadence, snap.version, kChromeWatchdogFrames);
 
-            // Static tier — chrome rebuild + clear + chrome/text flush,
-            // only when stale. On the very first paint needStatic is true
-            // (fresh cadence), so the target is fully initialised before
-            // the dynamic tier runs.
+            // Chrome rebuild (the heavy CPU tier: string formatting +
+            // ~80 glyph lookups + the two instanced uploads' scratch)
+            // is always cadence-gated to ~10 Hz, regardless of target.
             bool ok = true;
             if (needStatic) {
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
-                if (ok) {
-                    const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    ctx->ClearRenderTargetView(rtv, kClear);
-                    gpuShapes.flush(rtv);
-                    gpuText.flush(rtv);
-                }
+            }
+
+            // Chrome FLUSH (clear + re-upload the cached chrome scratch
+            // into THIS target) depends on whether the target keeps its
+            // pixels between frames:
+            //   * targetRetainsContent (D3D12 shim, a texture we own):
+            //     only flush when we just rebuilt — the chrome persists
+            //     in the shim between ticks, the bars overpaint only the
+            //     histo rect. The classic two-tier split.
+            //   * !targetRetainsContent (D3D11 swapchain image, whose
+            //     contents OpenXR does NOT guarantee across acquire):
+            //     flush every frame so the freshly-acquired image always
+            //     carries the current chrome. The cheap re-flush of the
+            //     cached scratch — NOT the 10 Hz rebuild above.
+            const bool flushChrome = ok && (needStatic || !targetRetainsContent);
+            if (flushChrome) {
+                const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                ctx->ClearRenderTargetView(rtv, kClear);
+                gpuShapes.flush(rtv);
+                gpuText.flush(rtv);
             }
 
             // Dynamic tier — bars every frame (the histogram scrolls at
@@ -2186,36 +2200,36 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // 2. Paint chrome + text + bars into our intermediate
-                //    paint target, then CopyResource it into the
-                //    current swapchain image.
+                // 2. Paint chrome + text + bars DIRECTLY into the
+                //    acquired swapchain image's RTV — no intermediate
+                //    texture, no CopyResource, no Flush.
                 //
-                //    CRITICAL: all our GPU work runs on the APP's
-                //    immediate context (we share the app's device — no
-                //    private device anymore). xrEndFrame executes on
-                //    the app's render thread, so any pipeline state we
-                //    leave bound leaks into the app's NEXT frame and
-                //    corrupts its scene rendering (observed: HelloXR
-                //    cubes vanish, Dirt Rally renders a green band over
-                //    everything — the app's own draws inheriting our
-                //    shaders / blend / RTV / etc.).
+                //    History: the green-band / vanishing-cubes bug that
+                //    plagued the first direct-to-swapchain attempt was a
+                //    pipeline-STATE LEAK (we share the app's immediate
+                //    context; xrEndFrame runs on the app's render thread,
+                //    so state we leave bound corrupts the app's next
+                //    frame). The intermediate+CopyResource and the Flush
+                //    were added chasing that symptom on wrong hypotheses
+                //    — they never fixed it. SwapDeviceContextState (the
+                //    state isolation below) did. With the leak fixed,
+                //    direct-to-swapchain renders correctly, so the copy
+                //    and flush are gone.
                 //
                 //    SwapDeviceContextState swaps in a private,
-                //    default-initialised state block for the duration
-                //    of our rendering and hands back the app's full
-                //    pipeline state. Atomic — no manual save/restore of
-                //    the ~15 state objects we touch.
+                //    default-initialised state block for our draws and
+                //    hands the app's full pipeline state back after. The
+                //    RAII guard restores it on every exit path (incl. a
+                //    std::bad_alloc from paintOverlay's allocations); the
+                //    catch(...) keeps the throw from crossing the
+                //    xrEndFrame C-ABI boundary. Both satisfy "never
+                //    crash / never corrupt the host".
                 //
-                //    The state MUST be handed back on every exit path,
-                //    including a std::bad_alloc thrown from the
-                //    allocations inside paintOverlay
-                //    (formatOverlayDisplayValues, the per-segment
-                //    vectors in the GPU text emitter). A RAII guard
-                //    restores it as the stack unwinds; the catch(...)
-                //    then keeps the throw from crossing the xrEndFrame
-                //    C-ABI boundary (which would terminate the host).
-                //    Both together satisfy "never crash / never corrupt
-                //    the host".
+                //    targetRetainsContent=false: OpenXR doesn't guarantee
+                //    swapchain image contents across acquire, so the
+                //    chrome is re-flushed every frame (the cheap cached-
+                //    scratch upload; the 10 Hz chrome REBUILD is still
+                //    gated).
                 bool painted = false;
                 {
                     m_context1->SwapDeviceContextState(
@@ -2231,28 +2245,19 @@ namespace openxr_api_layer::detail {
                     } stateGuard{m_context1.Get(), m_savedState.Get()};
 
                     try {
-                        painted =
-                            paintOverlay(m_core, m_bars, m_barsCadence,
-                                          m_context.Get(),
-                                          m_paintRtv.Get(),
-                                          m_glyphRenderer,
-                                          m_chromeShapeRenderer,
-                                          m_cpuRing, m_gpuRing, snap);
-
-                        // 3. CopyResource the painted intermediate into
-                        //    the swapchain image (still inside our
-                        //    isolated state block). Unbind the RTV first
-                        //    so the paint target isn't OM-bound while it
-                        //    serves as the copy source. Flush pushes the
-                        //    batch so the runtime's compositor — which
-                        //    may read on a separate context — sees
-                        //    finalised pixels.
-                        if (painted && imageIdx < m_images.size()) {
+                        if (imageIdx < m_imageRtvs.size()) {
+                            painted =
+                                paintOverlay(m_core, m_bars, m_barsCadence,
+                                              m_context.Get(),
+                                              m_imageRtvs[imageIdx].Get(),
+                                              m_glyphRenderer,
+                                              m_chromeShapeRenderer,
+                                              m_cpuRing, m_gpuRing, snap,
+                                              /*targetRetainsContent=*/false);
+                            // Unbind our RTV so the swapchain image isn't
+                            // left OM-bound when the runtime composites it.
                             ID3D11RenderTargetView* nullRtv = nullptr;
                             m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
-                            m_context->CopyResource(m_images[imageIdx].Get(),
-                                                     m_paintTexture.Get());
-                            m_context->Flush();
                         }
                     } catch (...) {
                         // Paint-time throw (OOM etc.): skip the overlay
@@ -2333,13 +2338,11 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Stash the OpenXR swapchain images. We don't create a
-                // D2D render target on each one (Pimax hands back
-                // DXGI_FORMAT_B8G8R8A8_TYPELESS textures, which D2D
-                // refuses), instead we paint into a shim BGRA8_UNORM
-                // texture we own and CopyResource it into the OpenXR
-                // image per frame. The diagnostic log on image 0 keeps
-                // around for future format / bindFlags regressions.
+                // Stash the OpenXR swapchain images; the per-image RTVs
+                // are created below (Pimax hands back BGRA8_TYPELESS, so
+                // each RTV needs an explicit BGRA8_UNORM view desc). The
+                // diagnostic log on image 0 stays around for future
+                // format / bindFlags regressions.
                 m_images.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     m_images[i] = raw[i].texture;
@@ -2426,53 +2429,26 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Intermediate paint target on the APP's device. We
-                // paint chrome + text + bars into this single
-                // BGRA8_UNORM texture, then CopyResource it into the
-                // current swapchain image each frame.
-                //
-                // Why an intermediate at all (the direct-to-swapchain
-                // attempt didn't work): Pimax's compositor reads the
-                // swapchain image in a way that doesn't observe the
-                // alpha=0 clear we wrote outside the chrome rect — the
-                // overlay ends up opaque-over-game. The shape we
-                // tested empirically: when the swapchain image
-                // arrives at xrReleaseSwapchainImage via a
-                // CopyResource (its previous state was COPY_DEST,
-                // not RENDER_TARGET), the compositor honours the
-                // alpha channel correctly. Direct RTV writes leave
-                // the image in a state the runtime doesn't expect.
-                //
-                // This is still cheaper than the original cross-device
-                // shim by a wide margin: same device + same context as
-                // everything else, no shared NT handle, no keyed
-                // mutex, no second D3D11 device. The per-frame cost
-                // is one CopyResource of a 720×435 BGRA8 image
-                // (~12 µs on a modern GPU) plus one Flush — vs the
-                // old path's keyed-mutex AcquireSync × 2 + CopyResource
-                // + D2D Begin/Clear/End.
-                D3D11_TEXTURE2D_DESC paintDesc{};
-                paintDesc.Width = static_cast<UINT>(kTexW);
-                paintDesc.Height = static_cast<UINT>(kTexH);
-                paintDesc.MipLevels = 1;
-                paintDesc.ArraySize = 1;
-                paintDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                paintDesc.SampleDesc.Count = 1;
-                paintDesc.Usage = D3D11_USAGE_DEFAULT;
-                paintDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-                if (FAILED(m_device->CreateTexture2D(
-                        &paintDesc, nullptr,
-                        m_paintTexture.GetAddressOf()))) {
-                    Log("xr_telemetry: overlay disabled — "
-                        "CreateTexture2D (paint target) failed\n");
-                    return false;
-                }
-                if (FAILED(m_device->CreateRenderTargetView(
-                        m_paintTexture.Get(), nullptr,
-                        m_paintRtv.GetAddressOf()))) {
-                    Log("xr_telemetry: overlay disabled — "
-                        "CreateRenderTargetView (paint target) failed\n");
-                    return false;
+                // One RTV per swapchain image — we paint chrome + text +
+                // bars DIRECTLY into the acquired image each frame (no
+                // intermediate texture, no CopyResource). The runtime's
+                // images are BGRA8 (typeless on Pimax), so we give the
+                // RTV an explicit BGRA8_UNORM desc to get a typed view.
+                m_imageRtvs.resize(m_images.size());
+                for (size_t i = 0; i < m_images.size(); ++i) {
+                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+                    rtvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                    rtvDesc.Texture2D.MipSlice = 0;
+                    if (FAILED(m_device->CreateRenderTargetView(
+                            m_images[i].Get(), &rtvDesc,
+                            m_imageRtvs[i].GetAddressOf()))) {
+                        Log(fmt::format(
+                            "xr_telemetry: overlay disabled — "
+                            "CreateRenderTargetView (swapchain image[{}]) "
+                            "failed\n", i));
+                        return false;
+                    }
                 }
                 // GPU pipelines. All three run on the APP's device +
                 // context, isolated per-frame via SwapDeviceContextState.
@@ -2560,17 +2536,13 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3DDeviceContextState> m_overlayState;
             ComPtr<ID3DDeviceContextState> m_savedState;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
-            // OpenXR swapchain images. Typically DXGI_FORMAT_B8G8R8A8_
-            // TYPELESS on Pimax OpenXR 0.1.0; we CopyResource into
-            // them from the intermediate paint target each frame
-            // rather than rendering directly (the runtime's
-            // compositor doesn't observe alpha=0 on directly-written
-            // BGRA8 RTVs, but does on CopyResource'd images).
+            // OpenXR swapchain images (BGRA8_TYPELESS on Pimax) + one
+            // typed BGRA8_UNORM RTV each. We paint directly into the
+            // acquired image's RTV every frame — no intermediate, no
+            // CopyResource. State isolation (SwapDeviceContextState)
+            // keeps our pipeline changes from leaking into the app.
             std::vector<ComPtr<ID3D11Texture2D>>          m_images;
-            // Intermediate paint target on the app's device. Single
-            // BGRA8_UNORM texture, no shared handle, no keyed mutex.
-            ComPtr<ID3D11Texture2D>                       m_paintTexture;
-            ComPtr<ID3D11RenderTargetView>                m_paintRtv;
+            std::vector<ComPtr<ID3D11RenderTargetView>>   m_imageRtvs;
 
             // GPU pipelines, all on the APP device. init() fails closed
             // on any of them (overlay disabled, no D2D fallback), so by
@@ -2680,7 +2652,8 @@ namespace openxr_api_layer::detail {
                                       m_shimRtv.Get(),
                                       m_glyphRenderer,
                                       m_chromeShapeRenderer,
-                                      m_cpuRing, m_gpuRing, snap);
+                                      m_cpuRing, m_gpuRing, snap,
+                                      /*targetRetainsContent=*/true);  // shim persists
                     ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
                     if (painted && wrapped && m_d3d11Context) {
                         // Unbind the shim RTV before the copy so it
@@ -3031,9 +3004,12 @@ namespace openxr_api_layer::detail {
             return fail("CreateRenderTargetView (target) failed");
 
         // Fresh cadence → first paintOverlay does a full static rebuild.
+        // targetRetainsContent is moot for a one-shot paint (needStatic
+        // is true on the first frame, so chrome flushes regardless).
         PaintCadence cadence;
         if (!paintOverlay(core, bars, cadence, ctx, rtv.Get(),
-                           text, shapes, cpuRing, gpuRing, snap))
+                           text, shapes, cpuRing, gpuRing, snap,
+                           /*targetRetainsContent=*/true))
             return fail("paintOverlay failed");
         ctx->Flush();
         return true;
