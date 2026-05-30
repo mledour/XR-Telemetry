@@ -2040,30 +2040,36 @@ namespace openxr_api_layer::detail {
 
         // -------- Shared all-GPU overlay paint --------------------------------
         //
-        // Direct-to-RTV paint (Task 15 — D3D11 path, swapchain image
-        // RTV; D3D12 path still passes its shim RTV until Task 16
-        // mirrors the change). Per-frame work:
-        //   * ClearRenderTargetView the target (replaces D2D Clear)
-        //   * If chrome is stale (cadence tick or watchdog): rebuild
-        //     the chrome shape + text scratches via paintChromeOnly.
-        //   * Always: flush both scratches against the target RTV +
-        //     issue both bars draws.
+        // Two-tier paint into a PERSISTENT target — the caller's fixed
+        // paint texture (D3D11 path) or shim (D3D12 path), NOT a rotating
+        // swapchain image. Because the target persists across frames we
+        // recover the original D2D design's static/dynamic split:
         //
-        // The chrome rebuild stays at the existing 10 Hz cadence; the
-        // flush is cheap (DISCARD-mapped memcpy + DrawInstanced) and
-        // fires every frame so each of the N swapchain images sees a
-        // fresh paint — the runtime can hand us any image each frame
-        // and the previous content is irrelevant.
+        //   * Static tier (cadence-gated, ~10 Hz via needStaticPaint):
+        //     rebuild the chrome shape + text scratches (paintChromeOnly),
+        //     ClearRenderTargetView the whole target, then flush chrome
+        //     shapes + text. This is the heavy CPU tier (string formatting
+        //     + ~80 glyph lookups + the two instanced uploads).
         //
-        // Ordering on the immediate context (which all four GPU
-        // submitters share):
-        //   ClearRTV → chrome shapes flush → text flush → bars draws.
-        // So layering reads bottom-to-top: shapes (under) → glyphs →
-        // bars. No fence, no flush, no extra sync needed.
+        //   * Dynamic tier (EVERY frame): the two histogram panels. The
+        //     bars' opaque panel-bg quad repaints only the (scissored)
+        //     histo rect, so on non-static frames the surrounding chrome
+        //     (frame / header / panel titles / current values / bottom
+        //     row) just persists in the target from the last static paint.
+        //     No clear, no chrome re-flush — the hot path is two drawPanel
+        //     calls.
+        //
+        // The caller CopyResource's the target into the current swapchain
+        // image every frame regardless (the images rotate; the target is
+        // the single source of truth), so it always carries the full
+        // composite.
+        //
+        // Ordering on the shared immediate context, on a static frame:
+        //   ClearRTV → chrome shapes → text → bars  (bottom-to-top).
+        // On a dynamic frame: just bars, over the persistent chrome.
         //
         // Returns false only on a hard chrome rebuild failure (null
-        // renderer pointer). The cadence consumes the result so a
-        // failed rebuild retries on the next frame.
+        // renderer pointer); the cadence then retries next frame.
         inline bool paintOverlay(
                 CoreRenderer&                       core,
                 HistogramBarRenderer&               bars,
@@ -2080,27 +2086,28 @@ namespace openxr_api_layer::detail {
             const bool needStatic = needStaticPaint(
                 cadence, snap.version, kChromeWatchdogFrames);
 
-            // Chrome rebuild (CPU work, cadence-gated). Re-populates
-            // gpuText / gpuShapes scratches from m_cachedValues.
+            // Static tier — chrome rebuild + clear + chrome/text flush,
+            // only when stale. On the very first paint needStatic is true
+            // (fresh cadence), so the target is fully initialised before
+            // the dynamic tier runs.
             bool ok = true;
             if (needStatic) {
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
+                if (ok) {
+                    const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    ctx->ClearRenderTargetView(rtv, kClear);
+                    gpuShapes.flush(rtv);
+                    gpuText.flush(rtv);
+                }
             }
 
+            // Dynamic tier — bars every frame (the histogram scrolls at
+            // the host rate). Skipped only if a static rebuild failed
+            // mid-frame, to avoid drawing bars over a half-cleared target.
             if (ok) {
-                // Clear, then flush every renderer against this frame's
-                // RTV. The bars renderer reuses ring-derived instances
-                // it rebuilds inside drawPanel; nothing to cache there.
-                const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                ctx->ClearRenderTargetView(rtv, kClear);
-
-                gpuShapes.flush(rtv);
-                gpuText.flush(rtv);
-
-                // Panel Ys + histo rects from the shared layout
-                // constants; identical geometry to drawHistoRegion /
-                // drawChrome so the GPU bars line up under the GPU
-                // titles.
+                // Panel Ys + histo rects from the shared layout constants;
+                // identical geometry to drawChrome so the bars line up
+                // under the panel titles.
                 const float gpuPanelY =
                     kInnerT + kHeaderHeight + kSectionGap;
                 const float cpuPanelY =
