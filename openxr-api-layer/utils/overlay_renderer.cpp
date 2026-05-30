@@ -3515,24 +3515,25 @@ namespace openxr_api_layer::detail {
                 // correctly, then ReleaseWrappedResources hands control
                 // back to the runtime's compositor.
                 //
-                // Shader path: paintOverlay clears + flushes chrome /
-                // text / bars into the shim's D3D11 RTV (the D3D12
-                // path stays on the shim until Task 16 mirrors the
-                // direct-to-swapchain shape from D3D11). The
-                // AcquireWrapped/CopyResource/Flush dance below
-                // ferries the painted shim into the D3D12 swapchain
-                // image.
-                const bool useGpuPath = m_useShaderBars && m_useGlyphAtlas &&
-                                         m_useChromeShapes && m_shimRtv;
-                const bool painted = useGpuPath
-                    ? paintOverlay(m_core, m_bars, m_barsCadence,
-                                    m_d3d11Context.Get(),
-                                    m_shimRtv.Get(),
-                                    m_glyphRenderer,
-                                    m_chromeShapeRenderer,
-                                    m_cpuRing, m_gpuRing, snap)
-                    : m_core.paint(m_shimRenderTarget.Get(), snap,
-                                    m_cpuRing, m_gpuRing);
+                // GPU path only — no D2D fallback. paintOverlay clears
+                // + flushes chrome / text / bars into the shim's D3D11
+                // RTV; the AcquireWrapped/CopyResource/Flush dance
+                // below ferries the painted shim into the D3D12
+                // swapchain image. The D3D12 path keeps the shim (the
+                // D3D11On12 bridge runs on a separate device, so the
+                // app-context state-leak that bit the D3D11 path can't
+                // occur here, and D3D11 shaders can't target D3D12
+                // resources directly anyway). m_useGpuPath is asserted
+                // at init — if any GPU pipeline failed to come up the
+                // overlay was disabled there, so this is always true
+                // when m_ready.
+                const bool painted =
+                    paintOverlay(m_core, m_bars, m_barsCadence,
+                                  m_d3d11Context.Get(),
+                                  m_shimRtv.Get(),
+                                  m_glyphRenderer,
+                                  m_chromeShapeRenderer,
+                                  m_cpuRing, m_gpuRing, snap);
                 ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
                 if (painted && wrapped && m_d3d11Context) {
                     m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
@@ -3734,57 +3735,49 @@ namespace openxr_api_layer::detail {
 
                 // RTV on the shim for the GPU passes. Format inherits
                 // from the BGRA8_UNORM shim texture, so nullptr desc
-                // produces the right view.
+                // produces the right view. Fail-closed: no D2D fallback
+                // (matches the D3D11 path).
                 if (FAILED(m_d3d11Device->CreateRenderTargetView(
                         m_shimTexture.Get(), nullptr,
                         m_shimRtv.GetAddressOf()))) {
-                    Log("xr_telemetry: D3D12 overlay GPU paths "
-                        "disabled — CreateRenderTargetView (shim) failed\n");
-                    // Continue init — m_useShaderBars stays false and
-                    // the D2D fallback path keeps the HUD alive.
+                    Log("xr_telemetry: overlay disabled — D3D12 path "
+                        "CreateRenderTargetView (shim) failed\n");
+                    return false;
                 }
 
-                // GPU histogram path. Same class as the D3D11 path;
-                // accepts any D3D11 device/context pair, here the
-                // D3D11On12 bridge. RTV is passed per drawPanel call.
-                m_useShaderBars = m_shimRtv && m_bars.init(
-                    m_d3d11Device.Get(), m_d3d11Context.Get());
-                if (!m_useShaderBars) {
-                    Log("xr_telemetry: D3D12 overlay GPU histogram path "
-                        "unavailable — falling back to D2D bar rendering\n");
+                // GPU pipelines on the D3D11On12 bridge. Same classes
+                // as the D3D11 path; each fails closed — if any init
+                // returns false the overlay is disabled (no D2D
+                // fallback). RTV is passed per draw call.
+                if (!m_bars.init(m_d3d11Device.Get(), m_d3d11Context.Get())) {
+                    Log("xr_telemetry: overlay disabled — D3D12 bars "
+                        "init failed\n");
+                    return false;
                 }
-
-                // GPU text path on the D3D11On12 bridge. Same private
-                // D3D11 device/context as the bars — the atlas texture
-                // is a different ID3D11Texture2D (separate device) than
-                // the D3D11 path's atlas, but both copy from the same
-                // CoreRenderer-owned BuildResult bitmap so the glyphs
-                // are pixel-identical across paths.
-                m_useGlyphAtlas =
-                    m_useShaderBars &&
-                    m_core.atlasReady() &&
-                    m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
-                                          static_cast<UINT>(kTexW),
-                                          static_cast<UINT>(kTexH),
-                                          m_core.atlas());
-                if (!m_useGlyphAtlas) {
-                    Log("xr_telemetry: D3D12 overlay GPU text path "
-                        "unavailable — falling back to D2D text rendering\n");
+                m_useShaderBars = true;
+                if (!m_core.atlasReady()) {
+                    Log("xr_telemetry: overlay disabled — D3D12 glyph atlas "
+                        "not built\n");
+                    return false;
                 }
-
-                // GPU chrome shapes on the D3D11On12 bridge. Mirror of
-                // the D3D11 path's init.
-                m_useChromeShapes =
-                    m_useShaderBars &&
-                    m_useGlyphAtlas &&
-                    m_chromeShapeRenderer.init(
+                if (!m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
+                                           static_cast<UINT>(kTexW),
+                                           static_cast<UINT>(kTexH),
+                                           m_core.atlas())) {
+                    Log("xr_telemetry: overlay disabled — D3D12 glyph "
+                        "renderer init failed\n");
+                    return false;
+                }
+                m_useGlyphAtlas = true;
+                if (!m_chromeShapeRenderer.init(
                         m_d3d11Device, m_d3d11Context,
                         static_cast<UINT>(kTexW),
-                        static_cast<UINT>(kTexH));
-                if (!m_useChromeShapes) {
-                    Log("xr_telemetry: D3D12 overlay GPU chrome shapes path "
-                        "unavailable — falling back to D2D chrome shapes\n");
+                        static_cast<UINT>(kTexH))) {
+                    Log("xr_telemetry: overlay disabled — D3D12 chrome "
+                        "shapes renderer init failed\n");
+                    return false;
                 }
+                m_useChromeShapes = true;
 
                 // One-time fill of the immutable quad-layer fields;
                 // mirror of the D3D11 path's helper (no need to share
