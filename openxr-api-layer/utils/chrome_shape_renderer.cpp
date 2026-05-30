@@ -130,7 +130,7 @@ namespace openxr_api_layer::utils::chrome_shapes {
         if (FAILED(m_device->CreateBuffer(
                 &bd, &srd, m_quadVB.GetAddressOf()))) return false;
 
-        if (!m_batch.init(m_device, m_ctx,
+        if (!m_batch.init(m_device.Get(), m_ctx.Get(),
                           static_cast<UINT>(sizeof(QuadInstance)),
                           kInitialInstances, kMaxInstances,
                           "ChromeShapeRenderer")) return false;

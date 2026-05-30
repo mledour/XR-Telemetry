@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
-#include <utility>
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -74,14 +73,18 @@ namespace openxr_api_layer::utils {
         // the renderer's createBuffers(), after device/ctx are known, in
         // place of the old growInstanceBuffer(initialInstances). Returns
         // false on device failure (caller logs + degrades).
-        bool init(Microsoft::WRL::ComPtr<ID3D11Device>        device,
-                  Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx,
-                  UINT                                        instanceSize,
-                  UINT                                        initialInstances,
-                  UINT                                        maxInstances,
-                  const char*                                 debugName) {
-            m_device       = std::move(device);
-            m_ctx          = std::move(ctx);
+        bool init(ID3D11Device*        device,
+                  ID3D11DeviceContext* ctx,
+                  UINT                 instanceSize,
+                  UINT                 initialInstances,
+                  UINT                 maxInstances,
+                  const char*          debugName) {
+            // Raw pointers, not ComPtr: this buffer is a member of the
+            // owning renderer, which holds the device/context refs — its
+            // lifetime is strictly nested, so an AddRef here would be pure
+            // churn (matches HistogramBarRenderer::init).
+            m_device       = device;
+            m_ctx          = ctx;
             m_instanceSize = instanceSize;
             m_initial      = initialInstances;
             m_max          = maxInstances;
@@ -132,15 +135,22 @@ namespace openxr_api_layer::utils {
         // the old one only on success (Swap), so a failed grow leaves the
         // prior buffer — and thus the last-good batch — usable.
         bool grow(UINT desired) {
-            UINT next = m_capacity ? m_capacity : m_initial;
-            while (next < desired) next *= 2;
-            if (next > m_max) {
+            // Cap check FIRST — also guards the doubling loop below from
+            // overflowing (it can only make `next` larger). Past the cap we
+            // bail and the caller suppresses the frame.
+            if (desired > m_max) {
                 ::openxr_api_layer::log::Log(fmt::format(
                     "xr_telemetry: {} instance buffer request {} exceeds "
                     "cap {} — bailing\n",
                     m_debugName, desired, m_max));
                 return false;
             }
+            UINT next = m_capacity ? m_capacity : m_initial;
+            while (next < desired) next *= 2;
+            // Smallest power of two >= desired; <= m_max for the power-of-two
+            // caps both renderers use. Clamp anyway so a future non-pow2 cap
+            // can't overshoot (desired <= m_max already guarantees room).
+            if (next > m_max) next = m_max;
             D3D11_BUFFER_DESC bd{};
             bd.ByteWidth      = next * m_instanceSize;
             bd.Usage          = D3D11_USAGE_DYNAMIC;
@@ -156,9 +166,9 @@ namespace openxr_api_layer::utils {
             return true;
         }
 
-        Microsoft::WRL::ComPtr<ID3D11Device>        m_device;
-        Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_ctx;
-        Microsoft::WRL::ComPtr<ID3D11Buffer>        m_buffer;
+        ID3D11Device*        m_device = nullptr;   // owned by the renderer;
+        ID3D11DeviceContext* m_ctx    = nullptr;   // lifetime nested in it
+        Microsoft::WRL::ComPtr<ID3D11Buffer> m_buffer;
         UINT        m_capacity     = 0;   // instances the buffer can hold
         UINT        m_instanceSize = 0;   // bytes per instance
         UINT        m_initial      = 0;   // initial / minimum capacity

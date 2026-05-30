@@ -1693,6 +1693,17 @@ namespace openxr_api_layer::detail {
         // Colours are the same straight-alpha palette as the chrome
         // constants. The histogram rect is fully opaque after the background
         // fill, so the runtime composites the quad layer correctly.
+        //
+        // NOTE: deliberately NOT folded onto utils::InstancedBatchBuffer
+        // (the shared batch buffer the chrome-shape / glyph-atlas renderers
+        // use). This renderer's instance buffers are FIXED-size (no power-
+        // of-two growth) and there are several of them (bars + quads), so it
+        // would share only the create+upload half, not the growth half the
+        // shared buffer is built around. It also still draws the quad passes
+        // unconditionally on a per-buffer Map failure (rather than
+        // suppressing the frame as the folded renderers do) — adopting the
+        // shared upload and that suppression is a separate follow-up, kept
+        // out of the behavior-preserving shared-base refactor.
         class HistogramBarRenderer {
           public:
             // RTV is supplied per-draw by the caller (Task 15 — D3D11

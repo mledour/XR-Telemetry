@@ -197,7 +197,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         }
 
         // Dynamic instance buffer (growth + upload owned by m_batch).
-        if (!m_batch.init(m_device, m_ctx,
+        if (!m_batch.init(m_device.Get(), m_ctx.Get(),
                           static_cast<UINT>(sizeof(TextInstance)),
                           kInitialInstances, kMaxInstances,
                           "GlyphAtlasRenderer")) return false;
