@@ -196,8 +196,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 return false;
         }
 
-        // Dynamic instance buffer, initial capacity kInitialInstances.
-        if (!growInstanceBuffer(kInitialInstances)) return false;
+        // Dynamic instance buffer (growth + upload owned by m_batch).
+        if (!m_batch.init(m_device, m_ctx,
+                          static_cast<UINT>(sizeof(TextInstance)),
+                          kInitialInstances, kMaxInstances,
+                          "GlyphAtlasRenderer")) return false;
 
         // Constant buffer: IMMUTABLE. Both texSize (the target dims) and
         // atlasSize are fixed for the renderer's lifetime, so we bake
@@ -218,30 +221,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 &bd, &srd, m_cb.GetAddressOf())))
             return false;
 
-        return true;
-    }
-
-    bool Renderer::growInstanceBuffer(UINT desired) {
-        UINT next = m_instanceCapacity ? m_instanceCapacity : kInitialInstances;
-        while (next < desired) next *= 2;
-        if (next > kMaxInstances) {
-            Log(fmt::format(
-                "xr_telemetry: GlyphAtlasRenderer instance buffer "
-                "request {} exceeds cap {} — bailing\n",
-                desired, kMaxInstances));
-            return false;
-        }
-        D3D11_BUFFER_DESC bd{};
-        bd.ByteWidth      = next * sizeof(TextInstance);
-        bd.Usage          = D3D11_USAGE_DYNAMIC;
-        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        ComPtr<ID3D11Buffer> buf;
-        if (FAILED(m_device->CreateBuffer(&bd, nullptr, buf.GetAddressOf()))) {
-            return false;
-        }
-        m_instanceVB.Swap(buf);
-        m_instanceCapacity = next;
         return true;
     }
 
@@ -404,30 +383,12 @@ namespace openxr_api_layer::utils::glyph_atlas {
         const UINT instanceCount = staticCount + dynamicCount;
         if (instanceCount == 0) return true;
 
-        // Grow if the batch outsizes the current GPU buffer. Bails (and
-        // skips the draw) on cap hit — graceful degrade.
-        if (instanceCount > m_instanceCapacity) {
-            if (!growInstanceBuffer(instanceCount)) return false;
-        }
-
-        // Upload both tiers via one DISCARD-mapped write.
-        {
-            D3D11_MAPPED_SUBRESOURCE map{};
-            if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
-                    D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                return false;
-            }
-            auto* dst = static_cast<TextInstance*>(map.pData);
-            if (staticCount) {
-                std::memcpy(dst, m_staticScratch.data(),
-                            staticCount * sizeof(TextInstance));
-            }
-            if (dynamicCount) {
-                std::memcpy(dst + staticCount, m_dynamicScratch.data(),
-                            dynamicCount * sizeof(TextInstance));
-            }
-            m_ctx->Unmap(m_instanceVB.Get(), 0);
-        }
+        // Grow-if-needed + DISCARD-map upload of both tiers, in order
+        // (static labels first, then dynamic values), via the shared
+        // InstancedBatchBuffer.
+        if (!m_batch.upload({ { m_staticScratch.data(),  staticCount },
+                              { m_dynamicScratch.data(), dynamicCount } }))
+            return false;
 
         // The cbuffer (texSize + atlasSize) is IMMUTABLE — baked once in
         // createBuffers, no per-frame upload.
@@ -450,7 +411,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         m_ctx->IASetInputLayout(m_layout.Get());
 
-        ID3D11Buffer* vbs[2]    = {m_quadVB.Get(), m_instanceVB.Get()};
+        ID3D11Buffer* vbs[2]    = {m_quadVB.Get(), m_batch.buffer()};
         const UINT    strides[2] = {sizeof(float) * 2, sizeof(TextInstance)};
         const UINT    offsets[2] = {0, 0};
         m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
