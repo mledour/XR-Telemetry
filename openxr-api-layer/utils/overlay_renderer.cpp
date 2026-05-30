@@ -34,16 +34,16 @@
 #include "framework/dispatch.gen.h"   // OpenXrApi (auto-generated at build)
 #include "framework/log.h"            // Log / ErrorLog
 
+// <d2d1.h> is included ONLY for the header-only D2D1_RECT_F / D2D1::RectF
+// helper used as the layout-rect type — no D2D runtime call remains after
+// the GPU migration, so d2d1.dll is never loaded into the host process.
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwrite_3.h>     // IDWriteFactory5 / IDWriteInMemoryFontFileLoader (Win10 1703+)
-// Extra DXGI / D3D11 headers required by the cross-device shim
-// path. pch.h's <d3d11.h> + <dxgi.h> only expose the base
-// interfaces; we need:
-//   - IDXGIResource1 (CreateSharedHandle)            from <dxgi1_2.h>
-//   - ID3D11Device1::OpenSharedResource1             from <d3d11_1.h>
-//   - IDXGIKeyedMutex                                from <dxgi.h>  ✓ already there
-#include <dxgi1_2.h>
+// <d3d11_1.h>: ID3D11Device1 / ID3D11DeviceContext1 / ID3DDeviceContextState
+// + CreateDeviceContextState / SwapDeviceContextState — the per-frame
+// pipeline-state isolation on the app's shared immediate context (D3D11
+// path). pch.h's <d3d11.h> only exposes the base interfaces.
 #include <d3d11_1.h>
 
 #include <array>
@@ -58,17 +58,15 @@
 // include path in both the layer and test vcxproj). Each header declares a
 // `const BYTE g_<filename>[]` (internal linkage, so including them in this
 // one TU is ODR-safe). HistogramBarRenderer builds the instanced-bar and
-// solid-quad pipelines from these to paint the histogram region on the GPU
-// instead of via the per-bar D2D FillRectangle loop.
+// solid-quad pipelines from these to paint the histogram region on the GPU.
 #include "overlay_bars_vs.h"
 #include "overlay_bars_ps.h"
 #include "overlay_quad_vs.h"
 #include "overlay_quad_ps.h"
 
-// Pragma-link D2D + DirectWrite so we don't have to add them to the
-// vcxproj's Link section. d2d1.lib and dwrite.lib ship with the Windows
-// SDK; no extra NuGet package needed.
-#pragma comment(lib, "d2d1.lib")
+// Pragma-link DirectWrite (the glyph atlas rasterises through it at init).
+// dwrite.lib ships with the Windows SDK; no extra NuGet package needed.
+// No d2d1.lib — D2D is header-type-only now (see the <d2d1.h> note above).
 #pragma comment(lib, "dwrite.lib")
 
 namespace openxr_api_layer::detail {
@@ -322,12 +320,15 @@ namespace openxr_api_layer::detail {
         constexpr float kColorFrameLine[4] = {0.122f, 0.133f, 0.133f, 1.00f};  // m_brushFrameLine (frame stroke)
         constexpr float kColorSeparator[4] = {0.184f, 0.200f, 0.204f, 1.00f};  // m_brushSeparator (panel & cell strokes)
 
-        // -------- CoreRenderer: D2D + DirectWrite painting ------------------
+        // -------- CoreRenderer: DirectWrite + glyph-atlas owner -------------
         //
-        // Shared between the D3D11-native path and the D3D12-via-D3D11On12
-        // bridge. Owns the D2D / DirectWrite factories + the cached
-        // IDWriteTextFormat. The per-image render targets live on the
-        // outer class because they bind to specific swapchain images.
+        // Shared between the D3D11 and D3D12 paths. Owns the DirectWrite
+        // factory + the bundled-font collection, and bakes the glyph atlas
+        // once at init (the GPU renderers copy from its BuildResult). It
+        // also holds drawChrome + the chrome sub-helpers, which emit onto
+        // the per-frame GPU renderers (m_textRenderer / m_chromeShapes)
+        // the caller stashes around a chrome rebuild. No D2D, no per-frame
+        // GPU resources of its own.
         class CoreRenderer {
           public:
             // -------- Public lifecycle --------------------------------------
@@ -337,7 +338,7 @@ namespace openxr_api_layer::detail {
             // IDWriteFactory's internal loader table never holds a
             // dangling pointer across sessions. Order of destruction:
             // m_customFontCollection → m_bundledFontFiles → loader
-            // (here, explicit unregister) → m_dwriteFactory → m_d2dFactory.
+            // (here, explicit unregister) → m_dwriteFactory.
             ~CoreRenderer() {
                 if (m_inMemoryFontLoader && m_dwriteFactory) {
                     m_dwriteFactory->UnregisterFontFileLoader(
@@ -346,11 +347,6 @@ namespace openxr_api_layer::detail {
             }
 
             bool init() {
-                if (FAILED(::D2D1CreateFactory(
-                        D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                        m_d2dFactory.GetAddressOf()))) {
-                    return false;
-                }
                 if (FAILED(::DWriteCreateFactory(
                         DWRITE_FACTORY_TYPE_SHARED,
                         __uuidof(IDWriteFactory),
@@ -363,11 +359,10 @@ namespace openxr_api_layer::detail {
                 // The TTF files live as RT_BUNDLED_FONT resources in the
                 // DLL (see fonts/bundled_fonts.rc.inc); we feed their
                 // bytes into an IDWriteInMemoryFontFileLoader and build
-                // a custom IDWriteFontCollection around them. The
-                // collection is then referenced by family name ("Barlow")
-                // in every CreateTextFormat call below — DirectWrite
-                // resolves through the custom collection, never falling
-                // back to system fonts.
+                // a custom IDWriteFontCollection around them. The glyph
+                // atlas builder (buildGlyphAtlas below) resolves the
+                // faces through this collection by family name, never
+                // falling back to system fonts.
                 //
                 // Why bundle two families: design lands on a true italic
                 // for the chiffres (Barlow Medium Italic) but keeps the
@@ -384,12 +379,11 @@ namespace openxr_api_layer::detail {
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the
-                // custom collection and let CreateTextFormat fall
-                // back to system default — Bahnschrift on Win10+. The
-                // fallback face is upright-only, so chiffres formats
-                // will render upright instead of italic. Graceful
-                // degrade — never crash the host process for a
-                // cosmetic font.
+                // custom collection and let the atlas builder resolve
+                // against the system default — Bahnschrift on Win10+.
+                // The fallback face is upright-only, so the chiffres
+                // render upright instead of italic. Graceful degrade —
+                // never crash the host process for a cosmetic font.
                 const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
                 const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
                 IDWriteFontCollection* customCollection = nullptr;
@@ -402,105 +396,32 @@ namespace openxr_api_layer::detail {
                     // fallback face since system Bahnschrift has no
                     // true italic face.
                     //
-                    // KNOWN DIVERGENCE on this path: D2D's
-                    // CreateTextFormat keeps DWRITE_FONT_STYLE_ITALIC
-                    // and DirectWrite synthesises the oblique glyphs
-                    // by shearing the upright face. The GPU atlas
-                    // path resolves via IDWriteFontFamily::
-                    // GetFirstMatchingFont(... ITALIC ...), which
-                    // does NOT synthesise — it returns the closest
-                    // existing face (upright). So when the bundled
-                    // fonts fail to load AND the GPU text path
-                    // succeeds, the big FPS digits render upright
-                    // on the GPU vs sheared on the D2D fallback.
-                    // Cosmetic, narrow trigger; flagged here so a
-                    // future tweak (e.g. shader-side shear, or
-                    // CreateGlyphRunAnalysis with a 2D oblique
-                    // transform in glyph_atlas.cpp) lands with the
-                    // context.
+                    // KNOWN LIMITATION on this fallback: the atlas
+                    // resolves the chiffres face via IDWriteFontFamily::
+                    // GetFirstMatchingFont(... ITALIC ...), which does
+                    // NOT synthesise oblique — it returns the closest
+                    // existing face. Bahnschrift has no italic cut, so
+                    // the big FPS digits render upright (not sheared)
+                    // when the bundled fonts fail to load. Cosmetic,
+                    // narrow trigger; flagged so a future fix (shader-
+                    // side shear, or a 2D oblique transform on
+                    // CreateGlyphRunAnalysis in glyph_atlas.cpp) lands
+                    // with the context.
                     kFamilyChiffres = L"Bahnschrift";
                     kFamilyLabels   = L"Bahnschrift";
                 } else {
                     customCollection = m_customFontCollection.Get();
                 }
 
-                // Format split — Barlow Medium Italic is reserved for
-                // digit characters only; everything else (labels,
-                // titles, unit suffixes like " ms" / "°C" / "%") uses
-                // Rajdhani SemiBold upright. The two pure-digit formats
-                // (m_fmtBigNumber / m_fmtAccentNumber) stay anchored
-                // directly on Barlow Italic because their strings are
-                // always digit-only (FPS / AVG / P95 / …). The mixed
-                // formats (m_fmtTemp, m_fmtMsValue, m_fmtMsCompound)
-                // anchor on Rajdhani upright and get per-range Barlow
-                // Italic overrides at draw time via drawValueAscii /
-                // drawValueWide — those helpers walk the value runs
-                // produced by findValueRuns and apply SetFontFamilyName
-                // + SetFontWeight + SetFontStyle on the digit portion.
-                //
-                //   Pure-digit (Barlow Medium Italic):
-                //     m_fmtBigNumber, m_fmtAccentNumber
-                //   Mixed value (Rajdhani SemiBold upright BASE +
-                //   per-digit Barlow Italic overrides):
-                //     m_fmtTemp, m_fmtMsValue, m_fmtMsCompound
-                //   Labels / titles (Rajdhani SemiBold upright):
-                //     m_fmtTinyLabelCenter, m_fmtSectionTitle
-                constexpr DWRITE_FONT_WEIGHT kChiffresWeight = DWRITE_FONT_WEIGHT_MEDIUM;
-                constexpr DWRITE_FONT_WEIGHT kLabelWeight    = DWRITE_FONT_WEIGHT_SEMI_BOLD;
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontBigNumber,    kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtBigNumber)) return false;
-                if (!makeFormat(kFamilyChiffres, customCollection, kFontAccentNumber, kChiffresWeight, DWRITE_FONT_STYLE_ITALIC,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtAccentNumber)) return false;
-                // m_fmtTemp is CENTER-aligned: the bottom panel
-                // stacks each value (TEMP / LOAD / VRAM) centred
-                // under its column label. Anchored on Rajdhani
-                // upright so the " °C" / " %" / " GB" unit suffixes
-                // render upright; digit prefixes get Barlow Italic
-                // via drawValueWide / drawValueAscii.
-                if (!makeFormat(kFamilyLabels,   customCollection, kFontTemp,         kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTemp)) return false;
-                // m_fmtMsValue anchors on Rajdhani upright too:
-                // the " ms" suffix renders upright and the digit
-                // prefix flips to Barlow Italic via drawValueAscii.
-                if (!makeFormat(kFamilyLabels,   customCollection, kFontMs,           kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsValue)) return false;
-                // m_fmtMsCompound's BASE is Rajdhani SemiBold upright
-                // (it's the "App" / " / Render " label portions plus
-                // the " ms" unit suffixes). drawValueAscii applies
-                // Barlow Medium Italic on the digit ranges per draw.
-                if (!makeFormat(kFamilyLabels,   customCollection, kFontMsCompound,   kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_TRAILING, m_fmtMsCompound)) return false;
-                if (!makeFormat(kFamilyLabels,   customCollection, kFontTinyLabel,    kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER, m_fmtTinyLabelCenter)) return false;
-                if (!makeFormat(kFamilyLabels,   customCollection, kFontSectionTitle, kLabelWeight,    DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_TEXT_ALIGNMENT_LEADING, m_fmtSectionTitle)) return false;
-
-                // TODO(barlow-followup): activate OpenType `tnum`
-                // (tabular figures) on the chiffres formats so digit
-                // widths stay uniform — without it, FPS bouncing
-                // between "138" and "142" makes the rendered string
-                // visibly shift horizontally at 10 Hz refresh. The
-                // typography opt-in lives on IDWriteTextLayout, not
-                // on IDWriteTextFormat, so it requires refactoring
-                // drawAscii/drawWide from ID2D1RenderTarget::DrawTextW
-                // to IDWriteTextLayout + DrawTextLayout. Not done in
-                // this PR (font swap is already a chunk). Tracked as
-                // a follow-up because both Rajdhani (previous) and
-                // Barlow (this) have proportional figures by default
-                // — switching fonts doesn't introduce regression on
-                // this axis, both versions of the HUD jitter equally.
-
-                // Bake the glyph atlas. Soft-failure path: if the
-                // build fails (font face unresolvable, atlas too
-                // small), m_atlasReady stays false and the GPU text
-                // renderer skips its init — the D2D text path keeps
-                // working. Never crash the host process for a glyph
-                // miss.
+                // Bake the glyph atlas. Soft-failure path: on a build
+                // miss m_atlasReady stays false and the callers (D3D11
+                // / D3D12 renderers, snapshot test) fail-close — the
+                // overlay is disabled rather than crashing the host.
+                // There is no D2D fallback anymore (Task 17 removed it).
                 if (!buildGlyphAtlas(kFamilyChiffres, kFamilyLabels,
                                       customCollection)) {
                     Log("xr_telemetry: glyph atlas build failed — "
-                        "GPU text path disabled, D2D fallback "
-                        "active\n");
+                        "overlay will be disabled\n");
                     m_atlasReady = false;
                 } else {
                     m_atlasReady = true;
@@ -519,270 +440,39 @@ namespace openxr_api_layer::detail {
             const glyph_atlas::BuildResult& atlas() const noexcept { return m_atlas; }
             bool atlasReady() const noexcept { return m_atlasReady; }
 
-            ID2D1Factory* d2d() const noexcept { return m_d2dFactory.Get(); }
-
-            // -------- Brushes (palette) -------------------------------------
+            // Rebuild the static chrome instance batches from the
+            // current snapshot. Pure CPU work: populates each
+            // renderer's scratch vector via drawChrome (which
+            // branches every drawWide / drawAscii / drawValueWide /
+            // drawPanelBg call through the GPU emitters). NO GPU
+            // submission happens here — the caller flushes the
+            // scratches into the target RTV later, every frame, even
+            // between chrome-cadence ticks. That's what makes
+            // direct-to-swapchain affordable: the costly drawChrome
+            // rebuild stays cadenced (~10 Hz) while the cheap
+            // map+DrawInstanced fires per frame against whichever of
+            // the N swapchain images the runtime hands us.
             //
-            // Brushes are bound to the render target they were created
-            // against — call once after the owning renderer creates its
-            // D2D ID2D1RenderTarget, not per frame. The redesign uses
-            // a ~12-brush palette (background fills, panel fills,
-            // text colours, gauge colours, bar colours, icon strokes);
-            // creating them all once amortises ~5 µs of D2D allocation
-            // away from the frame thread.
-            bool initBrushes(ID2D1RenderTarget* rt) {
-                if (!rt) return false;
-                // Adopt the RT's owning factory unconditionally. D2D
-                // resources (path geometries, stroke styles) are
-                // factory-bound — using one created from factory A
-                // against an RT from factory B causes a deferred
-                // error that surfaces at EndDraw time as a silent
-                // failure (no doctest assert hit, just `false`
-                // returned from paint()).
-                //
-                // Production path (D3D11/D3D12 renderers): rt was
-                // created via m_core.d2d()->CreateDxgiSurfaceRender
-                // Target(...), so rt->GetFactory == m_d2dFactory
-                // already; this is a refcount-only no-op.
-                //
-                // Snapshot path (renderOverlayToTarget): the test
-                // owns its own ID2D1Factory and creates a WIC bitmap
-                // RT from it. The factory init() created is now
-                // dropped (no D2D resources reference it yet — text
-                // formats only reference m_dwriteFactory), and the
-                // geometries later created in paint() use rt's
-                // factory. EndDraw then succeeds.
-                rt->GetFactory(m_d2dFactory.ReleaseAndGetAddressOf());
-                auto make = [&](D2D1::ColorF c, ComPtr<ID2D1SolidColorBrush>& out) {
-                    return SUCCEEDED(rt->CreateSolidColorBrush(c, out.GetAddressOf()));
-                };
-                // Palette tuned to a "futuristic gaming HUD / racing
-                // telemetry" aesthetic — deep carbon-black background,
-                // graphite panels, soft off-white text, saturated
-                // cyan and electric-blue accents. Hex values come
-                // from the design spec; alpha 0.94 on the outer bg
-                // composites the HUD over the game with a subtle
-                // window into the world behind it.
-                // Refined palette from the design spec — slightly
-                // lighter background, deeper panel fill, more
-                // muted cyan for text accents (vs. saturated
-                // cyan-bright reserved for the bar gradient top).
-                if (!make(D2D1::ColorF(0.020f, 0.024f, 0.024f, 0.94f), m_brushBg)) return false;          // #050606
-                if (!make(D2D1::ColorF(0.035f, 0.039f, 0.039f, 1.00f), m_brushPanelBg)) return false;    // #090A0A
-                if (!make(D2D1::ColorF(0.122f, 0.133f, 0.133f, 1.00f), m_brushFrameLine)) return false;  // #1F2222 darker frame
-                if (!make(D2D1::ColorF(0.184f, 0.200f, 0.204f, 1.00f), m_brushSeparator)) return false;  // #2F3334
-                // Text — neutral off-white, #F7F7F7. The HUD's single
-                // text brush: covers header micro-labels (FPS / P95 /
-                // P99 / …), footer captions (GPU TEMP / LOAD / VRAM),
-                // histogram titles (GPU FRAMETIME MS / CPU FRAMETIME
-                // MS), the FPS big number, and the upright "App" /
-                // " / Render " labels in the CPU compound. Earlier
-                // iterations split into a brighter "text" brush and a
-                // dimmer "label" brush, but the design lands on the
-                // same off-white for every text role.
-                if (!make(D2D1::ColorF(0.969f, 0.969f, 0.969f, 1.00f), m_brushTextWhite)) return false;  // #F7F7F7
-                // Cyan accent — the "duller" cyan from the spec
-                // (#19D1D9), reserved for TEXT accents (FPS AVG /
-                // P95 / P99 / P99.9 + healthy LOAD / VRAM). The
-                // brighter #28E0E5 lives in the bar gradient TOP
-                // (see m_gpuTealStops below) — different role,
-                // different colour.
-                if (!make(D2D1::ColorF(0.098f, 0.820f, 0.851f, 1.00f), m_brushAccentCyan)) return false; // #19D1D9
-                // Histogram bar GRADIENT brushes — top→bottom
-                // linear gradient inside each bar gives the bars
-                // the "lit from above" look from the design spec.
-                // The brushes are created here with placeholder
-                // endpoints (0,0)→(0,1); drawHistogramBars sets the
-                // actual strip-top / strip-bottom per frame via
-                // SetStartPoint / SetEndPoint. That avoids
-                // re-creating the brush every frame while still
-                // letting it sample the gradient across whichever
-                // strip is being painted.
-                D2D1_GRADIENT_STOP gpuStops[2] = {
-                    {0.0f, D2D1::ColorF(0.157f, 0.878f, 0.898f, 1.00f)},  // #28E0E5 (top, lighter)
-                    {1.0f, D2D1::ColorF(0.075f, 0.682f, 0.710f, 1.00f)},  // #13AEB5 (bottom, darker)
-                };
-                D2D1_GRADIENT_STOP cpuStops[2] = {
-                    {0.0f, D2D1::ColorF(0.157f, 0.686f, 1.000f, 1.00f)},  // #28AFFF (top, lighter)
-                    {1.0f, D2D1::ColorF(0.047f, 0.561f, 0.847f, 1.00f)},  // #0C8FD8 (bottom, darker)
-                };
-                if (FAILED(rt->CreateGradientStopCollection(
-                        gpuStops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
-                        m_gpuTealStops.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateGradientStopCollection(
-                        cpuStops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
-                        m_cpuBlueStops.GetAddressOf()))) return false;
-                const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES gradProps = {
-                    /* startPoint */ {0.0f, 0.0f},
-                    /* endPoint   */ {0.0f, 1.0f},
-                };
-                if (FAILED(rt->CreateLinearGradientBrush(
-                        gradProps, m_gpuTealStops.Get(),
-                        m_brushGpuTealGrad.GetAddressOf()))) return false;
-                if (FAILED(rt->CreateLinearGradientBrush(
-                        gradProps, m_cpuBlueStops.Get(),
-                        m_brushCpuBlueGrad.GetAddressOf()))) return false;
-                // Warning / critical tiers — kept from the previous
-                // palette. Apply to both histogram bars (per-sample)
-                // and LOAD / VRAM text (overall).
-                if (!make(D2D1::ColorF(1.000f, 0.553f, 0.000f, 1.00f), m_brushOrange)) return false;     // #FF8D00
-                if (!make(D2D1::ColorF(1.000f, 0.196f, 0.235f, 1.00f), m_brushGaugeRed)) return false;   // #FF323C
-                // Dashed grid + budget line — desaturated and low-
-                // alpha so they sit BEHIND the bars without competing
-                // for attention.
-                if (!make(D2D1::ColorF(0.353f, 0.431f, 0.451f, 0.30f), m_brushGridDash)) return false;   // #5A6E73 @ 30%
-                if (!make(D2D1::ColorF(0.949f, 0.957f, 0.961f, 0.45f), m_brushBudgetLine)) return false; // off-white @ 45%
-
-                // Stroke style for the dashed grid lines. ID2D1Strok
-                // Style is shareable; we cache the one we need.
-                D2D1_STROKE_STYLE_PROPERTIES dashProps =
-                    D2D1::StrokeStyleProperties(
-                        D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
-                        D2D1_LINE_JOIN_MITER, 10.0f,
-                        D2D1_DASH_STYLE_CUSTOM, 0.0f);
-                const FLOAT dashes[] = {2.0f, 4.0f};
-                if (FAILED(m_d2dFactory->CreateStrokeStyle(
-                        dashProps, dashes,
-                        static_cast<UINT32>(std::size(dashes)),
-                        m_strokeDashed.GetAddressOf()))) return false;
-                return true;
-            }
-
-            // -------- paint() -----------------------------------------------
-            //
-            // Layout (top → bottom):
-            //   - Outer frame: dark grey 2-px stroke around a deep-
-            //     carbon background, chamfered corners (12-px diagonal
-            //     cuts), 10-px padding to the texture edge so the
-            //     OpenXR runtime's bilinear filter doesn't soften the
-            //     corner anti-alias.
-            //   - Header bar: 5 cells (FPS / FPS AVG / P95 / P99 /
-            //     P99.9) with thin vertical separators. Big white FPS
-            //     number, cyan accent numbers on the right four cells.
-            //   - GPU FRAMETIME MS panel: title + "X.X ms" value
-            //     (top-right) + dashed grid + teal-gradient histogram.
-            //   - CPU FRAMETIME MS panel: title + compound
-            //     "App X ms / Render Y ms" (top-right) + blue-gradient
-            //     histogram.
-            //   - Bottom row (60 / 40 split between two panels):
-            //       GPU panel = TEMP / LOAD / VRAM (3 cells). LOAD &
-            //         VRAM are tier-coloured (cyan / orange / red
-            //         per gaugeTierForUtilisation).
-            //       CPU panel = TEMP / LOAD (2 cells). TEMP shows
-            //         "-- °C" until PawnIO support lands.
-            //
-            // Two-tier paint:
-            //   - Static tier (~10 Hz): outer frame, header, panel
-            //     chrome, bottom row. Triggered by `snap.version`
-            //     ticking, with kMaxFramesBetweenStaticPaints as a
-            //     defensive timeout in case the aggregator stalls.
-            //   - Dynamic tier (every frame): the two histogram
-            //     regions. The ring buffer is fed by pushFrameSample()
-            //     at the host frame rate, so refreshing the bars at
-            //     90-144 Hz is what makes the scroll look smooth.
-            //
-            // The shim texture is persistent between paint() calls.
-            // On dynamic-only frames we skip rt->Clear() so the
-            // static chrome from the last static paint stays in
-            // place — drawHistoRegion() opaquely overwrites the
-            // histogram rectangles, leaving the surrounding chrome
-            // untouched.
-            bool paint(ID2D1RenderTarget* rt,
-                       const OverlaySnapshot& snap,
-                       const HistogramRing<kRingSize>& cpuRing,
-                       const HistogramRing<kRingSize>& gpuRing) {
-                if (!rt) return false;
-                if (!m_brushBg || !m_strokeDashed) return false;  // brushes not init'd
-
-                const bool needStatic = needStaticPaint(
-                    m_cadence, snap.version, kMaxFramesBetweenPaints);
-
-                rt->BeginDraw();
-
-                // Panel Ys for the dynamic histo tier below. The chrome
-                // (incl. the bottom row) is drawn by drawChrome(), which
-                // recomputes its own Ys from the same constants — they
-                // can't drift since both derive from kInner{T} + the
-                // section heights.
-                const float headerY    = kInnerT;
-                const float gpuPanelY  = headerY + kHeaderHeight + kSectionGap;
-                const float cpuPanelY  = gpuPanelY + kFrametimeHeight + kSectionGap;
-
-                if (needStatic) {
-                    // Fully transparent clear — we paint our own
-                    // opaque panel backgrounds, so the corners
-                    // outside the frame composite through to the
-                    // game underneath as transparent pixels.
-                    rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
-
-                    m_cachedValues = formatOverlayDisplayValues(snap);
-                    drawChrome(rt, m_cachedValues);
-                }
-
-                // Dynamic tier — runs every frame so the histogram
-                // scrolls smoothly. Cheap relative to the static
-                // tier: ~2 FillRect + ~8 DrawLine + ~240 bar
-                // FillRect, no DirectWrite, no path geometry.
-                drawHistoRegion(rt, gpuPanelY, gpuRing, snap.target_fps,
-                                 m_brushGpuTealGrad.Get());
-                drawHistoRegion(rt, cpuPanelY, cpuRing, snap.target_fps,
-                                 m_brushCpuBlueGrad.Get());
-
-                const bool ok = SUCCEEDED(rt->EndDraw());
-                // Fold the result back into the cadence — see
-                // commitPaint() in overlay_cadence.h for the
-                // static-success / static-failure / dynamic rules
-                // (the dynamic branch advances the watchdog even on
-                // failure so a stuck dynamic tier can still recover).
-                commitPaint(m_cadence, needStatic, ok, snap.version);
-                return ok;
-            }
-
-            // Paint ONLY the static chrome (outer frame, header, panel
-            // titles + current values, bottom row) into `rt` — no
-            // histogram region, no cadence bookkeeping. Used by the
-            // D3D11 path, which draws the histogram on the GPU
-            // (HistogramBarRenderer) and drives its own cadence; the
-            // caller decides when chrome is stale and calls this only
-            // then. Wraps its own BeginDraw/EndDraw and clears first
-            // (the shim is fully repainted on a chrome refresh).
-            //
-            // `gpuText` / `gpuShapes` (both optional): when non-null,
-            // text and shape calls route through their respective
-            // GPU renderers instead of D2D's DrawText / FillRectangle
-            // / FillGeometry. The helper brackets the chrome paint
-            // with beginBatch / flush on each so all queued instances
-            // land as one DrawInstanced per pass. Order at flush time:
-            //   shape pass → text pass → bars pass (caller-driven)
-            // so the layering reads bottom-to-top correctly:
-            //   chrome shapes (under) → glyphs → bars.
-            //
-            // Either renderer being null causes its calls to fall
-            // through to the D2D path inside the leaf helpers
-            // (drawWide, drawPanelBg, ...). Both null + the D2D
-            // EndDraw still committing the shape work is the
-            // historical behaviour, kept as the bottom-of-stack
-            // fallback.
-            //
-            // Returns EndDraw success.
-            bool paintChromeOnly(ID2D1RenderTarget* rt,
-                                  glyph_atlas::Renderer*       gpuText,
+            // Both gpuText / gpuShapes must be non-null on the D3D11
+            // direct-to-swapchain path (Task 15) — D2D fallback was
+            // retired with the shim. Returns true on success; false
+            // only if the renderer pointers are null.
+            bool paintChromeOnly(glyph_atlas::Renderer*       gpuText,
                                   chrome_shapes::Renderer*     gpuShapes,
                                   const OverlaySnapshot& snap) {
-                if (!rt) return false;
-                if (!m_brushBg || !m_strokeDashed) return false;
+                if (!gpuText || !gpuShapes) return false;
                 m_textRenderer  = gpuText;
                 m_chromeShapes  = gpuShapes;
 
                 // RAII guard: nulls the transient renderer pointers on
                 // every exit path, including stack unwind through a
                 // std::bad_alloc inside drawChrome (drawValueTextGpu
-                // allocates a vector<Segment>, drawValueWide allocates
-                // a wide-string, etc.). Without the guard a throw
-                // would leave the pointers dangling at member values
-                // until the next paint reassigned them — not a UAF
-                // since the pointed-to objects outlive the paint, but
-                // sloppy in a "never crash the host" layer.
+                // allocates a vector<Segment>, etc.). Without the
+                // guard a throw would leave the pointers dangling at
+                // member values until the next paint reassigned them
+                // — not a UAF since the pointed-to objects outlive
+                // the paint, but sloppy in a "never crash the host"
+                // layer.
                 struct PaintGuard {
                     CoreRenderer* core;
                     ~PaintGuard() {
@@ -793,62 +483,50 @@ namespace openxr_api_layer::detail {
                     }
                 } _guard{this};
 
-                if (m_textRenderer) m_textRenderer->beginBatch();
-                if (m_chromeShapes) m_chromeShapes->beginBatch();
+                m_textRenderer->beginBatch();
+                m_chromeShapes->beginBatch();
 
-                rt->BeginDraw();
-                rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
                 m_cachedValues = formatOverlayDisplayValues(snap);
-                drawChrome(rt, m_cachedValues);
-                const bool d2dOk = SUCCEEDED(rt->EndDraw());
-
-                // Flush the GPU passes AFTER the D2D EndDraw so they
-                // composite on top of whatever D2D just committed.
-                // Shapes first so glyphs land on top of the chrome
-                // panels they sit inside.
-                if (m_chromeShapes) m_chromeShapes->flush();
-                if (m_textRenderer) m_textRenderer->flush();
-                return d2dOk;
+                drawChrome(m_cachedValues);
+                return true;
             }
 
           private:
-            // The static-tier drawing shared by paint() and
-            // paintChromeOnly(): outer chamfered frame, header bar,
-            // both frametime-panel chromes (background + title +
-            // current value, NO histogram), and the bottom TEMP/LOAD/
-            // VRAM row. Caller owns BeginDraw/Clear/EndDraw. Panel Ys
-            // derive from the namespace-scope layout constants so they
-            // can't drift from drawHistoRegion / the bar renderer.
-            void drawChrome(ID2D1RenderTarget* rt,
-                             const OverlayDisplayValues& v) {
+            // The static-tier drawing: outer frame, header bar, both
+            // frametime-panel chromes (background + title + current
+            // value, NO histogram — the bars renderer owns the histo
+            // region), and the bottom TEMP/LOAD/VRAM row. All emitted
+            // onto the m_chromeShapes / m_textRenderer batches. Panel
+            // Ys derive from the namespace-scope layout constants so
+            // they can't drift from the bar renderer's geometry.
+            void drawChrome(const OverlayDisplayValues& v) {
                 const float headerY   = kInnerT;
                 const float gpuPanelY = headerY + kHeaderHeight + kSectionGap;
                 const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
                 const float bottomY   = cpuPanelY + kFrametimeHeight + kSectionGap;
 
-                // Outer frame: octagonal-ish chamfered shape (12-px
-                // diagonal corner cuts), one FillGeometry/DrawGeometry
-                // pair for fill + metal-line stroke.
+                // Outer frame: a filled rect + 1-px outline (the 12-px
+                // chamfer was dropped when chrome shapes moved to the
+                // GPU quad shader — sharp corners, see chrome_shape_
+                // renderer.h). drawChamferedRect keeps the historical
+                // name + signature so the geometry intent stays legible.
                 const D2D1_RECT_F frameOuter = D2D1::RectF(
                     kOuterPad, kOuterPad,
                     static_cast<float>(kTexW) - kOuterPad,
                     static_cast<float>(kTexH) - kOuterPad);
-                drawChamferedRect(rt, frameOuter, 12.0f,
-                                   m_brushBg.Get(),
-                                   m_brushFrameLine.Get(), kFrameStroke);
+                drawChamferedRect(frameOuter, kFrameStroke);
 
-                drawHeaderBar(rt, kInnerL, headerY, kInnerR,
+                drawHeaderBar(kInnerL, headerY, kInnerR,
                                headerY + kHeaderHeight, v);
-                // Histogram content is owned by drawHistoRegion() (D2D
-                // path) or HistogramBarRenderer (D3D11 path); these
-                // panel calls only paint the chrome (bg + title +
+                // Histogram content is owned by HistogramBarRenderer;
+                // these panel calls only paint the chrome (bg + title +
                 // current value).
-                drawFrametimePanel(rt, kInnerL, gpuPanelY, kInnerR,
+                drawFrametimePanel(kInnerL, gpuPanelY, kInnerR,
                                     gpuPanelY + kFrametimeHeight,
                                     L"GPU FRAMETIME MS",
                                     v.gpu_frametime_ms,
                                     /*secondaryValue=*/std::string{});
-                drawFrametimePanel(rt, kInnerL, cpuPanelY, kInnerR,
+                drawFrametimePanel(kInnerL, cpuPanelY, kInnerR,
                                     cpuPanelY + kFrametimeHeight,
                                     L"CPU FRAMETIME MS",
                                     v.cpu_frametime_ms,
@@ -863,14 +541,14 @@ namespace openxr_api_layer::detail {
                 const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
                 const float cpuPanelL = gpuPanelR + kSectionGap;
                 const float cpuPanelR = kInnerR;
-                drawBottomPanel(rt, gpuPanelL, bottomY,
+                drawBottomPanel(gpuPanelL, bottomY,
                                  gpuPanelR, bottomY + kBottomHeight,
                                  L"GPU TEMP", L"GPU LOAD",
                                  v.gpu_temp_c, v.gpu_util_pct,
                                  v.gpu_util_fraction,
                                  /*vramValue=*/v.vram_pct,
                                  /*vramFraction=*/v.vram_fraction);
-                drawBottomPanel(rt, cpuPanelL, bottomY,
+                drawBottomPanel(cpuPanelL, bottomY,
                                  cpuPanelR, bottomY + kBottomHeight,
                                  L"CPU TEMP", L"CPU LOAD",
                                  v.cpu_temp_c, v.cpu_util_pct,
@@ -882,42 +560,6 @@ namespace openxr_api_layer::detail {
             // -------- end static-tier helpers --------
 
           private:
-            // -------- Format / brush helpers --------------------------------
-            //
-            // makeFormat takes an optional IDWriteFontCollection — non-null
-            // when the renderer loaded the bundled Barlow fonts, null when
-            // we fell back to system fonts. CreateTextFormat resolves the
-            // family name through the supplied collection (or the system
-            // collection on null).
-            //
-            // `style` selects upright (`DWRITE_FONT_STYLE_NORMAL`) vs
-            // true italic (`_ITALIC`). DirectWrite resolves the right
-            // font FACE inside the collection — for Barlow that means
-            // picking Barlow-Medium.ttf vs Barlow-MediumItalic.ttf
-            // (both bundled, see fonts/bundled_fonts.rc.inc). If the
-            // collection only has the upright face and ITALIC is
-            // requested, DirectWrite falls back to synthetic-oblique
-            // (sheared upright glyphs) — uglier but functional, and
-            // happens only on the system-fallback path where we
-            // couldn't load the bundle.
-            bool makeFormat(const wchar_t* family,
-                            IDWriteFontCollection* collection,
-                            float size,
-                            DWRITE_FONT_WEIGHT weight,
-                            DWRITE_FONT_STYLE style,
-                            DWRITE_TEXT_ALIGNMENT alignment,
-                            ComPtr<IDWriteTextFormat>& out) {
-                if (FAILED(m_dwriteFactory->CreateTextFormat(
-                        family, collection, weight,
-                        style,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        size, L"en-US", out.GetAddressOf()))) {
-                    return false;
-                }
-                out->SetTextAlignment(alignment);
-                out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                return true;
-            }
 
             // -------- Glyph-atlas BuildSpec assembly + bake -----------------
             //
@@ -1157,80 +799,26 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // -------- D2D format / brush → GPU equivalents -------------
+            // -------- GPU text leaf helpers -------------------------------
             //
-            // Constant-time lookups. The set is small (7 formats,
-            // 4 brushes) and identity-stable for the lifetime of the
-            // CoreRenderer instance, so a linear scan over raw pointer
-            // comparisons is the simplest fit. Called only on the
-            // chrome paint cadence, not per frame.
-            const GpuTextFormat* gpuFmtFor(IDWriteTextFormat* fmt) const noexcept {
-                if (!fmt) return nullptr;
-                if (fmt == m_fmtBigNumber.Get())        return &kFmtBigNumberGpu;
-                if (fmt == m_fmtAccentNumber.Get())     return &kFmtAccentNumberGpu;
-                if (fmt == m_fmtTemp.Get())             return &kFmtTempGpu;
-                if (fmt == m_fmtMsValue.Get())          return &kFmtMsValueGpu;
-                if (fmt == m_fmtMsCompound.Get())       return &kFmtMsCompoundGpu;
-                if (fmt == m_fmtTinyLabelCenter.Get())  return &kFmtTinyLabelGpu;
-                if (fmt == m_fmtSectionTitle.Get())     return &kFmtSectionTitleGpu;
-                return nullptr;
+            // Thin forwarders onto the glyph-atlas renderer. The chrome
+            // path is GPU-only now (the D2D fallback was retired with the
+            // shim in Task 15), so each helper takes the GpuTextFormat +
+            // straight-alpha colour directly — no IDWriteTextFormat /
+            // ID2D1Brush pointer indirection, no D2D DrawText. drawChrome
+            // only runs inside paintChromeOnly, which guarantees
+            // m_textRenderer is set; the guard is belt-and-braces.
+            void drawWide(const GpuTextFormat& fmt, const wchar_t* s,
+                           const D2D1_RECT_F& rect, const float color[4]) const {
+                if (!m_textRenderer || !s) return;
+                drawTextGpu(m_textRenderer, fmt, s, std::wcslen(s), rect, color);
             }
 
-            const float* gpuColorFor(ID2D1Brush* brush) const noexcept {
-                if (!brush) return nullptr;
-                if (brush == m_brushTextWhite.Get())  return kColorTextWhite;
-                if (brush == m_brushAccentCyan.Get()) return kColorAccentCyan;
-                if (brush == m_brushOrange.Get())     return kColorOrange;
-                if (brush == m_brushGaugeRed.Get())   return kColorGaugeRed;
-                return nullptr;
-            }
-
-            // ASCII-only DrawTextW shortcut. The redesign emits only
-            // ASCII digits + uppercase labels — except for the °C
-            // suffix, which we draw via the dedicated wide-literal
-            // path drawWide().
-            //
-            // When m_textRenderer is set (GPU text path active for the
-            // current chrome paint), we route through drawTextGpu using
-            // the GpuTextFormat + colour the IDWriteTextFormat / brush
-            // map to. Lookups are constant-time and cover every format
-            // / brush the call sites pass. Unknown args fall through
-            // to the D2D path so an unexpected caller still renders.
-            void drawAscii(ID2D1RenderTarget* rt, const std::string& s,
-                            IDWriteTextFormat* fmt,
-                            const D2D1_RECT_F& rect,
-                            ID2D1Brush* brush) const {
+            void drawAscii(const GpuTextFormat& fmt, const std::string& s,
+                            const D2D1_RECT_F& rect, const float color[4]) const {
                 if (s.empty()) return;
-                std::wstring wide(s.begin(), s.end());
-                if (m_textRenderer) {
-                    const auto* gfmt = gpuFmtFor(fmt);
-                    const auto* gcol = gpuColorFor(brush);
-                    if (gfmt && gcol) {
-                        drawTextGpu(m_textRenderer, *gfmt,
-                                     wide.c_str(), wide.size(), rect, gcol);
-                        return;
-                    }
-                }
-                rt->DrawTextW(wide.c_str(),
-                              static_cast<UINT32>(wide.length()),
-                              fmt, rect, brush);
-            }
-
-            void drawWide(ID2D1RenderTarget* rt, const wchar_t* s,
-                           IDWriteTextFormat* fmt,
-                           const D2D1_RECT_F& rect,
-                           ID2D1Brush* brush) const {
-                if (!s) return;
-                const std::size_t len = std::wcslen(s);
-                if (m_textRenderer) {
-                    const auto* gfmt = gpuFmtFor(fmt);
-                    const auto* gcol = gpuColorFor(brush);
-                    if (gfmt && gcol) {
-                        drawTextGpu(m_textRenderer, *gfmt, s, len, rect, gcol);
-                        return;
-                    }
-                }
-                rt->DrawTextW(s, static_cast<UINT32>(len), fmt, rect, brush);
+                const std::wstring wide(s.begin(), s.end());
+                drawWide(fmt, wide.c_str(), rect, color);
             }
 
             // A "value run" inside a rendered string: a value-shaped
@@ -1355,167 +943,46 @@ namespace openxr_api_layer::detail {
             // SemiBold upright. Auto-detects digit and unit ranges from
             // the string content via findValueRuns.
             //
-            // `brush` paints non-value characters. When `chiffresBrush`
-            // is non-null, BOTH the digit and unit portions of every
-            // value run flip to that brush — used by the CPU compound
-            // so "X.X ms" reads in cyan while "App" / " / Render "
-            // labels stay in white. When `unitFontSize > 0`, the unit
-            // portion of every value run shrinks to that size while
-            // the digit portion stays at the base size — used by the
-            // bottom panel to render " °C" / " %" at the small label
-            // size next to the big-number digit prefix.
+            // The base `color` paints non-value characters. When
+            // `chiffresColor` is non-null, BOTH the digit and unit
+            // portions of every value run flip to it — used by the CPU
+            // compound so "X.X ms" reads in cyan while "App" / " /
+            // Render " labels stay in white. When `unitFontSize > 0`,
+            // the unit portion of every value run shrinks to that size
+            // while the digit portion stays at the base size — used by
+            // the bottom panel to render " °C" / " %" at the small
+            // label size next to the big-number digit prefix.
             //
-            // NOTE on tabular figures (`tnum`): an earlier iteration
-            // attached an IDWriteTypography with DWRITE_FONT_FEATURE_TAG
-            // _TABULAR_FIGURES via layout->SetTypography in this code
-            // path AND on every drawAscii / drawWide path. A diagnostic
-            // CI run (see PR #21 commits e453b52 / b067bdc) confirmed
-            // the typography object was created successfully and
-            // SetTypography returned S_OK, yet the rendered output was
-            // bit-identical to the no-tnum baseline — chiffres "1"
-            // stayed at 318 width units instead of widening to 494
-            // like the font's tnum lookup specifies.
-            //
-            // Root cause hypothesis: DirectWrite's shape engine ignores
-            // IDWriteTypography feature overrides when the resolved font
-            // face comes from a custom IDWriteFontCollection populated
-            // via IDWriteInMemoryFontFileLoader (the path used by
-            // loadBundledFontCollection above). The chiffres-jitter
-            // cosmetic issue stays unaddressed until we either find a
-            // working DirectWrite path or accept the jitter as a known
-            // footnote. The hook point if we ever revisit is exactly
-            // here — applied per-layout, not per-format, so this
-            // helper would gain a SetTypography call without further
-            // refactor.
-            void drawValueWide(
-                ID2D1RenderTarget* rt,
-                const std::wstring& wide,
-                IDWriteTextFormat* baseFmt,
-                const D2D1_RECT_F& rect,
-                ID2D1Brush* brush,
-                ID2D1Brush* chiffresBrush = nullptr,
-                float unitFontSize = 0.0f) const {
-                if (wide.empty() || !baseFmt) return;
-
-                // GPU text branch — route through drawValueTextGpu when
-                // m_textRenderer is set (chrome paint inside the shader
-                // path). The GPU helper handles mixed face / colour /
-                // size segmentation in one pass; lookups translate the
-                // IDWriteTextFormat / brushes the D2D path was already
-                // passing into the GpuTextFormat + colour the renderer
-                // wants. unitFontSize is float on the D2D side because
-                // SetFontSize takes float; the atlas is keyed on
-                // uint16_t pixel sizes so we round-trip through that.
-                if (m_textRenderer) {
-                    const auto* gfmt = gpuFmtFor(baseFmt);
-                    const auto* gcol = gpuColorFor(brush);
-                    if (gfmt && gcol) {
-                        const float* gchif =
-                            chiffresBrush ? gpuColorFor(chiffresBrush) : nullptr;
-                        const uint16_t usize =
-                            static_cast<uint16_t>(unitFontSize + 0.5f);
-                        drawValueTextGpu(m_textRenderer, *gfmt,
-                                          wide.c_str(), wide.size(),
-                                          rect, gcol, gchif, usize);
-                        return;
-                    }
-                }
-
-                ComPtr<IDWriteTextLayout> layout;
-                if (FAILED(m_dwriteFactory->CreateTextLayout(
-                        wide.c_str(),
-                        static_cast<UINT32>(wide.length()),
-                        baseFmt,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        layout.GetAddressOf()))) {
-                    // Fall back to the simple single-style path so the
-                    // panel still shows something readable. The whole
-                    // string renders in the BASE format (upright
-                    // Rajdhani for the value cases) — digit runs lose
-                    // their italic Barlow flavour for this frame.
-                    drawWide(rt, wide.c_str(), baseFmt, rect, brush);
-                    return;
-                }
-
-                // Lock the layout's line spacing to the base format's
-                // natural metrics BEFORE applying any per-range font
-                // overrides. Without this, swapping the digit ranges to
-                // Barlow Medium Italic widens the line (DirectWrite
-                // takes max ascent/descent across the line's fonts),
-                // which shifts the paragraph-centred baseline a couple
-                // of pixels relative to the histogram title rendered
-                // via DrawTextW (which stays on pure-base-format line
-                // metrics). GetLineMetrics here reads the natural
-                // Rajdhani-only line because no overrides have been
-                // applied yet; piping those values through
-                // SetLineSpacing(UNIFORM, …) freezes them so the later
-                // Barlow per-range swap can't shift them.
-                {
-                    DWRITE_LINE_METRICS lm{};
-                    UINT32 lineCount = 0;
-                    if (SUCCEEDED(layout->GetLineMetrics(&lm, 1, &lineCount))
-                        && lineCount > 0) {
-                        layout->SetLineSpacing(
-                            DWRITE_LINE_SPACING_METHOD_UNIFORM,
-                            lm.height, lm.baseline);
-                    }
-                }
-
-                for (const ValueRun& run : findValueRuns(wide)) {
-                    // Italic sub-range → Barlow Medium Italic. Skipped
-                    // when the prefix is dash/dot-only (italicLen == 0
-                    // for "-- °C" / "--.- ms" placeholders). Font
-                    // resolution happens against m_customFontCollection
-                    // attached to baseFmt; that collection holds both
-                    // "Rajdhani" and "Barlow", so SetFontFamilyName
-                    // resolves without falling back to system fonts.
-                    if (run.italicLen > 0) {
-                        const DWRITE_TEXT_RANGE italicRange{
-                            run.italicStart, run.italicLen};
-                        layout->SetFontFamilyName(L"Barlow", italicRange);
-                        layout->SetFontWeight(DWRITE_FONT_WEIGHT_MEDIUM, italicRange);
-                        layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, italicRange);
-                    }
-
-                    // Unit sub-range → smaller size if requested
-                    // (bottom-panel " °C" / " %" at the label size).
-                    if (run.unitLen > 0 && unitFontSize > 0.0f) {
-                        layout->SetFontSize(unitFontSize,
-                            DWRITE_TEXT_RANGE{run.unitStart, run.unitLen});
-                    }
-
-                    // Whole value range (prefix + unit) → chiffres
-                    // brush via SetDrawingEffect, so D2D's default
-                    // text renderer paints both portions with that
-                    // brush instead of the base `brush`. Placeholder
-                    // dashes ride along with the digit + unit even
-                    // when italicLen == 0.
-                    if (chiffresBrush) {
-                        layout->SetDrawingEffect(chiffresBrush,
-                            DWRITE_TEXT_RANGE{
-                                run.brushStart, run.brushLen});
-                    }
-                }
-                rt->DrawTextLayout(
-                    D2D1::Point2F(rect.left, rect.top),
-                    layout.Get(), brush);
+            // Mixed-style value rendering — thin forwarder onto the GPU
+            // value emitter. Walks findValueRuns inside drawValueTextGpu
+            // to flip digit ranges to Barlow Italic, optionally shrink
+            // the unit suffix, and optionally recolour the value runs
+            // (chiffresColor). `unitFontSize` stays float at the call
+            // sites (it's a kFont* constant); the atlas is keyed on
+            // uint16_t pixel sizes so we round here.
+            void drawValueWide(const GpuTextFormat& fmt,
+                                const std::wstring& wide,
+                                const D2D1_RECT_F& rect,
+                                const float color[4],
+                                const float* chiffresColor = nullptr,
+                                float unitFontSize = 0.0f) const {
+                if (!m_textRenderer || wide.empty()) return;
+                const uint16_t usize = static_cast<uint16_t>(unitFontSize + 0.5f);
+                drawValueTextGpu(m_textRenderer, fmt, wide.c_str(), wide.size(),
+                                  rect, color, chiffresColor, usize);
             }
 
             // ASCII overload — byte-widens to wstring and forwards.
             // Caller contract: `s` is ASCII-only (same as drawAscii).
-            void drawValueAscii(
-                ID2D1RenderTarget* rt,
-                const std::string& s,
-                IDWriteTextFormat* baseFmt,
-                const D2D1_RECT_F& rect,
-                ID2D1Brush* brush,
-                ID2D1Brush* chiffresBrush = nullptr,
-                float unitFontSize = 0.0f) const {
+            void drawValueAscii(const GpuTextFormat& fmt,
+                                 const std::string& s,
+                                 const D2D1_RECT_F& rect,
+                                 const float color[4],
+                                 const float* chiffresColor = nullptr,
+                                 float unitFontSize = 0.0f) const {
                 if (s.empty()) return;
-                std::wstring wide(s.begin(), s.end());
-                drawValueWide(rt, wide, baseFmt, rect, brush,
-                               chiffresBrush, unitFontSize);
+                drawValueWide(fmt, std::wstring(s.begin(), s.end()), rect,
+                               color, chiffresColor, unitFontSize);
             }
 
             // -------- GPU-text equivalents of drawWide / drawValueWide ----
@@ -1715,75 +1182,57 @@ namespace openxr_api_layer::detail {
             // margins. On systems without the bundled font we fall
             // back to Bahnschrift — narrower but no true italic, so
             // chiffres come out as synthetic-oblique upright Bahnschrift.
-            void drawHeaderBar(ID2D1RenderTarget* rt, float l, float t,
+            void drawHeaderBar(float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
-                drawPanelBg(rt, l, t, r, b);
+                drawPanelBg(l, t, r, b);
 
                 const float w = r - l;
                 const float cellW = w / 5.0f;
 
-                // Vertical separators between cells (4 of them now).
-                // GPU branch renders each as a 1-px wide thin rect.
+                // Vertical separators between cells (4 of them), each a
+                // 1-px-wide thin rect on the chrome-shapes batch.
                 for (int i = 1; i <= 4; ++i) {
                     const float x = l + cellW * static_cast<float>(i);
-                    if (m_chromeShapes) {
-                        m_chromeShapes->addRect(
-                            x, t + kHeaderSepInsetY,
-                            1.0f, (b - kHeaderSepInsetY) - (t + kHeaderSepInsetY),
-                            kColorSeparator);
-                    } else {
-                        rt->DrawLine(
-                            D2D1::Point2F(x, t + kHeaderSepInsetY),
-                            D2D1::Point2F(x, b - kHeaderSepInsetY),
-                            m_brushSeparator.Get(), 1.0f);
-                    }
+                    m_chromeShapes->addRect(
+                        x, t + kHeaderSepInsetY,
+                        1.0f, (b - kHeaderSepInsetY) - (t + kHeaderSepInsetY),
+                        kColorSeparator);
                 }
 
                 const float labelH = 22.0f;
                 const float labelY = t + 4.0f;
                 const float valueY = labelY + labelH;
 
-                drawHeaderCell(rt,
-                                l + cellW * 0.0f, labelY, l + cellW * 1.0f, valueY,
+                drawHeaderCell(l + cellW * 0.0f, labelY, l + cellW * 1.0f, valueY,
                                 L"FPS", v.fps_instant,
-                                m_fmtBigNumber.Get(),
-                                m_brushTextWhite.Get());
-                drawHeaderCell(rt,
-                                l + cellW * 1.0f, labelY, l + cellW * 2.0f, valueY,
+                                kFmtBigNumberGpu, kColorTextWhite);
+                drawHeaderCell(l + cellW * 1.0f, labelY, l + cellW * 2.0f, valueY,
                                 L"FPS AVG", v.fps_avg,
-                                m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
-                drawHeaderCell(rt,
-                                l + cellW * 2.0f, labelY, l + cellW * 3.0f, valueY,
+                                kFmtAccentNumberGpu, kColorAccentCyan);
+                drawHeaderCell(l + cellW * 2.0f, labelY, l + cellW * 3.0f, valueY,
                                 L"P95", v.fps_p95,
-                                m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
-                drawHeaderCell(rt,
-                                l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
+                                kFmtAccentNumberGpu, kColorAccentCyan);
+                drawHeaderCell(l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
                                 L"P99", v.fps_p99,
-                                m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
-                drawHeaderCell(rt,
-                                l + cellW * 4.0f, labelY, l + cellW * 5.0f, valueY,
+                                kFmtAccentNumberGpu, kColorAccentCyan);
+                drawHeaderCell(l + cellW * 4.0f, labelY, l + cellW * 5.0f, valueY,
                                 L"P99.9", v.fps_p99_9,
-                                m_fmtAccentNumber.Get(),
-                                m_brushAccentCyan.Get());
+                                kFmtAccentNumberGpu, kColorAccentCyan);
             }
 
-            void drawHeaderCell(ID2D1RenderTarget* rt, float l, float t,
+            void drawHeaderCell(float l, float t,
                                  float r, float valueY,
                                  const wchar_t* label,
                                  const std::string& value,
-                                 IDWriteTextFormat* valueFormat,
-                                 ID2D1Brush* valueBrush) const {
+                                 const GpuTextFormat& valueFormat,
+                                 const float valueColor[4]) const {
                 const D2D1_RECT_F labelRect = D2D1::RectF(l, t, r, valueY);
-                drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
-                          labelRect, m_brushTextWhite.Get());
+                drawWide(kFmtTinyLabelGpu, label, labelRect, kColorTextWhite);
                 const D2D1_RECT_F valueRect = D2D1::RectF(
                     l, valueY - 2.0f, r,
                     valueY + kFontBigNumber + 6.0f);
-                drawAscii(rt, value, valueFormat, valueRect, valueBrush);
+                drawAscii(valueFormat, value, valueRect, valueColor);
             }
 
             // -------- Frametime panel ---------------------------------------
@@ -1799,24 +1248,22 @@ namespace openxr_api_layer::detail {
             // bars, budget line) is owned by drawHistoRegion() and is
             // refreshed every frame so the ring buffer's scroll stays
             // smooth — see paint()'s static/dynamic dispatch.
-            void drawFrametimePanel(ID2D1RenderTarget* rt, float l, float t,
+            void drawFrametimePanel(float l, float t,
                                      float r, float b,
                                      const wchar_t* title,
                                      const std::string& currentValue,
                                      const std::string& secondaryValue) const {
-                drawPanelBg(rt, l, t, r, b);
+                drawPanelBg(l, t, r, b);
 
-                // Title bar — top inner padding.
-                // Title row paddings shared with drawHistoRegion()
-                // — see kPanelTitleTopPad / kHistoTitleGap at the
-                // layout-constants block.
+                // Title bar — top inner padding. Title row paddings
+                // shared with the bar renderer's histo geometry (see
+                // kPanelTitleTopPad / kHistoTitleGap).
                 const float titleT = t + kPanelTitleTopPad;
                 const float titleB = titleT + kHistoTitleH;
                 const D2D1_RECT_F titleRect = D2D1::RectF(
                     l + kSectionInnerPad, titleT,
                     r - kSectionInnerPad, titleB);
-                drawWide(rt, title, m_fmtSectionTitle.Get(), titleRect,
-                          m_brushTextWhite.Get());
+                drawWide(kFmtSectionTitleGpu, title, titleRect, kColorTextWhite);
 
                 // Current value (top-right). Two shapes depending on
                 // whether `secondaryValue` is empty:
@@ -1846,184 +1293,30 @@ namespace openxr_api_layer::detail {
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 160.0f, titleT,
                         r - kSectionInnerPad,          titleB);
-                    drawValueAscii(rt, s, m_fmtMsValue.Get(), valueRect,
-                                    m_brushAccentCyan.Get());
+                    drawValueAscii(kFmtMsValueGpu, s, valueRect,
+                                    kColorAccentCyan);
                 } else {
                     // CPU panel: compound "App {x} ms / Render {y} ms".
                     // drawValueAscii finds the two "X.X ms" value runs
                     // and paints them in cyan (digits italic Barlow,
                     // " ms" upright Rajdhani — same colour, different
                     // font). "App" and " / Render " stay upright
-                    // Rajdhani in white via the base brush.
+                    // Rajdhani in white via the base colour.
                     const std::string compound =
                         "App " + secondaryValue + " ms / Render "
                         + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 320.0f, titleT,
                         r - kSectionInnerPad,          titleB);
-                    drawValueAscii(rt, compound, m_fmtMsCompound.Get(),
-                                    valueRect,
-                                    m_brushTextWhite.Get(),    // "App" / "/ Render"
-                                    m_brushAccentCyan.Get());  // value runs
+                    drawValueAscii(kFmtMsCompoundGpu, compound, valueRect,
+                                    kColorTextWhite,     // "App" / "/ Render"
+                                    kColorAccentCyan);   // value runs
                 }
 
                 // Histogram region is intentionally left untouched
-                // here — drawHistoRegion() fills it every frame so the
-                // bars scroll at the host rate while the chrome above
-                // only repaints on snap.version ticks.
-            }
-
-            // Histogram region: filled every frame with the panel's
-            // background, dashed grid, current ring contents, and the
-            // budget reference line. Repainting just this rectangle
-            // each frame keeps the histogram scrolling smoothly at
-            // 90-144 Hz while the surrounding chrome (panel title,
-            // current numeric value, outer frame, header, bottom row)
-            // is only redrawn when the aggregator ticks (~10 Hz).
-            //
-            // `panelY` is the panel's outer top in shim-pixel space;
-            // the region's geometry is derived from layout constants
-            // so the rect matches drawFrametimePanel's title row by
-            // construction (any drift here would silently misalign
-            // the grid under the title).
-            void drawHistoRegion(ID2D1RenderTarget* rt, float panelY,
-                                  const HistogramRing<kRingSize>& ring,
-                                  float targetFps,
-                                  ID2D1LinearGradientBrush* barBrush) const {
-                // Inner bounds + title paddings come from namespace-
-                // scope constexpr so this rect matches drawFrametime
-                // Panel()'s title row by construction. The previous
-                // 6.0f / kOuterPad-based duplication was a drift risk.
-                const float titleB = panelY + kPanelTitleTopPad + kHistoTitleH;
-                const float histoL = kInnerL + kSectionInnerPad;
-                const float histoR = kInnerR - kSectionInnerPad;
-                const float histoT = titleB + kHistoTitleGap;
-                const float histoB = panelY + kFrametimeHeight -
-                                      kSectionInnerPad;
-
-                // Opaque erase of the previous frame's bars+grid.
-                // Panel-bg brush is the same dark carbon used by
-                // drawPanelBg, so the seam under the title is
-                // invisible.
-                rt->FillRectangle(
-                    D2D1::RectF(histoL, histoT, histoR, histoB),
-                    m_brushPanelBg.Get());
-
-                drawDashedGrid(rt, histoL, histoT, histoR, histoB,
-                                /*lineCount=*/4);
-
-                const int64_t budgetNs = targetFps > 0.0f
-                    ? static_cast<int64_t>(1.0e9f / targetFps)
-                    : 0;
-                drawHistogramBars(rt, ring, budgetNs,
-                                   histoL, histoT, histoR, histoB,
-                                   barBrush);
-
-                // Budget line drawn AFTER bars so overruns visually
-                // pierce it (the user reads "bar crosses line ⇒
-                // budget breach"). Same brush/stroke as the static
-                // version used to do.
-                drawBudgetLine(rt, histoL, histoT, histoR, histoB);
-            }
-
-            // Budget reference line — fine solid line at the Y
-            // position where a bar at exactly 100 % budget tops out
-            // (= budgetLineFraction from the strip top). Drawn with
-            // the dedicated m_brushBudgetLine (brighter than the
-            // dashed grid). 1 px stroke, slight horizontal inset so
-            // it doesn't touch the panel's inner border.
-            void drawBudgetLine(ID2D1RenderTarget* rt, float l, float t,
-                                  float r, float b) const {
-                const float y = t + (b - t) * budgetLineFraction();
-                rt->DrawLine(
-                    D2D1::Point2F(l, y),
-                    D2D1::Point2F(r, y),
-                    m_brushBudgetLine.Get(), 1.0f);
-            }
-
-            // 4 evenly-spaced horizontal dashed lines across the
-            // histogram region. Visual purpose: give the user a sense
-            // of "vertical scale" for the bar heights, fpsVR-style.
-            void drawDashedGrid(ID2D1RenderTarget* rt, float l, float t,
-                                  float r, float b, int lineCount) const {
-                const float h = b - t;
-                for (int i = 1; i <= lineCount; ++i) {
-                    const float y = t + h * static_cast<float>(i) /
-                                          static_cast<float>(lineCount + 1);
-                    rt->DrawLine(
-                        D2D1::Point2F(l, y),
-                        D2D1::Point2F(r, y),
-                        m_brushGridDash.Get(), 1.0f,
-                        m_strokeDashed.Get());
-                }
-            }
-
-            void drawHistogramBars(ID2D1RenderTarget* rt,
-                                    const HistogramRing<kRingSize>& ring,
-                                    int64_t budgetNs,
-                                    float l, float t, float r, float b,
-                                    ID2D1LinearGradientBrush* accentBrush) const {
-                if (r <= l || b <= t || budgetNs <= 0) return;
-                const std::size_t n = ring.size();
-                if (n == 0) return;
-                const float fullW = r - l;
-                const float stripH = b - t;
-                const float barW =
-                    (fullW - kHistoBarGap * static_cast<float>(n - 1)) /
-                    static_cast<float>(n);
-                if (barW <= 0.0f) return;
-
-                // Update the gradient endpoints to span the strip's
-                // vertical range. Each bar then samples the gradient
-                // from its own position within the strip — a bar
-                // that only reaches halfway up gets only the bottom
-                // half of the gradient, matching how the spec's
-                // mock-up renders. accentBrush is typed as
-                // ID2D1LinearGradientBrush* so the previous per-
-                // frame QueryInterface (288 QIs/s at 144 Hz × 2
-                // strips) is gone — we already know the type at
-                // brush-creation time in initBrushes().
-                accentBrush->SetStartPoint(D2D1::Point2F((l + r) * 0.5f, t));
-                accentBrush->SetEndPoint  (D2D1::Point2F((l + r) * 0.5f, b));
-
-                // kDashPlaceholderH from overlay_layout.h — shared with the
-                // GPU path so the empty-slot dash height can't drift.
-                for (std::size_t i = 0; i < n; ++i) {
-                    const float x = l + static_cast<float>(i) * (barW + kHistoBarGap);
-                    const int64_t sample = ring.at(i);
-                    if (sample <= 0) {
-                        // Empty slot — render a 2-px dash at the
-                        // strip bottom as a placeholder. Tells the
-                        // user "this position exists, just no
-                        // signal yet" (typical during the first
-                        // second of a session while the ring fills,
-                        // or during a transient where a GPU query
-                        // result wasn't ready). Same brush as the
-                        // dashed grid lines so the placeholders
-                        // read as chart chrome rather than as data.
-                        const D2D1_RECT_F dash = D2D1::RectF(
-                            x, b - kDashPlaceholderH,
-                            x + barW, b);
-                        rt->FillRectangle(dash, m_brushGridDash.Get());
-                        continue;
-                    }
-                    const auto vis = barVisualForSample(sample, budgetNs);
-                    const float h = vis.heightFraction * stripH;
-                    if (h <= 0.0f) continue;
-                    // Per-bar tier colour: healthy bars use the
-                    // panel's accent (teal for GPU, blue for CPU),
-                    // warning tier goes ORANGE, critical goes RED.
-                    // Same palette as the gauge — keeps the visual
-                    // language consistent ("orange/red anywhere ⇒
-                    // headroom problem").
-                    ID2D1Brush* brush = accentBrush;
-                    if (vis.tier == BarTier::Red)         brush = m_brushGaugeRed.Get();
-                    else if (vis.tier == BarTier::Orange) brush = m_brushOrange.Get();
-                    const D2D1_RECT_F bar = D2D1::RectF(
-                        x, b - h,
-                        x + barW, b);
-                    rt->FillRectangle(bar, brush);
-                }
+                // here — HistogramBarRenderer fills it every frame so
+                // the bars scroll at the host rate while the chrome
+                // above only repaints on snap.version ticks.
             }
 
             // -------- Bottom panel (TEMP / LOAD [/ VRAM], text-only) --------
@@ -2048,7 +1341,7 @@ namespace openxr_api_layer::detail {
             // is only rendered when `vramValue` is non-empty (the
             // CPU panel passes "" and skips the third column
             // entirely — same code path, fewer columns).
-            void drawBottomPanel(ID2D1RenderTarget* rt, float l, float t,
+            void drawBottomPanel(float l, float t,
                                   float r, float b,
                                   const wchar_t* tempLabel,
                                   const wchar_t* loadLabel,
@@ -2057,41 +1350,32 @@ namespace openxr_api_layer::detail {
                                   float utilFraction,
                                   const std::string& vramValue,
                                   float vramFraction) const {
-                drawPanelBg(rt, l, t, r, b);
+                drawPanelBg(l, t, r, b);
 
-                // Tier-brush helper: same logic for LOAD and VRAM.
+                // Tier-colour helper: same logic for LOAD and VRAM.
                 // < 80 % = cyan default, 80–89 % = orange warning,
                 // ≥ 90 % = red critical. The TEMP value stays white
                 // (no thermal-tier contract yet — would require
                 // knowing TjMax per SKU).
-                auto tierBrush = [&](float fraction) -> ID2D1Brush* {
+                auto tierColor = [&](float fraction) -> const float* {
                     const BarTier tier = gaugeTierForUtilisation(fraction);
-                    if (tier == BarTier::Red)    return m_brushGaugeRed.Get();
-                    if (tier == BarTier::Orange) return m_brushOrange.Get();
-                    return m_brushAccentCyan.Get();
+                    if (tier == BarTier::Red)    return kColorGaugeRed;
+                    if (tier == BarTier::Orange) return kColorOrange;
+                    return kColorAccentCyan;
                 };
 
                 const bool hasVram = !vramValue.empty();
                 const int  numCols = hasVram ? 3 : 2;
                 const float colW   = (r - l) / static_cast<float>(numCols);
 
-                // Vertical separators between cells. Same brush as
-                // the panel inner stroke so they read as subtle
-                // column dividers, not hard borders. GPU branch
-                // renders each as a 1-px wide thin rect.
+                // Vertical separators between cells, each a 1-px-wide
+                // thin rect on the chrome-shapes batch.
                 for (int i = 1; i < numCols; ++i) {
                     const float x = l + colW * static_cast<float>(i);
-                    if (m_chromeShapes) {
-                        m_chromeShapes->addRect(
-                            x, t + kBottomSepInsetY,
-                            1.0f, (b - kBottomSepInsetY) - (t + kBottomSepInsetY),
-                            kColorSeparator);
-                    } else {
-                        rt->DrawLine(
-                            D2D1::Point2F(x, t + kBottomSepInsetY),
-                            D2D1::Point2F(x, b - kBottomSepInsetY),
-                            m_brushSeparator.Get(), 1.0f);
-                    }
+                    m_chromeShapes->addRect(
+                        x, t + kBottomSepInsetY,
+                        1.0f, (b - kBottomSepInsetY) - (t + kBottomSepInsetY),
+                        kColorSeparator);
                 }
 
                 // tempLabel / loadLabel arrive pre-built as wide
@@ -2119,12 +1403,12 @@ namespace openxr_api_layer::detail {
                                       const wchar_t* label,
                                       const std::string& asciiValue,
                                       const wchar_t* unitSuffix,
-                                      ID2D1Brush* valueBrush,
+                                      const float* valueColor,
                                       bool useWideValue) {
-                    drawWide(rt, label, m_fmtTinyLabelCenter.Get(),
+                    drawWide(kFmtTinyLabelGpu, label,
                               D2D1::RectF(cellL, labelY, cellR,
                                            labelY + 22.0f),
-                              m_brushTextWhite.Get());
+                              kColorTextWhite);
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
                     // prefix flips to Barlow Italic via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
@@ -2145,10 +1429,9 @@ namespace openxr_api_layer::detail {
                         std::wstring wide(asciiValue.begin(),
                                            asciiValue.end());
                         wide += unitSuffix;
-                        drawValueWide(rt, wide, m_fmtTemp.Get(),
-                                       valueRect,
-                                       valueBrush,
-                                       /*chiffresBrush=*/nullptr,
+                        drawValueWide(kFmtTempGpu, wide, valueRect,
+                                       valueColor,
+                                       /*chiffresColor=*/nullptr,
                                        /*unitFontSize=*/kFontTempUnit);
                     } else {
                         // % and other ASCII-safe suffixes — single
@@ -2170,10 +1453,9 @@ namespace openxr_api_layer::detail {
                                    "!useWideValue path");
                             full.push_back(static_cast<char>(*p));
                         }
-                        drawValueAscii(rt, full, m_fmtTemp.Get(),
-                                        valueRect,
-                                        valueBrush,
-                                        /*chiffresBrush=*/nullptr,
+                        drawValueAscii(kFmtTempGpu, full, valueRect,
+                                        valueColor,
+                                        /*chiffresColor=*/nullptr,
                                         /*unitFontSize=*/kFontTempUnit);
                     }
                 };
@@ -2193,16 +1475,16 @@ namespace openxr_api_layer::detail {
                 // bytes.
                 drawCell(l, l + colW,
                           tempLabel, tempValue, L" \u00B0C",
-                          m_brushTextWhite.Get(), /*useWideValue=*/true);
+                          kColorTextWhite, /*useWideValue=*/true);
                 // Cell 1 — <prefix> LOAD / "92 %"
                 drawCell(l + colW, l + colW * 2.0f,
                           loadLabel, utilValue, L" %",
-                          tierBrush(utilFraction), /*useWideValue=*/false);
+                          tierColor(utilFraction), /*useWideValue=*/false);
                 // Cell 2 — VRAM / "76 %" (GPU panel only)
                 if (hasVram) {
                     drawCell(l + colW * 2.0f, r,
                               L"VRAM", vramValue, L" %",
-                              tierBrush(vramFraction), /*useWideValue=*/false);
+                              tierColor(vramFraction), /*useWideValue=*/false);
                 }
             }
 
@@ -2214,91 +1496,36 @@ namespace openxr_api_layer::detail {
             // carbon-fibre hatch for a "raised metal" industrial
             // look; all three were dropped in favour of a flat panel.
             //
-            // GPU branch: sharp corners (the 4-px D2D rounding has no
-            // exact GPU equivalent in our quad shader; tradeoff is
-            // documented + accepted in the chrome-shape migration
-            // task). One fill rect + one 1-px outline = 5 quads per
-            // panel. D2D fallback path still does the rounded rect.
-            void drawPanelBg(ID2D1RenderTarget* rt, float l, float t,
-                              float r, float b) const {
-                if (m_chromeShapes) {
-                    m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
-                    m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
-                    return;
-                }
-                const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
-                    D2D1::RectF(l, t, r, b), 4.0f, 4.0f);
-                rt->FillRoundedRectangle(panel, m_brushPanelBg.Get());
-                rt->DrawRoundedRectangle(panel, m_brushSeparator.Get(), 1.0f);
+            // Sharp corners: the 4-px D2D rounding has no exact GPU
+            // equivalent in the quad shader (tradeoff documented +
+            // accepted in the chrome-shape migration). One fill rect +
+            // one 1-px outline = 5 quads per panel, on the chrome-
+            // shapes batch.
+            void drawPanelBg(float l, float t, float r, float b) const {
+                m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
+                m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
             }
 
-            // Outer frame with chamfered (cut) corners. Builds an
-            // octagonal-ish closed path: 4 straight edges joined by
-            // 4 diagonal cuts at the corners. `chamfer` is the
-            // diagonal cut length in pixels (12 px matches the
-            // design's industrial-HUD look). Single fill + stroke
-            // pair, no per-corner arc geometry needed.
-            //
-            // GPU branch: sharp corners (the 12-px chamfer has no
-            // exact GPU equivalent without a custom polygon shader;
-            // tradeoff is documented + accepted in the chrome-shape
-            // migration task). One fill rect + one 1-px outline.
-            // D2D fallback path still does the chamfered geometry.
-            void drawChamferedRect(ID2D1RenderTarget* rt,
-                                     const D2D1_RECT_F& rect,
-                                     float chamfer,
-                                     ID2D1Brush* fillBrush,
-                                     ID2D1Brush* strokeBrush,
+            // Outer frame. Historically a chamfered (cut-corner)
+            // octagon; the chamfer was dropped when chrome shapes moved
+            // to the GPU quad shader (no exact equivalent without a
+            // custom polygon pass). Now a plain filled rect + 1-px
+            // outline. Kept the name + rect/stroke signature so the
+            // call site in drawChrome reads as "the outer frame".
+            void drawChamferedRect(const D2D1_RECT_F& rect,
                                      float strokeWidth) const {
-                if (m_chromeShapes) {
-                    m_chromeShapes->addRect(rect.left, rect.top,
-                                              rect.right - rect.left,
-                                              rect.bottom - rect.top,
-                                              kColorBg);
-                    m_chromeShapes->addOutline(rect.left, rect.top,
-                                                rect.right - rect.left,
-                                                rect.bottom - rect.top,
-                                                strokeWidth,
-                                                kColorFrameLine);
-                    return;
-                }
-                ComPtr<ID2D1PathGeometry> path;
-                if (FAILED(m_d2dFactory->CreatePathGeometry(path.GetAddressOf()))) {
-                    // Fallback to a plain rounded-rect if path
-                    // creation fails for any reason (shouldn't
-                    // happen in practice — D2D factory is always
-                    // alive at paint time).
-                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
-                        rect, 8.0f, 8.0f);
-                    rt->FillRoundedRectangle(rr, fillBrush);
-                    rt->DrawRoundedRectangle(rr, strokeBrush, strokeWidth);
-                    return;
-                }
-                ComPtr<ID2D1GeometrySink> sink;
-                if (FAILED(path->Open(sink.GetAddressOf()))) return;
-                const float L = rect.left;
-                const float Rg = rect.right;
-                const float T = rect.top;
-                const float B = rect.bottom;
-                const float c = chamfer;
-                sink->BeginFigure(D2D1::Point2F(L + c, T),
-                                   D2D1_FIGURE_BEGIN_FILLED);
-                sink->AddLine(D2D1::Point2F(Rg - c, T));        // top edge
-                sink->AddLine(D2D1::Point2F(Rg, T + c));        // top-right cut
-                sink->AddLine(D2D1::Point2F(Rg, B - c));        // right edge
-                sink->AddLine(D2D1::Point2F(Rg - c, B));        // bottom-right cut
-                sink->AddLine(D2D1::Point2F(L + c, B));         // bottom edge
-                sink->AddLine(D2D1::Point2F(L, B - c));         // bottom-left cut
-                sink->AddLine(D2D1::Point2F(L, T + c));         // left edge
-                sink->AddLine(D2D1::Point2F(L + c, T));         // top-left cut (close)
-                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                sink->Close();
-                rt->FillGeometry(path.Get(), fillBrush);
-                rt->DrawGeometry(path.Get(), strokeBrush, strokeWidth);
+                m_chromeShapes->addRect(rect.left, rect.top,
+                                          rect.right - rect.left,
+                                          rect.bottom - rect.top,
+                                          kColorBg);
+                m_chromeShapes->addOutline(rect.left, rect.top,
+                                            rect.right - rect.left,
+                                            rect.bottom - rect.top,
+                                            strokeWidth,
+                                            kColorFrameLine);
             }
 
             // -------- Members -----------------------------------------------
-            ComPtr<ID2D1Factory>      m_d2dFactory;
             ComPtr<IDWriteFactory>    m_dwriteFactory;
             // Bundled-font state. Held for the lifetime of the
             // CoreRenderer so the IDWriteInMemoryFontFileLoader stays
@@ -2311,61 +1538,8 @@ namespace openxr_api_layer::detail {
             ComPtr<IDWriteInMemoryFontFileLoader> m_inMemoryFontLoader;
             std::vector<ComPtr<IDWriteFontFile>>  m_bundledFontFiles;
             ComPtr<IDWriteFontCollection>         m_customFontCollection;
-            // Text formats — one per (font, size, alignment) combo
-            // the layout uses. All immutable post-init, so paint()
-            // never allocates a format.
-            ComPtr<IDWriteTextFormat> m_fmtBigNumber;        // "142" (FPS)
-            ComPtr<IDWriteTextFormat> m_fmtAccentNumber;     // "138", "124", "108"
-            ComPtr<IDWriteTextFormat> m_fmtTemp;             // "67 °C", "92 %"
-            ComPtr<IDWriteTextFormat> m_fmtMsValue;          // "6.7 ms" (GPU)
-            ComPtr<IDWriteTextFormat> m_fmtMsCompound;       // "App ... ms / Render ... ms" (CPU, mixed style)
-            ComPtr<IDWriteTextFormat> m_fmtTinyLabelCenter;  // "FPS", "GPU TEMP", "GPU LOAD"
-            ComPtr<IDWriteTextFormat> m_fmtSectionTitle;     // "GPU FRAMETIME MS"
 
-            // Brushes — the 12-colour palette.
-            ComPtr<ID2D1SolidColorBrush> m_brushBg;
-            ComPtr<ID2D1SolidColorBrush> m_brushPanelBg;
-            ComPtr<ID2D1SolidColorBrush> m_brushFrameLine;
-            ComPtr<ID2D1SolidColorBrush> m_brushSeparator;
-            ComPtr<ID2D1SolidColorBrush> m_brushTextWhite;
-            ComPtr<ID2D1SolidColorBrush> m_brushAccentCyan;
-            // Histogram bar brushes use linear gradients (top→
-            // bottom) rather than solid colours, matching the design
-            // spec's "lit from above" look. Stop collections cached
-            // once at init, brushes are reused with per-strip
-            // endpoint updates in drawHistogramBars.
-            ComPtr<ID2D1GradientStopCollection> m_gpuTealStops;
-            ComPtr<ID2D1GradientStopCollection> m_cpuBlueStops;
-            ComPtr<ID2D1LinearGradientBrush>    m_brushGpuTealGrad;
-            ComPtr<ID2D1LinearGradientBrush>    m_brushCpuBlueGrad;
-            ComPtr<ID2D1SolidColorBrush> m_brushOrange;      // warning tier (≥ 80 % load)
-            ComPtr<ID2D1SolidColorBrush> m_brushGaugeRed;    // critical tier (≥ 90 % load)
-            ComPtr<ID2D1SolidColorBrush> m_brushGridDash;
-            ComPtr<ID2D1SolidColorBrush> m_brushBudgetLine;
-            // Dashed stroke style for the grid lines.
-            ComPtr<ID2D1StrokeStyle>     m_strokeDashed;
-
-            // Static-tier cadence. The static tier (frame chrome,
-            // header text, panel titles+values, bottom row) repaints
-            // on either:
-            //   - `snap.version` changing, or
-            //   - kMaxFramesBetweenPaints frames having elapsed since
-            //     the last static paint (defensive timeout against
-            //     a stalled aggregator).
-            //
-            // The aggregator publishes at ~10 Hz so the version
-            // trigger fires every ~9 frames at 90 Hz host rate;
-            // K=30 (~333 ms at 90 Hz, ~208 ms at 144 Hz) only kicks
-            // in if the aggregator stops ticking. The dynamic tier
-            // (histogram region) runs every frame regardless and is
-            // independent of the counter.
-            //
-            // The decision/update logic lives in overlay_cadence.h
-            // (needStaticPaint / commitPaint) so it's unit-testable
-            // without a render target — see test_overlay_cadence.cpp.
-            static constexpr int kMaxFramesBetweenPaints = 30;
             OverlayDisplayValues m_cachedValues;
-            PaintCadence         m_cadence;
 
             // Glyph atlas — baked once at init from the same DirectWrite
             // factory + custom collection above. Held as CPU-side data
@@ -2378,46 +1552,48 @@ namespace openxr_api_layer::detail {
 
             // GPU text renderer, stashed transiently by paintChromeOnly
             // for the duration of one chrome paint. drawWide / drawAscii /
-            // drawValueWide / drawValueAscii consult this — when non-null
-            // they emit drawRun calls onto the renderer's batch; when
-            // null they fall through to the D2D path. paintChromeOnly
-            // clears the pointer on exit so a stray frame after the paint
-            // doesn't touch a stale renderer.
+            // drawValueWide / drawValueAscii emit drawRun calls onto its
+            // batch. paintChromeOnly sets it before drawChrome and clears
+            // it (via a scope guard) on exit, so it's non-null for the
+            // whole chrome rebuild and null otherwise.
             glyph_atlas::Renderer*   m_textRenderer = nullptr;
 
             // GPU chrome-shape renderer, stashed the same way. drawPanelBg /
-            // drawChamferedRect / the column-separator inline DrawLine
-            // calls in drawHeaderBar / drawBottomPanel branch on it: when
-            // non-null they append rects to the renderer's batch; when
-            // null they fall through to the existing D2D shape calls.
+            // drawChamferedRect / the column-separator loops in
+            // drawHeaderBar / drawBottomPanel append rects to its batch.
             chrome_shapes::Renderer* m_chromeShapes = nullptr;
         };
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
         //
-        // Replaces drawHistoRegion()'s D2D work (one FillRectangle per bar,
-        // ×kRingSize ×2 panels every frame) with a handful of instanced GPU
-        // draws into the shim. Owns two pipelines — solid-colour quads for the
-        // background / grid / budget line, and gradient bars for the samples —
-        // plus an RTV on the shim and the dynamic instance + constant buffers
-        // refilled per panel per frame.
+        // Paints the histogram region (background + grid + bars + budget line)
+        // with a handful of instanced GPU draws. Owns two pipelines —
+        // solid-colour quads for the background / grid / budget line, and
+        // gradient bars for the samples — plus the dynamic instance + constant
+        // buffers refilled per panel per frame. The render target is passed
+        // per drawPanel(rtv, …) call (the D3D11 path's acquired swapchain
+        // image, the D3D12 path's shim).
         //
-        // Lives on the SAME D3D11 device as the shim's D2D render target, so
-        // both share one immediate context. Contract for the caller:
-        //   1. Flush() the D2D RT before drawPanel() — D2D batches commands;
-        //      flushing commits the chrome so our draws land on top of it.
-        //   2. Treat the D3D11 pipeline state as clobbered after drawPanel()
-        //      (and D2D clobbers ours), so each drawPanel() sets ALL state.
+        // Caller contract: the GPU pipeline state is fully owned per draw —
+        // drawPanel() (and the chrome-shape / glyph-atlas flushes that run
+        // alongside it) each set ALL the state they need, since they
+        // clobber each other's bindings on the shared context. Ordering on
+        // that context is chrome shapes → text → bars, so the bars land on
+        // top of the chrome.
         //
-        // Colours mirror initBrushes() exactly so the GPU output matches the
-        // old D2D look (modulo edge anti-aliasing). The histogram rect is
-        // fully opaque after the background fill, so premultiplied == straight
-        // there and the runtime composites the quad layer correctly.
+        // Colours are the same straight-alpha palette as the chrome
+        // constants. The histogram rect is fully opaque after the background
+        // fill, so the runtime composites the quad layer correctly.
         class HistogramBarRenderer {
           public:
-            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx,
-                       ID3D11Texture2D* shim) {
-                if (!device || !ctx || !shim) return false;
+            // RTV is supplied per-draw by the caller (Task 15 — D3D11
+            // path paints directly into one of N swapchain images,
+            // so the pipeline state stays renderer-owned while the
+            // target rotates each frame). Target dimensions (kTexW,
+            // kTexH) are constant for the renderer's lifetime so we
+            // bake them into the immutable cbuffer at init.
+            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx) {
+                if (!device || !ctx) return false;
                 m_device = device;
                 m_ctx = ctx;
 
@@ -2432,10 +1608,6 @@ namespace openxr_api_layer::detail {
                         step));
                     return false;
                 };
-
-                if (FAILED(m_device->CreateRenderTargetView(
-                        shim, nullptr, m_rtv.GetAddressOf())))
-                    return fail("CreateRenderTargetView (shim)");
 
                 // Shaders from embedded bytecode.
                 if (FAILED(m_device->CreateVertexShader(
@@ -2569,12 +1741,13 @@ namespace openxr_api_layer::detail {
             // barVisualForSample returns heightFraction 0 and the loop
             // emits no instances). That keeps the histo region from
             // freezing on stale shim content during the warm-up.
-            void drawPanel(const HistogramRing<kRingSize>& ring,
+            void drawPanel(ID3D11RenderTargetView* rtv,
+                            const HistogramRing<kRingSize>& ring,
                             int64_t budgetNs,
                             float histoL, float histoT,
                             float histoR, float histoB,
                             bool isGpu) {
-                if (!m_ready) return;
+                if (!m_ready || !rtv) return;
                 const float fullW = histoR - histoL;
                 const float stripH = histoB - histoT;
                 if (fullW <= 0.0f || stripH <= 0.0f) return;
@@ -2669,8 +1842,8 @@ namespace openxr_api_layer::detail {
                     // init()), so no re-upload here.
                 }
 
-                // --- pipeline state (D2D clobbered it; set everything) ---
-                m_ctx->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+                // --- pipeline state (prior passes clobbered it; set all) ---
+                m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
                 D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
                                   static_cast<float>(kTexH), 0.0f, 1.0f};
                 m_ctx->RSSetViewports(1, &vp);
@@ -2814,7 +1987,8 @@ namespace openxr_api_layer::detail {
             bool m_ready = false;
             ComPtr<ID3D11Device>           m_device;
             ComPtr<ID3D11DeviceContext>    m_ctx;
-            ComPtr<ID3D11RenderTargetView> m_rtv;
+            // RTV is supplied per drawPanel call (Task 15) so the
+            // renderer can paint into any of the N swapchain images.
             ComPtr<ID3D11VertexShader>     m_barsVS;
             ComPtr<ID3D11PixelShader>      m_barsPS;
             ComPtr<ID3D11VertexShader>     m_quadVS;
@@ -2836,52 +2010,104 @@ namespace openxr_api_layer::detail {
         // defensive. Shared by both renderers so a tweak lands once.
         constexpr int kChromeWatchdogFrames = 30;
 
-        // -------- Shared shader-path paint -----------------------------------
+        // -------- Shared all-GPU overlay paint --------------------------------
         //
-        // D2D chrome (only when snap.version ticks or the watchdog fires)
-        // + GPU instanced bars (every frame) into the shim. Used by both
-        // D3D11OverlayRenderer and D3D12OverlayRenderer — the only piece
-        // that differs across paths is the shim's render target, which
-        // the caller passes in. `bars` already owns the matching D3D11
-        // immediate context (captured at init() time on the same device
-        // backing `shimRT`), so the two stages talk to one another
-        // through that context with no extra plumbing here.
+        // Two-tier paint into a PERSISTENT target — the caller's fixed
+        // paint texture (D3D11 path) or shim (D3D12 path), NOT a rotating
+        // swapchain image. Because the target persists across frames we
+        // recover the original D2D design's static/dynamic split:
         //
-        // Ordering across the D2D ↔ D3D11 boundary is the load-bearing
-        // detail: CoreRenderer::paintChromeOnly's EndDraw flushes the D2D
-        // command batch onto the SAME immediate context that bars.draw
-        // Panel() submits its instanced draws to, so the GPU executes
-        // [chrome → bars] in submission order — no fence, no flush, no
-        // extra sync needed. On the D3D12 path the D3D11On12 wrapped-
-        // resource Acquire/Release dance happens AFTER this returns (in
-        // renderAndCompose) and ferries the shim into the D3D12 swapchain
-        // image without disturbing this ordering.
+        //   * Static tier (cadence-gated, ~10 Hz via needStaticPaint):
+        //     rebuild the chrome shape + text scratches (paintChromeOnly),
+        //     ClearRenderTargetView the whole target, then flush chrome
+        //     shapes + text. This is the heavy CPU tier (string formatting
+        //     + ~80 glyph lookups + the two instanced uploads).
         //
-        // Returns false only when a needed chrome repaint failed; the
-        // cadence then leaves lastPaintedVersion alone so the next frame
-        // retries the static branch until it lands.
-        inline bool paintShimViaShader(
+        //   * Dynamic tier (EVERY frame): the two histogram panels. The
+        //     bars' opaque panel-bg quad repaints only the (scissored)
+        //     histo rect, so on non-static frames the surrounding chrome
+        //     (frame / header / panel titles / current values / bottom
+        //     row) just persists in the target from the last static paint.
+        //     No clear, no chrome re-flush — the hot path is two drawPanel
+        //     calls.
+        //
+        // Targets differ by path: D3D11 passes the acquired swapchain
+        // image directly (targetRetainsContent=false → full repaint each
+        // frame); D3D12 passes its persistent shim (targetRetainsContent
+        // =true → two-tier), then CopyResource's the shim into the wrapped
+        // image. Either way the target carries the full composite by the
+        // time the caller hands it back to the runtime.
+        //
+        // Ordering on the shared immediate context, on a static frame:
+        //   ClearRTV → chrome shapes → text → bars  (bottom-to-top).
+        // On a dynamic frame: just bars, over the persistent chrome.
+        //
+        // Returns false only on a hard chrome rebuild failure (null
+        // renderer pointer); the cadence then retries next frame.
+        inline bool paintOverlay(
                 CoreRenderer&                       core,
                 HistogramBarRenderer&               bars,
                 PaintCadence&                       cadence,
-                ID2D1RenderTarget*                  shimRT,
-                glyph_atlas::Renderer*              gpuText,
-                chrome_shapes::Renderer*            gpuShapes,
+                ID3D11DeviceContext*                ctx,
+                ID3D11RenderTargetView*             rtv,
+                glyph_atlas::Renderer&              gpuText,
+                chrome_shapes::Renderer&            gpuShapes,
                 const HistogramRing<kRingSize>&     cpuRing,
                 const HistogramRing<kRingSize>&     gpuRing,
-                const OverlaySnapshot&              snap) {
+                const OverlaySnapshot&              snap,
+                bool                                targetRetainsContent) {
+            if (!ctx || !rtv) return false;
+
             const bool needStatic = needStaticPaint(
                 cadence, snap.version, kChromeWatchdogFrames);
 
+            // Chrome rebuild (the heavy CPU tier: string formatting +
+            // ~80 glyph lookups + the two instanced uploads' scratch)
+            // is always cadence-gated to ~10 Hz, regardless of target.
             bool ok = true;
             if (needStatic) {
-                ok = core.paintChromeOnly(shimRT, gpuText, gpuShapes, snap);
+                ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
             }
 
+            // Chrome FLUSH (clear + re-upload the cached chrome scratch
+            // into THIS target) depends on whether the target keeps its
+            // pixels between frames:
+            //   * targetRetainsContent (D3D12 shim, a texture we own):
+            //     only flush when we just rebuilt — the chrome persists
+            //     in the shim between ticks, the bars overpaint only the
+            //     histo rect. The classic two-tier split.
+            //   * !targetRetainsContent (D3D11 swapchain image, whose
+            //     contents OpenXR does NOT guarantee across acquire):
+            //     flush every frame so the freshly-acquired image always
+            //     carries the current chrome. The cheap re-flush of the
+            //     cached scratch — NOT the 10 Hz rebuild above.
+            const bool flushChrome = ok && (needStatic || !targetRetainsContent);
+            if (flushChrome) {
+                const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                ctx->ClearRenderTargetView(rtv, kClear);
+                // If a chrome flush fails (transient Map/grow under
+                // memory pressure) AFTER we've cleared the target,
+                // suppress the whole frame — otherwise we'd composite
+                // bars + whatever-drew over a blank background. The
+                // cadence keeps needStatic set so the next frame retries
+                // the rebuild. (Both flushes run; we don't short-circuit
+                // so a partial draw still lands consistently before we
+                // bail.)
+                const bool shapesOk = gpuShapes.flush(rtv);
+                const bool textOk   = gpuText.flush(rtv);
+                if (!shapesOk || !textOk) {
+                    commitPaint(cadence, needStatic, /*ok=*/false, snap.version);
+                    return false;
+                }
+            }
+
+            // Dynamic tier — bars every frame (the histogram scrolls at
+            // the host rate). Skipped only if a static rebuild failed
+            // mid-frame, to avoid drawing bars over a half-cleared target.
             if (ok) {
                 // Panel Ys + histo rects from the shared layout constants;
-                // identical geometry to drawHistoRegion / drawChrome so
-                // the GPU bars line up under the D2D titles.
+                // identical geometry to drawChrome so the bars line up
+                // under the panel titles.
                 const float gpuPanelY =
                     kInnerT + kHeaderHeight + kSectionGap;
                 const float cpuPanelY =
@@ -2899,10 +2125,10 @@ namespace openxr_api_layer::detail {
                                     kHistoTitleH + kHistoTitleGap;
                 const float cpuB = cpuPanelY + kFrametimeHeight -
                                     kSectionInnerPad;
-                bars.drawPanel(gpuRing, budgetNs,
+                bars.drawPanel(rtv, gpuRing, budgetNs,
                                 histoL, gpuT, histoR, gpuB,
                                 /*isGpu=*/true);
-                bars.drawPanel(cpuRing, budgetNs,
+                bars.drawPanel(rtv, cpuRing, budgetNs,
                                 histoL, cpuT, histoR, cpuB,
                                 /*isGpu=*/false);
             }
@@ -2926,29 +2152,8 @@ namespace openxr_api_layer::detail {
             }
 
             ~D3D11OverlayRenderer() override {
-                // Session summary for the keyed-mutex timeouts. The
-                // per-occurrence log throttles to first + every
-                // kMutexTimeoutLogStride-th, so a user reporting a
-                // glitchy HUD may have only one or two log lines
-                // even after hours of timeouts. Always emit a
-                // session-end total when non-zero — support reads
-                // this to triage "intermittent sync issue" vs
-                // "isolated startup hiccup".
-                if (m_myMutexTimeouts || m_appMutexTimeouts) {
-                    Log(fmt::format(
-                        "xr_telemetry: session ended with {} paint-mutex + "
-                        "{} copy-mutex acquire timeouts.\n",
-                        m_myMutexTimeouts, m_appMutexTimeouts));
-                }
                 if (m_swapchain != XR_NULL_HANDLE && m_api) {
                     m_api->xrDestroySwapchain(m_swapchain);
-                }
-                // The shared NT handle outlives the resource pair — close
-                // it so a long-running app doesn't leak kernel handles
-                // session-after-session.
-                if (m_sharedHandle) {
-                    ::CloseHandle(m_sharedHandle);
-                    m_sharedHandle = nullptr;
                 }
             }
 
@@ -2981,137 +2186,87 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // 2. Paint into the shim texture (typed BGRA8 we own)
-                //    on OUR private D3D11 device. The app's device may
-                //    not have been created with D3D11_CREATE_DEVICE_
-                //    BGRA_SUPPORT (verified empirically: D2D returns
-                //    E_INVALIDARG on CreateDxgiSurfaceRenderTarget on
-                //    any texture from a non-BGRA-flag device, even when
-                //    the texture itself is BGRA8_UNORM). The shim
-                //    lives on m_myDevice (always created with BGRA
-                //    support) and is shared into the app's device via
-                //    DXGI_RESOURCE_MISC_SHARED_NTHANDLE so we can copy
-                //    it to the runtime's swapchain image without
-                //    crossing process boundaries.
+                // 2. Paint chrome + text + bars DIRECTLY into the
+                //    acquired swapchain image's RTV — no intermediate
+                //    texture, no CopyResource, no Flush.
                 //
-                //    Cross-device sync uses a keyed mutex pair:
-                //      key=0 : owned by app side (initial state after
-                //              CreateSharedHandle / OpenSharedResource1)
-                //      key=1 : owned by our render side after we paint
-                //    Each side AcquireSyncs the key it expects, then
-                //    ReleaseSyncs the OTHER key once it's done, handing
-                //    over to the next side.
+                //    History: the green-band / vanishing-cubes bug that
+                //    plagued the first direct-to-swapchain attempt was a
+                //    pipeline-STATE LEAK (we share the app's immediate
+                //    context; xrEndFrame runs on the app's render thread,
+                //    so state we leave bound corrupts the app's next
+                //    frame). The intermediate+CopyResource and the Flush
+                //    were added chasing that symptom on wrong hypotheses
+                //    — they never fixed it. SwapDeviceContextState (the
+                //    state isolation below) did. With the leak fixed,
+                //    direct-to-swapchain renders correctly, so the copy
+                //    and flush are gone.
                 //
-                //    CRITICAL INVARIANT: every frame must end with the
-                //    mutex back at key=0. If we transition 0→1 (via a
-                //    successful paint-side AcquireSync+ReleaseSync) but
-                //    fail to perform the matching 1→0 transition on the
-                //    copy side, the next frame's AcquireSync(0,50) will
-                //    time out forever and the HUD freezes for the rest
-                //    of the session — and the one-shot timeout log hides
-                //    the symptom from us. So the copy block below treats
-                //    the 1→0 handover as MANDATORY whenever we hold the
-                //    key, falling back to an empty handover if the
-                //    happy-path copy is gated off.
-                bool painted     = false;
-                bool weHaveKey1  = false;  // we owe a 1→0 transition to the mutex pair
-                if (m_myShimMutex && m_myShimRenderTarget) {
-                    // Bounded acquire so an upstream sync failure on
-                    // the app side doesn't hang the frame thread
-                    // forever. 50 ms is well above any realistic copy
-                    // cost on the previous frame.
-                    HRESULT hr = m_myShimMutex->AcquireSync(0, 50);
-                    if (hr == S_OK) {
-                        painted = m_useShaderBars
-                            ? paintShimViaShader(m_core, m_bars, m_barsCadence,
-                                                  m_myShimRenderTarget.Get(),
-                                                  m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
-                                                  m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
-                                                  m_cpuRing, m_gpuRing, snap)
-                            : m_core.paint(m_myShimRenderTarget.Get(), snap,
-                                            m_cpuRing, m_gpuRing);
-                        m_myShimMutex->ReleaseSync(1);
-                        weHaveKey1 = true;
-                    } else {
-                        // Periodic log: first occurrence + every
-                        // kMutexTimeoutLogStride-th after that. A
-                        // recurring hiccup at e.g. 1 % of frames at
-                        // 144 Hz produces one log line every ~12 s,
-                        // visible enough to triage but not flooding.
-                        ++m_myMutexTimeouts;
-                        if (m_myMutexTimeouts == 1 ||
-                            m_myMutexTimeouts % kMutexTimeoutLogStride == 0) {
-                            Log(fmt::format(
-                                "xr_telemetry: overlay paint mutex acquire timed "
-                                "out (HRESULT={:#x}, key=0, total={}). HUD will "
-                                "skip frames until sync recovers.\n",
-                                static_cast<unsigned int>(hr),
-                                m_myMutexTimeouts));
+                //    SwapDeviceContextState swaps in a private,
+                //    default-initialised state block for our draws and
+                //    hands the app's full pipeline state back after. The
+                //    RAII guard restores it on every exit path (incl. a
+                //    std::bad_alloc from paintOverlay's allocations); the
+                //    catch(...) keeps the throw from crossing the
+                //    xrEndFrame C-ABI boundary. Both satisfy "never
+                //    crash / never corrupt the host".
+                //
+                //    targetRetainsContent=false: OpenXR doesn't guarantee
+                //    swapchain image contents across acquire, so the
+                //    chrome is re-flushed every frame (the cheap cached-
+                //    scratch upload; the 10 Hz chrome REBUILD is still
+                //    gated).
+                //
+                //    LIMITATION: this only isolates the app's IMMEDIATE
+                //    context. An app that submits its frame from a
+                //    DEFERRED context, or from another thread racing
+                //    xrEndFrame, isn't serialised by our swap — on such
+                //    an engine the state-leak corruption could resurface.
+                //    Not observed on the tested runtimes (Pimax + Dirt /
+                //    LMU / HelloXR, all immediate-context within the
+                //    xrEndFrame thread), and the overlay's
+                //    disable_environment escape hatch lets a user kill
+                //    the layer if it ever does. The fully-robust
+                //    alternative is a dedicated private device +
+                //    CopyResource (the D3D12 model) — but that's the
+                //    per-frame copy we just removed for a 6x CPU win, so
+                //    we take the immediate-context bet and document it.
+                bool painted = false;
+                {
+                    m_context1->SwapDeviceContextState(
+                        m_overlayState.Get(),
+                        m_savedState.ReleaseAndGetAddressOf());
+                    struct StateRestoreGuard {
+                        ID3D11DeviceContext1*   ctx;
+                        ID3DDeviceContextState* appState;
+                        ~StateRestoreGuard() {
+                            if (ctx && appState)
+                                ctx->SwapDeviceContextState(appState, nullptr);
                         }
-                    }
-                }
+                    } stateGuard{m_context1.Get(), m_savedState.Get()};
 
-                // 3. Copy the painted shim into the OpenXR swapchain
-                //    image via the app's device. The two textures are
-                //    in the same "type group" (B8G8R8A8 family), so
-                //    D3D11 allows the copy even though one side is
-                //    typeless. If anything in the copy gate is missing
-                //    (no app context, runtime returned a bogus image
-                //    index, or paint itself returned false), we still
-                //    MUST perform the empty 1→0 handover to satisfy
-                //    the keyed-mutex invariant — see the long comment
-                //    in step 2.
-                if (weHaveKey1) {
-                    const bool canCopy = painted && m_context &&
-                                          imageIdx < m_images.size();
-                    bool handedBack = false;
-                    if (m_appShimMutex) {
-                        HRESULT hr = m_appShimMutex->AcquireSync(1, 50);
-                        if (hr == S_OK) {
-                            if (canCopy) {
-                                m_context->CopyResource(m_images[imageIdx].Get(),
-                                                         m_appShim.Get());
-                            }
-                            m_appShimMutex->ReleaseSync(0);
-                            handedBack = true;
-                        } else {
-                            ++m_appMutexTimeouts;
-                            if (m_appMutexTimeouts == 1 ||
-                                m_appMutexTimeouts % kMutexTimeoutLogStride == 0) {
-                                Log(fmt::format(
-                                    "xr_telemetry: overlay copy mutex acquire timed "
-                                    "out (HRESULT={:#x}, key=1, total={}). HUD will "
-                                    "skip frames until sync recovers.\n",
-                                    static_cast<unsigned int>(hr),
-                                    m_appMutexTimeouts));
-                            }
+                    try {
+                        if (imageIdx < m_imageRtvs.size()) {
+                            painted =
+                                paintOverlay(m_core, m_bars, m_barsCadence,
+                                              m_context.Get(),
+                                              m_imageRtvs[imageIdx].Get(),
+                                              m_glyphRenderer,
+                                              m_chromeShapeRenderer,
+                                              m_cpuRing, m_gpuRing, snap,
+                                              /*targetRetainsContent=*/false);
+                            // Unbind our RTV so the swapchain image isn't
+                            // left OM-bound when the runtime composites it.
+                            ID3D11RenderTargetView* nullRtv = nullptr;
+                            m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
                         }
-                    }
-                    if (!handedBack) {
-                        // Recovery path: the happy-path handover failed
-                        // (app-side acquire timed out, or m_appShimMutex
-                        // is somehow null after a successful init). The
-                        // mutex pair is still at key=1 — fix it via the
-                        // paint-side handle. We own the key (we just
-                        // ReleaseSync(1)'d it three lines up), so the
-                        // AcquireSync(1) should be instant; we then
-                        // ReleaseSync(0) WITHOUT copying. The swapchain
-                        // image keeps whatever it had last frame; we
-                        // suppress this frame's composition layer
-                        // below so the runtime doesn't repaint stale
-                        // bytes as fresh telemetry.
-                        if (m_myShimMutex &&
-                            m_myShimMutex->AcquireSync(1, 50) == S_OK) {
-                            m_myShimMutex->ReleaseSync(0);
-                        }
-                        // If even this fails (the mutex is genuinely
-                        // broken — kernel object corrupted, app-side
-                        // device removed mid-handover, etc.), the next
-                        // frame's AcquireSync(0) will time out and we
-                        // log + bail cleanly. No spin, no deadlock.
+                    } catch (...) {
+                        // Paint-time throw (OOM etc.): skip the overlay
+                        // this frame. stateGuard still restores the
+                        // app's context state on unwind out of this block.
                         painted = false;
                     }
-                }
+                }   // stateGuard restores the app's pipeline state here
 
                 // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
@@ -3142,7 +2297,7 @@ namespace openxr_api_layer::detail {
             bool init() {
                 if (!m_device || !m_api || m_session == XR_NULL_HANDLE) return false;
                 if (!m_core.init()) {
-                    Log("xr_telemetry: overlay D2D/DirectWrite init failed; HUD disabled\n");
+                    Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);
@@ -3184,13 +2339,11 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Stash the OpenXR swapchain images. We don't create a
-                // D2D render target on each one (Pimax hands back
-                // DXGI_FORMAT_B8G8R8A8_TYPELESS textures, which D2D
-                // refuses), instead we paint into a shim BGRA8_UNORM
-                // texture we own and CopyResource it into the OpenXR
-                // image per frame. The diagnostic log on image 0 keeps
-                // around for future format / bindFlags regressions.
+                // Stash the OpenXR swapchain images; the per-image RTVs
+                // are created below (Pimax hands back BGRA8_TYPELESS, so
+                // each RTV needs an explicit BGRA8_UNORM view desc). The
+                // diagnostic log on image 0 stays around for future
+                // format / bindFlags regressions.
                 m_images.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     m_images[i] = raw[i].texture;
@@ -3208,16 +2361,12 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // Diagnostic for the app's D3D11 device — D2D requires
-                // it to have been created with D3D11_CREATE_DEVICE_BGRA
-                // _SUPPORT (= 0x20). If the app didn't ask for that
-                // flag (LMU / DR2 / etc. don't, since they don't use
-                // D2D), every D2D RT-creation against textures from
-                // this device returns E_INVALIDARG. Below we sidestep
-                // this by allocating our OWN D3D11 device with the
-                // flag set, paint with D2D on that device, and share
-                // the result back to the app's device via a shared
-                // NT handle + keyed mutex.
+                // Diagnostic for the app's D3D11 device. Task 15 made
+                // direct-to-swapchain painting possible, so the
+                // BGRA_SUPPORT flag is no longer load-bearing for the
+                // hot path — the GPU shaders (overlay_quad / overlay_
+                // bars / overlay_text) work on any device. We still
+                // log it for triage.
                 const UINT appFlags = m_device->GetCreationFlags();
                 const D3D_FEATURE_LEVEL appLevel = m_device->GetFeatureLevel();
                 const bool appHasBgra =
@@ -3229,204 +2378,107 @@ namespace openxr_api_layer::detail {
                     appHasBgra ? "yes" : "no",
                     static_cast<unsigned int>(appLevel)));
 
-                // 1. Reach the adapter the app's device sits on; we
-                //    want our private device on the SAME GPU so the
-                //    shared-resource path stays in-VRAM (driver-side
-                //    optimisation; cross-adapter shares fall back to
-                //    a CPU bounce).
-                ComPtr<IDXGIDevice> appDxgi;
-                if (FAILED(m_device.As(&appDxgi))) {
+                // m_context was captured by the constructor; sanity-
+                // check we didn't somehow land here without it.
+                if (!m_context) {
                     Log("xr_telemetry: overlay disabled — app device "
-                        "QueryInterface IDXGIDevice failed\n");
-                    return false;
-                }
-                ComPtr<IDXGIAdapter> adapter;
-                if (FAILED(appDxgi->GetAdapter(adapter.GetAddressOf()))) {
-                    Log("xr_telemetry: overlay disabled — IDXGIDevice "
-                        "GetAdapter failed\n");
+                        "context not captured\n");
                     return false;
                 }
 
-                // 2. Create our private D3D11 device on the same
-                //    adapter, force BGRA_SUPPORT so D2D works on
-                //    anything we allocate. SINGLETHREADED is the
-                //    sensible default since only this object's
-                //    renderAndCompose ever touches it.
-                D3D_FEATURE_LEVEL outLevel{};
-                HRESULT hr = ::D3D11CreateDevice(
-                    adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                        D3D11_CREATE_DEVICE_SINGLETHREADED,
-                    nullptr, 0, D3D11_SDK_VERSION,
-                    m_myDevice.GetAddressOf(),
-                    &outLevel,
-                    nullptr);   // we never invoke ID3D11DeviceContext
-                                // directly — D2D drives it through
-                                // the RT — so don't even capture it.
-                if (FAILED(hr) || !m_myDevice) {
-                    Log(fmt::format(
-                        "xr_telemetry: overlay disabled — D3D11CreateDevice "
-                        "(BGRA-capable secondary) failed (HRESULT={:#x})\n",
-                        static_cast<unsigned int>(hr)));
-                    return false;
-                }
-
-                // 3. Create the shim texture on OUR device with the
-                //    shared-NT-handle flag + keyed mutex. The keyed
-                //    mutex serialises access between our paint side
-                //    and the app's copy side per frame.
-                D3D11_TEXTURE2D_DESC shimDesc{};
-                shimDesc.Width = static_cast<UINT>(kTexW);
-                shimDesc.Height = static_cast<UINT>(kTexH);
-                shimDesc.MipLevels = 1;
-                shimDesc.ArraySize = 1;
-                shimDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                shimDesc.SampleDesc.Count = 1;
-                shimDesc.Usage = D3D11_USAGE_DEFAULT;
-                shimDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-                shimDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
-                                      D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-                hr = m_myDevice->CreateTexture2D(
-                    &shimDesc, nullptr, m_myShim.GetAddressOf());
-                if (FAILED(hr)) {
-                    Log(fmt::format(
-                        "xr_telemetry: overlay disabled — CreateTexture2D "
-                        "(shared shim) failed (HRESULT={:#x})\n",
-                        static_cast<unsigned int>(hr)));
-                    return false;
-                }
-
-                // 4. Get the shared NT handle from our shim.
-                ComPtr<IDXGIResource1> myShimResource;
-                if (FAILED(m_myShim.As(&myShimResource))) {
-                    Log("xr_telemetry: overlay disabled — shim QueryInterface "
-                        "IDXGIResource1 failed\n");
-                    return false;
-                }
-                if (FAILED(myShimResource->CreateSharedHandle(
-                        nullptr,
-                        DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                        nullptr,
-                        &m_sharedHandle))) {
-                    Log("xr_telemetry: overlay disabled — CreateSharedHandle "
-                        "failed\n");
-                    return false;
-                }
-
-                // 5. Open the shared handle on the app's device so we
-                //    can CopyResource from it via the app's context.
-                ComPtr<ID3D11Device1> appDevice1;
-                if (FAILED(m_device.As(&appDevice1))) {
+                // D3D11.1 state isolation. We render on the app's
+                // immediate context, so we MUST NOT leak pipeline
+                // state into the app's own rendering. CreateDevice
+                // ContextState gives us a private, default-init state
+                // block; SwapDeviceContextState (per frame) swaps it
+                // in for our draws and hands back the app's state to
+                // restore afterwards. Without this the app inherits
+                // our shaders / blend / RTV and renders garbage.
+                if (FAILED(m_device.As(&m_device1))) {
                     Log("xr_telemetry: overlay disabled — app device "
-                        "QueryInterface ID3D11Device1 failed\n");
+                        "QueryInterface ID3D11Device1 failed (need "
+                        "D3D11.1 for state isolation)\n");
                     return false;
                 }
-                if (FAILED(appDevice1->OpenSharedResource1(
-                        m_sharedHandle, __uuidof(ID3D11Texture2D),
-                        reinterpret_cast<void**>(m_appShim.GetAddressOf())))) {
-                    Log("xr_telemetry: overlay disabled — OpenSharedResource1 "
-                        "failed\n");
+                if (FAILED(m_context.As(&m_context1))) {
+                    Log("xr_telemetry: overlay disabled — app context "
+                        "QueryInterface ID3D11DeviceContext1 failed\n");
                     return false;
                 }
-
-                // 6. Cache the keyed-mutex interfaces on both sides.
-                if (FAILED(m_myShim.As(&m_myShimMutex)) ||
-                    FAILED(m_appShim.As(&m_appShimMutex))) {
-                    Log("xr_telemetry: overlay disabled — keyed mutex "
-                        "QueryInterface failed on shim\n");
-                    return false;
-                }
-
-                // 7. Create the D2D render target on our shim (BGRA-
-                //    capable device, no typeless surface, no E_INVALID
-                //    ARG this time).
-                ComPtr<IDXGISurface> shimSurface;
-                if (FAILED(m_myShim.As(&shimSurface))) {
-                    Log("xr_telemetry: overlay disabled — myShim QueryInterface "
-                        "IDXGISurface failed\n");
-                    return false;
-                }
-                D2D1_RENDER_TARGET_PROPERTIES props =
-                    D2D1::RenderTargetProperties(
-                        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                        D2D1::PixelFormat(
-                            DXGI_FORMAT_B8G8R8A8_UNORM,
-                            D2D1_ALPHA_MODE_PREMULTIPLIED));
-                hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                    shimSurface.Get(), &props,
-                    m_myShimRenderTarget.GetAddressOf());
-                if (FAILED(hr)) {
-                    Log(fmt::format(
-                        "xr_telemetry: overlay disabled — CreateDxgiSurfaceRender"
-                        "Target (private-device shim) failed (HRESULT={:#x})\n",
-                        static_cast<unsigned int>(hr)));
-                    return false;
-                }
-                if (!m_core.initBrushes(m_myShimRenderTarget.Get())) {
-                    Log("xr_telemetry: overlay disabled — initBrushes (private "
-                        "device) failed\n");
+                // Mirror the app device's threading mode into the
+                // context-state object. MS docs: if the device was
+                // created with D3D11_CREATE_DEVICE_SINGLETHREADED, every
+                // context-state object created from it MUST carry
+                // D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED —
+                // otherwise CreateDeviceContextState fails (overlay then
+                // silently disabled) or the locking contract is violated.
+                const UINT ctxStateFlags =
+                    (appFlags & D3D11_CREATE_DEVICE_SINGLETHREADED)
+                        ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED
+                        : 0u;
+                const D3D_FEATURE_LEVEL ctxStateLevels[] = { appLevel };
+                D3D_FEATURE_LEVEL chosenLevel{};
+                if (FAILED(m_device1->CreateDeviceContextState(
+                        ctxStateFlags,
+                        ctxStateLevels, 1,
+                        D3D11_SDK_VERSION,
+                        __uuidof(ID3D11Device1),
+                        &chosenLevel,
+                        m_overlayState.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — "
+                        "CreateDeviceContextState failed\n");
                     return false;
                 }
 
-                // GPU histogram path. Capture m_myDevice's immediate
-                // context (D2D doesn't expose it) and init the bar
-                // renderer against the same shim the D2D RT paints
-                // into. If anything here fails we DON'T disable the
-                // overlay — m_useShaderBars stays false and the paint
-                // path falls back to the full D2D paint(), so the HUD
-                // still works, just without the GPU fast path.
-                m_myDevice->GetImmediateContext(m_myContext.GetAddressOf());
-                m_useShaderBars =
-                    m_myContext &&
-                    m_bars.init(m_myDevice.Get(), m_myContext.Get(),
-                                 m_myShim.Get());
-                if (!m_useShaderBars) {
-                    Log("xr_telemetry: overlay GPU histogram path "
-                        "unavailable — falling back to D2D bar rendering\n");
+                // One RTV per swapchain image — we paint chrome + text +
+                // bars DIRECTLY into the acquired image each frame (no
+                // intermediate texture, no CopyResource). The runtime's
+                // images are BGRA8 (typeless on Pimax), so we give the
+                // RTV an explicit BGRA8_UNORM desc to get a typed view.
+                m_imageRtvs.resize(m_images.size());
+                for (size_t i = 0; i < m_images.size(); ++i) {
+                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+                    rtvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                    rtvDesc.Texture2D.MipSlice = 0;
+                    if (FAILED(m_device->CreateRenderTargetView(
+                            m_images[i].Get(), &rtvDesc,
+                            m_imageRtvs[i].GetAddressOf()))) {
+                        Log(fmt::format(
+                            "xr_telemetry: overlay disabled — "
+                            "CreateRenderTargetView (swapchain image[{}]) "
+                            "failed\n", i));
+                        return false;
+                    }
                 }
-
-                // GPU text path. Initialised against the same private
-                // device + shim that the bars target so all GPU drawing
-                // shares one immediate context. Failure here is
-                // non-fatal too: m_useGlyphAtlas stays false and the
-                // D2D text path keeps painting chrome / values for as
-                // long as CoreRenderer's IDWriteTextFormat objects are
-                // alive.
-                m_useGlyphAtlas =
-                    m_useShaderBars &&
-                    m_core.atlasReady() &&
-                    m_glyphRenderer.init(m_myDevice, m_myContext,
-                                          m_myShim, m_core.atlas());
-                if (!m_useGlyphAtlas) {
-                    Log("xr_telemetry: overlay GPU text path "
-                        "unavailable — falling back to D2D text rendering\n");
+                // GPU pipelines. All three run on the APP's device +
+                // context, isolated per-frame via SwapDeviceContextState.
+                // Fail-closed: if any one fails to init, the overlay is
+                // disabled (no D2D fallback) — the layer logs and
+                // makeD3D11OverlayRenderer returns nullptr.
+                if (!m_bars.init(m_device.Get(), m_context.Get())) {
+                    Log("xr_telemetry: overlay disabled — bars init failed\n");
+                    return false;
                 }
-
-                // GPU chrome shapes path. Same device / context / shim
-                // as the bars + text renderers. Soft-fails identically:
-                // m_useChromeShapes stays false and the D2D chrome
-                // shape calls (FillRoundedRectangle / FillGeometry /
-                // DrawLine) keep painting from CoreRenderer.
-                //
-                // Gated on m_useGlyphAtlas because GPU shapes flush
-                // AFTER the D2D EndDraw inside paintChromeOnly. When
-                // text falls back to D2D (atlas build failed), D2D
-                // commits text DURING EndDraw, and a subsequent GPU
-                // shape pass would paint panel backgrounds OVER the
-                // just-drawn glyphs — the text would disappear. By
-                // tying the two flags together we stay in a coherent
-                // GPU-or-D2D mode end-to-end. Loses GPU shape perf in
-                // the rare atlas-fail case; acceptable until paint
-                // ordering is rebuilt to clear via D3D11 + paint
-                // shapes BEFORE D2D BeginDraw.
-                m_useChromeShapes =
-                    m_useShaderBars &&
-                    m_useGlyphAtlas &&
-                    m_chromeShapeRenderer.init(
-                        m_myDevice, m_myContext, m_myShim);
-                if (!m_useChromeShapes) {
-                    Log("xr_telemetry: overlay GPU chrome shapes path "
-                        "unavailable — falling back to D2D chrome shapes\n");
+                if (!m_core.atlasReady()) {
+                    Log("xr_telemetry: overlay disabled — glyph atlas not "
+                        "built (DirectWrite face resolution failed)\n");
+                    return false;
+                }
+                if (!m_glyphRenderer.init(m_device, m_context,
+                                           static_cast<UINT>(kTexW),
+                                           static_cast<UINT>(kTexH),
+                                           m_core.atlas())) {
+                    Log("xr_telemetry: overlay disabled — glyph renderer "
+                        "init failed\n");
+                    return false;
+                }
+                if (!m_chromeShapeRenderer.init(m_device, m_context,
+                                                 static_cast<UINT>(kTexW),
+                                                 static_cast<UINT>(kTexH))) {
+                    Log("xr_telemetry: overlay disabled — chrome shapes "
+                        "renderer init failed\n");
+                    return false;
                 }
 
                 // Fill the immutable XrCompositionLayerQuad fields
@@ -3438,12 +2490,13 @@ namespace openxr_api_layer::detail {
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
-                    "images, private-device shim BGRA8 RT, feature_level={:#x})\n",
-                    imgCount, static_cast<unsigned int>(outLevel)));
+                    "images, direct-to-swapchain BGRA8 RT, "
+                    "feature_level={:#x})\n",
+                    imgCount, static_cast<unsigned int>(appLevel)));
                 return true;
             }
 
-            // Shader-path paint is the free function paintShimViaShader()
+            // Shader-path paint is the free function paintOverlay()
             // declared above the class — same body served both
             // D3D11OverlayRenderer and D3D12OverlayRenderer, so the
             // duplicate per-class definitions are gone.
@@ -3470,73 +2523,39 @@ namespace openxr_api_layer::detail {
 
             OpenXrApi*                  m_api = nullptr;
             XrSession                   m_session = XR_NULL_HANDLE;
-            // App's D3D11 device + context (whatever flags it was
-            // created with — typically no BGRA_SUPPORT). Used only for
-            // CopyResource'ing into the OpenXR swapchain image.
+            // App's D3D11 device + context. All GPU paint work goes
+            // through these now — no second device, no cross-device
+            // share, no keyed mutex.
             ComPtr<ID3D11Device>        m_device;
             ComPtr<ID3D11DeviceContext> m_context;
+            // D3D11.1 views of the same device/context, for state
+            // isolation (SwapDeviceContextState). m_overlayState is
+            // our private pipeline-state block; m_savedState holds the
+            // app's state for the duration of one overlay paint.
+            ComPtr<ID3D11Device1>        m_device1;
+            ComPtr<ID3D11DeviceContext1> m_context1;
+            ComPtr<ID3DDeviceContextState> m_overlayState;
+            ComPtr<ID3DDeviceContextState> m_savedState;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
-            // OpenXR swapchain images. Typically DXGI_FORMAT_B8G8R8A8_
-            // TYPELESS on Pimax OpenXR 0.1.0; we never render directly
-            // to these, only CopyResource into them from our shared
-            // shim once the D2D paint is done.
-            std::vector<ComPtr<ID3D11Texture2D>>   m_images;
+            // OpenXR swapchain images (BGRA8_TYPELESS on Pimax) + one
+            // typed BGRA8_UNORM RTV each. We paint directly into the
+            // acquired image's RTV every frame — no intermediate, no
+            // CopyResource. State isolation (SwapDeviceContextState)
+            // keeps our pipeline changes from leaking into the app.
+            std::vector<ComPtr<ID3D11Texture2D>>          m_images;
+            std::vector<ComPtr<ID3D11RenderTargetView>>   m_imageRtvs;
 
-            // Our private D3D11 device — same adapter as the app's,
-            // but explicitly created with D3D11_CREATE_DEVICE_BGRA
-            // _SUPPORT so D2D works. Holds the shim texture we paint.
-            // The immediate context is deliberately not captured:
-            // every draw goes through D2D's RT, never through a raw
-            // ID3D11DeviceContext API we'd own.
-            ComPtr<ID3D11Device>        m_myDevice;
-            // The shim, twice. m_myShim lives on m_myDevice and is the
-            // D2D render target. m_appShim is the SAME underlying
-            // GPU resource, opened on the app's device via OpenShared
-            // Resource1, so we can CopyResource from it on the app's
-            // context.
-            ComPtr<ID3D11Texture2D>     m_myShim;
-            ComPtr<ID3D11Texture2D>     m_appShim;
-            // Keyed mutex pair, one interface per side of the shim,
-            // serialises paint vs copy. AcquireSync(key) waits for the
-            // other side to ReleaseSync(key); the two sides toggle
-            // between key=0 (app side owns) and key=1 (our side owns).
-            ComPtr<IDXGIKeyedMutex>     m_myShimMutex;
-            ComPtr<IDXGIKeyedMutex>     m_appShimMutex;
-            HANDLE                      m_sharedHandle = nullptr;
-            // D2D render target on m_myShim — the actual paint surface
-            // for the static chrome.
-            ComPtr<ID2D1RenderTarget>   m_myShimRenderTarget;
-            // m_myDevice's immediate context. D2D drives its own RT
-            // internally, but HistogramBarRenderer needs a raw context
-            // to issue the instanced bar/quad draws into the shim after
-            // the D2D chrome lands.
-            ComPtr<ID3D11DeviceContext> m_myContext;
-            // GPU histogram renderer: paints the histo region (bg +
-            // grid + bars + budget) into m_myShim via instanced draws,
-            // replacing the per-bar D2D FillRectangle loop. m_useShader
-            // Bars gates whether it initialised; on failure the path
-            // falls back to the full D2D paint().
+            // GPU pipelines, all on the APP device. init() fails closed
+            // on any of them (overlay disabled, no D2D fallback), so by
+            // the time we paint all three are live — no per-renderer
+            // enable flag needed.
             HistogramBarRenderer        m_bars;
-            bool                        m_useShaderBars = false;
-            // GPU text renderer: samples the pre-baked glyph atlas
-            // (built once on CoreRenderer's DirectWrite factory) to
-            // emit one instanced quad per glyph. Replaces the per-call
-            // D2D DrawText / DrawTextLayout work for chrome labels +
-            // mixed value strings. m_useGlyphAtlas gates wiring just
-            // like m_useShaderBars — on failure we fall back to D2D
-            // text and never crash the host.
             glyph_atlas::Renderer       m_glyphRenderer;
-            bool                        m_useGlyphAtlas = false;
-            // GPU chrome-shape renderer: replaces the D2D shape calls
-            // (FillRoundedRectangle / FillGeometry / DrawLine) inside
-            // drawPanelBg / drawChamferedRect / column separators with
-            // one DrawInstanced over the shared overlay_quad shader.
             chrome_shapes::Renderer     m_chromeShapeRenderer;
-            bool                        m_useChromeShapes = false;
-            // Chrome cadence for the shader path: the bars redraw every
-            // frame on the GPU, the D2D chrome only when snap.version
-            // ticks or the watchdog fires (kChromeWatchdogFrames lives
-            // at namespace scope, shared with the D3D12 renderer).
+            // Chrome cadence: drawChrome rebuild only when snap.version
+            // ticks or the watchdog fires (kChromeWatchdogFrames at
+            // namespace scope). The rebuilt scratches re-flush every
+            // frame into the paint target.
             PaintCadence                m_barsCadence;
 
             CoreRenderer                m_core;
@@ -3544,40 +2563,29 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
             bool                        m_ready = false;
-            // Periodic-log counters for the bounded keyed-mutex
-            // acquires. A sync glitch from the runtime / app side
-            // is logged on first occurrence and then every Nth
-            // recurrence (kMutexTimeoutLogStride) so a sustained
-            // issue doesn't silently freeze the HUD for the rest
-            // of the session — support can see "the timeouts kept
-            // happening" instead of "1 timeout 4 hours ago".
-            //
-            // Also rolled up at destructor time so the session
-            // summary records the total — useful when a user
-            // submits a bug report after closing the game.
-            static constexpr uint64_t   kMutexTimeoutLogStride = 1000;
-            uint64_t                    m_myMutexTimeouts  = 0;
-            uint64_t                    m_appMutexTimeouts = 0;
         };
 
         // -------- D3D12 renderer (via D3D11On12 bridge) ---------------------
         //
-        // App uses D3D12. D2D is D3D11-only, so we wrap the app's D3D12
-        // device into an ID3D11Device via D3D11On12CreateDevice. Each
-        // swapchain image (ID3D12Resource*) is then bridged to an
-        // ID3D11Resource via CreateWrappedResource — the wrapped
-        // resource exposes a DXGI surface D2D can paint into.
+        // App uses D3D12. Our GPU shader pipelines are D3D11, so we wrap
+        // the app's D3D12 device into an ID3D11Device via
+        // D3D11On12CreateDevice. Each swapchain image (ID3D12Resource*) is
+        // bridged to an ID3D11Resource via CreateWrappedResource so the
+        // bridge can CopyResource into it.
         //
-        // Per-frame dance:
+        // We paint the chrome / text / bars shaders into a BGRA8 shim on
+        // the bridge device, then CopyResource the shim into the wrapped
+        // swapchain image. Per-frame dance:
         //   1. Acquire+wait the OpenXR swapchain image.
-        //   2. D3D11On12::AcquireWrappedResources(wrapped) — flips the
+        //   2. paintOverlay → shim RTV (chrome shapes + glyph atlas + bars).
+        //   3. D3D11On12::AcquireWrappedResources(wrapped) — flips the
         //      wrapped resource's state so D3D11 can write to it.
-        //   3. D2D BeginDraw / DrawTextW / FillRectangle / EndDraw.
-        //   4. D3D11On12::ReleaseWrappedResources(wrapped) — flips
-        //      state back so D3D12 can read it for compositing.
-        //   5. ID3D11DeviceContext::Flush() — pumps the D3D11On12
-        //      command list into the underlying D3D12 queue.
-        //   6. xrReleaseSwapchainImage.
+        //   4. CopyResource(wrapped, shim).
+        //   5. D3D11On12::ReleaseWrappedResources(wrapped) — flips state
+        //      back so D3D12 can read it for compositing.
+        //   6. ID3D11DeviceContext::Flush() — pumps the D3D11On12 command
+        //      list into the underlying D3D12 queue.
+        //   7. xrReleaseSwapchainImage.
         class D3D12OverlayRenderer final : public OverlayRenderer {
           public:
             D3D12OverlayRenderer(OpenXrApi* api, XrSession session,
@@ -3622,33 +2630,48 @@ namespace openxr_api_layer::detail {
                     return nullptr;
                 }
 
-                // Paint into the typed BGRA8 shim we own (D2D refuses
-                // the typeless surface the runtime exposes via the
-                // wrapped resource). After paint, AcquireWrappedResources
-                // around the CopyResource so the underlying D3D12
-                // texture goes through the D3D11On12 state transition
-                // correctly, then ReleaseWrappedResources hands control
-                // back to the runtime's compositor.
+                // paintOverlay clears + flushes chrome / text / bars
+                // into the shim's D3D11 RTV; the AcquireWrapped /
+                // CopyResource / Flush dance below ferries the painted
+                // shim into the wrapped D3D12 swapchain image. The
+                // D3D12 path keeps the shim because the D3D11On12 bridge
+                // runs on a separate D3D11 device — so the app-context
+                // state-leak that bit the D3D11 path can't occur here
+                // (no state isolation needed), and D3D11 shaders can't
+                // target the D3D12 resources directly anyway.
                 //
-                // Shader path (m_useShaderBars): D2D chrome only when
-                // stale + HistogramBarRenderer.drawPanel every frame,
-                // both via the shared paintShimViaShader() helper. The
-                // AcquireWrapped/CopyResource/Flush dance below is
-                // unchanged; it ferries whatever the shim ended up with
-                // into the D3D12 swapchain image.
-                const bool painted = m_useShaderBars
-                    ? paintShimViaShader(m_core, m_bars, m_barsCadence,
-                                          m_shimRenderTarget.Get(),
-                                          m_useGlyphAtlas    ? &m_glyphRenderer       : nullptr,
-                                          m_useChromeShapes  ? &m_chromeShapeRenderer : nullptr,
-                                          m_cpuRing, m_gpuRing, snap)
-                    : m_core.paint(m_shimRenderTarget.Get(), snap,
-                                    m_cpuRing, m_gpuRing);
-                ID3D11Resource* wrapped = m_wrappedResources[imageIdx].Get();
-                if (painted && wrapped && m_d3d11Context) {
-                    m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
-                    m_d3d11Context->CopyResource(wrapped, m_shimTexture.Get());
-                    m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                // try/catch: paintOverlay allocates (display-value
+                // strings, per-segment vectors), so an OOM throw is
+                // possible. It can't corrupt app state here (separate
+                // device), but it must not cross the xrEndFrame C-ABI
+                // boundary — catch and skip the overlay this frame.
+                bool painted = false;
+                try {
+                    painted =
+                        paintOverlay(m_core, m_bars, m_barsCadence,
+                                      m_d3d11Context.Get(),
+                                      m_shimRtv.Get(),
+                                      m_glyphRenderer,
+                                      m_chromeShapeRenderer,
+                                      m_cpuRing, m_gpuRing, snap,
+                                      /*targetRetainsContent=*/true);  // shim persists
+                    ID3D11Resource* wrapped =
+                        imageIdx < m_wrappedResources.size()
+                            ? m_wrappedResources[imageIdx].Get()
+                            : nullptr;
+                    if (painted && wrapped && m_d3d11Context) {
+                        // Unbind the shim RTV before the copy so it
+                        // isn't OM-bound while serving as the copy
+                        // source (matches the D3D11 path; silences the
+                        // debug layer's render-target-hazard warning).
+                        ID3D11RenderTargetView* nullRtv = nullptr;
+                        m_d3d11Context->OMSetRenderTargets(1, &nullRtv, nullptr);
+                        m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
+                        m_d3d11Context->CopyResource(wrapped, m_shimTexture.Get());
+                        m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
+                    }
+                } catch (...) {
+                    painted = false;
                 }
                 // Flush the D3D11On12 command list into the D3D12 queue
                 // so the runtime sees the painted content when it
@@ -3678,8 +2701,8 @@ namespace openxr_api_layer::detail {
 
                 // 1. Wrap the D3D12 device via D3D11On12CreateDevice.
                 //    The D3D11 device this returns shares the same
-                //    underlying D3D12 device, so D2D's draws end up in
-                //    the D3D12 queue's command stream.
+                //    underlying D3D12 device, so our D3D11 shader draws
+                //    end up in the D3D12 queue's command stream.
                 //
                 //    D3D11On12CreateDevice takes raw `IUnknown*` (not
                 //    ComPtr<>) for both the D3D12 device and the queue
@@ -3709,7 +2732,7 @@ namespace openxr_api_layer::detail {
                 }
 
                 if (!m_core.init()) {
-                    Log("xr_telemetry: overlay D2D/DirectWrite init failed; HUD disabled\n");
+                    Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);
@@ -3815,79 +2838,48 @@ namespace openxr_api_layer::detail {
                         static_cast<unsigned int>(hr)));
                     return false;
                 }
-                ComPtr<IDXGISurface> shimSurface;
-                if (FAILED(m_shimTexture.As(&shimSurface))) {
-                    Log("xr_telemetry: overlay disabled — D3D12 path shim "
-                        "QueryInterface IDXGISurface failed\n");
-                    return false;
-                }
-                D2D1_RENDER_TARGET_PROPERTIES props =
-                    D2D1::RenderTargetProperties(
-                        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                        D2D1::PixelFormat(
-                            DXGI_FORMAT_B8G8R8A8_UNORM,
-                            D2D1_ALPHA_MODE_PREMULTIPLIED));
-                hr = m_core.d2d()->CreateDxgiSurfaceRenderTarget(
-                    shimSurface.Get(), &props,
-                    m_shimRenderTarget.GetAddressOf());
-                if (FAILED(hr)) {
-                    Log(fmt::format(
-                        "xr_telemetry: overlay disabled — D3D12 path Create"
-                        "DxgiSurfaceRenderTarget (shim) failed (HRESULT={:#x})\n",
-                        static_cast<unsigned int>(hr)));
-                    return false;
-                }
-                if (!m_core.initBrushes(m_shimRenderTarget.Get())) {
-                    Log("xr_telemetry: overlay disabled — initBrushes (D3D12 "
-                        "path) failed\n");
+
+                // RTV on the shim for the GPU passes. Format inherits
+                // from the BGRA8_UNORM shim texture, so nullptr desc
+                // produces the right view. Fail-closed: no D2D fallback
+                // (matches the D3D11 path).
+                if (FAILED(m_d3d11Device->CreateRenderTargetView(
+                        m_shimTexture.Get(), nullptr,
+                        m_shimRtv.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — D3D12 path "
+                        "CreateRenderTargetView (shim) failed\n");
                     return false;
                 }
 
-                // GPU histogram path. The HistogramBarRenderer is the
-                // same class the D3D11 path uses; it accepts any D3D11
-                // device/context pair backing a BIND_RENDER_TARGET
-                // texture, which here is the D3D11On12 bridge. On
-                // failure we DON'T disable the overlay — m_useShader
-                // Bars stays false and the paint path falls back to
-                // m_core.paint() (full D2D), so the HUD still works.
-                m_useShaderBars = m_bars.init(
-                    m_d3d11Device.Get(), m_d3d11Context.Get(),
-                    m_shimTexture.Get());
-                if (!m_useShaderBars) {
-                    Log("xr_telemetry: D3D12 overlay GPU histogram path "
-                        "unavailable — falling back to D2D bar rendering\n");
+                // GPU pipelines on the D3D11On12 bridge. Same classes
+                // as the D3D11 path; each fails closed — if any init
+                // returns false the overlay is disabled (no D2D
+                // fallback). RTV is passed per draw call.
+                if (!m_bars.init(m_d3d11Device.Get(), m_d3d11Context.Get())) {
+                    Log("xr_telemetry: overlay disabled — D3D12 bars "
+                        "init failed\n");
+                    return false;
                 }
-
-                // GPU text path on the D3D11On12 bridge. Same shim, same
-                // private D3D11 device/context as the bars — the atlas
-                // texture is a different ID3D11Texture2D (separate
-                // device) than the D3D11 path's atlas, but both copy
-                // from the same CoreRenderer-owned BuildResult bitmap
-                // so the glyphs are pixel-identical across paths.
-                m_useGlyphAtlas =
-                    m_useShaderBars &&
-                    m_core.atlasReady() &&
-                    m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
-                                          m_shimTexture, m_core.atlas());
-                if (!m_useGlyphAtlas) {
-                    Log("xr_telemetry: D3D12 overlay GPU text path "
-                        "unavailable — falling back to D2D text rendering\n");
+                if (!m_core.atlasReady()) {
+                    Log("xr_telemetry: overlay disabled — D3D12 glyph atlas "
+                        "not built\n");
+                    return false;
                 }
-
-                // GPU chrome shapes on the D3D11On12 bridge. Mirror of
-                // the D3D11 path's init: same shim target, same
-                // device, soft-fail down to the D2D shape calls. Same
-                // gate on m_useGlyphAtlas — see the D3D11 path's
-                // comment for why mixing GPU shapes + D2D text breaks
-                // the layering.
-                m_useChromeShapes =
-                    m_useShaderBars &&
-                    m_useGlyphAtlas &&
-                    m_chromeShapeRenderer.init(
-                        m_d3d11Device, m_d3d11Context, m_shimTexture);
-                if (!m_useChromeShapes) {
-                    Log("xr_telemetry: D3D12 overlay GPU chrome shapes path "
-                        "unavailable — falling back to D2D chrome shapes\n");
+                if (!m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
+                                           static_cast<UINT>(kTexW),
+                                           static_cast<UINT>(kTexH),
+                                           m_core.atlas())) {
+                    Log("xr_telemetry: overlay disabled — D3D12 glyph "
+                        "renderer init failed\n");
+                    return false;
+                }
+                if (!m_chromeShapeRenderer.init(
+                        m_d3d11Device, m_d3d11Context,
+                        static_cast<UINT>(kTexW),
+                        static_cast<UINT>(kTexH))) {
+                    Log("xr_telemetry: overlay disabled — D3D12 chrome "
+                        "shapes renderer init failed\n");
+                    return false;
                 }
 
                 // One-time fill of the immutable quad-layer fields;
@@ -3902,7 +2894,7 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Shader-path paint is the free function paintShimViaShader()
+            // Shader-path paint is the free function paintOverlay()
             // declared above the class bodies — same body served both
             // D3D11OverlayRenderer and D3D12OverlayRenderer, so the
             // duplicate per-class definitions are gone.
@@ -3929,42 +2921,25 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11On12Device>              m_d3d11On12;
             XrSwapchain                           m_swapchain = XR_NULL_HANDLE;
             std::vector<ComPtr<ID3D11Resource>>   m_wrappedResources;
-            // Shim — same role as in D3D11OverlayRenderer. Created on
-            // the bridged D3D11 device (not the app's D3D12 device);
-            // D2D paints into it, then CopyResource sends the result
-            // to the wrapped D3D12 swapchain image each frame.
+            // Shim — created on the bridged D3D11 device (not the app's
+            // D3D12 device). The GPU pipelines paint into it via m_shimRtv,
+            // then the wrapped-resource CopyResource sends the result to
+            // the D3D12 swapchain image each frame.
             ComPtr<ID3D11Texture2D>               m_shimTexture;
-            ComPtr<ID2D1RenderTarget>             m_shimRenderTarget;
-            // GPU histogram path. Same HistogramBarRenderer the D3D11
-            // path uses (device-agnostic — it just needs an
-            // ID3D11Device + context + a BIND_RENDER_TARGET texture).
-            // Here the device IS the D3D11On12 bridge: our instanced
-            // bar/quad draws sit on m_d3d11Context alongside the D2D
-            // chrome, and the existing wrapped-resource CopyResource +
-            // Flush dance in renderAndCompose ferries the result into
-            // the D3D12 swapchain image. The D3D11On12 Flush() stays
-            // (incompressible — that's the D3D12 queue handoff), so
-            // the perf win is the D2D bar work moved to the GPU; the
-            // bridge overhead is unchanged.
+            ComPtr<ID3D11RenderTargetView>        m_shimRtv;
+            // GPU pipelines on the D3D11On12 bridge — same classes as the
+            // D3D11 path, here targeting the shim RTV. The D3D11On12
+            // Flush() in renderAndCompose is incompressible (the D3D12
+            // queue handoff), so the bridge overhead is the price of the
+            // D3D12 path; the chrome/text/bars themselves are all GPU.
+            // init() fails closed on any of them, so no enable flags.
             HistogramBarRenderer                  m_bars;
-            bool                                  m_useShaderBars = false;
-            // GPU text renderer on the D3D11On12 bridge. Atlas texture
-            // lives on the private D3D11 device; the atlas bitmap is
-            // copied from CoreRenderer's BuildResult, so glyph cuts
-            // match the D3D11 path's renderer bit-for-bit. Soft-fails
-            // the same way m_useShaderBars does — D2D text path is the
-            // documented fallback when the atlas fails to build or the
-            // D3D11 pipeline init returns false.
             glyph_atlas::Renderer                 m_glyphRenderer;
-            bool                                  m_useGlyphAtlas = false;
-            // GPU chrome shapes on the D3D11On12 bridge. Same
-            // pattern as the D3D11 path's m_chromeShapeRenderer.
             chrome_shapes::Renderer               m_chromeShapeRenderer;
-            bool                                  m_useChromeShapes = false;
-            // Chrome cadence for the shader path — paints D2D only on
-            // snap.version ticks or the watchdog. Same kChromeWatchdog
-            // Frames constant as the D3D11 path, hoisted to namespace
-            // scope so a tweak lands once.
+            // Chrome cadence — drawChrome rebuild only on snap.version
+            // ticks or the watchdog. Same kChromeWatchdogFrames constant
+            // as the D3D11 path, hoisted to namespace scope so a tweak
+            // lands once.
             PaintCadence                          m_barsCadence;
             CoreRenderer                          m_core;
             HistogramRing<kRingSize>              m_cpuRing;
@@ -3992,46 +2967,55 @@ namespace openxr_api_layer::detail {
                             : nullptr;
     }
 
-    // -------- Snapshot entry point ----------------------------------------
+    // -------- GPU-path snapshot entry point -------------------------------
     //
-    // One-shot render to an externally-owned ID2D1RenderTarget. Used by
-    // the visual-regression snapshot tool — caller provides a WIC bitmap
-    // render target, this function paints the HUD into it, caller saves
-    // the bitmap to PNG. Reuses the same CoreRenderer as the in-engine
-    // path, so the snapshot reflects EXACTLY what the user sees in the
-    // headset (modulo font availability — see the bundled-Barlow
-    // fallback in init()).
-    //
-    // Not suitable for per-frame use: every call allocates a fresh
-    // CoreRenderer + its brushes / fonts. The cost (~5 ms of D2D/
-    // DirectWrite init) is fine for a once-per-CI-run snapshot tool
-    // but would be wasteful in production.
-    bool renderOverlayToTarget(
-        ID2D1RenderTarget* rt,
+    // Mirrors the in-headset D3D11 paint: build the atlas, init the three
+    // GPU renderers against `target`, and run one paintOverlay pass.
+    // Caller reads `target` back afterwards. See the header for the
+    // contract (BGRA8_UNORM target, BGRA-capable device).
+    bool renderOverlayToTextureD3D11(
+        ID3D11Device* device,
+        ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* target,
         const OverlaySnapshot& snap,
         const HistogramRing<kOverlayHistoRingSize>& cpuRing,
         const HistogramRing<kOverlayHistoRingSize>& gpuRing,
         std::string* errOut) {
-        // CoreRenderer is in this TU's anonymous namespace (nested in
-        // openxr_api_layer::detail), so the unqualified name resolves
-        // here from the enclosing detail namespace.
-        //
-        // errOut is an optional diagnostic outparam used by the
-        // snapshot test — when a step fails it captures which one,
-        // since paint()'s EndDraw return value collapses every
-        // possible draw-time queued error into a single bool. The
-        // production callers leave it null.
         auto fail = [&](const char* msg) {
             if (errOut) *errOut = msg;
             return false;
         };
-        if (!rt)                     return fail("rt is null");
+        if (!device || !ctx || !target) return fail("null device/ctx/target");
+
         CoreRenderer core;
-        if (!core.init())            return fail("core.init() failed (D2D / DWrite factory or text format creation)");
-        if (!core.initBrushes(rt))   return fail("core.initBrushes(rt) failed (brush / gradient / stroke style creation)");
-        if (!core.paint(rt, snap, cpuRing, gpuRing)) {
-            return fail("core.paint(rt, ...) failed (EndDraw returned an HRESULT — usually a cross-factory or queued-draw error)");
-        }
+        if (!core.init()) return fail("core.init() failed (DWrite / atlas)");
+        if (!core.atlasReady()) return fail("glyph atlas not built");
+
+        HistogramBarRenderer    bars;
+        glyph_atlas::Renderer   text;
+        chrome_shapes::Renderer shapes;
+        if (!bars.init(device, ctx)) return fail("bars init failed");
+        if (!text.init(device, ctx, static_cast<UINT>(kTexW),
+                        static_cast<UINT>(kTexH), core.atlas()))
+            return fail("glyph renderer init failed");
+        if (!shapes.init(device, ctx, static_cast<UINT>(kTexW),
+                          static_cast<UINT>(kTexH)))
+            return fail("chrome shapes init failed");
+
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(device->CreateRenderTargetView(
+                target, nullptr, rtv.GetAddressOf())))
+            return fail("CreateRenderTargetView (target) failed");
+
+        // Fresh cadence → first paintOverlay does a full static rebuild.
+        // targetRetainsContent is moot for a one-shot paint (needStatic
+        // is true on the first frame, so chrome flushes regardless).
+        PaintCadence cadence;
+        if (!paintOverlay(core, bars, cadence, ctx, rtv.Get(),
+                           text, shapes, cpuRing, gpuRing, snap,
+                           /*targetRetainsContent=*/true))
+            return fail("paintOverlay failed");
+        ctx->Flush();
         return true;
     }
 

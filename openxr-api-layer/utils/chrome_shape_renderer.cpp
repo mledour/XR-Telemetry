@@ -45,12 +45,14 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
     bool Renderer::init(ComPtr<ID3D11Device>        device,
                         ComPtr<ID3D11DeviceContext> ctx,
-                        ComPtr<ID3D11Texture2D>     renderTarget) {
-        if (!device || !ctx || !renderTarget) return false;
+                        UINT                        dstWidth,
+                        UINT                        dstHeight) {
+        if (!device || !ctx || dstWidth == 0 || dstHeight == 0) return false;
 
         m_device = std::move(device);
         m_ctx    = std::move(ctx);
-        m_target = std::move(renderTarget);
+        m_dstW   = dstWidth;
+        m_dstH   = dstHeight;
 
         auto fail = [](const char* step) {
             Log(fmt::format(
@@ -58,10 +60,6 @@ namespace openxr_api_layer::utils::chrome_shapes {
                 "step: {}\n", step));
             return false;
         };
-
-        if (FAILED(m_device->CreateRenderTargetView(
-                m_target.Get(), nullptr, m_rtv.GetAddressOf())))
-            return fail("CreateRenderTargetView");
 
         if (!createPipeline()) return fail("createPipeline");
         if (!createBuffers())  return fail("createBuffers");
@@ -134,12 +132,11 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
         if (!growInstanceBuffer(kInitialInstances)) return false;
 
-        // texSize derived once from the target dimensions. IMMUTABLE
-        // because the shim is fixed-size for the renderer's lifetime.
-        D3D11_TEXTURE2D_DESC td{};
-        m_target->GetDesc(&td);
+        // texSize derived once from the init dstWidth/dstHeight. IMMUTABLE
+        // because the swapchain image dimensions are fixed for the
+        // renderer's lifetime.
         const QuadConstants init{
-            { static_cast<float>(td.Width), static_cast<float>(td.Height) },
+            { static_cast<float>(m_dstW), static_cast<float>(m_dstH) },
             { 0.0f, 0.0f }
         };
         D3D11_BUFFER_DESC cbd{};
@@ -207,23 +204,31 @@ namespace openxr_api_layer::utils::chrome_shapes {
         addRect(x + w - strokeWidth, y + strokeWidth, strokeWidth, h - 2 * strokeWidth, color); // right
     }
 
-    void Renderer::flush() {
-        if (!m_ready || m_scratch.empty()) return;
+    bool Renderer::flush(ID3D11RenderTargetView* rtv) {
+        // Returns true if the chrome was drawn (or there was nothing to
+        // draw), false only on a real GPU failure (buffer-grow / Map),
+        // so the caller can suppress a frame that would otherwise
+        // composite bars over a freshly-cleared, chrome-less target.
+        //
+        // Scratch is owned by beginBatch() (the ~10 Hz chrome rebuild)
+        // and persists between flushes so every frame can re-upload the
+        // same chrome. So NONE of the bail-outs here clear it — a
+        // transient failure must leave the last-good scratch intact so
+        // the next frame's flush retries instead of dropping the chrome
+        // until the next beginBatch.
+        if (!m_ready || !rtv) return false;
+        if (m_scratch.empty()) return true;
 
         const UINT count = static_cast<UINT>(m_scratch.size());
         if (count > m_capacity) {
-            if (!growInstanceBuffer(count)) {
-                m_scratch.clear();
-                return;
-            }
+            if (!growInstanceBuffer(count)) return false;
         }
 
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                m_scratch.clear();
-                return;
+                return false;
             }
             std::memcpy(map.pData, m_scratch.data(),
                         count * sizeof(QuadInstance));
@@ -231,13 +236,13 @@ namespace openxr_api_layer::utils::chrome_shapes {
         }
 
         // Full pipeline state — caller is assumed to have left the
-        // device in an unknown configuration.
-        m_ctx->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
-        D3D11_TEXTURE2D_DESC td{};
-        m_target->GetDesc(&td);
+        // device in an unknown configuration. Viewport uses the same
+        // (dstW, dstH) the cbuffer was built with, so pixel-space NDC
+        // math in the VS stays consistent across paints.
+        m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
         D3D11_VIEWPORT vp{
             0.0f, 0.0f,
-            static_cast<float>(td.Width), static_cast<float>(td.Height),
+            static_cast<float>(m_dstW), static_cast<float>(m_dstH),
             0.0f, 1.0f};
         m_ctx->RSSetViewports(1, &vp);
         m_ctx->RSSetState(m_raster.Get());
@@ -256,7 +261,11 @@ namespace openxr_api_layer::utils::chrome_shapes {
         m_ctx->VSSetConstantBuffers(0, 1, m_cb.GetAddressOf());
 
         m_ctx->DrawInstanced(4, count, 0, 0);
-        m_scratch.clear();
+        // Scratch is NOT cleared — kept alive between flushes so the
+        // caller can re-flush the same chrome onto every swapchain
+        // image without paying the drawChrome rebuild cost each frame.
+        // beginBatch() is the only way to drop scratch.
+        return true;
     }
 
 }   // namespace openxr_api_layer::utils::chrome_shapes

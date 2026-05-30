@@ -24,13 +24,14 @@
 
 // =============================================================================
 // overlay_renderer.h — in-headset HUD renderer. Owns the OpenXR swapchain
-// for the overlay quad, the DirectWrite/D2D resources that paint text into
-// it, and the histogram rings that drive the mini bars.
+// for the overlay quad, the glyph atlas + GPU pipelines that paint into it,
+// and the histogram rings that drive the mini bars.
 //
 // Two concrete implementations live in overlay_renderer.cpp:
-//   - D3D11OverlayRenderer: app uses D3D11 → we paint directly with D2D.
-//   - D3D12OverlayRenderer: app uses D3D12 → we bridge via D3D11On12 so
-//     D2D (which is D3D11-only) can still paint into the D3D12 swapchain.
+//   - D3D11OverlayRenderer: app uses D3D11 → we paint directly into the
+//     swapchain image via the chrome-shape / glyph-atlas / bar shaders.
+//   - D3D12OverlayRenderer: app uses D3D12 → we bridge via D3D11On12 and
+//     paint the same shaders into a shim, then CopyResource across.
 //
 // Callers (layer.cpp) get an abstract `OverlayRenderer` back from the
 // matching factory and use it the same way for both paths.
@@ -52,21 +53,14 @@ namespace openxr_api_layer {
     class OpenXrApi;
 }
 
-// Forward declaration so consumers of this header (layer.cpp etc.) don't
-// have to drag in <d2d1.h> just because the test entry point below takes
-// an ID2D1RenderTarget*. pch.h pulls D3D11/D3D12 but not D2D — D2D only
-// lives in overlay_renderer.cpp and the test TU. A bare struct fwd decl
-// is enough for the pointer-parameter signature; the implementation in
-// the .cpp sees the real definition via <d2d1.h>.
-struct ID2D1RenderTarget;
-
 namespace openxr_api_layer::detail {
 
     // Abstract renderer interface. Holds the lifecycle the layer drives:
-    //   1. ctor: creates D2D / DirectWrite + the OpenXR swapchain.
-    //            If init fails (BGRA8 unsupported, D3D resource fail),
-    //            isReady() returns false and the rest of the API is a
-    //            no-op. The caller logs and degrades.
+    //   1. ctor: bakes the glyph atlas (DirectWrite), creates the GPU
+    //            pipelines (chrome shapes / glyph atlas / bars) + the
+    //            OpenXR swapchain. If init fails (atlas bake or a
+    //            pipeline init), isReady() returns false and the rest of
+    //            the API is a no-op. The caller logs and degrades.
     //   2. pushFrameSample: per-frame, fed from fanoutRecord — adds
     //                       samples to the per-cycle CPU and GPU time
     //                       histogram rings (one per column of the
@@ -84,9 +78,9 @@ namespace openxr_api_layer::detail {
       public:
         virtual ~OverlayRenderer() = default;
 
-        // True once the constructor succeeded — D2D, DirectWrite, the
-        // OpenXR swapchain, and all the brushes are alive. False if
-        // init failed (e.g. BGRA8 unsupported by the runtime). Caller
+        // True once the constructor succeeded — the glyph atlas, the
+        // three GPU pipelines, and the OpenXR swapchain are alive.
+        // False if init failed (atlas bake or a pipeline init). Caller
         // skips render calls in that case.
         virtual bool isReady() const noexcept = 0;
 
@@ -121,26 +115,15 @@ namespace openxr_api_layer::detail {
         OpenXrApi* api, XrSession session, ID3D11Device* device);
 
     // Factory: app uses D3D12. We bridge via D3D11On12 (the wrapper that
-    // exposes the D3D12 device as an ID3D11Device so D2D can paint into
-    // its textures). `device` + `queue` come from XrGraphicsBinding
+    // exposes the D3D12 device as an ID3D11Device so our D3D11 shader
+    // pipelines can paint into its textures). `device` + `queue` come from
+    // XrGraphicsBinding
     // D3D12KHR. Returns nullptr if init fails.
     std::unique_ptr<OverlayRenderer> makeD3D12OverlayRenderer(
         OpenXrApi* api, XrSession session,
         ID3D12Device* device, ID3D12CommandQueue* queue);
 
     // -------- Snapshot / test entry point ---------------------------------
-    //
-    // Renders the overlay HUD to an arbitrary ID2D1RenderTarget — useful
-    // for visual-regression tests (a WIC bitmap RT in a CI tool produces
-    // a PNG that can be diffed against a golden image) and for offline
-    // preview generation.
-    //
-    // Same paint pipeline as the in-game renderers, just decoupled from
-    // OpenXR swapchain plumbing. Caller is responsible for the render
-    // target's lifecycle (Begin/EndDraw not required — this function
-    // handles them internally), but the brushes / text formats are
-    // allocated fresh on every call so the function is suitable only
-    // for one-shot rendering (NOT per-frame). Returns true on success.
     //
     // The histogram ring template parameter must match the in-engine
     // kRingSize. We expose that as kOverlayHistoRingSize here so test
@@ -153,12 +136,24 @@ namespace openxr_api_layer::detail {
     // every bar pixel-aligned. ~133 samples ≈ 1.5 s @ 90 Hz.
     constexpr std::size_t kOverlayHistoRingSize = 133;
 
-    // errOut: optional. On false return, populated with a short string
-    // identifying which step failed (init / initBrushes / paint). Used
-    // by the snapshot test to surface a useful failure message via
-    // doctest INFO(); production callers leave it null.
-    bool renderOverlayToTarget(
-        ID2D1RenderTarget* rt,
+    // -------- GPU-path snapshot entry point (Task 18) ---------------------
+    //
+    // Renders the overlay HUD through the SAME GPU pipeline the in-headset
+    // D3D11 path uses (chrome shapes + glyph atlas + instanced bars,
+    // shaders sampled / blended on the GPU) into `target` — a caller-owned
+    // BGRA8_UNORM texture sized kTexW × kTexH with D3D11_BIND_RENDER_TARGET.
+    // The caller reads `target` back via a staging copy to obtain pixels
+    // for the golden comparison. This is the snapshot coverage of the
+    // actual shipping render path (the legacy D2D snapshot entry was
+    // retired with the rest of the D2D layer).
+    //
+    // `device` may be any D3D11 device (BGRA_SUPPORT not required — the
+    // GPU shaders render BGRA8 regardless). errOut: optional
+    // failure-step string for a useful doctest message on failure.
+    bool renderOverlayToTextureD3D11(
+        ID3D11Device* device,
+        ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* target,
         const OverlaySnapshot& snap,
         const HistogramRing<kOverlayHistoRingSize>& cpuRing,
         const HistogramRing<kOverlayHistoRingSize>& gpuRing,
