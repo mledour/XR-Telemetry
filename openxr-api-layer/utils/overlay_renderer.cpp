@@ -3298,7 +3298,8 @@ namespace openxr_api_layer::detail {
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
-                    "images, direct-to-swapchain BGRA8 RT, feature_level={:#x})\n",
+                    "images, intermediate-then-CopyResource BGRA8 RT, "
+                    "feature_level={:#x})\n",
                     imgCount, static_cast<unsigned int>(appLevel)));
                 return true;
             }
