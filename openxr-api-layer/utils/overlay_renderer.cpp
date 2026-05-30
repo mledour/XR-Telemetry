@@ -2964,13 +2964,32 @@ namespace openxr_api_layer::detail {
                 }
 
                 // 2. Paint chrome + text + bars into our intermediate
-                //    paint target. We then CopyResource it into the
-                //    current swapchain image — see the long comment
-                //    in init() for why an intermediate is needed
-                //    (direct-to-swapchain didn't honour alpha on
-                //    Pimax's compositor; landing the image via a
-                //    CopyResource leaves it in the state the runtime
-                //    expects).
+                //    paint target, then CopyResource it into the
+                //    current swapchain image.
+                //
+                //    CRITICAL: all our GPU work runs on the APP's
+                //    immediate context (we share the app's device — no
+                //    private device anymore). xrEndFrame executes on
+                //    the app's render thread, so any pipeline state we
+                //    leave bound leaks into the app's NEXT frame and
+                //    corrupts its scene rendering (observed: HelloXR
+                //    cubes vanish, Dirt Rally renders a green band over
+                //    everything — the app's own draws inheriting our
+                //    shaders / blend / RTV / etc.).
+                //
+                //    SwapDeviceContextState swaps in a private,
+                //    default-initialised state block for the duration
+                //    of our rendering and hands back the app's full
+                //    pipeline state, which we restore on the way out.
+                //    This is the documented mechanism for a component
+                //    sharing a device context with another (the old
+                //    shim path sidestepped it by owning a private
+                //    device/context). Atomic — no manual save/restore
+                //    of the ~15 state objects we touch.
+                m_context1->SwapDeviceContextState(
+                    m_overlayState.Get(),
+                    m_savedState.ReleaseAndGetAddressOf());
+
                 const bool painted =
                     paintOverlay(m_core, m_bars, m_barsCadence,
                                   m_context.Get(),
@@ -2979,15 +2998,11 @@ namespace openxr_api_layer::detail {
                                   m_chromeShapeRenderer,
                                   m_cpuRing, m_gpuRing, snap);
 
-                // 3. Drop the RTV binding before the CopyResource +
-                //    Release dance so D3D11 doesn't carry the bind
-                //    state into the next pass. CopyResource on the
-                //    same context handles its own ordering with our
-                //    paint writes; the trailing Flush pushes the
-                //    whole batch to the GPU so the runtime's
-                //    compositor reads finalised pixels (Pimax may
-                //    composite on a separate context — implicit
-                //    same-context ordering wouldn't be enough).
+                // 3. CopyResource the painted intermediate into the
+                //    swapchain image (still inside our isolated state
+                //    block). The Flush pushes the batch to the GPU so
+                //    the runtime's compositor — which may read on a
+                //    separate context — sees finalised pixels.
                 if (painted && imageIdx < m_images.size()) {
                     ID3D11RenderTargetView* nullRtv = nullptr;
                     m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
@@ -2995,6 +3010,12 @@ namespace openxr_api_layer::detail {
                                              m_paintTexture.Get());
                     m_context->Flush();
                 }
+
+                // Restore the app's pipeline state before returning to
+                // xrEndFrame — the app continues rendering on this
+                // context next frame and must see exactly what it left.
+                m_context1->SwapDeviceContextState(
+                    m_savedState.Get(), nullptr);
 
                 // 4. Release regardless of paint success — the runtime
                 //    needs the image released to keep the swapchain
@@ -3113,6 +3134,39 @@ namespace openxr_api_layer::detail {
                 if (!m_context) {
                     Log("xr_telemetry: overlay disabled — app device "
                         "context not captured\n");
+                    return false;
+                }
+
+                // D3D11.1 state isolation. We render on the app's
+                // immediate context, so we MUST NOT leak pipeline
+                // state into the app's own rendering. CreateDevice
+                // ContextState gives us a private, default-init state
+                // block; SwapDeviceContextState (per frame) swaps it
+                // in for our draws and hands back the app's state to
+                // restore afterwards. Without this the app inherits
+                // our shaders / blend / RTV and renders garbage.
+                if (FAILED(m_device.As(&m_device1))) {
+                    Log("xr_telemetry: overlay disabled — app device "
+                        "QueryInterface ID3D11Device1 failed (need "
+                        "D3D11.1 for state isolation)\n");
+                    return false;
+                }
+                if (FAILED(m_context.As(&m_context1))) {
+                    Log("xr_telemetry: overlay disabled — app context "
+                        "QueryInterface ID3D11DeviceContext1 failed\n");
+                    return false;
+                }
+                const D3D_FEATURE_LEVEL ctxStateLevels[] = { appLevel };
+                D3D_FEATURE_LEVEL chosenLevel{};
+                if (FAILED(m_device1->CreateDeviceContextState(
+                        0,
+                        ctxStateLevels, 1,
+                        D3D11_SDK_VERSION,
+                        __uuidof(ID3D11Device1),
+                        &chosenLevel,
+                        m_overlayState.GetAddressOf()))) {
+                    Log("xr_telemetry: overlay disabled — "
+                        "CreateDeviceContextState failed\n");
                     return false;
                 }
 
@@ -3336,6 +3390,14 @@ namespace openxr_api_layer::detail {
             // share, no keyed mutex.
             ComPtr<ID3D11Device>        m_device;
             ComPtr<ID3D11DeviceContext> m_context;
+            // D3D11.1 views of the same device/context, for state
+            // isolation (SwapDeviceContextState). m_overlayState is
+            // our private pipeline-state block; m_savedState holds the
+            // app's state for the duration of one overlay paint.
+            ComPtr<ID3D11Device1>        m_device1;
+            ComPtr<ID3D11DeviceContext1> m_context1;
+            ComPtr<ID3DDeviceContextState> m_overlayState;
+            ComPtr<ID3DDeviceContextState> m_savedState;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
             // OpenXR swapchain images. Typically DXGI_FORMAT_B8G8R8A8_
             // TYPELESS on Pimax OpenXR 0.1.0; we CopyResource into
