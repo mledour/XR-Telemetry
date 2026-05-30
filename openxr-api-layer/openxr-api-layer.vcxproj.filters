@@ -41,13 +41,28 @@
     <ClInclude Include="telemetry_internals.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="utils\chrome_shape_renderer.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
     <ClInclude Include="utils\default_settings_template.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\glyph_atlas.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\glyph_atlas_renderer.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\gpu_telemetry.h">
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="utils\histogram_ring.h">
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="utils\hotkey.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\instanced_batch.h">
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="utils\name_utils.h">
@@ -88,6 +103,21 @@
     <ClCompile Include="framework\log.cpp">
       <Filter>Framework</Filter>
     </ClCompile>
+    <ClCompile Include="utils\chrome_shape_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\glyph_atlas.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\glyph_atlas_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\gpu_telemetry.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\my_logic.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
     <ClCompile Include="utils\overlay_renderer.cpp">
       <Filter>Utilities</Filter>
     </ClCompile>
@@ -119,6 +149,18 @@
     <None Include="shaders\overlay_quad.hlsli">
       <Filter>Assets</Filter>
     </None>
+    <None Include="shaders\overlay_text.hlsli">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="fonts\Barlow-MediumItalic.ttf">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="fonts\Rajdhani-SemiBold.ttf">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="fonts\OFL.txt">
+      <Filter>Assets</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <FxCompile Include="shaders\overlay_bars_vs.hlsl">
@@ -131,6 +173,12 @@
       <Filter>Assets</Filter>
     </FxCompile>
     <FxCompile Include="shaders\overlay_quad_ps.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_vs.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_ps.hlsl">
       <Filter>Assets</Filter>
     </FxCompile>
   </ItemGroup>
