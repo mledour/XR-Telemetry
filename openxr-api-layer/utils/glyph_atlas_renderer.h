@@ -45,15 +45,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
     //     pipeline state (VS/PS, input layout, sampler, blend, RTV
     //     from the supplied target texture). The atlas can be shared
     //     across multiple renderers on different D3D11 devices.
-    //   * One frame is:
-    //         beginBatch();
-    //         drawRun(...); drawRun(...); ...      // any number
+    //   * One frame is up to two batches — static (labels / titles,
+    //     baked once) and dynamic (values, rebuilt each version bump):
+    //         beginStaticBatch();  drawRun(...); ...   // once, cached
+    //         beginDynamicBatch(); drawRun(...); ...   // every bump
     //         flush();
-    //     beginBatch resets the scratch instance vector; drawRun appends
-    //     one TextInstance per glyph; flush uploads the whole vector in
-    //     one DISCARD-mapped write and emits a single DrawInstanced. The
-    //     pipeline state is set inside flush() — the renderer assumes the
-    //     caller (D2D / bars / external paint) has clobbered everything.
+    //     begin*Batch clears + targets that tier's scratch; drawRun
+    //     appends one TextInstance per glyph to the active tier; flush
+    //     uploads static-then-dynamic contiguously in one DISCARD-mapped
+    //     write + a single DrawInstanced. The pipeline state is set inside
+    //     flush() — the renderer assumes the caller (bars / external
+    //     paint) has clobbered everything.
     //
     // Coordinate convention:
     //   * Destination space matches the rest of the overlay: pixel-space
@@ -108,7 +110,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
         bool isReady() const noexcept { return m_ready; }
 
         // -------- Batched draw ----------------------------------------
-        void beginBatch() noexcept;
+        //
+        // Two scratch tiers so static text (labels / titles, laid out
+        // once) survives across version bumps while only the dynamic
+        // text (values) is re-laid-out each bump. flush() uploads both
+        // contiguously in one DrawInstanced. beginStaticBatch clears +
+        // targets the static scratch; beginDynamicBatch clears + targets
+        // the dynamic one. drawRun appends to whichever was last selected
+        // (dynamic by default, so a stray drawRun can't corrupt the
+        // cached static layout).
+        void beginStaticBatch() noexcept;
+        void beginDynamicBatch() noexcept;
 
         // Emit one glyph quad per character. Missing glyphs (no entry in
         // the atlas table) advance the pen by a fallback width but emit
@@ -179,8 +191,9 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // Per-flush growth: if a batch exceeds the current instance-buffer
         // capacity, we recreate the buffer at the next power of two. Cap
         // at kMaxInstances to keep a bug from runaway-growing the buffer.
-        static constexpr UINT kInitialInstances = 1024;   // ~48 KB
-        static constexpr UINT kMaxInstances     = 65536;  // ~3 MB
+        static constexpr UINT kInitialInstances       = 1024;   // ~48 KB (dynamic tier reserve)
+        static constexpr UINT kInitialStaticInstances = 256;    // labels / titles reserve
+        static constexpr UINT kMaxInstances           = 65536;  // ~3 MB
 
         bool createPipeline();              // shaders + input layout + states
         bool createBuffers();               // VB + IB + CB
@@ -225,8 +238,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
         uint16_t m_atlasW = 0;
         uint16_t m_atlasH = 0;
 
-        // Scratch storage for queued instances — reused across batches.
-        std::vector<TextInstance> m_scratch;
+        // Scratch storage for queued instances, split into two tiers.
+        // m_staticScratch holds the labels / titles laid out once and
+        // reused across version bumps; m_dynamicScratch holds the values,
+        // cleared + rebuilt each bump. flush() uploads static then dynamic
+        // contiguously in a single DrawInstanced. m_activeStatic selects
+        // which one drawRun appends to (set by beginStaticBatch /
+        // beginDynamicBatch); defaults to the dynamic tier so a stray
+        // drawRun can never corrupt the cached static layout.
+        std::vector<TextInstance> m_staticScratch;
+        std::vector<TextInstance> m_dynamicScratch;
+        bool                      m_activeStatic = false;
     };
 
 }   // namespace openxr_api_layer::utils::glyph_atlas

@@ -89,7 +89,8 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_glyphs       = atlas.glyphs;
         m_faceMetrics  = atlas.faceMetrics;
 
-        m_scratch.reserve(kInitialInstances);
+        m_dynamicScratch.reserve(kInitialInstances);
+        m_staticScratch.reserve(kInitialStaticInstances);
 
         m_ready = true;
         return true;
@@ -274,10 +275,16 @@ namespace openxr_api_layer::utils::glyph_atlas {
     }
 
     // ===================================================================
-    // beginBatch / drawRun / measure / metrics
+    // beginStaticBatch / beginDynamicBatch / drawRun / measure / metrics
     // ===================================================================
-    void Renderer::beginBatch() noexcept {
-        m_scratch.clear();
+    void Renderer::beginStaticBatch() noexcept {
+        m_activeStatic = true;
+        m_staticScratch.clear();
+    }
+
+    void Renderer::beginDynamicBatch() noexcept {
+        m_activeStatic = false;
+        m_dynamicScratch.clear();
     }
 
     float Renderer::drawRun(GlyphFace      face,
@@ -288,6 +295,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
                             std::size_t    n,
                             const float    color[4]) {
         if (!m_ready || n == 0 || !s) return penX;
+
+        // Append into whichever tier beginStaticBatch / beginDynamicBatch
+        // last selected (dynamic by default).
+        std::vector<TextInstance>& scratch =
+            m_activeStatic ? m_staticScratch : m_dynamicScratch;
 
         float x = penX;
         for (std::size_t i = 0; i < n; ++i) {
@@ -324,7 +336,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 ti.color[1] = color[1];
                 ti.color[2] = color[2];
                 ti.color[3] = color[3];
-                m_scratch.push_back(ti);
+                scratch.push_back(ti);
             }
             x += gi.advanceX;
         }
@@ -377,30 +389,43 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // (buffer-grow / Map) so the caller can suppress a frame that
         // would otherwise composite over a freshly-cleared target.
         //
-        // Scratch is owned by beginBatch() and persists between flushes
-        // so every frame re-uploads the same text. None of the bail-outs
-        // clear it — a transient failure must leave the last-good scratch
-        // intact so the next frame retries rather than blanking the text
-        // until the next beginBatch.
+        // Both scratch tiers are owned by beginStaticBatch /
+        // beginDynamicBatch and persist between flushes so every frame
+        // re-uploads the same text. None of the bail-outs clear them — a
+        // transient failure must leave the last-good scratches intact so
+        // the next frame retries rather than blanking the text until the
+        // next begin*Batch.
         if (!m_ready || !rtv) return false;
-        if (m_scratch.empty()) return true;
+
+        // One DrawInstanced over both tiers: static labels first, then
+        // dynamic values, uploaded contiguously into the instance buffer.
+        const UINT staticCount   = static_cast<UINT>(m_staticScratch.size());
+        const UINT dynamicCount  = static_cast<UINT>(m_dynamicScratch.size());
+        const UINT instanceCount = staticCount + dynamicCount;
+        if (instanceCount == 0) return true;
 
         // Grow if the batch outsizes the current GPU buffer. Bails (and
         // skips the draw) on cap hit — graceful degrade.
-        const UINT instanceCount = static_cast<UINT>(m_scratch.size());
         if (instanceCount > m_instanceCapacity) {
             if (!growInstanceBuffer(instanceCount)) return false;
         }
 
-        // Upload instances via DISCARD-mapped write.
+        // Upload both tiers via one DISCARD-mapped write.
         {
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
                     D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                 return false;
             }
-            std::memcpy(map.pData, m_scratch.data(),
-                        instanceCount * sizeof(TextInstance));
+            auto* dst = static_cast<TextInstance*>(map.pData);
+            if (staticCount) {
+                std::memcpy(dst, m_staticScratch.data(),
+                            staticCount * sizeof(TextInstance));
+            }
+            if (dynamicCount) {
+                std::memcpy(dst + staticCount, m_dynamicScratch.data(),
+                            dynamicCount * sizeof(TextInstance));
+            }
             m_ctx->Unmap(m_instanceVB.Get(), 0);
         }
 
@@ -442,10 +467,10 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_ctx->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
 
         m_ctx->DrawInstanced(4, instanceCount, 0, 0);
-        // Scratch is NOT cleared — kept alive between flushes so the
-        // caller can re-flush the same text onto every swapchain image
-        // without paying the drawChrome rebuild cost each frame.
-        // beginBatch() is the only way to drop scratch.
+        // Neither scratch is cleared — both kept alive between flushes so
+        // the caller can re-flush the same text onto every swapchain image
+        // without paying the drawChrome rebuild cost each frame. The
+        // begin*Batch calls are the only way to drop a tier's scratch.
         return true;
     }
 
