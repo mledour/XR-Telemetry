@@ -1599,8 +1599,8 @@ namespace openxr_api_layer::detail {
         // solid-colour quads for the background / grid / budget line, and
         // gradient bars for the samples — plus the dynamic instance + constant
         // buffers refilled per panel per frame. The render target is passed
-        // per drawPanel(rtv, …) call (the D3D11 path's intermediate paint
-        // texture, the D3D12 path's shim).
+        // per drawPanel(rtv, …) call (the D3D11 path's acquired swapchain
+        // image, the D3D12 path's shim).
         //
         // Caller contract: the GPU pipeline state is fully owned per draw —
         // drawPanel() (and the chrome-shape / glyph-atlas flushes that run
@@ -2059,10 +2059,12 @@ namespace openxr_api_layer::detail {
         //     No clear, no chrome re-flush — the hot path is two drawPanel
         //     calls.
         //
-        // The caller CopyResource's the target into the current swapchain
-        // image every frame regardless (the images rotate; the target is
-        // the single source of truth), so it always carries the full
-        // composite.
+        // Targets differ by path: D3D11 passes the acquired swapchain
+        // image directly (targetRetainsContent=false → full repaint each
+        // frame); D3D12 passes its persistent shim (targetRetainsContent
+        // =true → two-tier), then CopyResource's the shim into the wrapped
+        // image. Either way the target carries the full composite by the
+        // time the caller hands it back to the runtime.
         //
         // Ordering on the shared immediate context, on a static frame:
         //   ClearRTV → chrome shapes → text → bars  (bottom-to-top).
@@ -2489,7 +2491,7 @@ namespace openxr_api_layer::detail {
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
-                    "images, intermediate-then-CopyResource BGRA8 RT, "
+                    "images, direct-to-swapchain BGRA8 RT, "
                     "feature_level={:#x})\n",
                     imgCount, static_cast<unsigned int>(appLevel)));
                 return true;
