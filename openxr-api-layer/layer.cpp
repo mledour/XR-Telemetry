@@ -51,7 +51,6 @@
 #include "layer.h"
 #include "telemetry_internals.h"
 #include "utils/default_settings_template.h"
-#include "utils/frame_profiler.h"   // TEMP diagnostic — revert before merge
 #include "utils/gpu_telemetry.h"
 #include "utils/name_utils.h"
 #include "utils/overlay_aggregator.h"
@@ -1897,16 +1896,8 @@ namespace openxr_api_layer {
             // appGpuTimer.stop() position. The runtime's xrEndFrame
             // commands queue AFTER ours and are excluded from the
             // measurement.
-            // TEMP diagnostic (revert with frame_profiler.h): break our
-            // xrEndFrame overhead into gpuResolve / overlay / runtime-forward.
-            // Runs on both DX11 and DX12 so the two logs contrast directly.
-            static utils::diag::SectionProfiler<3> s_endProf{
-                "xrEndFrame", {"gpuResolve", "overlay", "fwd"}, 300};
-            const int64_t pfA = utils::diag::profQpc();
-
             const auto resolved =
                 m_gpuTimer ? m_gpuTimer->endFrameAndResolveOldest() : std::nullopt;
-            const int64_t pfB = utils::diag::profQpc();   // TEMP
 
             // Render the overlay (if active + ready) and build a
             // modified XrFrameEndInfo that appends our quad to the
@@ -1961,7 +1952,6 @@ namespace openxr_api_layer {
                     frameEndInfo->layerCount, kMaxAppLayers));
             }
 
-            const int64_t pfD = utils::diag::profQpc();   // TEMP
             const XrResult result = OpenXrApi::xrEndFrame(session, effectiveInfo);
             // end_frame_ns isolates the runtime + downstream layers' work
             // inside xrEndFrame (layer composition, projection correction,
@@ -1970,13 +1960,6 @@ namespace openxr_api_layer {
             // where mature compositors stay in the hundreds of µs.
             const int64_t tEndExit = QpcNow();
             const int64_t endFrameNs = detail::qpcToNs(tEndExit - tEnd, m_qpcFrequency);
-
-            // TEMP diagnostic (revert): gpuResolve = GPU-timer close+resolve;
-            // overlay = renderAndCompose; fwd = downstream runtime xrEndFrame.
-            s_endProf.add(0, pfB - pfA);
-            s_endProf.add(1, pfD - pfB);
-            s_endProf.add(2, tEndExit - pfD);
-            s_endProf.tick();
 
             const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
             const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);

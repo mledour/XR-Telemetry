@@ -27,7 +27,6 @@
 #include "chrome_shape_renderer.h"
 #include "glyph_atlas.h"
 #include "glyph_atlas_renderer.h"
-#include "frame_profiler.h"   // TEMP diagnostic — revert before merge
 #include "histogram_ring.h"
 #include "overlay_cadence.h"
 #include "overlay_layout.h"
@@ -2745,15 +2744,6 @@ namespace openxr_api_layer::detail {
                 float scale) override {
                 if (!m_ready || !snap.valid) return nullptr;
 
-                // TEMP diagnostic (revert with frame_profiler.h): per-step
-                // CPU breakdown of the D3D12 paint dance.
-                static utils::diag::SectionProfiler<6> s_d3d12Prof{
-                    "D3D12.render",
-                    {"acq+wait", "acqWrap", "paint", "relWrap", "flush", "release"},
-                    300};
-                const int64_t q0 = utils::diag::profQpc();
-                int64_t q1 = q0, q2 = q0, q3 = q0, q4 = q0, q5 = q0, q6 = q0;
-
                 uint32_t imageIdx = 0;
                 XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                 if (XR_FAILED(m_api->xrAcquireSwapchainImage(
@@ -2766,7 +2756,6 @@ namespace openxr_api_layer::detail {
                     m_api->xrReleaseSwapchainImage(m_swapchain, nullptr);
                     return nullptr;
                 }
-                q1 = utils::diag::profQpc();   // TEMP — after acquire+wait
 
                 // Paint the overlay DIRECTLY into the acquired wrapped
                 // D3D12 swapchain image — no shim, no per-frame CopyResource
@@ -2794,7 +2783,6 @@ namespace openxr_api_layer::detail {
                 bool painted = false;
                 if (wrapped && m_d3d11Context && m_d3d11On12) {
                     m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
-                    q2 = utils::diag::profQpc();   // TEMP — after AcquireWrapped
                     try {
                         painted =
                             paintOverlay(m_core, m_bars, m_barsCadence,
@@ -2806,23 +2794,19 @@ namespace openxr_api_layer::detail {
                     } catch (...) {
                         painted = false;
                     }
-                    q3 = utils::diag::profQpc();   // TEMP — after paintOverlay
                     // Unbind the RTV so the image isn't OM-bound when we
                     // flip it to PIXEL_SHADER_RESOURCE for compositing
                     // (silences the debug layer's render-target hazard).
                     ID3D11RenderTargetView* nullRtv = nullptr;
                     m_d3d11Context->OMSetRenderTargets(1, &nullRtv, nullptr);
                     m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
-                    q4 = utils::diag::profQpc();   // TEMP — after ReleaseWrapped
                 }
                 // Flush the D3D11On12 command list into the D3D12 queue so
                 // the runtime sees the painted image when it composites.
                 if (m_d3d11Context) m_d3d11Context->Flush();
-                q5 = utils::diag::profQpc();   // TEMP — after Flush
 
                 XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                 m_api->xrReleaseSwapchainImage(m_swapchain, &releaseInfo);
-                q6 = utils::diag::profQpc();   // TEMP — after xrReleaseSwapchainImage
 
                 if (!painted) return nullptr;
 
@@ -2833,15 +2817,6 @@ namespace openxr_api_layer::detail {
                 m_quadLayer.space = viewSpace;
                 m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
                 m_quadLayer.size = {geo.width_m, geo.height_m};
-
-                // TEMP diagnostic (revert): accumulate the per-step deltas.
-                s_d3d12Prof.add(0, q1 - q0);   // acquire + wait
-                s_d3d12Prof.add(1, q2 - q1);   // AcquireWrappedResources
-                s_d3d12Prof.add(2, q3 - q2);   // paintOverlay
-                s_d3d12Prof.add(3, q4 - q3);   // unbind + ReleaseWrappedResources
-                s_d3d12Prof.add(4, q5 - q4);   // Flush
-                s_d3d12Prof.add(5, q6 - q5);   // xrReleaseSwapchainImage
-                s_d3d12Prof.tick();
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
