@@ -354,6 +354,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="utils\gpu_telemetry.h" />
     <ClInclude Include="utils\histogram_ring.h" />
     <ClInclude Include="utils\hotkey.h" />
+    <ClInclude Include="utils\instanced_batch.h" />
     <ClInclude Include="utils\name_utils.h" />
     <ClInclude Include="utils\overlay_aggregator.h" />
     <ClInclude Include="utils\overlay_cadence.h" />

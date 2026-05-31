@@ -130,7 +130,10 @@ namespace openxr_api_layer::utils::chrome_shapes {
         if (FAILED(m_device->CreateBuffer(
                 &bd, &srd, m_quadVB.GetAddressOf()))) return false;
 
-        if (!growInstanceBuffer(kInitialInstances)) return false;
+        if (!m_batch.init(m_device.Get(), m_ctx.Get(),
+                          static_cast<UINT>(sizeof(QuadInstance)),
+                          kInitialInstances, kMaxInstances,
+                          "ChromeShapeRenderer")) return false;
 
         // texSize derived once from the init dstWidth/dstHeight. IMMUTABLE
         // because the swapchain image dimensions are fixed for the
@@ -148,29 +151,6 @@ namespace openxr_api_layer::utils::chrome_shapes {
         if (FAILED(m_device->CreateBuffer(
                 &cbd, &cbsrd, m_cb.GetAddressOf()))) return false;
 
-        return true;
-    }
-
-    bool Renderer::growInstanceBuffer(UINT desired) {
-        UINT next = m_capacity ? m_capacity : kInitialInstances;
-        while (next < desired) next *= 2;
-        if (next > kMaxInstances) {
-            Log(fmt::format(
-                "xr_telemetry: ChromeShapeRenderer instance buffer "
-                "request {} exceeds cap {} — bailing\n",
-                desired, kMaxInstances));
-            return false;
-        }
-        D3D11_BUFFER_DESC bd{};
-        bd.ByteWidth      = next * sizeof(QuadInstance);
-        bd.Usage          = D3D11_USAGE_DYNAMIC;
-        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
-        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        ComPtr<ID3D11Buffer> buf;
-        if (FAILED(m_device->CreateBuffer(&bd, nullptr, buf.GetAddressOf())))
-            return false;
-        m_instanceVB.Swap(buf);
-        m_capacity = next;
         return true;
     }
 
@@ -220,20 +200,7 @@ namespace openxr_api_layer::utils::chrome_shapes {
         if (m_scratch.empty()) return true;
 
         const UINT count = static_cast<UINT>(m_scratch.size());
-        if (count > m_capacity) {
-            if (!growInstanceBuffer(count)) return false;
-        }
-
-        {
-            D3D11_MAPPED_SUBRESOURCE map{};
-            if (FAILED(m_ctx->Map(m_instanceVB.Get(), 0,
-                    D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-                return false;
-            }
-            std::memcpy(map.pData, m_scratch.data(),
-                        count * sizeof(QuadInstance));
-            m_ctx->Unmap(m_instanceVB.Get(), 0);
-        }
+        if (!m_batch.upload({ { m_scratch.data(), count } })) return false;
 
         // Full pipeline state — caller is assumed to have left the
         // device in an unknown configuration. Viewport uses the same
@@ -251,7 +218,7 @@ namespace openxr_api_layer::utils::chrome_shapes {
         m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         m_ctx->IASetInputLayout(m_layout.Get());
 
-        ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_instanceVB.Get()};
+        ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_batch.buffer()};
         const UINT strides[2] = {sizeof(float) * 2, sizeof(QuadInstance)};
         const UINT offsets[2] = {0, 0};
         m_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);

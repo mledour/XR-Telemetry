@@ -30,6 +30,7 @@
 #include <wrl/client.h>
 
 #include "glyph_atlas.h"
+#include "instanced_batch.h"
 
 namespace openxr_api_layer::utils::glyph_atlas {
 
@@ -188,9 +189,10 @@ namespace openxr_api_layer::utils::glyph_atlas {
             float atlasSize[2];   // atlas (atlasWidth, atlasHeight)
         };
 
-        // Per-flush growth: if a batch exceeds the current instance-buffer
-        // capacity, we recreate the buffer at the next power of two. Cap
-        // at kMaxInstances to keep a bug from runaway-growing the buffer.
+        // Instance-buffer sizing, handed to m_batch (InstancedBatchBuffer),
+        // which owns the power-of-two growth + DISCARD-map upload. Initial
+        // GPU capacity / dynamic-tier vector reserve, the static-tier vector
+        // reserve, and the hard cap (runaway-growth guard).
         static constexpr UINT kInitialInstances       = 1024;   // ~48 KB (dynamic tier reserve)
         static constexpr UINT kInitialStaticInstances = 256;    // labels / titles reserve
         static constexpr UINT kMaxInstances           = 65536;  // ~3 MB
@@ -198,7 +200,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
         bool createPipeline();              // shaders + input layout + states
         bool createBuffers();               // VB + IB + CB
         bool createAtlasTexture(const BuildResult& atlas);
-        bool growInstanceBuffer(UINT desired);
 
         // Map a fallback advance for a missing glyph: use ' ' at the same
         // (face, sizePx). If even that's missing, return 0 — the caller's
@@ -218,8 +219,10 @@ namespace openxr_api_layer::utils::glyph_atlas {
         Microsoft::WRL::ComPtr<ID3D11InputLayout>      m_layout;
 
         Microsoft::WRL::ComPtr<ID3D11Buffer>           m_quadVB;
-        Microsoft::WRL::ComPtr<ID3D11Buffer>           m_instanceVB;
-        UINT                                            m_instanceCapacity = 0;
+        // Dynamic instance VB + its growth + DISCARD-map upload, shared
+        // with chrome_shapes::Renderer (see instanced_batch.h). Holds the
+        // static + dynamic glyph tiers, uploaded contiguously in one flush.
+        InstancedBatchBuffer                           m_batch;
         Microsoft::WRL::ComPtr<ID3D11Buffer>           m_cb;
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D>          m_atlasTex;

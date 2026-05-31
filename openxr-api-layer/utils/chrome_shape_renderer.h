@@ -28,6 +28,8 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 
+#include "instanced_batch.h"
+
 namespace openxr_api_layer::utils::chrome_shapes {
 
     // ===================================================================
@@ -134,7 +136,6 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
         bool createPipeline();
         bool createBuffers();
-        bool growInstanceBuffer(UINT desired);
 
         bool m_ready = false;
 
@@ -148,8 +149,9 @@ namespace openxr_api_layer::utils::chrome_shapes {
         Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;
         Microsoft::WRL::ComPtr<ID3D11InputLayout>      m_layout;
         Microsoft::WRL::ComPtr<ID3D11Buffer>           m_quadVB;
-        Microsoft::WRL::ComPtr<ID3D11Buffer>           m_instanceVB;
-        UINT                                            m_capacity = 0;
+        // Dynamic instance VB + its growth + DISCARD-map upload, shared
+        // with glyph_atlas::Renderer (see instanced_batch.h).
+        InstancedBatchBuffer                           m_batch;
         Microsoft::WRL::ComPtr<ID3D11Buffer>           m_cb;
         Microsoft::WRL::ComPtr<ID3D11BlendState>       m_blend;
         Microsoft::WRL::ComPtr<ID3D11RasterizerState>  m_raster;
