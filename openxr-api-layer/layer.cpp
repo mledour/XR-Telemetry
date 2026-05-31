@@ -742,16 +742,10 @@ namespace openxr_api_layer {
             virtual std::optional<GpuFrameResult> endFrameAndResolveOldest() = 0;
         };
 
-        // Shared ring constants. kGpuRingSize=8 → ~89 ms in flight at 90 Hz.
-        // Sized well above the deepest realistic GPU→CPU latency (the VR
-        // compositor adds a few frames) so the D3D12 timer's slot recycle
-        // never catches in-flight work in steady state. The recycle checks
-        // are NON-blocking (see D3D12GpuTimer::beginFrame), so a too-small
-        // ring wouldn't stall — it would just drop GPU samples; the headroom
-        // here makes that rare. Bounds the pending CSV records held back at
-        // session end (≤ kGpuRingSize). The D3D11 timer reuses its slots
-        // without a fence, so the size only matters for D3D12.
-        constexpr size_t kGpuRingSize = 8;
+        // Shared ring constants. kGpuRingSize=4 → ~44 ms in flight at 90 Hz,
+        // comfortably above any realistic GPU→CPU latency. Keep small to
+        // limit pending CSV records the layer holds back at session end.
+        constexpr size_t kGpuRingSize = 4;
         enum class GpuSlotState { Idle, Started, Pending };
 
         // ---- D3D11 path -----------------------------------------------------
@@ -1044,27 +1038,19 @@ namespace openxr_api_layer {
                 // explicit — the D3D12 debug layer flags violations
                 // viciously and a single missed reset corrupts later
                 // recordings.
-                // NON-BLOCKING recycle check (the D3D11 path's DONOTFLUSH
-                // posture): if this slot's previous GPU submission hasn't
-                // completed, SKIP this frame's timing instead of waiting for
-                // it. Blocking here (the old waitForFenceBounded up to
-                // 100 ms) coupled the layer's xrEndFrame CPU time to GPU
-                // completion: whenever the GPU ran behind, the slot's fence
-                // wasn't signaled yet and the CPU stalled until it caught up
-                // — precisely the DX12 CPU spike this removes (the D3D11
-                // timer never blocks, which is why DX11 stays flat). With
-                // kGpuRingSize sized above the in-flight depth this skip is
-                // rare; when it fires we just drop one GPU sample.
-                //
-                // Contract with OpenXrLayer::m_pendingFrames: xrEndFrame
-                // unconditionally pushes a FrameRecord for `frame_index`,
-                // so the orphan stays in the pending deque until either
-                // a later frame's GpuFrameResult arrives (patchAndDrain
-                // Pending flushes everything older than the resolved
-                // index with gpu_time_ns=0) or xrDestroySession runs
-                // flushPendingFramesUnresolved. No leak, no stuck row.
                 if (slot.fenceValueAtBegin > 0 &&
-                    m_fence->GetCompletedValue() < slot.fenceValueAtBegin) {
+                    !waitForFenceBounded(slot.fenceValueAtBegin, /*timeoutMs=*/100)) {
+                    // GPU is >100 ms behind on this slot — drop the begin
+                    // for this frame, the slot stays whatever it was. The
+                    // matching end will see state != Started and skip too.
+                    //
+                    // Contract with OpenXrLayer::m_pendingFrames: xrEndFrame
+                    // unconditionally pushes a FrameRecord for `frame_index`,
+                    // so the orphan stays in the pending deque until either
+                    // a later frame's GpuFrameResult arrives (patchAndDrain
+                    // Pending flushes everything older than the resolved
+                    // index with gpu_time_ns=0) or xrDestroySession runs
+                    // flushPendingFramesUnresolved. No leak, no stuck row.
                     return;
                 }
 
@@ -1093,12 +1079,10 @@ namespace openxr_api_layer {
                 if (closing.state == GpuSlotState::Started) {
                     auto& pair = closing.endPair;
                     if (closing.fenceValueAtEnd > 0 &&
-                        m_fence->GetCompletedValue() < closing.fenceValueAtEnd) {
-                        // Non-blocking, same posture as beginFrame: this
-                        // slot's previous end submission hasn't completed —
-                        // skip the close rather than stall the CPU. The slot
-                        // becomes orphan (its data won't resolve) but the
-                        // ring keeps cycling; no CPU spike.
+                        !waitForFenceBounded(closing.fenceValueAtEnd, /*timeoutMs=*/100)) {
+                        // Same degrade as beginFrame: skip the close, the
+                        // slot becomes orphan — its data will never be
+                        // resolved but the ring keeps cycling.
                         closing.state = GpuSlotState::Idle;
                     } else if (SUCCEEDED(pair.allocator->Reset()) &&
                                SUCCEEDED(pair.cmdList->Reset(pair.allocator.Get(), nullptr))) {
