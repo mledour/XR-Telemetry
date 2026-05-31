@@ -2163,27 +2163,18 @@ namespace openxr_api_layer::detail {
         //     DrawInstanced; the static-label cache keeps the chrome scratch
         //     stable between rebuilds).
         //
-        // targetRetainsContent selects the flush strategy:
-        //   * false (BOTH live paths today — D3D11 renders into the acquired
-        //     swapchain image; D3D12 into the D3D11On12-wrapped image): the
-        //     swapchain images rotate and OpenXR doesn't guarantee content
-        //     across acquire, so we ClearRTV + re-flush chrome every frame.
-        //   * true (a PERSISTENT target we own): flush chrome only on a
-        //     static tick and let it persist between ticks, bars overpainting
-        //     just the histo rect — the classic two-tier split. Currently NO
-        //     caller passes true: the D3D12 shim that used it was retired
-        //     when that path moved to direct-to-image. The branch is kept for
-        //     a possible future persistent-target path.
+        // Both render paths (D3D11 into the acquired swapchain image; D3D12
+        // into the D3D11On12-wrapped image) target a ROTATING swapchain
+        // image whose contents OpenXR does NOT guarantee across acquire, so
+        // every frame ClearRTVs and re-flushes the cached chrome, then the
+        // bars. Only the cheap flush is per-frame — the chrome REBUILD stays
+        // cadence-gated (~10 Hz).
         //
         // Ordering on the immediate context (static frame): ClearRTV →
         // chrome shapes → text → bars (bottom-to-top).
         //
-        // Ordering on the shared immediate context, on a static frame:
-        //   ClearRTV → chrome shapes → text → bars  (bottom-to-top).
-        // On a dynamic frame: just bars, over the persistent chrome.
-        //
-        // Returns false only on a hard chrome rebuild failure (null
-        // renderer pointer); the cadence then retries next frame.
+        // Returns false on a hard chrome rebuild failure (null renderer
+        // pointer) or a flush failure; the cadence then retries next frame.
         inline bool paintOverlay(
                 CoreRenderer&                       core,
                 HistogramBarRenderer&               bars,
@@ -2194,8 +2185,7 @@ namespace openxr_api_layer::detail {
                 chrome_shapes::Renderer&            gpuShapes,
                 const HistogramRing<kRingSize>&     cpuRing,
                 const HistogramRing<kRingSize>&     gpuRing,
-                const OverlaySnapshot&              snap,
-                bool                                targetRetainsContent) {
+                const OverlaySnapshot&              snap) {
             if (!ctx || !rtv) return false;
 
             const bool needStatic = needStaticPaint(
@@ -2209,20 +2199,14 @@ namespace openxr_api_layer::detail {
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
             }
 
-            // Chrome FLUSH (clear + re-upload the cached chrome scratch
-            // into THIS target) depends on whether the target keeps its
-            // pixels between frames:
-            //   * targetRetainsContent (a persistent target we own): only
-            //     flush when we just rebuilt — the chrome persists between
-            //     ticks, the bars overpaint only the histo rect. Currently
-            //     unused (see the function doc); kept for a future
-            //     persistent-target path.
-            //   * !targetRetainsContent (both live paths — a rotating
-            //     swapchain image whose contents OpenXR does NOT guarantee
-            //     across acquire): flush every frame so the freshly-acquired
-            //     image always carries the current chrome. The cheap re-
-            //     flush of the cached scratch — NOT the 10 Hz rebuild above.
-            const bool flushChrome = ok && (needStatic || !targetRetainsContent);
+            // Chrome FLUSH (ClearRTV + re-upload the cached chrome scratch):
+            // every frame, because the swapchain image rotates and OpenXR
+            // doesn't guarantee its contents across acquire — the freshly-
+            // acquired image must carry the current chrome. Cheap: the cached
+            // scratch is re-uploaded, NOT the ~10 Hz rebuild above. Gated
+            // only on `ok` so a failed rebuild doesn't flush a half-built
+            // scratch.
+            const bool flushChrome = ok;
             if (flushChrome) {
                 const float kClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 ctx->ClearRenderTargetView(rtv, kClear);
@@ -2352,11 +2336,10 @@ namespace openxr_api_layer::detail {
                 //    xrEndFrame C-ABI boundary. Both satisfy "never
                 //    crash / never corrupt the host".
                 //
-                //    targetRetainsContent=false: OpenXR doesn't guarantee
-                //    swapchain image contents across acquire, so the
-                //    chrome is re-flushed every frame (the cheap cached-
-                //    scratch upload; the 10 Hz chrome REBUILD is still
-                //    gated).
+                //    OpenXR doesn't guarantee swapchain image contents
+                //    across acquire, so the chrome is re-flushed every
+                //    frame (the cheap cached-scratch upload; the 10 Hz
+                //    chrome REBUILD is still gated).
                 //
                 //    LIMITATION: this only isolates the app's IMMEDIATE
                 //    context. An app that submits its frame from a
@@ -2396,8 +2379,7 @@ namespace openxr_api_layer::detail {
                                               m_imageRtvs[imageIdx].Get(),
                                               m_glyphRenderer,
                                               m_chromeShapeRenderer,
-                                              m_cpuRing, m_gpuRing, snap,
-                                              /*targetRetainsContent=*/false);
+                                              m_cpuRing, m_gpuRing, snap);
                             // Unbind our RTV so the swapchain image isn't
                             // left OM-bound when the runtime composites it.
                             ID3D11RenderTargetView* nullRtv = nullptr;
@@ -2779,9 +2761,8 @@ namespace openxr_api_layer::detail {
                 // D3D12 swapchain image — no shim, no per-frame CopyResource
                 // (the D3D11 path's direct-to-swapchain win, mirrored here).
                 // The wrapped images rotate and OpenXR doesn't guarantee
-                // content across acquire, so we repaint fully each frame
-                // (targetRetainsContent=false); the cached static chrome
-                // makes that cheap.
+                // content across acquire, so we repaint fully each frame;
+                // the cached static chrome makes that cheap.
                 //
                 // AcquireWrappedResources flips the image into the D3D11-
                 // writable RENDER_TARGET state before we draw; Release flips
@@ -2809,8 +2790,7 @@ namespace openxr_api_layer::detail {
                                           m_imageRtvs[imageIdx].Get(),
                                           m_glyphRenderer,
                                           m_chromeShapeRenderer,
-                                          m_cpuRing, m_gpuRing, snap,
-                                          /*targetRetainsContent=*/false);
+                                          m_cpuRing, m_gpuRing, snap);
                     } catch (...) {
                         painted = false;
                     }
@@ -3150,13 +3130,11 @@ namespace openxr_api_layer::detail {
                 target, nullptr, rtv.GetAddressOf())))
             return fail("CreateRenderTargetView (target) failed");
 
-        // Fresh cadence → first paintOverlay does a full static rebuild.
-        // targetRetainsContent is moot for a one-shot paint (needStatic
-        // is true on the first frame, so chrome flushes regardless).
+        // Fresh cadence → first paintOverlay does a full static rebuild
+        // (needStatic is true on the first frame, so chrome flushes).
         PaintCadence cadence;
         if (!paintOverlay(core, bars, cadence, ctx, rtv.Get(),
-                           text, shapes, cpuRing, gpuRing, snap,
-                           /*targetRetainsContent=*/true))
+                           text, shapes, cpuRing, gpuRing, snap))
             return fail("paintOverlay failed");
         ctx->Flush();
         return true;
