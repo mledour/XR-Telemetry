@@ -55,7 +55,7 @@ namespace openxr_api_layer::detail {
         // is the initial sentinel: it differs from every real aggregator
         // version (those start at 0 and only climb), so the very first
         // paint always takes the static branch — there's no prior chrome
-        // in the shim to preserve.
+        // to preserve.
         uint64_t lastPaintedVersion = UINT64_MAX;
 
         // Frames elapsed since the last successful static paint. Drives
@@ -74,7 +74,7 @@ namespace openxr_api_layer::detail {
     //     static paint → repaint the chrome so the new values show.
     //   - watchdog: maxFramesBetweenStatic frames elapsed with no version
     //     change → force a static anyway (defensive against a stalled
-    //     aggregator or a shim that lost its chrome).
+    //     aggregator).
     //
     // The "+ 1" mirrors counting THIS frame: with framesSincePaint == K-1
     // entering the call, this is the Kth dynamic frame and the watchdog

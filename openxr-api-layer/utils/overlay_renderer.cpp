@@ -2277,6 +2277,12 @@ namespace openxr_api_layer::detail {
             }
 
             ~D3D11OverlayRenderer() override {
+                // Release the per-image RTVs + texture handles (which alias
+                // the swapchain's images) BEFORE destroying the swapchain —
+                // a runtime that frees image backing at xrDestroySwapchain
+                // would otherwise leave us holding dangling views.
+                m_imageRtvs.clear();
+                m_images.clear();
                 if (m_swapchain != XR_NULL_HANDLE && m_api) {
                     m_api->xrDestroySwapchain(m_swapchain);
                 }
@@ -2724,6 +2730,15 @@ namespace openxr_api_layer::detail {
             }
 
             ~D3D12OverlayRenderer() override {
+                // Release our D3D11 views + wrapped-resource handles (which
+                // alias the swapchain's D3D12 textures) BEFORE destroying the
+                // swapchain. Flush first so no in-flight bridge work still
+                // references them; on runtimes that free image backing at
+                // xrDestroySwapchain, releasing the wrappers afterward would
+                // be a use-after-free.
+                if (m_d3d11Context) m_d3d11Context->Flush();
+                m_imageRtvs.clear();
+                m_wrappedResources.clear();
                 if (m_swapchain != XR_NULL_HANDLE && m_api) {
                     m_api->xrDestroySwapchain(m_swapchain);
                 }
@@ -2775,14 +2790,48 @@ namespace openxr_api_layer::detail {
                 // D3D11On12 bridge is a separate device from the app's, so
                 // the shared-context state-leak that bit the D3D11 path
                 // can't occur here.
+                // m_imageRtvs and m_wrappedResources are resized to imgCount
+                // together in init(), so one bounds check covers both (same
+                // invariant the D3D11 path checks). A desync should be
+                // impossible; log once if it ever happens so it surfaces as
+                // a diagnostic rather than an intermittently-vanishing HUD.
+                const bool idxOk = imageIdx < m_imageRtvs.size();
+                if (!idxOk) {
+                    static bool s_loggedOob = false;
+                    if (!s_loggedOob) {
+                        s_loggedOob = true;
+                        Log(fmt::format(
+                            "xr_telemetry: overlay D3D12 image index {} out "
+                            "of range ({} images) — overlay skipped\n",
+                            imageIdx, m_imageRtvs.size()));
+                    }
+                }
                 ID3D11Resource* wrapped =
-                    (imageIdx < m_wrappedResources.size() &&
-                     imageIdx < m_imageRtvs.size())
-                        ? m_wrappedResources[imageIdx].Get()
-                        : nullptr;
+                    idxOk ? m_wrappedResources[imageIdx].Get() : nullptr;
                 bool painted = false;
                 if (wrapped && m_d3d11Context && m_d3d11On12) {
                     m_d3d11On12->AcquireWrappedResources(&wrapped, 1);
+                    // RAII: ALWAYS unbind our RTV + release the wrapped
+                    // resource on the way out — even if paintOverlay throws,
+                    // or a future early-return is added between here and the
+                    // scope end. Leaving the image stuck in RENDER_TARGET
+                    // state would make the runtime composite garbage. Mirrors
+                    // the D3D11 path's StateRestoreGuard discipline.
+                    struct WrappedReleaseGuard {
+                        ID3D11On12Device*    on12;
+                        ID3D11DeviceContext* ctx;
+                        ID3D11Resource*      res;
+                        ~WrappedReleaseGuard() {
+                            if (!on12 || !ctx || !res) return;
+                            // Unbind first so the resource isn't OM-bound
+                            // when it flips to PIXEL_SHADER_RESOURCE
+                            // (silences the debug layer's RT hazard).
+                            ID3D11RenderTargetView* nullRtv = nullptr;
+                            ctx->OMSetRenderTargets(1, &nullRtv, nullptr);
+                            on12->ReleaseWrappedResources(&res, 1);
+                        }
+                    } releaseGuard{m_d3d11On12.Get(), m_d3d11Context.Get(),
+                                    wrapped};
                     try {
                         painted =
                             paintOverlay(m_core, m_bars, m_barsCadence,
@@ -2794,12 +2843,6 @@ namespace openxr_api_layer::detail {
                     } catch (...) {
                         painted = false;
                     }
-                    // Unbind the RTV so the image isn't OM-bound when we
-                    // flip it to PIXEL_SHADER_RESOURCE for compositing
-                    // (silences the debug layer's render-target hazard).
-                    ID3D11RenderTargetView* nullRtv = nullptr;
-                    m_d3d11Context->OMSetRenderTargets(1, &nullRtv, nullptr);
-                    m_d3d11On12->ReleaseWrappedResources(&wrapped, 1);
                 }
                 // Flush the D3D11On12 command list into the D3D12 queue so
                 // the runtime sees the painted image when it composites.
@@ -3003,10 +3046,10 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // One-time fill of the immutable quad-layer fields;
-                // mirror of the D3D11 path's helper (no need to share
-                // since each renderer owns its own m_swapchain and
-                // m_quadLayer).
+                // One-time fill of the immutable quad-layer fields.
+                // Byte-identical to the D3D11 path's helper — a shared base
+                // could host this (m_swapchain + m_quadLayer are both
+                // members); tracked as the D3D11/D3D12 dedup follow-up.
                 initQuadLayerConstants();
 
                 Log("xr_telemetry: overlay D3D12 renderer ready ("
@@ -3051,7 +3094,7 @@ namespace openxr_api_layer::detail {
             // resource.
             std::vector<ComPtr<ID3D11RenderTargetView>> m_imageRtvs;
             // GPU pipelines on the D3D11On12 bridge — same classes as the
-            // D3D11 path, here targeting the shim RTV. The D3D11On12
+            // D3D11 path, targeting the per-image RTVs above. The D3D11On12
             // Flush() in renderAndCompose is incompressible (the D3D12
             // queue handoff), so the bridge overhead is the price of the
             // D3D12 path; the chrome/text/bars themselves are all GPU.
