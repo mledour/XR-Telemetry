@@ -121,20 +121,21 @@ namespace openxr_api_layer::detail {
         //   kSectionGap          (8)
         //   kFrametimeHeight    (90) — CPU panel
         //   kSectionGap          (8)
-        //   kBottomHeight      (109)
+        //   kBottomHeight       (90)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 435 = kTexH, leaving zero slack between the last
+        //   Total = 416 = kTexH, leaving zero slack between the last
         //   panel and the inner bottom edge. Keeping the budget exact
         //   makes the top and bottom borders read at the same
         //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
         //   on each side). `bottomY + kBottomHeight == kInnerB` by
-        //   construction (asserted via the (void)kInnerB line in
-        //   paint()). Bumping any of the heights past this budget
-        //   will visually clip the bottom panel.
+        //   construction (kInnerB derives from kTexH below, so the two
+        //   stay locked as long as the budget sums to kTexH). Bumping
+        //   any of the heights past this budget will visually clip the
+        //   bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 435;
+        constexpr int32_t kTexH = 416;
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
@@ -168,13 +169,17 @@ namespace openxr_api_layer::detail {
                                                       // of the strip — eliminates the
                                                       // empty top-half users observed
                                                       // in light-load scenarios.
-        constexpr float kBottomHeight     = 109.0f;  // 4 + label(22) + ~7 gap +
-                                                      // metric(43) cell-centred +
-                                                      // ~33 bottom margin. Sized
-                                                      // so the centred digit lands
-                                                      // with equal top/bottom space
-                                                      // (33 px each) and the label
-                                                      // sits in the upper region.
+        constexpr float kBottomHeight     = 90.0f;   // matches kHeaderHeight: the
+                                                      // bottom TEMP/LOAD/VRAM row now
+                                                      // reads at the same box height
+                                                      // as the FPS header. 4 + label
+                                                      // (22), then metric(43) centred
+                                                      // in the region BELOW the label
+                                                      // (the value rect is anchored at
+                                                      // labelY+22 in drawBottomPanel,
+                                                      // not the full cell) so the
+                                                      // 43-px digit stays clear of the
+                                                      // caption at this reduced height.
 
         // Histogram strip metrics — sits inside the frametime panel,
         // below the title row.
@@ -1443,16 +1448,17 @@ namespace openxr_api_layer::detail {
                 // extra word of horizontal space.
 
                 // Cell layout — label anchored near the top, metric
-                // paragraph-centred in the whole cell. The value rect
-                // spans the full cell height so paragraph CENTER
-                // (inherited from m_fmtTemp) puts the 43-px digit on
-                // the cell's vertical centre — equal blank space
-                // above (cell top → digit top) and below (digit
-                // bottom → cell bottom). The label sits in the upper
-                // region without overlapping (digit centre ≈ cellH/2,
-                // label rect = 22 px from t+4 → t+26 stays well above
-                // the digit at t+33 → t+76 for the current
-                // kBottomHeight = 109).
+                // paragraph-centred in the region BELOW the label (not
+                // the whole cell). The value rect starts at labelY+22
+                // (the label's bottom edge), so paragraph CENTER
+                // (inherited from m_fmtTemp) places the 43-px digit in
+                // the space under the caption — it can't ride up into
+                // the label even though kBottomHeight (90, matched to
+                // the FPS header) is tight. Label rect = 22 px from
+                // t+4 → t+26; the digit centres in [t+26, b] and clears
+                // the caption with room to spare. (Centring in the FULL
+                // cell, as an earlier revision did, needed the old
+                // 109-px height to keep the same clearance.)
                 const float labelY = t + 4.0f;
 
                 auto drawCell = [&](float cellL, float cellR,
@@ -1477,7 +1483,13 @@ namespace openxr_api_layer::detail {
                     // the whole value shares the per-tier colour (white
                     // / cyan / orange / red), only the font face and
                     // size change between digit and unit.
-                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, t, cellR, b);
+                    // Anchor the value region at the label's bottom
+                    // (labelY + 22) rather than the cell top, so the
+                    // paragraph-centred digit sits in the space under
+                    // the caption — keeps the 43-px metric clear of the
+                    // label now that the cell is only kBottomHeight (90)
+                    // tall. labelY + 22 == the label rect's bottom above.
+                    const D2D1_RECT_F valueRect = D2D1::RectF(cellL, labelY + 22.0f, cellR, b);
                     if (useWideValue) {
                         // For the °C suffix the whole string must be
                         // wide. tempValue is ASCII, so byte-widening

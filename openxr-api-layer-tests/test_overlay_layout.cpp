@@ -267,8 +267,9 @@ TEST_CASE("formatOverlayDisplayValues: utilisation fractions clamped to [0, 1]")
 }
 
 // =============================================================================
-// geometryForPosition — quad pose lookup. Updated for the 720×540 redesign:
-// quad base size is 0.28 × 0.21 m (4:3 to match the new texture aspect).
+// geometryForPosition — quad pose lookup. Quad base width is fixed; the
+// height tracks the texture aspect (kTexW/kTexH) so HMD pixels stay square.
+// The expected dimensions below move whenever the texture height changes.
 // =============================================================================
 
 TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
@@ -284,13 +285,13 @@ TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
     // vertical budget changes (e.g. section-gap tweaks freeing
     // texture height).
     CHECK(g.width_m  == doctest::Approx(0.28f).epsilon(0.001));
-    CHECK(g.height_m == doctest::Approx(0.169f).epsilon(0.001));
+    CHECK(g.height_m == doctest::Approx(0.162f).epsilon(0.001));
 }
 
 TEST_CASE("geometryForPosition: aspect ratio matches the texture's native") {
     const auto g = geometryForPosition("head_top_right", 1.0f);
     const float aspect = g.width_m / g.height_m;
-    CHECK(aspect == doctest::Approx(720.0f / 435.0f).epsilon(0.01));
+    CHECK(aspect == doctest::Approx(720.0f / 416.0f).epsilon(0.01));
 }
 
 TEST_CASE("geometryForPosition: head_top_left mirrors X") {
