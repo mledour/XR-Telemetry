@@ -2840,10 +2840,16 @@ namespace openxr_api_layer::detail {
                     static bool s_loggedOob = false;
                     if (!s_loggedOob) {
                         s_loggedOob = true;
-                        Log(fmt::format(
-                            "xr_telemetry: overlay D3D12 image index {} out "
-                            "of range ({} images) — overlay skipped\n",
-                            imageIdx, m_imageRtvs.size()));
+                        // fmt::format + Log allocate and can throw; this runs
+                        // on the xrEndFrame render thread, so an escaping
+                        // exception would cross the extern-"C" boundary (the
+                        // paint below is wrapped for exactly this reason).
+                        try {
+                            Log(fmt::format(
+                                "xr_telemetry: overlay D3D12 image index {} out "
+                                "of range ({} images) — overlay skipped\n",
+                                imageIdx, m_imageRtvs.size()));
+                        } catch (...) {}
                     }
                 }
                 ID3D11Resource* wrapped =

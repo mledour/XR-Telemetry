@@ -1281,13 +1281,15 @@ namespace openxr_api_layer {
         // sessions/ folder.
         ~OpenXrLayer() override {
             // If xrDestroySession was never called (e.g. host process is
-            // tearing down without a graceful OpenXR shutdown), flush any
-            // FrameRecord still waiting on a GPU result so they end up in
-            // the CSV with gpu_time_ns=0 rather than disappearing.
-            flushPendingFramesUnresolved();
-            m_gpuTimer.reset();
+            // tearing down without a graceful OpenXR shutdown), release the
+            // session-scoped handles ourselves: this flushes GPU-pending
+            // records to the CSV (gpu_time_ns=0) and — the bug this fixes —
+            // resets the overlay renderer and destroys the view XrSpace.
+            // xrDestroySession does this too, but this path used to skip it,
+            // leaking the XrSpace and tearing the swapchain down against a
+            // session the runtime may already be destroying.
+            releaseSessionScopedResources();
 
-            const uint64_t written = m_csv.written();
             // Auto mode: keep the existing probe-instance protection
             // (delete an empty CSV from OpenComposite / OXRT capability
             // probes). Hotkey mode: any open CSV at this point came
@@ -1297,6 +1299,10 @@ namespace openxr_api_layer {
             const bool deleteIfEmpty =
                 m_settings.log.mode == detail::LogMode::Auto;
             m_csv.stop(deleteIfEmpty);
+            // Read the frame count AFTER stop() joins the writer thread —
+            // reading m_csv.written() while the writer is still draining
+            // races on the non-atomic counter.
+            const uint64_t written = m_csv.written();
             if (m_csvPath.has_filename()) {
                 if (written == 0 && deleteIfEmpty) {
                     Log(fmt::format("xr_telemetry: probe XrInstance — no frames; csv deleted: {}\n",
@@ -1567,8 +1573,19 @@ namespace openxr_api_layer {
                         "gpu_time_ns will be 0 for this session\n");
                 }
                 if (m_settings.overlay.enabled) {
-                    m_overlayRenderer = detail::makeD3D11OverlayRenderer(
-                        this, *session, d3d11->device);
+                    // Construction runs the renderer's init(), which allocates
+                    // and logs (fmt::format) — both can throw. This runs inside
+                    // xrCreateSession (an extern-"C" boundary), so contain any
+                    // throw and degrade to no-overlay rather than unwinding
+                    // across the ABI.
+                    try {
+                        m_overlayRenderer = detail::makeD3D11OverlayRenderer(
+                            this, *session, d3d11->device);
+                    } catch (...) {
+                        m_overlayRenderer.reset();
+                        Log("xr_telemetry: overlay disabled — D3D11 renderer "
+                            "init threw (out of memory?)\n");
+                    }
                 }
                 // D3D11 path: walk ID3D11Device → IDXGIDevice → IDXGIAdapter.
                 // Same pattern overlay_renderer.cpp uses to find the
@@ -1590,8 +1607,16 @@ namespace openxr_api_layer {
                         "creation failed; gpu_time_ns will be 0 for this session\n");
                 }
                 if (m_settings.overlay.enabled) {
-                    m_overlayRenderer = detail::makeD3D12OverlayRenderer(
-                        this, *session, d3d12->device, d3d12->queue);
+                    // See the D3D11 path: contain any init() throw inside the
+                    // xrCreateSession C-ABI boundary, degrade to no-overlay.
+                    try {
+                        m_overlayRenderer = detail::makeD3D12OverlayRenderer(
+                            this, *session, d3d12->device, d3d12->queue);
+                    } catch (...) {
+                        m_overlayRenderer.reset();
+                        Log("xr_telemetry: overlay disabled — D3D12 renderer "
+                            "init threw (out of memory?)\n");
+                    }
                 }
                 // D3D12 path: ID3D12Device::GetAdapterLuid → IDXGIFactory4::
                 // EnumAdapterByLuid. The factory is short-lived (released
@@ -1671,32 +1696,11 @@ namespace openxr_api_layer {
             if (m_bypassApiLayer) {
                 return OpenXrApi::xrDestroySession(session);
             }
-            // Session-scoped cleanup only. Flush any FrameRecords still
-            // waiting on a GPU result before we release the queries
-            // (they'll land in the CSV with gpu_time_ns=0), then drop
-            // the D3D timer so its query heap / command lists / fence
-            // don't outlive the dying session's device.
-            flushPendingFramesUnresolved();
-            m_gpuTimer.reset();
-            // GPU telemetry reader is also session-scoped: it holds
-            // an IDXGIAdapter3 refcount that came from the session's
-            // graphics binding device. Releasing here lets the
-            // application's IDXGIAdapter drop cleanly when the
-            // session shuts down. Reset the cached sample too so a
-            // new session doesn't briefly publish the previous
-            // session's last reading via the FrameRecord copy below.
-            m_gpuTelemetry.reset();
-            m_lastGpuTelemetry = detail::GpuTelemetrySample{};
-            m_lastGpuTelemetryPollNs = 0;
-            // Overlay renderer + view space are also session-scoped
-            // (they hold an XrSwapchain + an ID3D11Device wrapping the
-            // session's device). Release before the session goes away,
-            // re-create on the next xrCreateSession if one fires.
-            m_overlayRenderer.reset();
-            if (m_viewSpace != XR_NULL_HANDLE) {
-                OpenXrApi::xrDestroySpace(m_viewSpace);
-                m_viewSpace = XR_NULL_HANDLE;
-            }
+            // Session-scoped cleanup only: flush GPU-pending records, drop the
+            // timer/telemetry, release the overlay renderer + view space.
+            // Shared with ~OpenXrLayer (the destroy-instance-without-destroy-
+            // session path) so the two teardowns can't drift apart.
+            releaseSessionScopedResources();
             // DO NOT touch m_csv / m_recording / m_overlay / m_overlay
             // Active here. The OpenXR spec allows multiple xrCreateSession
             // / xrDestroySession cycles within a single xrInstance, and
@@ -1838,12 +1842,15 @@ namespace openxr_api_layer {
                                                   m_csvPath.string()));
                         }
                     } else {
-                        const uint64_t written = m_csv.written();
                         // deleteIfEmpty=false: in hotkey mode, an empty
                         // recording is the user's explicit signal "did my
                         // binding fire?" — keep the header+footer file so
                         // they can confirm in the sessions/ folder.
                         m_csv.stop(/*deleteIfEmpty=*/false);
+                        // Read the count AFTER stop() joins the writer —
+                        // m_written is non-atomic and the writer may still be
+                        // draining when we enter stop().
+                        const uint64_t written = m_csv.written();
                         m_recording = false;
                         Log(fmt::format("xr_telemetry: hotkey pressed — "
                                          "recording stopped ({} frames written to {})\n",
@@ -2063,17 +2070,17 @@ namespace openxr_api_layer {
                 if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
                     m_lastGpuTelemetry = m_gpuTelemetry->poll();
                     m_lastGpuTelemetryPollNs = nowNs;
-                    // Forward to the aggregator so the next overlay
-                    // refresh publishes the fresh reading. Pushing
-                    // every tick (rather than on every frame between
-                    // ticks) keeps the aggregator's "valid until
-                    // next publish" semantics clean.
-                    if (m_overlayActive) {
-                        m_overlay.pushGpuTelemetry(
-                            m_lastGpuTelemetry.gpu_temp_c,
-                            m_lastGpuTelemetry.vram_used_bytes,
-                            m_lastGpuTelemetry.vram_budget_bytes);
-                    }
+                    // Forward to the aggregator so the next overlay refresh
+                    // publishes the fresh reading. Pushed on every poll
+                    // regardless of m_overlayActive: gating it on the overlay
+                    // being on meant that right after an overlay-hotkey toggle
+                    // the HUD showed a stale (or never-set) temp/VRAM for up to
+                    // a full poll interval. The push is a cheap setter that
+                    // just keeps the aggregator's cached value current.
+                    m_overlay.pushGpuTelemetry(
+                        m_lastGpuTelemetry.gpu_temp_c,
+                        m_lastGpuTelemetry.vram_used_bytes,
+                        m_lastGpuTelemetry.vram_budget_bytes);
                 }
             }
 
@@ -2121,11 +2128,15 @@ namespace openxr_api_layer {
                     patchAndDrainPending(resolved->frame_index, resolved->gpu_time_ns);
                 }
             } else {
-                // No GPU timer → no deferred path. Push immediately,
-                // gpu_time_ns stays at 0 (which the aggregator clamps
-                // back to 100% headroom via the helper formula).
-                if (m_recording)     m_csv.push(rec);
-                if (m_overlayActive) m_overlay.pushFrame(rec);
+                // No GPU timer → no deferred path; dispatch immediately,
+                // gpu_time_ns stays at 0 (which the aggregator clamps back
+                // to 100% headroom via the helper formula). Route through
+                // fanoutRecord — NOT a bare m_csv.push + m_overlay.pushFrame
+                // — so the overlay renderer's histogram rings also get fed
+                // via pushFrameSample. The hand-rolled push here used to skip
+                // that, so on a binding with no GPU timer the HUD's CPU/GPU
+                // bar strips stayed empty for the whole session.
+                fanoutRecord(rec);
             }
 
             return result;
@@ -2218,6 +2229,30 @@ namespace openxr_api_layer {
         void flushPendingFramesUnresolved() {
             detail::flushPendingFramesUnresolved(
                 m_pendingFrames, [this](const FrameRecord& r) { fanoutRecord(r); });
+        }
+
+        // Release every session-scoped handle the layer owns: flush any
+        // GPU-pending FrameRecords to their sinks, drop the GPU timer + its
+        // query heap, release the GPU-telemetry adapter ref (+ reset the
+        // cached sample), drop the overlay renderer (XrSwapchain + D3D
+        // wrapper), and destroy the head-locked view XrSpace. Shared by
+        // xrDestroySession (per-session teardown — all re-created on the next
+        // xrCreateSession) and ~OpenXrLayer (the destroy-instance-without-
+        // destroy-session shutdown, where the runtime never handed us an
+        // xrDestroySession to clean up in). Deliberately does NOT touch
+        // m_csv / m_recording / m_overlay / m_overlayActive — those span
+        // multiple sessions within one xrInstance.
+        void releaseSessionScopedResources() {
+            flushPendingFramesUnresolved();
+            m_gpuTimer.reset();
+            m_gpuTelemetry.reset();
+            m_lastGpuTelemetry = detail::GpuTelemetrySample{};
+            m_lastGpuTelemetryPollNs = 0;
+            m_overlayRenderer.reset();
+            if (m_viewSpace != XR_NULL_HANDLE) {
+                OpenXrApi::xrDestroySpace(m_viewSpace);
+                m_viewSpace = XR_NULL_HANDLE;
+            }
         }
 
         bool m_bypassApiLayer = false;

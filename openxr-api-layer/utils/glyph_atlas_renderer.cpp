@@ -354,9 +354,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
         auto it = m_glyphs.find(spaceKey);
         if (it != m_glyphs.end()) return it->second.advanceX;
 
-        // No space glyph either — just punt with 0. The caller's string
-        // collapses, but the renderer doesn't crash.
-        return 0.0f;
+        // No space glyph baked for this face (e.g. a digits-only face like
+        // Barlow) — fall back to a half-em advance so a stray codepoint
+        // leaves a visible GAP instead of zero-advancing and overprinting the
+        // rest of the run on top of itself. Still never crashes.
+        return static_cast<float>(sizePx) * 0.5f;
     }
 
     // ===================================================================
