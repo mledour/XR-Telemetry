@@ -52,6 +52,7 @@
 #include <rapidjson/error/en.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -167,7 +168,17 @@ namespace openxr_api_layer::detail {
             const auto it = obj.FindMember(key);
             if (it == obj.MemberEnd()) return defaultVal;
             if (it->value.IsInt())     return it->value.GetInt();
-            if (it->value.IsDouble())  return static_cast<int>(it->value.GetDouble());
+            if (it->value.IsDouble()) {
+                // Range-check before the cast: a double outside int range
+                // (e.g. "refresh_hz": 1e18) is UB to static_cast<int>, and
+                // NaN fails both comparisons. Fall back to the default — the
+                // caller clamps the sane range anyway.
+                const double d = it->value.GetDouble();
+                if (d >= static_cast<double>(std::numeric_limits<int>::min()) &&
+                    d <= static_cast<double>(std::numeric_limits<int>::max()))
+                    return static_cast<int>(d);
+                return defaultVal;
+            }
             return defaultVal;
         }
         // Permissive float reader: accepts integer-typed JSON too (a user
@@ -304,6 +315,15 @@ namespace openxr_api_layer::detail {
                 if (rawPosition.size() > 64) {
                     rawPosition = "head_top_right";
                 }
+                // Normalise to lowercase ASCII so geometryForPosition's
+                // case-sensitive compares match a user who writes e.g.
+                // "Head_Top_Left". (The layout helper stays iequalsAscii-free
+                // by relying on this normalisation — see overlay_layout.h.)
+                std::transform(rawPosition.begin(), rawPosition.end(),
+                               rawPosition.begin(), [](unsigned char c) {
+                                   return static_cast<char>(
+                                       (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+                               });
                 result.settings.overlay.position = std::move(rawPosition);
             }
 

@@ -277,11 +277,31 @@ TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {
     CHECK(parseSettings(R"({"overlay":{"refresh_hz":12.0}})").settings.overlay.refresh_hz == 12);
 }
 
+TEST_CASE("parseSettings: out-of-range refresh_hz float degrades safely (no UB)") {
+    // static_cast<int> of a double outside int range is UB; the parser must
+    // range-check before the cast. Out-of-range / huge values fall back to
+    // the default (10) instead of invoking UB, then clamp as usual.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1e18}})").settings.overlay.refresh_hz == 10);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":-1e18}})").settings.overlay.refresh_hz == 10);
+    // In-range-but-large float still casts, then clamps to the [1,60] ceiling.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1000000.0}})").settings.overlay.refresh_hz == 60);
+}
+
 TEST_CASE("parseSettings: overlay mode strings are case-insensitive") {
     CHECK(parseSettings(R"({"overlay":{"mode":"HOTKEY"}})").settings.overlay.mode ==
           OverlayMode::Hotkey);
     CHECK(parseSettings(R"({"overlay":{"mode":"Auto"}})").settings.overlay.mode ==
           OverlayMode::Auto);
+}
+
+TEST_CASE("parseSettings: overlay position is normalised to lowercase") {
+    // geometryForPosition compares case-sensitively against lowercase
+    // snake_case, so the parser lowercases — a user writing mixed case
+    // still gets the placement they asked for instead of the fallback.
+    CHECK(parseSettings(R"({"overlay":{"position":"Head_Top_Left"}})")
+              .settings.overlay.position == "head_top_left");
+    CHECK(parseSettings(R"({"overlay":{"position":"HEAD_CENTER"}})")
+              .settings.overlay.position == "head_center");
 }
 
 TEST_CASE("parseSettings: unknown overlay mode falls back to auto (no error surfaced)") {
