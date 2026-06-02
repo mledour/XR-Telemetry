@@ -237,7 +237,7 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     // kTexH change, bump these in lockstep so the snapshot covers the
     // full painted area.
     constexpr UINT W = 720;
-    constexpr UINT H = 435;
+    constexpr UINT H = 416;
 
     // WARP D3D11 device. WARP (software rasteriser) is deterministic
     // run-to-run and available on GitHub's GPU-less CI runners, while
