@@ -38,11 +38,10 @@
 //   3 = Empty   → 2-px dashColor placeholder at the strip bottom
 // =============================================================================
 
-// Per-panel constants. All positions are in shim-texture pixels; the vertex
-// shader converts to NDC using texSize. Colours are straight-alpha RGBA in
-// the same linear values initBrushes() feeds D2D (the bars are opaque, so
-// straight == premultiplied for the BGRA8 shim; only the dash carries alpha,
-// and it lands on the already-opaque panel background).
+// Per-panel constants. All positions are in overlay-texture pixels; the vertex
+// shader converts to NDC using texSize. Colours are straight-alpha RGBA (the
+// bars are opaque, so straight == premultiplied on the BGRA8 target; only the
+// dash carries alpha, and it lands on the already-opaque panel background).
 // Packing note: members are ordered so each maps cleanly onto HLSL's
 // 16-byte constant registers with no implicit padding — the two float2
 // pairs fill reg0, (histoBotRight, barWidth, dashHeight) fills reg1, and

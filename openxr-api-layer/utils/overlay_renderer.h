@@ -31,7 +31,8 @@
 //   - D3D11OverlayRenderer: app uses D3D11 → we paint directly into the
 //     swapchain image via the chrome-shape / glyph-atlas / bar shaders.
 //   - D3D12OverlayRenderer: app uses D3D12 → we bridge via D3D11On12 and
-//     paint the same shaders into a shim, then CopyResource across.
+//     paint the same shaders directly into the wrapped swapchain image
+//     (no private shim, no per-frame CopyResource).
 //
 // Callers (layer.cpp) get an abstract `OverlayRenderer` back from the
 // matching factory and use it the same way for both paths.

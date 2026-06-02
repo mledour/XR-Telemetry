@@ -1312,8 +1312,8 @@ namespace openxr_api_layer {
                 }
             }
 
-            // PR1 verification: log the aggregator's final snapshot once
-            // per xrInstance lifetime. Moved here from xrDestroySession
+            // Log the aggregator's final snapshot once per xrInstance
+            // lifetime. Moved here from xrDestroySession
             // because OpenComposite's probe pattern fires xrDestroy
             // Session BEFORE the real gameplay session has accumulated
             // any frames — logging there produced a "session too short"
@@ -1486,8 +1486,8 @@ namespace openxr_api_layer {
             }
 
             // ---- overlay feature ---------------------------------------
-            // The aggregator is constructed up-front so PR2's renderer
-            // can call snapshot() unconditionally. It needs the real
+            // The aggregator is constructed up-front so the overlay
+            // renderer can call snapshot() unconditionally. It needs the real
             // QPC frequency (cached in the constructor) and the user-
             // configured refresh cadence converted to nanoseconds.
             const int64_t overlayIntervalNs =
@@ -1857,7 +1857,7 @@ namespace openxr_api_layer {
             // hotkey with separate combos. m_overlayHotkeyDetector keeps
             // its own latch so a press for one doesn't fire the other.
             //
-            // No file I/O — overlay is purely in-memory state in PR1.
+            // No file I/O on this toggle — it just flips m_overlayActive.
             // The Log() on toggle is on a user-initiated rising edge
             // (not every frame), so the per-frame DBWinMutex concern
             // documented above doesn't apply.

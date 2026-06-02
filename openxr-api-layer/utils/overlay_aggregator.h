@@ -29,9 +29,9 @@
 // Why "aggregator" and not just "render once per frame":
 //   - Per-frame numbers shimmer at 90/120 Hz; the user can't read them.
 //   - fpsvr-style displays refresh at ~5-10 Hz, averaging the noise out.
-//   - The renderer (PR2 — coming later) can call snapshot() in its own
-//     refresh tick and get whatever the most recent finalised aggregate
-//     was. No coupling between renderer cadence and aggregation cadence.
+//   - The renderer calls snapshot() in its own refresh tick and gets
+//     whatever the most recent finalised aggregate was. No coupling
+//     between renderer cadence and aggregation cadence.
 //
 // Inputs: FrameRecord (from telemetry_internals.h). Outputs: Snapshot —
 // fps_instant / fps_avg / cpu_frame_ms / gpu_frame_ms / cpu_utilisation_pct
@@ -54,9 +54,9 @@
 
 namespace openxr_api_layer::detail {
 
-    // What the future renderer (PR2) will draw into the head-locked quad.
-    // All fields are floats so the rendering code can pass them straight to
-    // DirectWrite / a string formatter without further conversion.
+    // What the renderer draws into the head-locked quad. All fields are
+    // floats so the rendering code can pass them straight to a string
+    // formatter without further conversion.
     struct OverlaySnapshot {
         float fps_instant = 0;          // 1e9 / last frame_total_ns
         float fps_avg = 0;              // 1e9 / mean(frame_total_ns over the refresh window)

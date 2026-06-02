@@ -27,12 +27,11 @@
 // Generic instanced axis-aligned rectangles in straight-alpha colour, used
 // to paint the parts of the histogram region that AREN'T the bars: the
 // opaque panel-background fill, the 4 dashed-style grid lines (drawn as thin
-// translucent rects), and the budget reference line. One DrawInstanced per
-// group replaces the D2D FillRectangle / DrawLine calls so the dynamic frame
-// touches no D2D at all. Colours carry their own alpha; the blend state is
-// straight alpha-over, and every rect lands on the already-opaque panel
-// background so the composited result stays opaque (premultiplied == straight
-// for the BGRA8 shim there).
+// translucent rects), and the budget reference line — one DrawInstanced per
+// group. Colours carry their own alpha; the blend state is straight alpha-
+// over, and every rect lands on the already-opaque panel background so the
+// composited result stays opaque (premultiplied == straight on the BGRA8
+// target).
 // =============================================================================
 
 cbuffer QuadConstants : register(b0)

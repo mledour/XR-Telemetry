@@ -46,11 +46,9 @@
 // path). pch.h's <d3d11.h> only exposes the base interfaces.
 #include <d3d11_1.h>
 
-#include <array>
 #include <cmath>
 #include <cstring>     // std::memcpy for constant-buffer uploads
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
-#include <iterator>    // std::size for the dash-style array
 #include <string>
 #include <vector>
 
@@ -1805,16 +1803,23 @@ namespace openxr_api_layer::detail {
                                    m_quadVB))
                     return fail("CreateBuffer (unit quad VB)");
 
-                // Dynamic instance buffers + the bars constant buffer
-                // (refilled per panel per frame).
+                // Dynamic instance buffers — refilled from the ring each
+                // frame (the histogram scrolls at the host frame rate).
                 if (!createDynamic(kRingSize * sizeof(BarInstance),
                                     D3D11_BIND_VERTEX_BUFFER, m_barInstances))
                     return fail("CreateBuffer (bar instances)");
                 if (!createDynamic(kQuadSlots * sizeof(QuadInstance),
                                     D3D11_BIND_VERTEX_BUFFER, m_quadInstances))
                     return fail("CreateBuffer (quad instances)");
+                // Two bars constant buffers, one per panel (CPU / GPU). Their
+                // contents are invariant for the renderer's life (panel rect +
+                // isGpu colours never change), so each is filled ONCE on first
+                // use (see drawPanel) instead of re-mapped every frame — same
+                // intent as the IMMUTABLE m_quadCB below.
                 if (!createDynamic(sizeof(BarConstants),
-                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB))
+                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB[0]) ||
+                    !createDynamic(sizeof(BarConstants),
+                                    D3D11_BIND_CONSTANT_BUFFER, m_barCB[1]))
                     return fail("CreateBuffer (bar constants)");
 
                 // The quad constant buffer carries only texSize, which is
@@ -1860,8 +1865,6 @@ namespace openxr_api_layer::detail {
                 m_ready = true;
                 return true;
             }
-
-            bool isReady() const noexcept { return m_ready; }
 
             // Paint one panel's histogram region (bg + grid + bars + budget)
             // into the target image. Rect is in target pixels; isGpu picks
@@ -1958,23 +1961,29 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // --- constant buffers ---
-                {
+                // --- constant buffer (one per panel, filled once) ---
+                // Every BarConstants field is invariant for the renderer's
+                // life — texSize, the panel rect, the bar/dash sizes, and the
+                // isGpu-keyed colours never change frame to frame. So fill the
+                // panel's buffer the first time it's drawn and just bind it
+                // after, instead of re-mapping 112 B per panel every frame.
+                // (m_quadCB is IMMUTABLE for the same reason.)
+                const int cbIdx = isGpu ? 1 : 0;
+                if (!m_barCBFilled[cbIdx]) {
                     BarConstants bc{};
                     bc.texSize[0] = static_cast<float>(kTexW);
                     bc.texSize[1] = static_cast<float>(kTexH);
                     bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
                     bc.barWidth = kBarPx;   // fixed 4-px integer width
-                    bc.dashHeight = kDashPlaceholderH;  // shared with D2D path
+                    bc.dashHeight = kDashPlaceholderH;  // tier-3 "no data" dash
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
                     copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
                     copyColor(bc.orange, kOrange);
                     copyColor(bc.red,    kRed);
                     copyColor(bc.dash,   kGridDash);
-                    upload(m_barCB, &bc, sizeof(bc));
-                    // m_quadCB is IMMUTABLE (texSize is invariant — see
-                    // init()), so no re-upload here.
+                    if (upload(m_barCB[cbIdx], &bc, sizeof(bc)))
+                        m_barCBFilled[cbIdx] = true;
                 }
 
                 // --- pipeline state (prior passes clobbered it; set all) ---
@@ -2018,7 +2027,7 @@ namespace openxr_api_layer::detail {
 
                 // bar pass — samples on top of bg/grid (instances 0..barCount).
                 if (barCount > 0) {
-                    bindBarPipeline();
+                    bindBarPipeline(m_barCB[cbIdx].GetAddressOf());
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
                 }
 
@@ -2098,13 +2107,15 @@ namespace openxr_api_layer::detail {
                 return SUCCEEDED(m_device->CreateBuffer(
                     &bd, nullptr, out.GetAddressOf()));
             }
-            void upload(ComPtr<ID3D11Buffer>& cb, const void* src, UINT bytes) {
+            bool upload(ComPtr<ID3D11Buffer>& cb, const void* src, UINT bytes) {
                 D3D11_MAPPED_SUBRESOURCE map{};
                 if (SUCCEEDED(m_ctx->Map(cb.Get(), 0,
                         D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                     std::memcpy(map.pData, src, bytes);
                     m_ctx->Unmap(cb.Get(), 0);
+                    return true;
                 }
+                return false;
             }
             void bindQuadPipeline() {
                 ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_quadInstances.Get()};
@@ -2116,7 +2127,7 @@ namespace openxr_api_layer::detail {
                 m_ctx->PSSetShader(m_quadPS.Get(), nullptr, 0);
                 m_ctx->VSSetConstantBuffers(0, 1, m_quadCB.GetAddressOf());
             }
-            void bindBarPipeline() {
+            void bindBarPipeline(ID3D11Buffer* const* barCB) {
                 ID3D11Buffer* vbs[2] = {m_quadVB.Get(), m_barInstances.Get()};
                 const UINT strides[2] = {sizeof(float) * 2, sizeof(BarInstance)};
                 const UINT offsets[2] = {0, 0};
@@ -2129,8 +2140,8 @@ namespace openxr_api_layer::detail {
                 // stops. Binding it only to the VS left the PS's b0 null,
                 // so every bar shaded as (0,0,0,0) — transparent, hence
                 // "no bars" despite the geometry drawing correctly.
-                m_ctx->VSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
-                m_ctx->PSSetConstantBuffers(0, 1, m_barCB.GetAddressOf());
+                m_ctx->VSSetConstantBuffers(0, 1, barCB);
+                m_ctx->PSSetConstantBuffers(0, 1, barCB);
             }
 
             bool m_ready = false;
@@ -2147,7 +2158,8 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D11Buffer>           m_quadVB;
             ComPtr<ID3D11Buffer>           m_barInstances;
             ComPtr<ID3D11Buffer>           m_quadInstances;
-            ComPtr<ID3D11Buffer>           m_barCB;
+            ComPtr<ID3D11Buffer>           m_barCB[2];   // [0]=CPU, [1]=GPU panel
+            bool                           m_barCBFilled[2] = {false, false};
             ComPtr<ID3D11Buffer>           m_quadCB;
             ComPtr<ID3D11BlendState>       m_blend;
             ComPtr<ID3D11RasterizerState>  m_raster;
@@ -2277,8 +2289,9 @@ namespace openxr_api_layer::detail {
         // -------- D3D11 native renderer --------------------------------------
         //
         // App uses D3D11 directly. Each swapchain image is an ID3D11Texture2D
-        // we obtain via xrEnumerateSwapchainImages, and we create one D2D
-        // render target per image (cached for the swapchain's lifetime).
+        // we obtain via xrEnumerateSwapchainImages, and we create one D3D11
+        // render-target view per image (cached for the swapchain's lifetime);
+        // the shaders paint straight into the acquired image.
         class D3D11OverlayRenderer final : public OverlayRenderer {
           public:
             D3D11OverlayRenderer(OpenXrApi* api, XrSession session,
@@ -2428,10 +2441,19 @@ namespace openxr_api_layer::detail {
                 //    settings if we ever expose it), and the
                 //    position/size pair derived from the user's
                 //    settings.overlay.position + scale.
-                const auto geo = geometryForPosition(position, scale);
+                //
+                //    position+scale are immutable after xrCreateInstance, so
+                //    the geometry is cached and recomputed only on change.
+                if (!m_geoValid || scale != m_geoScale ||
+                    position != m_geoPosition) {
+                    m_geo         = geometryForPosition(position, scale);
+                    m_geoPosition = position;
+                    m_geoScale    = scale;
+                    m_geoValid    = true;
+                }
                 m_quadLayer.space = viewSpace;
-                m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
-                m_quadLayer.size = {geo.width_m, geo.height_m};
+                m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
@@ -2705,6 +2727,12 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>    m_cpuRing;
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
+            // Cached geometryForPosition result — position/scale are immutable
+            // after init, so recompute only when they change (renderAndCompose).
+            OverlayGeometry             m_geo{};
+            std::string                 m_geoPosition;
+            float                       m_geoScale = 0.0f;
+            bool                        m_geoValid = false;
             bool                        m_ready = false;
         };
 
@@ -2868,10 +2896,18 @@ namespace openxr_api_layer::detail {
                 // Immutable quad fields filled once in init(); per-
                 // frame writes only the view-space + the position/
                 // size pair (see the D3D11 path's longer comment).
-                const auto geo = geometryForPosition(position, scale);
+                // position+scale are immutable after xrCreateInstance, so the
+                // geometry is cached and recomputed only on change.
+                if (!m_geoValid || scale != m_geoScale ||
+                    position != m_geoPosition) {
+                    m_geo         = geometryForPosition(position, scale);
+                    m_geoPosition = position;
+                    m_geoScale    = scale;
+                    m_geoValid    = true;
+                }
                 m_quadLayer.space = viewSpace;
-                m_quadLayer.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
-                m_quadLayer.size = {geo.width_m, geo.height_m};
+                m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
@@ -3123,6 +3159,12 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>              m_cpuRing;
             HistogramRing<kRingSize>              m_gpuRing;
             XrCompositionLayerQuad                m_quadLayer{};
+            // Cached geometryForPosition result — position/scale are immutable
+            // after init, so recompute only when they change.
+            OverlayGeometry                       m_geo{};
+            std::string                           m_geoPosition;
+            float                                 m_geoScale = 0.0f;
+            bool                                  m_geoValid = false;
             bool                                  m_ready = false;
         };
 

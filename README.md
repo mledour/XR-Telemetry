@@ -126,9 +126,10 @@ cap on a 90 Hz HMD).
 | `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. |
 | `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
 
-**Graphics-API support.** D3D11 hosts paint via DirectWrite + Direct2D
-straight into a BGRA8 swapchain. D3D12 hosts go through D3D11On12 so
-D2D (which is D3D11-only) can render into the D3D12 swapchain image.
+**Graphics-API support.** D3D11 hosts paint the HUD with GPU shaders (a
+prebuilt glyph atlas + instanced quads) straight into a BGRA8 swapchain.
+D3D12 hosts go through D3D11On12 so those same D3D11 shaders can render
+directly into the D3D12 swapchain image.
 **Vulkan and OpenGL hosts are not supported** — the layer logs
 `overlay disabled — Vulkan/OpenGL hosts not supported by the renderer`
 and the CSV-logging path keeps running.
