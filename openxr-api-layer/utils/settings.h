@@ -31,7 +31,8 @@
 //       "mode": "auto" | "hotkey",
 //       "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
 //     },
-//     "overlay": { ... }                ← reserved, not parsed yet
+//     "overlay": { "enabled", "mode", "hotkey", "refresh_hz",
+//                  "position", "scale" }
 //   }
 //
 // Everything is permissive: missing fields fall back to the "preserve
@@ -78,9 +79,9 @@ namespace openxr_api_layer::detail {
     };
 
     // Parsed "overlay" block. Same shape as LogSettings + `refresh_hz` for
-    // the snapshot cadence (and a `position` string reserved for the
-    // future renderer in PR2 — only "head_top_right" is meaningful today,
-    // everything else falls back to it).
+    // the snapshot cadence, a `position` string (head_top_right /
+    // head_top_left / head_top_center / head_center; unknown values fall
+    // back to head_top_right), and a `scale` multiplier.
     //
     // Defaults are deliberately opt-in: enabled=false. A user upgrading
     // from a pre-overlay layer gets the same CSV-only behaviour they had
@@ -306,8 +307,9 @@ namespace openxr_api_layer::detail {
                 result.settings.overlay.position = std::move(rawPosition);
             }
 
-            // `scale` clamped to [0.5, 2.0]. 1.0 ≙ default quad size
-            // (~0.20 m × 0.075 m at 1 m view-space distance).
+            // `scale` clamped to [0.5, 2.0]. 1.0 ≙ the default quad size
+            // (see kBaseWidth / kBaseHeight in overlay_layout.h); 0.5 → half,
+            // 2.0 → double.
             const float rawScale = getFloatOr(ov, "scale", 1.0f);
             result.settings.overlay.scale = std::clamp(rawScale, 0.5f, 2.0f);
         }

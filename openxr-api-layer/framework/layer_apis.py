@@ -46,12 +46,11 @@ override_functions = [
     # the GPU timestamp query ring. xrDestroySession releases the queries
     # cleanly so we don't leak D3D11 resources.
     #
-    # Note: despite layer.cpp's xrCreateInstance comment saying
-    # xrDestroySession is "implicitly handled by the framework", that
-    # comment is wrong — the framework only auto-handles xrCreateInstance,
+    # Note: the framework only auto-handles xrCreateInstance,
     # xrDestroyInstance, xrGetInstanceProcAddr, and
-    # xrEnumerateInstanceExtensionProperties (dispatch_generator.py:42).
-    # fov_crop overrides xrDestroySession via this same mechanism.
+    # xrEnumerateInstanceExtensionProperties (dispatch_generator.py:42), so
+    # xrDestroySession must be overridden explicitly here — the same
+    # mechanism fov_crop uses.
     "xrCreateSession",
     "xrDestroySession",
 ]

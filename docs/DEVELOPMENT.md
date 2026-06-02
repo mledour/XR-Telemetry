@@ -28,7 +28,7 @@ openxr-api-layer/
     entry.cpp                         ← DLL entry point + loader negotiation
     log.{h,cpp}                       ← file + ETW logging helpers
   utils/
-    overlay_renderer.{h,cpp}        ← in-headset HUD (D2D/DirectWrite)
+    overlay_renderer.{h,cpp}        ← in-headset HUD (GPU shaders + glyph atlas)
     overlay_aggregator.{h,cpp}      ← per-frame metric accumulator
     histogram_ring.h                ← ring buffer for frametime samples
     gpu_telemetry.{h,cpp}           ← NvAPI / DXGI VRAM polling
@@ -150,24 +150,26 @@ build time only.
 ### What it does and why
 
 `test_overlay_snapshot.cpp` renders the in-headset HUD with hard-coded
-mock telemetry into an offscreen WIC bitmap via the exact same
-`CoreRenderer` the production renderers use, encodes the bitmap to
-PNG, and diffs the result pixel-for-pixel against the golden image
-checked in at `screenshots/overlay_snapshot.png`.
+mock telemetry into an offscreen D3D11 texture (WARP) via
+`renderOverlayToTextureD3D11` — the exact same GPU pipeline (chrome
+shapes + glyph atlas + instanced bars) the in-headset D3D11 path uses —
+reads the pixels back, encodes them to PNG, and diffs the result
+pixel-for-pixel against the golden image checked in at
+`screenshots/overlay_snapshot.png`.
 
 This catches things that ordinary unit tests can't: layout shifts of
 a few pixels, palette regressions, font substitution, mojibake (a
 literal `°` byte gets corrupted to `Â°` when MSVC reads a UTF-8
 source file as CP1252), accidental edits to gradients or stroke
-widths, off-by-one in any of the dozens of `DrawLine` /
-`FillGeometry` / `DrawText` calls inside the renderer. A passing CI
+widths, off-by-one in any of the glyph, grid, or bar instances the
+renderer emits. A passing CI
 run is a per-commit guarantee that the HUD still looks exactly the
 way the golden looks.
 
 The rendering is deterministic across CI runners because:
 
-- WIC's bitmap render target is a **software** D2D context (no GPU,
-  no driver differences).
+- The HUD is rendered on a **WARP** (software-rasteriser) D3D11
+  device — no physical GPU, no driver differences run-to-run.
 - The mock snapshot in `makeMockSnapshot()` is a hard-coded `OverlaySnapshot`
   struct — no clock reads, no system queries.
 - The bundled font collection (see
@@ -185,9 +187,9 @@ The rendering is deterministic across CI runners because:
    the EXE's resource table (custom type `RT_BUNDLED_FONT` == 256,
    declared in `bundled_fonts.rc.inc`).
 2. The PowerShell test step runs `openxr-api-layer-tests.exe`. The
-   snapshot test creates a WIC bitmap RT sized to the overlay texture,
-   calls `renderOverlayToTarget(...)`, encodes to `overlay_snapshot.png`
-   in the runner's CWD.
+   snapshot test creates a WARP D3D11 BGRA8 render target sized to the
+   overlay texture, calls `renderOverlayToTextureD3D11(...)`, reads the
+   pixels back, and encodes `overlay_snapshot.png` in the runner's CWD.
 3. The test then decodes both the golden (`screenshots/overlay_snapshot.png`,
    path resolved from `__FILE__` so it's CWD-independent) and the
    fresh PNG, and compares the BGRA byte buffers.
@@ -208,7 +210,7 @@ count of differing pixels and the `(x, y)` of the first one.
 | `openxr-api-layer/openxr-api-layer.rc.in` | Production-DLL counterpart — same TTFs, same IDs, same custom type |
 | `openxr-api-layer/fonts/*.ttf` | The bundled font files — declared in `bundled_fonts.rc.inc`, referenced from both `.rc` files |
 | `screenshots/overlay_snapshot.png` | The golden image diffed by the snapshot test |
-| `openxr-api-layer/utils/overlay_renderer.cpp` | `renderOverlayToTarget()` — the shared entry point used by both the in-headset path and the snapshot test |
+| `openxr-api-layer/utils/overlay_renderer.cpp` | `renderOverlayToTextureD3D11()` — the shared entry point used by both the in-headset path and the snapshot test |
 
 ### Adding a new resource (font, image, …) used by the renderer
 

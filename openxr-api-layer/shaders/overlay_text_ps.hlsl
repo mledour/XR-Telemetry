@@ -31,8 +31,8 @@
 // The atlas is grayscale (mean of CLEARTYPE_3x1 subpixels in the builder), so
 // a single .r sample gives the coverage. No gamma correction here: the overlay
 // target is BGRA8 and we treat it as linear — perceptually fine for HUD text
-// at the sizes we ship, and consistent with the existing D2D path which also
-// runs sRGB-as-linear on the shim target.
+// at the sizes we ship (the swapchain image is created BGRA8_UNORM, not
+// _SRGB, so the runtime samples our bytes without a gamma decode).
 // =============================================================================
 
 #include "overlay_text.hlsli"

@@ -64,9 +64,9 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // for both call sites at once.
     //
     // Failure semantics: init returns false on any D3D11 creation
-    // failure; the caller logs + leaves the renderer disabled and the
-    // D2D path keeps painting chrome shapes. The layer never crashes
-    // the host for a chrome-rendering miss.
+    // failure; the caller logs and disables the overlay entirely (fail-
+    // closed — there is no D2D fallback). The layer never crashes the
+    // host for a chrome-rendering miss.
     // ===================================================================
     class Renderer {
       public:
