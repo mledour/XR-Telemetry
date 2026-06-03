@@ -134,6 +134,20 @@ namespace {
             out << R"({"log":{"enabled":true}})";
         }
 
+        // Like enableLog, but flips overlay.enabled. Without at least one
+        // feature enabled the layer runs as a pure pass-through
+        // (m_bypassApiLayer — see xrCreateInstance), so xrEndFrame returns
+        // before the overlay block. The overlay-integration tests need a
+        // live xrEndFrame; the renderer itself is supplied via
+        // ForceOverlayActiveForTest, not built from a graphics binding.
+        void enableOverlay(const char* appName) {
+            const auto perAppPath = m_tempDir /
+                (openxr_api_layer::sanitizeForFilename(appName) + "_settings.json");
+            std::ofstream out(perAppPath);
+            REQUIRE(out.is_open());
+            out << R"({"overlay":{"enabled":true}})";
+        }
+
         // Common setup: wire the singleton to the mock runtime and call
         // xrCreateInstance. Resolves m_xrWaitFrame / m_xrBeginFrame /
         // m_xrEndFrame / m_xrDestroyInstance so the OpenXrApi virtual
@@ -802,6 +816,7 @@ TEST_CASE("template constexpr matches installer/default_settings.json (no schema
 // empty for the whole session on a binding without a GPU timer.
 TEST_CASE("overlay: no-GPU-timer frames still feed the renderer histogram") {
     TelemetryFixture fx;
+    fx.enableOverlay("OverlayBarsTest");   // else the layer bypasses xrEndFrame
     auto* api = fx.startLayer("OverlayBarsTest");
 
     auto mock = std::make_unique<MockOverlayRenderer>();
@@ -822,6 +837,7 @@ TEST_CASE("overlay: no-GPU-timer frames still feed the renderer histogram") {
 // list, on top of whatever the app submitted (here, zero layers).
 TEST_CASE("overlay: active renderer injects its quad into xrEndFrame") {
     TelemetryFixture fx;
+    fx.enableOverlay("OverlayInjectTest");
     auto* api = fx.startLayer("OverlayInjectTest");
 
     openxr_api_layer::ForceOverlayActiveForTest(
@@ -837,15 +853,19 @@ TEST_CASE("overlay: active renderer injects its quad into xrEndFrame") {
 // inject a layer — the app's submission passes through untouched.
 TEST_CASE("overlay: renderAndCompose returning null injects nothing") {
     TelemetryFixture fx;
+    fx.enableOverlay("OverlayNullTest");
     auto* api = fx.startLayer("OverlayNullTest");
 
     auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
     mock->returnLayer = false;
     openxr_api_layer::ForceOverlayActiveForTest(
         std::move(mock), reinterpret_cast<XrSpace>(0xBEEF));
 
     driveOneFrame(api);
 
+    // renderAndCompose ran (not a bypass) but returned null → no injection.
+    CHECK(mockPtr->renderAndComposeCalls >= 1);
     CHECK(mock::state().lastEndFrameLayerCount == 0);
     CHECK(mock::state().lastEndFrameQuadCount == 0);
 }
@@ -857,6 +877,7 @@ TEST_CASE("overlay: instance teardown releases the view space (no xrDestroySessi
     bool rendererDestroyed = false;
     {
         TelemetryFixture fx;
+        fx.enableOverlay("OverlayTeardownTest");
         auto* api = fx.startLayer("OverlayTeardownTest");
 
         auto mock = std::make_unique<MockOverlayRenderer>();
