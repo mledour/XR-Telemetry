@@ -633,8 +633,10 @@ TEST_CASE("OverlayAggregator: percentiles throttle to the configured interval") 
 }
 
 TEST_CASE("OverlayAggregator: default interval recomputes percentiles every publish") {
-    // 2-arg ctor → percentileIntervalNs defaults to 0 → no throttle, so a
-    // second publish 100 ms later reflects the (now slow) ring immediately.
+    // 1-arg ctor → qpcFrequency defaults to 1 GHz (so the ns timestamps below
+    // are taken at face value) and percentileIntervalNs defaults to 0 → no
+    // throttle, so a second publish 100 ms later reflects the (now slow) ring
+    // immediately.
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     for (int i = 0; i < 200; ++i) agg.pushFrame(fastFrame(int64_t(i) * 100'000LL));
     agg.pushFrame(fastFrame(100'000'000LL));

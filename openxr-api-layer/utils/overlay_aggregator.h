@@ -184,7 +184,9 @@ namespace openxr_api_layer::detail {
               // production caller hits that path (OpenXrLayer always
               // passes the cached QueryPerformanceFrequency).
               m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 10'000'000LL),
-              m_percentileIntervalNs(percentileIntervalNs > 0 ? percentileIntervalNs : 0) {}
+              // Stored as-given; the publish path treats any value <= 0 as
+              // "recompute every publish", so no normalisation is needed here.
+              m_percentileIntervalNs(percentileIntervalNs) {}
 
         // Push a single GpuTelemetrySample-equivalent reading. The
         // aggregator stores the latest valid temperature / VRAM

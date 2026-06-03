@@ -2235,22 +2235,12 @@ namespace openxr_api_layer::detail {
                 // {chrome rebuild | aggregator publish | GPU poll}. Gated on
                 // IsTraceEnabled(): a session with no ETW listener pays
                 // nothing (no QPC reads, no event).
-                const bool trace = IsTraceEnabled();
-                LARGE_INTEGER tChromeStart{};
-                if (trace) {
-                    QueryPerformanceCounter(&tChromeStart);
-                }
+                log::ScopedQpcSpan span;
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
-                if (trace) {
-                    LARGE_INTEGER tChromeEnd{}, qpcFreq{};
-                    QueryPerformanceCounter(&tChromeEnd);
-                    QueryPerformanceFrequency(&qpcFreq);
-                    const int64_t rebuildNs =
-                        qpcToNs(tChromeEnd.QuadPart - tChromeStart.QuadPart,
-                                qpcFreq.QuadPart);
+                if (span.enabled()) {
                     TraceLoggingWrite(g_traceProvider,
                                       "xr_telemetry_chrome_rebuild",
-                                      TLArg(rebuildNs, "duration_ns"),
+                                      TLArg(span.elapsedNs(), "duration_ns"),
                                       TLArg(snap.version, "snapshot_version"));
                 }
             }
