@@ -156,13 +156,13 @@ namespace mock {
             return XR_SUCCESS;
         }
 
-        // Helmet-overlay companion stubs. The integration tests never
-        // enable the overlay, so none of these is actually exercised
-        // end-to-end — they only need to resolve at layer init time.
-        // Returning XR_ERROR_FUNCTION_UNSUPPORTED when the overlay path
-        // does call them surfaces as a graceful degrade in the layer
-        // (isArmed() stays false) rather than a silent null-pointer
-        // call, matching how the layer treats hostile runtimes.
+        // Helmet-overlay companion stubs. The CSV-only integration tests
+        // don't build a real D3D overlay (no GPU in the headless runtime),
+        // but the overlay-integration tests inject a mock renderer via
+        // ForceOverlayActiveForTest and drive the quad injection + the
+        // teardown's xrDestroySpace through these stubs (which record what
+        // they receive — see State). The swapchain stubs only need to
+        // resolve at layer-init time for the non-overlay tests.
 
         XrResult XRAPI_CALL m_xrCreateReferenceSpace(XrSession /*session*/,
                                                     const XrReferenceSpaceCreateInfo* /*info*/,
@@ -172,7 +172,9 @@ namespace mock {
             return XR_SUCCESS;
         }
 
-        XrResult XRAPI_CALL m_xrDestroySpace(XrSpace /*space*/) {
+        XrResult XRAPI_CALL m_xrDestroySpace(XrSpace space) {
+            g_state.destroySpaceCallCount++;
+            g_state.lastDestroyedSpace = space;
             return XR_SUCCESS;
         }
 
@@ -249,7 +251,10 @@ namespace mock {
         XrResult XRAPI_CALL m_xrEndFrame(XrSession /*session*/, const XrFrameEndInfo* info) {
             g_state.endFrameCallCount++;
             g_state.lastEndFrameProjLayers.clear();
+            g_state.lastEndFrameLayerCount = 0;
+            g_state.lastEndFrameQuadCount = 0;
             if (!info) return XR_SUCCESS;
+            g_state.lastEndFrameLayerCount = info->layerCount;
             for (uint32_t i = 0; i < info->layerCount; ++i) {
                 const auto* base = info->layers[i];
                 if (!base) continue;
@@ -258,6 +263,8 @@ namespace mock {
                     State::RecordedProjLayer rec;
                     rec.views.assign(proj->views, proj->views + proj->viewCount);
                     g_state.lastEndFrameProjLayers.push_back(std::move(rec));
+                } else if (base->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    g_state.lastEndFrameQuadCount++;
                 }
             }
             return XR_SUCCESS;

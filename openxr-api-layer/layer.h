@@ -39,6 +39,8 @@
 // File Explorer properties.
 #include "version.h"
 
+#include <memory>
+
 namespace openxr_api_layer {
 
     const std::string LayerName = LAYER_NAME;
@@ -47,6 +49,19 @@ namespace openxr_api_layer {
     // Singleton accessor used by framework/dispatch.cpp to dispatch
     // intercepted calls to your OpenXrLayer subclass.
     OpenXrApi* GetInstance();
+
+    // Forward declaration for the test seam below; the full renderer
+    // interface lives in utils/overlay_renderer.h.
+    namespace detail { class OverlayRenderer; }
+
+    // Test-only seam: force the singleton's overlay into the active state
+    // with the given (typically mock) renderer + view-space handle, as if
+    // xrCreateSession had built a D3D-backed overlay. Lets the headless
+    // integration tests drive the xrEndFrame overlay fanout / layer-
+    // injection and the teardown paths, which otherwise need a real GPU
+    // device + an OpenXR swapchain. No effect in production (never called).
+    void ForceOverlayActiveForTest(
+        std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace);
 
     // The path where the DLL is loaded from (e.g. to find a data file
     // shipped next to the DLL in the install directory).

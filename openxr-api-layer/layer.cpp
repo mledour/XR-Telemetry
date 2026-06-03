@@ -1267,6 +1267,21 @@ namespace openxr_api_layer {
             QueryPerformanceFrequency(&freq);
             m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 10'000'000LL;
         }
+
+        // Test seam (see ForceOverlayActiveForTest in layer.h): drop the
+        // singleton straight into "overlay active" with a (mock) renderer +
+        // a view-space handle, as if xrCreateSession had built a D3D-backed
+        // overlay. Lets headless integration tests drive the xrEndFrame
+        // overlay fanout / layer-injection and the teardown paths without a
+        // real GPU device or OpenXR swapchain. Not used in production.
+        void forceOverlayActiveForTest(
+                std::unique_ptr<detail::OverlayRenderer> renderer,
+                XrSpace viewSpace) {
+            m_overlayRenderer = std::move(renderer);
+            m_viewSpace = viewSpace;
+            m_overlayActive = true;
+        }
+
         // SINGLETON LIFETIME — this destructor runs from
         // ResetInstance() (auto-generated xrDestroyInstance), so the
         // application's threads are still alive and the writer thread can
@@ -2399,6 +2414,15 @@ namespace openxr_api_layer {
             g_instance = std::make_unique<OpenXrLayer>();
         }
         return g_instance.get();
+    }
+
+    // Test seam — see layer.h. GetInstance() always returns the concrete
+    // OpenXrLayer singleton (creating it if needed), so the static_cast is
+    // safe.
+    void ForceOverlayActiveForTest(
+            std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace) {
+        static_cast<OpenXrLayer*>(GetInstance())
+            ->forceOverlayActiveForTest(std::move(renderer), viewSpace);
     }
 
     // dllHome / localAppData are defined in framework/entry.cpp for the
