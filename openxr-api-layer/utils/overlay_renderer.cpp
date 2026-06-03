@@ -77,6 +77,13 @@ namespace openxr_api_layer::detail {
     // even though it should be equivalent per the standard.
     using ::openxr_api_layer::log::Log;
     using ::openxr_api_layer::log::ErrorLog;
+    // Pull the ETW provider handle into this namespace so the unqualified
+    // TraceLoggingWrite / IsTraceEnabled() macros (both name g_traceProvider)
+    // resolve here — paintOverlay() emits the chrome-rebuild timing span
+    // through it. Explicit using-declaration, same style as the Log /
+    // ErrorLog lines above (a using-directive trips some MSVC builds; see the
+    // note above).
+    using ::openxr_api_layer::log::g_traceProvider;
 
     // Local aliases for the utils sub-namespaces. Without these,
     // unqualified `glyph_atlas::Renderer` / `chrome_shapes::Renderer`
@@ -2220,7 +2227,32 @@ namespace openxr_api_layer::detail {
             // is always cadence-gated to ~10 Hz, regardless of target.
             bool ok = true;
             if (needStatic) {
+                // Spike decomposition (perf/overlay-spike-instrumentation):
+                // the chrome rebuild is the cadence-gated heavy CPU tier
+                // (value string formatting + value-glyph layout). Time it as
+                // a discrete ETW span so the bench harness can split the
+                // ~10 Hz target_us spike into its three contributors —
+                // {chrome rebuild | aggregator publish | GPU poll}. Gated on
+                // IsTraceEnabled(): a session with no ETW listener pays
+                // nothing (no QPC reads, no event).
+                const bool trace = IsTraceEnabled();
+                LARGE_INTEGER tChromeStart{};
+                if (trace) {
+                    QueryPerformanceCounter(&tChromeStart);
+                }
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
+                if (trace) {
+                    LARGE_INTEGER tChromeEnd{}, qpcFreq{};
+                    QueryPerformanceCounter(&tChromeEnd);
+                    QueryPerformanceFrequency(&qpcFreq);
+                    const int64_t rebuildNs =
+                        qpcToNs(tChromeEnd.QuadPart - tChromeStart.QuadPart,
+                                qpcFreq.QuadPart);
+                    TraceLoggingWrite(g_traceProvider,
+                                      "xr_telemetry_chrome_rebuild",
+                                      TLArg(rebuildNs, "duration_ns"),
+                                      TLArg(snap.version, "snapshot_version"));
+                }
             }
 
             // Chrome FLUSH (ClearRTV + re-upload the cached chrome scratch):

@@ -2083,7 +2083,23 @@ namespace openxr_api_layer {
                     m_overlay.refreshIntervalNs(),
                     kGpuTelemetryMinPollIntervalNs);
                 if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
+                    // Spike decomposition (perf/overlay-spike-instrumentation):
+                    // the GPU telemetry poll (NvAPI / DXGI) runs at the
+                    // aggregator cadence (~10 Hz) on the frame thread, so it is
+                    // one of the three contributors to the periodic target_us
+                    // spike. Time just the poll() call as a discrete ETW span.
+                    // Gated on IsTraceEnabled() for zero non-tracing overhead.
+                    const bool trace = IsTraceEnabled();
+                    const int64_t tPollStart = trace ? QpcNow() : 0;
                     m_lastGpuTelemetry = m_gpuTelemetry->poll();
+                    if (trace) {
+                        const int64_t pollNs = detail::qpcToNs(
+                            QpcNow() - tPollStart, m_qpcFrequency);
+                        TraceLoggingWrite(g_traceProvider,
+                                          "xr_telemetry_gpu_poll",
+                                          TLArg(pollNs, "duration_ns"),
+                                          TLArg(frameIndex, "frame_index"));
+                    }
                     m_lastGpuTelemetryPollNs = nowNs;
                     // Forward to the aggregator so the next overlay refresh
                     // publishes the fresh reading. Pushed on every poll
@@ -2216,7 +2232,26 @@ namespace openxr_api_layer {
         void fanoutRecord(const FrameRecord& r) {
             if (m_recording)     m_csv.push(r);
             if (m_overlayActive) {
+                // Spike decomposition (perf/overlay-spike-instrumentation):
+                // pushFrame() is cheap accumulation on most frames, but every
+                // ~10 Hz it triggers publishAndReset() — which sorts the
+                // ~4320-sample percentile ring. Detect that publish via the
+                // snapshot version bump and time only those frames, as a
+                // discrete ETW span. Gated on IsTraceEnabled() for zero
+                // non-tracing overhead.
+                const bool trace = IsTraceEnabled();
+                const uint64_t verBefore =
+                    trace ? m_overlay.snapshot().version : 0;
+                const int64_t tPubStart = trace ? QpcNow() : 0;
                 m_overlay.pushFrame(r);
+                if (trace && m_overlay.snapshot().version != verBefore) {
+                    const int64_t publishNs = detail::qpcToNs(
+                        QpcNow() - tPubStart, m_qpcFrequency);
+                    TraceLoggingWrite(g_traceProvider,
+                                      "xr_telemetry_publish",
+                                      TLArg(publishNs, "duration_ns"),
+                                      TLArg(r.frame_index, "frame_index"));
+                }
                 if (m_overlayRenderer) {
                     // The CPU histogram strip displays per-cycle CPU
                     // work (frame_total − wait_block), matching the
