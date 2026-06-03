@@ -79,6 +79,18 @@ namespace mock {
         uint32_t waitFrameCallCount = 0;
         uint32_t beginFrameCallCount = 0;
 
+        // Overlay-injection recording: the layer appends its head-locked
+        // XrCompositionLayerQuad after the app's layers when the overlay is
+        // active. These capture the augmented submission so a test can assert
+        // the quad was injected (and that exactly one was).
+        uint32_t lastEndFrameLayerCount = 0;   // info->layerCount as submitted
+        uint32_t lastEndFrameQuadCount  = 0;   // # XR_TYPE_COMPOSITION_LAYER_QUAD
+
+        // xrDestroySpace recording — lets the overlay-teardown test confirm
+        // the head-locked view space is released on instance shutdown.
+        uint32_t destroySpaceCallCount = 0;
+        XrSpace  lastDestroyedSpace = XR_NULL_HANDLE;
+
         // ---- Fake handle plumbing -------------------------------------------
 
         // The layer never dereferences handles — they're opaque pointers to
