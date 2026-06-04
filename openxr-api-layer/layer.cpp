@@ -1513,7 +1513,14 @@ namespace openxr_api_layer {
             // configured refresh cadence converted to nanoseconds.
             const int64_t overlayIntervalNs =
                 1'000'000'000LL / std::max(1, m_settings.overlay.refresh_hz);
-            m_overlay = detail::OverlayAggregator(overlayIntervalNs, m_qpcFrequency);
+            // 3rd arg: recompute the P95/P99/P99.9 percentiles at most once
+            // per kPercentileRefreshIntervalNs (~1 Hz) rather than on every
+            // publish. The percentile window is 30-48 s, and the ring sort was
+            // the dominant per-publish cost (~150 µs, per the
+            // xr_telemetry_publish ETW span). The rest of the snapshot still
+            // refreshes at overlayIntervalNs.
+            m_overlay = detail::OverlayAggregator(overlayIntervalNs, m_qpcFrequency,
+                                                  kPercentileRefreshIntervalNs);
 
             if (m_settings.overlay.enabled) {
                 if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
@@ -2067,23 +2074,32 @@ namespace openxr_api_layer {
             // CSV a stable, per-frame column and the overlay
             // aggregator a fresh value for its publish.
             //
-            // The poll interval tracks the aggregator's refresh
-            // window (which itself follows settings.overlay.refresh_hz
-            // ∈ [1, 60]) so a user that bumps refresh_hz to 20 also
-            // gets twice-as-frequent thermal samples — same coherent
-            // visual rate. It's clamped at kGpuTelemetryMinPollIntervalNs
-            // (= 100 ms, i.e. 10 Hz) on the FAST end because NvAPI's
-            // underlying driver counters refresh at ~1 Hz; polling
-            // faster wastes CPU on identical values. No upper clamp:
-            // if the user picks refresh_hz=1, we still poll at 1 Hz —
-            // matches their explicit "I want slow" choice.
+            // The poll fires at max(aggregator refresh,
+            // kGpuTelemetryMinPollIntervalNs). That floor is 1 s — matching
+            // the ~1 Hz rate at which the driver itself updates these counters
+            // (see the constant for the full rationale) — so in practice the
+            // poll lands at ~1 Hz for every overlay refresh_hz: polling faster
+            // only re-reads identical values.
             if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
                 const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
                 const int64_t pollInterval = std::max(
                     m_overlay.refreshIntervalNs(),
                     kGpuTelemetryMinPollIntervalNs);
                 if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
+                    // Spike decomposition (perf/overlay-spike-instrumentation):
+                    // poll() runs on the frame thread at the GPU-telemetry
+                    // cadence — now ~1 Hz (see kGpuTelemetryMinPollIntervalNs)
+                    // — so it surfaces as one of the periodic target_us
+                    // contributors. ScopedQpcSpan times just the poll() call
+                    // and is a no-op unless a trace session is listening.
+                    log::ScopedQpcSpan span;
                     m_lastGpuTelemetry = m_gpuTelemetry->poll();
+                    if (span.enabled()) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "xr_telemetry_gpu_poll",
+                                          TLArg(span.elapsedNs(), "duration_ns"),
+                                          TLArg(frameIndex, "frame_index"));
+                    }
                     m_lastGpuTelemetryPollNs = nowNs;
                     // Forward to the aggregator so the next overlay refresh
                     // publishes the fresh reading. Pushed on every poll
@@ -2216,7 +2232,31 @@ namespace openxr_api_layer {
         void fanoutRecord(const FrameRecord& r) {
             if (m_recording)     m_csv.push(r);
             if (m_overlayActive) {
+                // Spike decomposition (perf/overlay-spike-instrumentation):
+                // pushFrame() is cheap accumulation on most frames, but every
+                // ~10 Hz it triggers publishAndReset() — which sorts the
+                // ~4320-sample percentile ring. Detect that publish via the
+                // snapshot version bump and time only those frames, as a
+                // discrete ETW span. Gated on IsTraceEnabled() for zero
+                // non-tracing overhead.
+                log::ScopedQpcSpan span;
+                const uint64_t verBefore =
+                    span.enabled() ? m_overlay.snapshot().version : 0;
                 m_overlay.pushFrame(r);
+                const int64_t publishNs = span.enabled() ? span.elapsedNs() : 0;
+                const uint64_t verAfter = m_overlay.snapshot().version;
+                if (span.enabled() && verAfter != verBefore) {
+                    // Log BOTH keys so the three spike spans join on one
+                    // timeline: frame_index links to xr_telemetry_gpu_poll, and
+                    // snapshot_version (the version THIS publish produced) links
+                    // to xr_telemetry_chrome_rebuild, which has only the version
+                    // to key on.
+                    TraceLoggingWrite(g_traceProvider,
+                                      "xr_telemetry_publish",
+                                      TLArg(publishNs, "duration_ns"),
+                                      TLArg(r.frame_index, "frame_index"),
+                                      TLArg(verAfter, "snapshot_version"));
+                }
                 if (m_overlayRenderer) {
                     // The CPU histogram strip displays per-cycle CPU
                     // work (frame_total − wait_block), matching the
@@ -2376,18 +2416,28 @@ namespace openxr_api_layer {
         std::unique_ptr<detail::GpuTelemetryReader> m_gpuTelemetry;
         detail::GpuTelemetrySample m_lastGpuTelemetry{};
         int64_t m_lastGpuTelemetryPollNs = 0;
-        // 100 ms — the minimum interval between GPU telemetry polls.
-        // Caps the per-second NvAPI/DXGI call rate at 10 (vs. 90-144
-        // if we polled every frame on a typical HMD). NvAPI's
-        // thermal counters refresh at ~1 Hz on the driver side, so
-        // polling faster than 10 Hz adds no signal and just burns
-        // ~2-3 ms/s of frame-thread CPU. The effective interval is
-        // max(this, m_overlay.refreshIntervalNs()) — so a user that
-        // explicitly lowered overlay refresh_hz to 1 (or 5, etc.)
-        // gets matching telemetry pacing, while the FAST-end cap
-        // protects us from accidental hammering if a future setting
-        // ever exposes a higher refresh rate.
-        static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 100'000'000LL;
+        // 1 s — the minimum interval between GPU telemetry polls. NvAPI/DXGI
+        // thermal + VRAM counters refresh at ~1 Hz on the driver side, so
+        // polling faster returns identical values and just burns frame-thread
+        // CPU. The xr_telemetry_gpu_poll ETW span measured poll() at ~37 µs
+        // (mean) / ~114 µs (max) on the frame thread; at the old 100 ms (10 Hz)
+        // floor that landed on ~1 frame in 9 and was a top-3 contributor to
+        // the periodic target_us spike. Matching the floor to the ~1 Hz driver
+        // cadence keeps the cached temp/VRAM just as fresh while taking the
+        // poll off all but ~1 frame per second. The effective interval stays
+        // max(this, m_overlay.refreshIntervalNs()); since refresh_hz is capped
+        // at 60 (>= 16.6 ms) this 1 s floor now dominates for every refresh
+        // rate, which is intended.
+        static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 1'000'000'000LL;
+
+        // Minimum spacing between overlay percentile (P95/P99/P99.9) re-sorts,
+        // passed to OverlayAggregator. ~1 Hz like the poll floor above, but for
+        // an UNRELATED reason — the percentiles describe a 30-48 s window, so
+        // re-sorting faster adds no signal. Kept a SEPARATE constant from
+        // kGpuTelemetryMinPollIntervalNs on purpose: they coincide at 1 s today
+        // but track different facts (a slow-moving statistic vs. the driver
+        // counter cadence), so they must be free to move independently.
+        static constexpr int64_t kPercentileRefreshIntervalNs = 1'000'000'000LL;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.

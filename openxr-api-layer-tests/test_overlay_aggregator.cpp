@@ -588,6 +588,67 @@ TEST_CASE("OverlayAggregator: percentile window caps at 4320 samples") {
 }
 
 // =============================================================================
+// Percentile recompute throttle — the 3rd ctor arg (percentileIntervalNs)
+// caps how often the P95/P99/P99.9 ring is re-sorted. The sort dominated
+// publishAndReset's frame-thread cost (~150 µs for a full ring), so production
+// passes ~1 s; the percentile window is 30-48 s, so a slower refresh loses no
+// signal. Between recomputes the snapshot latches the previous values. The
+// default interval (0) keeps the historical "recompute every publish".
+// =============================================================================
+
+namespace {
+    // 90 fps frame at timestamp `ts` (ns); only frame_total feeds percentiles.
+    FrameRecord fastFrame(int64_t ts) {
+        return makeRecord(ts, 4'000'000, 5'000'000, 11'111'111, 11'111'111, 64, 55);
+    }
+    // 45 fps frame — skews the ring slow so a recompute is observable.
+    FrameRecord slowFrame(int64_t ts) {
+        return makeRecord(ts, 4'000'000, 5'000'000, 22'222'222, 22'222'222, 64, 55);
+    }
+}
+
+TEST_CASE("OverlayAggregator: percentiles throttle to the configured interval") {
+    // refresh 100 ms; percentile recompute floor 1 s.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL,
+                          /*qpcFrequency=*/1'000'000'000LL,
+                          /*percentileIntervalNs=*/1'000'000'000LL);
+
+    // 200 fast frames inside the first window, then publish at t=100 ms. The
+    // first publish always primes the percentiles regardless of the interval.
+    for (int i = 0; i < 200; ++i) agg.pushFrame(fastFrame(int64_t(i) * 100'000LL));
+    agg.pushFrame(fastFrame(100'000'000LL));
+    const float primed = agg.snapshot().fps_p95;
+    CHECK(primed == doctest::Approx(90.0f).epsilon(0.01));
+
+    // Skew the ring slow, then publish at t=200 ms — only 100 ms since the
+    // prime (< 1 s), so the percentiles MUST stay frozen at the primed value.
+    for (int i = 0; i < 400; ++i) agg.pushFrame(slowFrame(100'000'001LL + i));
+    agg.pushFrame(slowFrame(200'000'000LL));
+    CHECK(agg.snapshot().fps_p95 == doctest::Approx(primed).epsilon(1e-4));
+
+    // Publish at t=1200 ms — >= 1 s since the prime → recompute; the slow
+    // frames now dominate the ring and pull P95 down toward 45 fps.
+    agg.pushFrame(slowFrame(1'200'000'000LL));
+    CHECK(agg.snapshot().fps_p95 < primed - 1.0f);
+}
+
+TEST_CASE("OverlayAggregator: default interval recomputes percentiles every publish") {
+    // 1-arg ctor → qpcFrequency defaults to 1 GHz (so the ns timestamps below
+    // are taken at face value) and percentileIntervalNs defaults to 0 → no
+    // throttle, so a second publish 100 ms later reflects the (now slow) ring
+    // immediately.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    for (int i = 0; i < 200; ++i) agg.pushFrame(fastFrame(int64_t(i) * 100'000LL));
+    agg.pushFrame(fastFrame(100'000'000LL));
+    const float primed = agg.snapshot().fps_p95;
+    CHECK(primed == doctest::Approx(90.0f).epsilon(0.01));
+
+    for (int i = 0; i < 400; ++i) agg.pushFrame(slowFrame(100'000'001LL + i));
+    agg.pushFrame(slowFrame(200'000'000LL));
+    CHECK(agg.snapshot().fps_p95 < primed - 1.0f);   // updated, not frozen
+}
+
+// =============================================================================
 // GPU telemetry — pushGpuTelemetry latches the latest reading and the next
 // publish copies it into the snapshot. NaN / 0 sentinels propagate through
 // unchanged so the renderer can treat "no source available" specially.

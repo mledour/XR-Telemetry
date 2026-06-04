@@ -153,8 +153,21 @@ namespace openxr_api_layer::detail {
         //                    below catches that case and substitutes
         //                    10 MHz (matching OpenXrLayer's broken-HAL
         //                    fallback, see comment near the clamp).
+        // percentileIntervalNs: minimum spacing between P95/P99/P99.9
+        //                    re-sorts. 0 (the default) means "recompute on
+        //                    every publish" — the historical behaviour, kept
+        //                    as the default so the unit tests stay
+        //                    deterministic without threading a clock through
+        //                    them. Production passes ~1 s (see OpenXrLayer):
+        //                    the percentile window is 30-48 s, so re-sorting
+        //                    10×/s only churned CPU. The sort was the
+        //                    dominant cost of publishAndReset (~150 µs for a
+        //                    full 4320-entry ring, measured via the
+        //                    xr_telemetry_publish ETW span); throttling it to
+        //                    ~1 Hz removes it from 9 of every 10 publishes.
         explicit OverlayAggregator(int64_t refreshIntervalNs = 100'000'000LL,
-                                   int64_t qpcFrequency = 1'000'000'000LL) noexcept
+                                   int64_t qpcFrequency = 1'000'000'000LL,
+                                   int64_t percentileIntervalNs = 0) noexcept
             : m_intervalNs(refreshIntervalNs > 0 ? refreshIntervalNs : 1),
               // Clamp anything < 1 kHz to the 10 MHz fallback. Real
               // Windows QPC is always at least 1 MHz, usually exactly
@@ -170,7 +183,10 @@ namespace openxr_api_layer::detail {
               // the "1 tick = 1 ns" identity test convention, and no
               // production caller hits that path (OpenXrLayer always
               // passes the cached QueryPerformanceFrequency).
-              m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 10'000'000LL) {}
+              m_qpcFrequency(qpcFrequency >= 1000 ? qpcFrequency : 10'000'000LL),
+              // Stored as-given; the publish path treats any value <= 0 as
+              // "recompute every publish", so no normalisation is needed here.
+              m_percentileIntervalNs(percentileIntervalNs) {}
 
         // Push a single GpuTelemetrySample-equivalent reading. The
         // aggregator stores the latest valid temperature / VRAM
@@ -288,68 +304,84 @@ namespace openxr_api_layer::detail {
             const float avgPeriod = static_cast<float>(m_sumPeriodNs) / countF;
             m_snapshot.target_fps = avgPeriod > 0.0f ? 1.0e9f / avgPeriod : 0.0f;
 
-            // Percentiles — sort a copy of the (up to 720) ring entries
-            // and pick at index ceil(p * (N-1)). std::nth_element would
-            // be O(N) vs sort's O(N log N), but we need both 95% AND
-            // 99% so we'd nth_element twice anyway, and 720 ints sort
-            // in well under 100 µs even debug-build (verified via the
-            // local timing harness). Done once per publish (~10 Hz),
-            // so the cost amortises trivially.
-            if (m_percentileCount > 0) {
-                // Copy into the pre-allocated scratch member and sort
-                // in place — avoids the per-publish std::vector
-                // allocation that would otherwise burn ~340 KB/s of
-                // allocator churn (kPercentileWindowSize × sizeof(int64_t)
-                // × 10 Hz) inside the host process.
+            // Percentiles (P95 / P99 / P99.9). Two cost controls here, both
+            // motivated by the xr_telemetry_publish ETW span showing the old
+            // std::sort of the full 4320-entry ring at ~150 µs — the single
+            // dominant term in publishAndReset's frame-thread cost:
+            //
+            //   1) std::nth_element instead of std::sort. We need only three
+            //      order statistics, not a total order. Selection is O(n) per
+            //      pick vs sort's O(n log n); nesting the three picks from the
+            //      highest index down keeps each successive selection inside
+            //      the previous left partition, so the total stays well under
+            //      one full sort.
+            //   2) Recompute at most every m_percentileIntervalNs. The
+            //      percentiles describe a 30-48 s window, so refreshing them
+            //      faster than ~1 Hz adds churn with no perceptible signal.
+            //      Between recomputes the snapshot carries the previous values
+            //      (same latch idea as the GPU telemetry below). With the
+            //      default interval of 0 this gates to "every publish", which
+            //      is what the unit tests assume.
+            //
+            // m_percentilesPrimed forces the very first computation
+            // immediately so the HUD isn't blank for up to one interval at
+            // session start.
+            const bool refreshPercentiles =
+                m_percentileCount > 0 &&
+                (m_percentileIntervalNs <= 0 || !m_percentilesPrimed ||
+                 nowNs - m_lastPercentileNs >= m_percentileIntervalNs);
+            if (refreshPercentiles) {
+                // Copy the live ring into the pre-allocated scratch (no
+                // per-publish heap allocation). Done only when we actually
+                // recompute, so the ~34 KB copy is also skipped on the
+                // throttled publishes.
                 std::copy(m_percentileRing.begin(),
                           m_percentileRing.begin() + m_percentileCount,
                           m_percentileSortScratch.begin());
-                const auto sortedBegin = m_percentileSortScratch.begin();
-                const auto sortedEnd   = sortedBegin + m_percentileCount;
-                std::sort(sortedBegin, sortedEnd);
-                // The valid range is [sortedBegin, sortedBegin +
-                // m_percentileCount). The rest of the 4320-element
-                // scratch array is stale data from previous publishes,
-                // so the percentile lookup must use m_percentileCount
-                // as the bound, NOT m_percentileSortScratch.size().
-                // P95 of FPS in the fpsVR convention reads as:
-                // "95 % of frames hit AT LEAST this FPS — the slowest
-                //  5 % drop below". We sort frametimes ASCENDING, so
-                // the slow 5 % are at the high-index end. The boundary
-                // value sits at `floor(p * N)` in zero-indexed terms:
-                //
-                //   N=100, p=0.95 → idx 95  (5 frames at idx 95..99)
-                //   N=720, p=0.95 → idx 684 (36 frames at idx 684..719)
-                //   N=720, p=0.99 → idx 712 (8 frames at idx 712..719)
-                //
-                // Critically, we use INTEGER arithmetic via permille
-                // (per-thousand) rather than `floor(p * N)` with a
-                // float p — `0.95 * 100` in IEEE-754 double evaluates
-                // to 94.99999... (because 0.95 has no exact binary
-                // representation), and floor() returns 94 instead of
-                // the intended 95. The boundary off-by-one drops P95
-                // into the fast tail, which is the OPPOSITE of what
-                // the user expects. Integer arithmetic
-                // (permille × N / 1000) keeps the index exact at
-                // every clean percentile value.
-                auto frametimeAtPermille = [&](int permille) -> int64_t {
-                    const std::size_t n = m_percentileCount;
-                    if (n == 0) return 0;
+                const auto begin = m_percentileSortScratch.begin();
+                const std::size_t n = m_percentileCount;
+
+                // INTEGER permille (per-thousand) indexing, NOT floor(p*N)
+                // with a float p — `0.95 * 100` is 94.99999… in IEEE-754 and
+                // floor() yields 94, dropping P95 into the fast tail, the
+                // OPPOSITE of intent. Frametimes are ascending, so the slow
+                // tail sits at the high indices and "P95 FPS" is the FPS at
+                // the frametime 95 % of frames stay at-or-below. The valid
+                // range is [begin, begin+n); the rest of the 4320-entry
+                // scratch is stale, so every index is bounded by n.
+                auto idxOf = [n](int permille) -> std::size_t {
                     std::size_t idx = (static_cast<std::size_t>(permille) * n) / 1000;
-                    if (idx >= n) idx = n - 1;
-                    return m_percentileSortScratch[idx];
+                    return idx >= n ? n - 1 : idx;
                 };
-                const int64_t ft_p95   = frametimeAtPermille(950);
-                const int64_t ft_p99   = frametimeAtPermille(990);
-                const int64_t ft_p99_9 = frametimeAtPermille(999);
+                const std::size_t i95  = idxOf(950);
+                const std::size_t i99  = idxOf(990);
+                const std::size_t i999 = idxOf(999);
+
+                // i95 <= i99 <= i999 always. After nth_element positions
+                // i999 over [begin, begin+n), the i999 smallest elements
+                // occupy [begin, begin+i999) (in arbitrary order) and the
+                // global i99-th statistic is among them — so confine the next
+                // selection to that subrange, and i95 within [begin,
+                // begin+i99). The guards keep `nth` strictly < `last` when
+                // indices coincide at small n (nth must be dereferenceable);
+                // a coinciding index is already correctly placed by the prior
+                // wider selection.
+                std::nth_element(begin, begin + i999, begin + n);
+                if (i99 < i999) std::nth_element(begin, begin + i99, begin + i999);
+                if (i95 < i99)  std::nth_element(begin, begin + i95, begin + i99);
+
+                const int64_t ft_p95   = m_percentileSortScratch[i95];
+                const int64_t ft_p99   = m_percentileSortScratch[i99];
+                const int64_t ft_p99_9 = m_percentileSortScratch[i999];
                 m_snapshot.fps_p95   = ft_p95   > 0 ? 1.0e9f / static_cast<float>(ft_p95)   : 0.0f;
                 m_snapshot.fps_p99   = ft_p99   > 0 ? 1.0e9f / static_cast<float>(ft_p99)   : 0.0f;
                 m_snapshot.fps_p99_9 = ft_p99_9 > 0 ? 1.0e9f / static_cast<float>(ft_p99_9) : 0.0f;
-            } else {
-                m_snapshot.fps_p95   = 0.0f;
-                m_snapshot.fps_p99   = 0.0f;
-                m_snapshot.fps_p99_9 = 0.0f;
+
+                m_lastPercentileNs  = nowNs;
+                m_percentilesPrimed = true;
             }
+            // else: leave m_snapshot.fps_p95 / p99 / p99_9 at the last
+            // computed values (0 until the first prime).
 
             // utilisation = 100 - headroom. Clamp to [0, 100] so a single
             // CPU-bound frame's negative headroom doesn't spike the
@@ -394,6 +426,13 @@ namespace openxr_api_layer::detail {
         int64_t m_qpcFrequency;
         int64_t m_lastRefreshNs = 0;
         bool    m_armed = false;
+        // Percentile re-sort throttle (see the constructor doc). The interval
+        // is set from the ctor arg; m_lastPercentileNs is the QPC-ns time of
+        // the last P95/P99/P99.9 recompute, and m_percentilesPrimed makes the
+        // first publish with samples compute immediately.
+        int64_t m_percentileIntervalNs = 0;
+        int64_t m_lastPercentileNs = 0;
+        bool    m_percentilesPrimed = false;
         int64_t m_sumCpuNs = 0;     // per-cycle (frame_total - wait_block) — Render ms
         int64_t m_sumAppCpuNs = 0;  // wait→end window (rec.app_cpu_ns) — App ms
         int64_t m_sumGpuNs = 0;
