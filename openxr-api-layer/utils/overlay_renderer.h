@@ -46,6 +46,7 @@
 
 #include "histogram_ring.h"
 #include "overlay_aggregator.h"
+#include "overlay_layout.h"
 
 #include <memory>
 #include <string>
@@ -55,6 +56,23 @@ namespace openxr_api_layer {
 }
 
 namespace openxr_api_layer::detail {
+
+    // Field-for-field bridges between the OpenXR XrPosef and the OpenXR-free
+    // OverlayPose used by the pure pose math in overlay_layout.h. Kept here
+    // (an OpenXR-aware header) rather than in overlay_layout.h so that header
+    // stays buildable without the OpenXR SDK for the unit tests. Used by the
+    // layer's world-anchor freeze path and by the tests.
+    inline OverlayPose toOverlayPose(const XrPosef& p) noexcept {
+        return {{p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w},
+                {p.position.x, p.position.y, p.position.z}};
+    }
+    inline XrPosef toXrPosef(const OverlayPose& p) noexcept {
+        XrPosef out;
+        out.orientation = {p.orientation.x, p.orientation.y, p.orientation.z,
+                           p.orientation.w};
+        out.position = {p.position.x, p.position.y, p.position.z};
+        return out;
+    }
 
     // Abstract renderer interface. Holds the lifecycle the layer drives:
     //   1. ctor: bakes the glyph atlas (DirectWrite), creates the GPU

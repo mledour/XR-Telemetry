@@ -88,6 +88,26 @@ namespace openxr_api_layer::detail {
 
     namespace {
 
+        // Write the per-frame space + pose + size into the quad layer.
+        // Shared verbatim by the D3D11 and D3D12 renderAndCompose paths so
+        // the anchor contract can't drift between the two backends:
+        //   - anchorPose == null → head-locked: keep the identity orientation
+        //     filled once in init(), use the geometry offset as the position.
+        //   - anchorPose != null → world-locked: take the caller's frozen
+        //     world pose verbatim (orientation included).
+        // The quad SIZE always comes from the geometry in both modes.
+        inline void applyQuadPose(XrCompositionLayerQuad& quad, XrSpace space,
+                                  const XrPosef* anchorPose,
+                                  const OverlayGeometry& geo) noexcept {
+            quad.space = space;
+            if (anchorPose) {
+                quad.pose = *anchorPose;
+            } else {
+                quad.pose.position = {geo.pos_x, geo.pos_y, geo.pos_z};
+            }
+            quad.size = {geo.width_m, geo.height_m};
+        }
+
         // -------- Layout constants (fpsVR redesign) -------------------------
         //
         // Texture stays at this fixed size regardless of `scale` — the
@@ -2456,18 +2476,7 @@ namespace openxr_api_layer::detail {
                     m_geoScale    = scale;
                     m_geoValid    = true;
                 }
-                m_quadLayer.space = space;
-                if (anchorPose) {
-                    // World-locked: the caller froze a full world pose at
-                    // activation (head pose ∘ position offset). Take it
-                    // verbatim — the geometry above only supplies the size.
-                    m_quadLayer.pose = *anchorPose;
-                } else {
-                    // Head-locked: identity orientation (filled once in
-                    // init) + the settings position offset in view space.
-                    m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
-                }
-                m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
+                applyQuadPose(m_quadLayer, space, anchorPose, m_geo);
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
@@ -2927,18 +2936,7 @@ namespace openxr_api_layer::detail {
                     m_geoScale    = scale;
                     m_geoValid    = true;
                 }
-                m_quadLayer.space = space;
-                if (anchorPose) {
-                    // World-locked: the caller froze a full world pose at
-                    // activation (head pose ∘ position offset). Take it
-                    // verbatim — the geometry above only supplies the size.
-                    m_quadLayer.pose = *anchorPose;
-                } else {
-                    // Head-locked: identity orientation (filled once in
-                    // init) + the settings position offset in view space.
-                    m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
-                }
-                m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
+                applyQuadPose(m_quadLayer, space, anchorPose, m_geo);
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }

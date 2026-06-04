@@ -1281,14 +1281,12 @@ namespace openxr_api_layer {
             m_overlayRenderer = std::move(renderer);
             m_viewSpace = viewSpace;
             m_overlayActive = true;
-            // World-locked path: a non-null LOCAL space + the World anchor
-            // mode make xrEndFrame locate + freeze the quad. Leave the
-            // settings alone otherwise so head-locked tests are unchanged.
-            if (localSpace != XR_NULL_HANDLE) {
-                m_localSpace = localSpace;
-                m_settings.overlay.anchor = detail::OverlayAnchor::World;
-                m_needsReanchor = true;
-            }
+            // A non-null LOCAL space is exactly what production uses to mean
+            // "world mode" (xrCreateSession only creates one when anchor==
+            // World), so the seam just sets it — no settings mutation. NULL
+            // leaves the layer head-locked, unchanged.
+            m_localSpace = localSpace;
+            requestReanchor();
         }
 
         // SINGLETON LIFETIME — this destructor runs from
@@ -1720,13 +1718,18 @@ namespace openxr_api_layer {
                     localSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
                     if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
                             *session, &localSpaceInfo, &m_localSpace))) {
+                        // Fall back to head-locked: m_localSpace stays NULL,
+                        // which is exactly what the xrEndFrame draw path
+                        // treats as "head mode" — so the leftover anchor==World
+                        // setting and any pending reanchor request are inert,
+                        // never consulted without a non-null m_localSpace.
                         Log("xr_telemetry: overlay anchor=world unavailable — "
                             "xrCreateReferenceSpace(LOCAL) failed; falling back to "
                             "head-locked for this session\n");
                         m_localSpace = XR_NULL_HANDLE;
                     }
                     // Force a fresh anchor on the first frame of this session.
-                    m_needsReanchor = true;
+                    requestReanchor();
                 }
             }
             return result;
@@ -1924,9 +1927,10 @@ namespace openxr_api_layer {
                     // Rising edge → re-centre a world-locked panel in front
                     // of the user. This is the (intentional) re-center
                     // gesture: toggle the HUD off then on to reposition it.
-                    // No-op for head-locked (m_localSpace stays NULL).
+                    // No-op for head-locked (the draw path ignores the
+                    // request when m_localSpace is NULL).
                     if (m_overlayActive) {
-                        m_needsReanchor = true;
+                        requestReanchor();
                     }
                     Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
                                      m_overlayActive ? "ENABLED" : "DISABLED"));
@@ -1978,63 +1982,52 @@ namespace openxr_api_layer {
             if (m_overlayRenderer && m_overlayActive &&
                 m_viewSpace != XR_NULL_HANDLE) {
                 // Resolve the quad's reference frame for this frame.
-                //   Head-locked (default, or world fell back because LOCAL
-                //   creation failed) → VIEW space, no frozen pose.
-                //   World-locked → LOCAL space + a pose frozen from the
-                //   head pose at activation (m_anchorPose).
+                //   Head-locked → VIEW space, no frozen pose. This is the
+                //     default, and also where world mode lands once it has
+                //     given up waiting for a tracked pose.
+                //   World-locked (m_localSpace != NULL — see the member doc;
+                //     it implies anchor==World by construction) → LOCAL space
+                //     + the pose frozen at activation (m_anchorPose).
                 XrSpace overlaySpace = m_viewSpace;
                 const XrPosef* anchorPose = nullptr;
-                bool readyToDraw = true;
+                bool skipDrawThisFrame = false;
 
-                if (m_settings.overlay.anchor == detail::OverlayAnchor::World &&
-                    m_localSpace != XR_NULL_HANDLE && frameEndInfo) {
+                if (m_localSpace != XR_NULL_HANDLE && !m_worldAnchorGaveUp &&
+                    frameEndInfo) {
                     if (m_needsReanchor) {
-                        // Freeze the panel where the user is looking right
-                        // now. xrLocateSpace(VIEW in LOCAL) gives the head
-                        // pose; compose it with the corner offset so the
-                        // panel lands in the same spot it would head-locked,
-                        // then stays put. If the pose isn't fully tracked
-                        // (just-resumed, lost tracking) we keep the flag set
-                        // and skip drawing — never freeze to a bad pose.
-                        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-                        constexpr XrSpaceLocationFlags kValid =
-                            XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-                        if (XR_SUCCEEDED(OpenXrApi::xrLocateSpace(
-                                m_viewSpace, m_localSpace,
-                                frameEndInfo->displayTime, &loc)) &&
-                            (loc.locationFlags & kValid) == kValid) {
-                            const detail::OverlayGeometry geo =
-                                detail::geometryForPosition(
-                                    m_settings.overlay.position,
-                                    m_settings.overlay.scale);
-                            const detail::OverlayPose head{
-                                {loc.pose.orientation.x, loc.pose.orientation.y,
-                                 loc.pose.orientation.z, loc.pose.orientation.w},
-                                {loc.pose.position.x, loc.pose.position.y,
-                                 loc.pose.position.z}};
-                            const detail::OverlayPose anchored =
-                                detail::composeAnchorPose(
-                                    head, {geo.pos_x, geo.pos_y, geo.pos_z});
-                            m_anchorPose.orientation = {
-                                anchored.orientation.x, anchored.orientation.y,
-                                anchored.orientation.z, anchored.orientation.w};
-                            m_anchorPose.position = {anchored.position.x,
-                                                     anchored.position.y,
-                                                     anchored.position.z};
+                        const XrTime now = frameEndInfo->displayTime;
+                        if (m_reanchorStartTime == 0) {
+                            m_reanchorStartTime = now;
+                        }
+                        XrPosef frozen;
+                        if (tryFreezeWorldAnchor(now, frozen)) {
+                            m_anchorPose = frozen;
                             m_needsReanchor = false;
+                        } else if (now - m_reanchorStartTime >= kReanchorTimeoutNs) {
+                            // Waited past the budget without a tracked head
+                            // pose (e.g. a 3DoF/seated runtime that never
+                            // reports VIEW-in-LOCAL as tracked). Degrade to
+                            // head-locked for the rest of the session so the
+                            // HUD appears rather than silently never drawing.
+                            // Logged once via the latch.
+                            m_worldAnchorGaveUp = true;
+                            Log("xr_telemetry: overlay anchor=world could not "
+                                "acquire a tracked head pose within timeout; "
+                                "falling back to head-locked for this session\n");
                         } else {
-                            // Not anchored yet — hold off drawing this frame.
-                            readyToDraw = false;
+                            // Still waiting for tracking — don't draw to a
+                            // stale/unfrozen pose this frame.
+                            skipDrawThisFrame = true;
                         }
                     }
+                    // Draw world-locked only once a fresh anchor is frozen.
                     if (!m_needsReanchor) {
                         overlaySpace = m_localSpace;
                         anchorPose = &m_anchorPose;
                     }
                 }
 
-                if (readyToDraw) {
+                if (!skipDrawThisFrame) {
                     overlayLayer = m_overlayRenderer->renderAndCompose(
                         overlaySpace, anchorPose, m_overlay.snapshot(),
                         m_settings.overlay.position,
@@ -2373,7 +2366,48 @@ namespace openxr_api_layer {
             }
             // Next session (the spec allows multiple create/destroy cycles
             // per instance) must re-anchor from its own head pose.
+            requestReanchor();
+        }
+
+        // Raise a fresh world-anchor request: the next world-mode frame will
+        // re-locate the head and freeze the panel. Resets the timeout stamp
+        // and clears any prior give-up so a re-summon retries from scratch.
+        // Cheap no-op for head-locked sessions (the draw path ignores it
+        // when m_localSpace is NULL).
+        void requestReanchor() {
             m_needsReanchor = true;
+            m_reanchorStartTime = 0;
+            m_worldAnchorGaveUp = false;
+        }
+
+        // Try to freeze the world-anchor pose from the current head pose.
+        // Locates the VIEW space in the LOCAL space at displayTime and, only
+        // if the pose is fully VALID *and* TRACKED, composes it with the
+        // corner offset into a world pose written to `out`. The TRACKED gate
+        // matters: a runtime keeps the *_VALID bits set on a last-known /
+        // extrapolated pose during a tracking blip but clears the *_TRACKED
+        // bits — freezing to that would pin the panel to a stale pose for the
+        // session. Returns true on a clean freeze, false if the locate failed
+        // or the pose wasn't tracked (caller retries next frame / times out).
+        bool tryFreezeWorldAnchor(XrTime displayTime, XrPosef& out) {
+            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+            constexpr XrSpaceLocationFlags kTracked =
+                XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+            if (XR_FAILED(OpenXrApi::xrLocateSpace(
+                    m_viewSpace, m_localSpace, displayTime, &loc)) ||
+                (loc.locationFlags & kTracked) != kTracked) {
+                return false;
+            }
+            const detail::OverlayGeometry geo = detail::geometryForPosition(
+                m_settings.overlay.position, m_settings.overlay.scale);
+            const detail::OverlayPose anchored = detail::composeAnchorPose(
+                detail::toOverlayPose(loc.pose),
+                {geo.pos_x, geo.pos_y, geo.pos_z});
+            out = detail::toXrPosef(anchored);
+            return true;
         }
 
         bool m_bypassApiLayer = false;
@@ -2447,20 +2481,38 @@ namespace openxr_api_layer {
         XrSpace m_viewSpace = XR_NULL_HANDLE;
 
         // Local space (XR_REFERENCE_SPACE_TYPE_LOCAL) — the play-space
-        // frame the overlay quad is frozen into when overlay.anchor ==
-        // World. Created at xrCreateSession ONLY in that mode (head-locked
-        // sessions leave it NULL), destroyed at xrDestroySession.
+        // frame the overlay quad is frozen into for a world-locked anchor.
+        // Created at xrCreateSession ONLY when overlay.anchor == World (and
+        // the create succeeds); head-locked sessions leave it NULL.
+        // Destroyed at xrDestroySession. A non-null m_localSpace is the
+        // single signal the xrEndFrame draw path uses to mean "world mode"
+        // — it implies anchor==World by construction, so nothing downstream
+        // re-reads the setting.
         XrSpace m_localSpace = XR_NULL_HANDLE;
 
-        // World-anchor state (overlay.anchor == World only). m_anchorPose
-        // is the quad's frozen pose in m_localSpace; m_needsReanchor asks
-        // xrEndFrame to recompute it from the current head pose. Set true
-        // at session start and on every rising edge of m_overlayActive, so
-        // the panel re-centres in front of the user each time the HUD is
-        // (re-)summoned. Until a locate succeeds the flag stays set and the
-        // quad isn't drawn — we never freeze to an untracked pose.
+        // World-anchor state (world mode only — i.e. m_localSpace != NULL).
+        // m_anchorPose is the quad's frozen pose in m_localSpace.
+        // m_needsReanchor asks xrEndFrame to recompute it from the current
+        // head pose; it's (re-)raised by requestReanchor() at session start
+        // and on every rising edge of m_overlayActive, so the panel
+        // re-centres each time the HUD is summoned. Until a tracked locate
+        // succeeds we don't draw — we never freeze to an untracked pose.
+        // m_reanchorStartTime stamps the first attempt (0 = unset) so we can
+        // time out; m_worldAnchorGaveUp latches true once we've waited past
+        // the budget without a tracked pose and degraded to head-locked for
+        // the rest of the session (logged once).
         XrPosef m_anchorPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
         bool m_needsReanchor = true;
+        XrTime m_reanchorStartTime = 0;
+        bool m_worldAnchorGaveUp = false;
+
+        // Max wall-clock we wait for a tracked head pose before giving up on
+        // the world anchor and degrading to head-locked. Tracking blips
+        // (inside-out occlusion, just-resumed session) recover in well under
+        // a second; 2 s is generous headroom while still guaranteeing the
+        // HUD appears rather than black-holing if a runtime never reports a
+        // tracked VIEW-in-LOCAL pose (e.g. a 3DoF/seated runtime).
+        static constexpr XrTime kReanchorTimeoutNs = 2'000'000'000;
 
         // One-shot: an app submits more composition layers than our
         // stack-allocated augmentation array can hold (16). We can't

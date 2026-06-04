@@ -333,21 +333,48 @@ namespace openxr_api_layer::detail {
         };
     }
 
+    // Strip a quaternion down to its yaw (rotation about world +Y) only,
+    // discarding pitch and roll, and return it normalised. This is the
+    // swing–twist "twist about Y" component: for a unit quaternion the
+    // twist about Y is (0, qy, 0, qw) renormalised. Used so a world-locked
+    // panel always hangs upright and level, no matter how the user's head
+    // was tilted at the instant it was summoned (looking down, head cocked).
+    //
+    // Renormalising here also means we never hand a non-unit orientation to
+    // XrCompositionLayerQuad.pose, even if the runtime returned a slightly
+    // drifted (non-unit) head orientation from xrLocateSpace.
+    //
+    // Degenerate case — qy and qw both ~0 (head rolled ~180° onto its side,
+    // so the yaw is undefined): fall back to identity (face +Z / world
+    // forward) rather than dividing by zero.
+    inline OverlayQuat yawOnlyQuat(const OverlayQuat& q) noexcept {
+        const float n = std::sqrt(q.y * q.y + q.w * q.w);
+        if (n < 1e-6f) {
+            return {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+        const float inv = 1.0f / n;
+        return {0.0f, q.y * inv, 0.0f, q.w * inv};
+    }
+
     // Freeze the head-locked quad into a world-space pose at activation.
     //   `head`   — the headset pose in the world (LOCAL) reference space,
     //              from xrLocateSpace(viewSpace, localSpace, …).
     //   `offset` — the quad CENTRE offset in the head's local frame, i.e.
     //              the geometryForPosition() {pos_x, pos_y, pos_z}.
-    // The quad inherits the head's orientation (so it faces the user the
-    // way it did the instant it was summoned) and sits at the offset
-    // rotated into world space and added to the head position. The result
-    // is handed straight to XrCompositionLayerQuad.pose; the quad's per-
-    // frame pose then stays fixed in the play space until the next anchor.
+    // The panel takes the head's YAW only (so it faces the way the user was
+    // looking horizontally) and stays upright — pitch and roll are dropped
+    // so a glance down or a tilted head at the summon instant doesn't leave
+    // the panel permanently pitched/rolled. The offset is rotated by that
+    // same yaw and added to the head position, so the panel sits forward at
+    // a consistent height. The result is handed straight to
+    // XrCompositionLayerQuad.pose and stays fixed in the play space until
+    // the next anchor.
     inline OverlayPose composeAnchorPose(const OverlayPose& head,
                                          const OverlayVec3& offset) noexcept {
-        const OverlayVec3 r = rotateByQuat(head.orientation, offset);
+        const OverlayQuat yaw = yawOnlyQuat(head.orientation);
+        const OverlayVec3 r = rotateByQuat(yaw, offset);
         return {
-            head.orientation,
+            yaw,
             { head.position.x + r.x,
               head.position.y + r.y,
               head.position.z + r.z },

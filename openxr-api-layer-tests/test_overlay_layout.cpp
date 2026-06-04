@@ -43,6 +43,7 @@ using openxr_api_layer::detail::OverlayVec3;
 using openxr_api_layer::detail::OverlayQuat;
 using openxr_api_layer::detail::OverlayPose;
 using openxr_api_layer::detail::rotateByQuat;
+using openxr_api_layer::detail::yawOnlyQuat;
 using openxr_api_layer::detail::composeAnchorPose;
 using openxr_api_layer::detail::normaliseBar;
 using openxr_api_layer::detail::BarTier;
@@ -384,7 +385,7 @@ TEST_CASE("composeAnchorPose: identity head → orientation identity, position =
 TEST_CASE("composeAnchorPose: rotated head places the offset in world space") {
     // Head at origin, yawed +90° about Y. A quad 1 m "forward" in the
     // head's local frame (offset -Z) must land 1 m along world -X, and
-    // inherit the head's orientation so it still faces the user.
+    // keep the head's yaw so it still faces the user.
     constexpr float s = 0.70710678f;
     const OverlayPose head{{0.0f, s, 0.0f, s}, {0.0f, 0.0f, 0.0f}};
     const auto a = composeAnchorPose(head, {0.0f, 0.0f, -1.0f});
@@ -393,6 +394,56 @@ TEST_CASE("composeAnchorPose: rotated head places the offset in world space") {
     CHECK(a.position.z == doctest::Approx(0.0f).epsilon(0.0001));
     CHECK(a.orientation.y == doctest::Approx(s).epsilon(0.0001));
     CHECK(a.orientation.w == doctest::Approx(s).epsilon(0.0001));
+}
+
+TEST_CASE("yawOnlyQuat: identity stays identity") {
+    const auto y = yawOnlyQuat({0.0f, 0.0f, 0.0f, 1.0f});
+    CHECK(y.x == doctest::Approx(0.0f));
+    CHECK(y.y == doctest::Approx(0.0f));
+    CHECK(y.z == doctest::Approx(0.0f));
+    CHECK(y.w == doctest::Approx(1.0f));
+}
+
+TEST_CASE("yawOnlyQuat: pure pitch (about X) collapses to identity") {
+    // 90° about X — no yaw component → upright (identity) panel.
+    constexpr float s = 0.70710678f;
+    const auto y = yawOnlyQuat({s, 0.0f, 0.0f, s});
+    CHECK(y.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.w == doctest::Approx(1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("yawOnlyQuat: keeps the yaw component and renormalises") {
+    // Pure +90° yaw must pass through unchanged and stay unit-length.
+    constexpr float s = 0.70710678f;
+    const auto y = yawOnlyQuat({0.0f, s, 0.0f, s});
+    CHECK(y.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.y == doctest::Approx(s).epsilon(0.0001));
+    CHECK(y.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.w == doctest::Approx(s).epsilon(0.0001));
+    const float norm = std::sqrt(y.x*y.x + y.y*y.y + y.z*y.z + y.w*y.w);
+    CHECK(norm == doctest::Approx(1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: drops head pitch/roll so the panel stays upright") {
+    // Head pitched 90° down (about X) at eye height. The frozen panel must
+    // be upright (identity orientation) and its forward offset must lie in
+    // the horizontal plane (y unchanged from the head's), NOT pitched down
+    // with the gaze. This is the yaw-only anchor (finding #10).
+    constexpr float s = 0.70710678f;
+    const OverlayPose head{{s, 0.0f, 0.0f, s}, {0.0f, 1.6f, 0.0f}};
+    const OverlayVec3 offset{0.0f, 0.0f, -1.0f};   // 1 m forward in head frame
+    const auto a = composeAnchorPose(head, offset);
+    // Upright panel.
+    CHECK(a.orientation.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.w == doctest::Approx(1.0f).epsilon(0.0001));
+    // Forward stayed horizontal: 1 m along world -Z, height unchanged.
+    CHECK(a.position.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(1.6f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(-1.0f).epsilon(0.0001));
 }
 
 // =============================================================================
