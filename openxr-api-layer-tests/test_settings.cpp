@@ -36,6 +36,7 @@ using openxr_api_layer::detail::parseSettings;
 using openxr_api_layer::detail::ParsedSettings;
 using openxr_api_layer::detail::LogMode;
 using openxr_api_layer::detail::OverlayMode;
+using openxr_api_layer::detail::OverlayAnchor;
 using openxr_api_layer::detail::defaultHotkey;
 using openxr_api_layer::detail::defaultOverlayHotkey;
 using openxr_api_layer::detail::formatHotkey;
@@ -56,6 +57,7 @@ namespace {
         CHECK(p.settings.overlay.refresh_hz == 10);
         CHECK(p.settings.overlay.position == "head_top_right");
         CHECK(p.settings.overlay.scale == 1.0f);
+        CHECK(p.settings.overlay.anchor == OverlayAnchor::Head);
     }
 }
 
@@ -213,6 +215,33 @@ TEST_CASE("parseSettings: full overlay block parses every field") {
     CHECK(formatHotkey(p.settings.overlay.hotkey) == "Alt+F12");
     CHECK(p.settings.overlay.refresh_hz == 20);
     CHECK(p.settings.overlay.position == "head_top_left");
+}
+
+TEST_CASE("parseSettings: overlay.anchor=world switches to the world frame") {
+    const auto p = parseSettings(R"({"overlay":{"anchor":"world"}})");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.anchor == OverlayAnchor::World);
+}
+
+TEST_CASE("parseSettings: overlay.anchor is case-insensitive") {
+    // iequalsAscii match — a user writing "World" must still get world.
+    CHECK(parseSettings(R"({"overlay":{"anchor":"World"}})")
+              .settings.overlay.anchor == OverlayAnchor::World);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"WORLD"}})")
+              .settings.overlay.anchor == OverlayAnchor::World);
+}
+
+TEST_CASE("parseSettings: overlay.anchor missing/typo/wrong-type falls back to head") {
+    // Anything that isn't "world" keeps the stock head-locked behaviour,
+    // so a config written before `anchor` existed never changes meaning.
+    CHECK(parseSettings(R"({"overlay":{}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"head"}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"squiggle"}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":42}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
 }
 
 TEST_CASE("parseSettings: overlay defaults match the documented shipped template") {

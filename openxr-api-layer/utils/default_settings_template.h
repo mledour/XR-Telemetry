@@ -53,7 +53,7 @@ namespace openxr_api_layer::detail {
     }
   },
   "overlay": {
-    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position places the head-locked quad (head_top_right default, or head_top_left / head_top_center / head_center); scale (0.5-2.0) multiplies its size.",
+    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position places the quad (head_top_right default, or head_top_left / head_top_center / head_center); scale (0.5-2.0) multiplies its size. anchor selects the reference frame: head (default) keeps the HUD attached to the headset so it follows your gaze; world freezes it in the play space in front of you at the moment it turns on and leaves it there as you move (toggle it off then on to re-centre it).",
     "enabled": false,
     "mode": "auto",
     "hotkey": {
@@ -63,7 +63,8 @@ namespace openxr_api_layer::detail {
     },
     "refresh_hz": 10,
     "position": "head_top_right",
-    "scale": 1.0
+    "scale": 1.0,
+    "anchor": "head"
   }
 }
 )";

@@ -306,6 +306,54 @@ namespace openxr_api_layer::detail {
         return g;
     }
 
+    // --- World-anchor pose math -------------------------------------------
+    //
+    // POD mirrors of XrVector3f / XrQuaternionf / XrPosef, field-for-field
+    // (XrPosef is { XrQuaternionf orientation; XrVector3f position; },
+    // XrQuaternionf is {x,y,z,w}, XrVector3f is {x,y,z}). Declared here
+    // — instead of using the OpenXR types — so this header stays buildable
+    // on macOS / Linux for the unit tests (see the file banner). The
+    // renderer copies field-by-field between these and the real Xr types.
+    struct OverlayVec3 { float x, y, z; };
+    struct OverlayQuat { float x, y, z, w; };
+    struct OverlayPose { OverlayQuat orientation; OverlayVec3 position; };
+
+    // Rotate a vector by a unit quaternion (the q·v·q⁻¹ sandwich, in the
+    // branch-free t = 2·(q.xyz × v) form). Used to express the head-local
+    // quad offset in world coordinates when freezing a world anchor.
+    inline OverlayVec3 rotateByQuat(const OverlayQuat& q,
+                                    const OverlayVec3& v) noexcept {
+        const float tx = 2.0f * (q.y * v.z - q.z * v.y);
+        const float ty = 2.0f * (q.z * v.x - q.x * v.z);
+        const float tz = 2.0f * (q.x * v.y - q.y * v.x);
+        return {
+            v.x + q.w * tx + (q.y * tz - q.z * ty),
+            v.y + q.w * ty + (q.z * tx - q.x * tz),
+            v.z + q.w * tz + (q.x * ty - q.y * tx),
+        };
+    }
+
+    // Freeze the head-locked quad into a world-space pose at activation.
+    //   `head`   — the headset pose in the world (LOCAL) reference space,
+    //              from xrLocateSpace(viewSpace, localSpace, …).
+    //   `offset` — the quad CENTRE offset in the head's local frame, i.e.
+    //              the geometryForPosition() {pos_x, pos_y, pos_z}.
+    // The quad inherits the head's orientation (so it faces the user the
+    // way it did the instant it was summoned) and sits at the offset
+    // rotated into world space and added to the head position. The result
+    // is handed straight to XrCompositionLayerQuad.pose; the quad's per-
+    // frame pose then stays fixed in the play space until the next anchor.
+    inline OverlayPose composeAnchorPose(const OverlayPose& head,
+                                         const OverlayVec3& offset) noexcept {
+        const OverlayVec3 r = rotateByQuat(head.orientation, offset);
+        return {
+            head.orientation,
+            { head.position.x + r.x,
+              head.position.y + r.y,
+              head.position.z + r.z },
+        };
+    }
+
     // Convert one histogram sample (nanoseconds) into a 0..1 normalised
     // bar height, given the highest sample currently in the ring. Used
     // by older fall-back paths; the current renderer uses

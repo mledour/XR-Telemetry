@@ -70,9 +70,11 @@ namespace openxr_api_layer::detail {
     //                        latest snapshot into the next swapchain
     //                        image, returns a pointer to the
     //                        XrCompositionLayerBaseHeader the caller
-    //                        appends to xrEndFrame's layer array. Pose
-    //                        is computed from the view-space passed in
-    //                        + the settings position/scale.
+    //                        appends to xrEndFrame's layer array. The
+    //                        quad is attached to the `space` passed in;
+    //                        in head-locked mode the pose is the settings
+    //                        position offset, in world-locked mode the
+    //                        caller passes a pre-frozen world pose.
     //   4. dtor: tears down all D3D + OpenXR resources before the
     //            session's device handle disappears.
     class OverlayRenderer {
@@ -96,10 +98,20 @@ namespace openxr_api_layer::detail {
         // when nothing should be drawn this frame (snap.valid == false,
         // or any OpenXR / D3D call along the path failed).
         //
+        // `space` is the reference space the quad is attached to. When
+        // `anchorPose` is null (head-locked), the quad pose is the
+        // settings `position`/`scale` offset in that space (i.e. `space`
+        // is the VIEW space). When `anchorPose` is non-null (world-
+        // locked), `space` is the LOCAL space and the quad takes that
+        // pre-frozen pose verbatim — `position` then only feeds the quad
+        // SIZE via `scale` (the offset was baked into anchorPose by the
+        // caller at activation).
+        //
         // The returned pointer is owned by the renderer; it stays valid
         // until the next renderAndCompose() call or destruction.
         virtual const XrCompositionLayerBaseHeader* renderAndCompose(
-            XrSpace viewSpace,
+            XrSpace space,
+            const XrPosef* anchorPose,
             const OverlaySnapshot& snap,
             const std::string& position,
             float scale) = 0;

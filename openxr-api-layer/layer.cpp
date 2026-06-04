@@ -54,6 +54,7 @@
 #include "utils/gpu_telemetry.h"
 #include "utils/name_utils.h"
 #include "utils/overlay_aggregator.h"
+#include "utils/overlay_layout.h"
 #include "utils/overlay_renderer.h"
 #include "utils/settings.h"
 
@@ -1276,10 +1277,18 @@ namespace openxr_api_layer {
         // real GPU device or OpenXR swapchain. Not used in production.
         void forceOverlayActiveForTest(
                 std::unique_ptr<detail::OverlayRenderer> renderer,
-                XrSpace viewSpace) {
+                XrSpace viewSpace, XrSpace localSpace) {
             m_overlayRenderer = std::move(renderer);
             m_viewSpace = viewSpace;
             m_overlayActive = true;
+            // World-locked path: a non-null LOCAL space + the World anchor
+            // mode make xrEndFrame locate + freeze the quad. Leave the
+            // settings alone otherwise so head-locked tests are unchanged.
+            if (localSpace != XR_NULL_HANDLE) {
+                m_localSpace = localSpace;
+                m_settings.overlay.anchor = detail::OverlayAnchor::World;
+                m_needsReanchor = true;
+            }
         }
 
         // SINGLETON LIFETIME — this destructor runs from
@@ -1695,6 +1704,30 @@ namespace openxr_api_layer {
                     m_overlayRenderer.reset();
                     m_viewSpace = XR_NULL_HANDLE;
                 }
+
+                // World-locked anchor: also create a LOCAL space to freeze
+                // the quad into. Only when the user asked for it — a head-
+                // locked session has no use for it. If LOCAL creation fails
+                // we fall back to head-locked (m_localSpace stays NULL; the
+                // xrEndFrame anchor path checks for it) rather than dropping
+                // the overlay — the HUD is more useful head-locked than
+                // gone.
+                if (m_viewSpace != XR_NULL_HANDLE &&
+                    m_settings.overlay.anchor == detail::OverlayAnchor::World) {
+                    XrReferenceSpaceCreateInfo localSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                    localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+                    localSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                    localSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+                    if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                            *session, &localSpaceInfo, &m_localSpace))) {
+                        Log("xr_telemetry: overlay anchor=world unavailable — "
+                            "xrCreateReferenceSpace(LOCAL) failed; falling back to "
+                            "head-locked for this session\n");
+                        m_localSpace = XR_NULL_HANDLE;
+                    }
+                    // Force a fresh anchor on the first frame of this session.
+                    m_needsReanchor = true;
+                }
             }
             return result;
         }
@@ -1888,6 +1921,13 @@ namespace openxr_api_layer {
                 if (m_overlayHotkeyDetector.tick(
                         pollHotkeyPressed(m_settings.overlay.hotkey))) {
                     m_overlayActive = !m_overlayActive;
+                    // Rising edge → re-centre a world-locked panel in front
+                    // of the user. This is the (intentional) re-center
+                    // gesture: toggle the HUD off then on to reposition it.
+                    // No-op for head-locked (m_localSpace stays NULL).
+                    if (m_overlayActive) {
+                        m_needsReanchor = true;
+                    }
                     Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
                                      m_overlayActive ? "ENABLED" : "DISABLED"));
                 }
@@ -1937,10 +1977,69 @@ namespace openxr_api_layer {
             const XrCompositionLayerBaseHeader* overlayLayer = nullptr;
             if (m_overlayRenderer && m_overlayActive &&
                 m_viewSpace != XR_NULL_HANDLE) {
-                overlayLayer = m_overlayRenderer->renderAndCompose(
-                    m_viewSpace, m_overlay.snapshot(),
-                    m_settings.overlay.position,
-                    m_settings.overlay.scale);
+                // Resolve the quad's reference frame for this frame.
+                //   Head-locked (default, or world fell back because LOCAL
+                //   creation failed) → VIEW space, no frozen pose.
+                //   World-locked → LOCAL space + a pose frozen from the
+                //   head pose at activation (m_anchorPose).
+                XrSpace overlaySpace = m_viewSpace;
+                const XrPosef* anchorPose = nullptr;
+                bool readyToDraw = true;
+
+                if (m_settings.overlay.anchor == detail::OverlayAnchor::World &&
+                    m_localSpace != XR_NULL_HANDLE && frameEndInfo) {
+                    if (m_needsReanchor) {
+                        // Freeze the panel where the user is looking right
+                        // now. xrLocateSpace(VIEW in LOCAL) gives the head
+                        // pose; compose it with the corner offset so the
+                        // panel lands in the same spot it would head-locked,
+                        // then stays put. If the pose isn't fully tracked
+                        // (just-resumed, lost tracking) we keep the flag set
+                        // and skip drawing — never freeze to a bad pose.
+                        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+                        constexpr XrSpaceLocationFlags kValid =
+                            XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                        if (XR_SUCCEEDED(OpenXrApi::xrLocateSpace(
+                                m_viewSpace, m_localSpace,
+                                frameEndInfo->displayTime, &loc)) &&
+                            (loc.locationFlags & kValid) == kValid) {
+                            const detail::OverlayGeometry geo =
+                                detail::geometryForPosition(
+                                    m_settings.overlay.position,
+                                    m_settings.overlay.scale);
+                            const detail::OverlayPose head{
+                                {loc.pose.orientation.x, loc.pose.orientation.y,
+                                 loc.pose.orientation.z, loc.pose.orientation.w},
+                                {loc.pose.position.x, loc.pose.position.y,
+                                 loc.pose.position.z}};
+                            const detail::OverlayPose anchored =
+                                detail::composeAnchorPose(
+                                    head, {geo.pos_x, geo.pos_y, geo.pos_z});
+                            m_anchorPose.orientation = {
+                                anchored.orientation.x, anchored.orientation.y,
+                                anchored.orientation.z, anchored.orientation.w};
+                            m_anchorPose.position = {anchored.position.x,
+                                                     anchored.position.y,
+                                                     anchored.position.z};
+                            m_needsReanchor = false;
+                        } else {
+                            // Not anchored yet — hold off drawing this frame.
+                            readyToDraw = false;
+                        }
+                    }
+                    if (!m_needsReanchor) {
+                        overlaySpace = m_localSpace;
+                        anchorPose = &m_anchorPose;
+                    }
+                }
+
+                if (readyToDraw) {
+                    overlayLayer = m_overlayRenderer->renderAndCompose(
+                        overlaySpace, anchorPose, m_overlay.snapshot(),
+                        m_settings.overlay.position,
+                        m_settings.overlay.scale);
+                }
             }
 
             constexpr uint32_t kMaxAppLayers = 16;
@@ -2268,6 +2367,13 @@ namespace openxr_api_layer {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
                 m_viewSpace = XR_NULL_HANDLE;
             }
+            if (m_localSpace != XR_NULL_HANDLE) {
+                OpenXrApi::xrDestroySpace(m_localSpace);
+                m_localSpace = XR_NULL_HANDLE;
+            }
+            // Next session (the spec allows multiple create/destroy cycles
+            // per instance) must re-anchor from its own head pose.
+            m_needsReanchor = true;
         }
 
         bool m_bypassApiLayer = false;
@@ -2339,6 +2445,22 @@ namespace openxr_api_layer {
         // Session, destroyed at xrDestroySession. NULL when the layer
         // hasn't bound a session yet.
         XrSpace m_viewSpace = XR_NULL_HANDLE;
+
+        // Local space (XR_REFERENCE_SPACE_TYPE_LOCAL) — the play-space
+        // frame the overlay quad is frozen into when overlay.anchor ==
+        // World. Created at xrCreateSession ONLY in that mode (head-locked
+        // sessions leave it NULL), destroyed at xrDestroySession.
+        XrSpace m_localSpace = XR_NULL_HANDLE;
+
+        // World-anchor state (overlay.anchor == World only). m_anchorPose
+        // is the quad's frozen pose in m_localSpace; m_needsReanchor asks
+        // xrEndFrame to recompute it from the current head pose. Set true
+        // at session start and on every rising edge of m_overlayActive, so
+        // the panel re-centres in front of the user each time the HUD is
+        // (re-)summoned. Until a locate succeeds the flag stays set and the
+        // quad isn't drawn — we never freeze to an untracked pose.
+        XrPosef m_anchorPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        bool m_needsReanchor = true;
 
         // One-shot: an app submits more composition layers than our
         // stack-allocated augmentation array can hold (16). We can't
@@ -2420,9 +2542,10 @@ namespace openxr_api_layer {
     // OpenXrLayer singleton (creating it if needed), so the static_cast is
     // safe.
     void ForceOverlayActiveForTest(
-            std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace) {
+            std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace,
+            XrSpace localSpace) {
         static_cast<OpenXrLayer*>(GetInstance())
-            ->forceOverlayActiveForTest(std::move(renderer), viewSpace);
+            ->forceOverlayActiveForTest(std::move(renderer), viewSpace, localSpace);
     }
 
     // dllHome / localAppData are defined in framework/entry.cpp for the

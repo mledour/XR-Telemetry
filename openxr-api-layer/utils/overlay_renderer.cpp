@@ -2322,7 +2322,8 @@ namespace openxr_api_layer::detail {
             }
 
             const XrCompositionLayerBaseHeader* renderAndCompose(
-                XrSpace viewSpace,
+                XrSpace space,
+                const XrPosef* anchorPose,
                 const OverlaySnapshot& snap,
                 const std::string& position,
                 float scale) override {
@@ -2433,14 +2434,18 @@ namespace openxr_api_layer::detail {
                 if (!painted) return nullptr;
 
                 // 4. Build the composition layer pose. The immutable
-                //    fields (type, layerFlags, swapchain ref, imageRect,
-                //    identity orientation) were filled once in init();
-                //    here we just write the three values that vary per
-                //    frame: the head-locked view space (a session-
-                //    scoped XrSpace that the caller may rotate via
-                //    settings if we ever expose it), and the
-                //    position/size pair derived from the user's
-                //    settings.overlay.position + scale.
+                //    fields (type, layerFlags, swapchain ref, imageRect)
+                //    were filled once in init(); here we write the space,
+                //    pose, and size that vary per frame.
+                //
+                //    Two anchor modes share this path (see OverlayAnchor):
+                //      - head-locked  → `space` is the VIEW space, pose =
+                //        identity orientation + the settings position
+                //        offset (cached geometry below).
+                //      - world-locked → `space` is the LOCAL space and
+                //        `anchorPose` carries the world pose the caller
+                //        froze at activation; we take it verbatim and the
+                //        geometry only contributes the quad size.
                 //
                 //    position+scale are immutable after xrCreateInstance, so
                 //    the geometry is cached and recomputed only on change.
@@ -2451,8 +2456,17 @@ namespace openxr_api_layer::detail {
                     m_geoScale    = scale;
                     m_geoValid    = true;
                 }
-                m_quadLayer.space = viewSpace;
-                m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                m_quadLayer.space = space;
+                if (anchorPose) {
+                    // World-locked: the caller froze a full world pose at
+                    // activation (head pose ∘ position offset). Take it
+                    // verbatim — the geometry above only supplies the size.
+                    m_quadLayer.pose = *anchorPose;
+                } else {
+                    // Head-locked: identity orientation (filled once in
+                    // init) + the settings position offset in view space.
+                    m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                }
                 m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
@@ -2793,7 +2807,8 @@ namespace openxr_api_layer::detail {
             }
 
             const XrCompositionLayerBaseHeader* renderAndCompose(
-                XrSpace viewSpace,
+                XrSpace space,
+                const XrPosef* anchorPose,
                 const OverlaySnapshot& snap,
                 const std::string& position,
                 float scale) override {
@@ -2899,9 +2914,10 @@ namespace openxr_api_layer::detail {
 
                 if (!painted) return nullptr;
 
-                // Immutable quad fields filled once in init(); per-
-                // frame writes only the view-space + the position/
-                // size pair (see the D3D11 path's longer comment).
+                // Immutable quad fields filled once in init(); per-frame
+                // writes the space + pose + size. Head-locked uses the
+                // position offset, world-locked takes the caller's frozen
+                // anchorPose (see the D3D11 path's longer comment).
                 // position+scale are immutable after xrCreateInstance, so the
                 // geometry is cached and recomputed only on change.
                 if (!m_geoValid || scale != m_geoScale ||
@@ -2911,8 +2927,17 @@ namespace openxr_api_layer::detail {
                     m_geoScale    = scale;
                     m_geoValid    = true;
                 }
-                m_quadLayer.space = viewSpace;
-                m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                m_quadLayer.space = space;
+                if (anchorPose) {
+                    // World-locked: the caller froze a full world pose at
+                    // activation (head pose ∘ position offset). Take it
+                    // verbatim — the geometry above only supplies the size.
+                    m_quadLayer.pose = *anchorPose;
+                } else {
+                    // Head-locked: identity orientation (filled once in
+                    // init) + the settings position offset in view space.
+                    m_quadLayer.pose.position = {m_geo.pos_x, m_geo.pos_y, m_geo.pos_z};
+                }
                 m_quadLayer.size = {m_geo.width_m, m_geo.height_m};
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);

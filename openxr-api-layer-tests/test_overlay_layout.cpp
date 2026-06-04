@@ -39,6 +39,11 @@ using openxr_api_layer::detail::OverlaySnapshot;
 using openxr_api_layer::detail::OverlayDisplayValues;
 using openxr_api_layer::detail::formatOverlayDisplayValues;
 using openxr_api_layer::detail::geometryForPosition;
+using openxr_api_layer::detail::OverlayVec3;
+using openxr_api_layer::detail::OverlayQuat;
+using openxr_api_layer::detail::OverlayPose;
+using openxr_api_layer::detail::rotateByQuat;
+using openxr_api_layer::detail::composeAnchorPose;
 using openxr_api_layer::detail::normaliseBar;
 using openxr_api_layer::detail::BarTier;
 using openxr_api_layer::detail::barVisualForSample;
@@ -335,6 +340,59 @@ TEST_CASE("geometryForPosition: scale multiplies width and height") {
     // a 2× HUD still hug the same corner of the user's FOV.
     CHECK(half.pos_x == doctest::Approx(normal.pos_x).epsilon(0.001));
     CHECK(half.pos_y == doctest::Approx(normal.pos_y).epsilon(0.001));
+}
+
+// =============================================================================
+// rotateByQuat / composeAnchorPose — world-anchor pose math. Pure, runtime-
+// free; this is what freezes the head-locked quad into the play space when
+// overlay.anchor == world. A regression here puts the world-locked panel in
+// the wrong spot or facing the wrong way.
+// =============================================================================
+
+TEST_CASE("rotateByQuat: identity quaternion leaves the vector unchanged") {
+    const OverlayQuat ident{0.0f, 0.0f, 0.0f, 1.0f};
+    const OverlayVec3 v{0.3f, -1.2f, 0.7f};
+    const auto r = rotateByQuat(ident, v);
+    CHECK(r.x == doctest::Approx(v.x).epsilon(0.0001));
+    CHECK(r.y == doctest::Approx(v.y).epsilon(0.0001));
+    CHECK(r.z == doctest::Approx(v.z).epsilon(0.0001));
+}
+
+TEST_CASE("rotateByQuat: +90° about Y maps forward (-Z) to -X") {
+    // Right-handed rotation about +Y by +90°: -Z → -X.
+    constexpr float s = 0.70710678f;   // sin/cos of 45°
+    const OverlayQuat yaw90{0.0f, s, 0.0f, s};
+    const auto r = rotateByQuat(yaw90, {0.0f, 0.0f, -1.0f});
+    CHECK(r.x == doctest::Approx(-1.0f).epsilon(0.0001));
+    CHECK(r.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(r.z == doctest::Approx(0.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: identity head → orientation identity, position = head + offset") {
+    const OverlayPose head{{0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 1.5f, -2.0f}};
+    const OverlayVec3 offset{0.22f, 0.14f, -1.0f};
+    const auto a = composeAnchorPose(head, offset);
+    CHECK(a.orientation.x == doctest::Approx(0.0f));
+    CHECK(a.orientation.y == doctest::Approx(0.0f));
+    CHECK(a.orientation.z == doctest::Approx(0.0f));
+    CHECK(a.orientation.w == doctest::Approx(1.0f));
+    CHECK(a.position.x == doctest::Approx(1.0f + 0.22f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(1.5f + 0.14f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(-2.0f - 1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: rotated head places the offset in world space") {
+    // Head at origin, yawed +90° about Y. A quad 1 m "forward" in the
+    // head's local frame (offset -Z) must land 1 m along world -X, and
+    // inherit the head's orientation so it still faces the user.
+    constexpr float s = 0.70710678f;
+    const OverlayPose head{{0.0f, s, 0.0f, s}, {0.0f, 0.0f, 0.0f}};
+    const auto a = composeAnchorPose(head, {0.0f, 0.0f, -1.0f});
+    CHECK(a.position.x == doctest::Approx(-1.0f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.y == doctest::Approx(s).epsilon(0.0001));
+    CHECK(a.orientation.w == doctest::Approx(s).epsilon(0.0001));
 }
 
 // =============================================================================
