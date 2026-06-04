@@ -117,6 +117,13 @@ namespace openxr_api_layer::detail {
         float gpu_temp_c = std::numeric_limits<float>::quiet_NaN();
         uint64_t vram_used_bytes = 0;
         uint64_t vram_budget_bytes = 0;
+        // CPU package temperature, populated from CpuTelemetryReader::poll()
+        // via OverlayAggregator::pushCpuTelemetry. NaN ⇒ no helper publishing
+        // (the layer ships no CPU-temp source in-process — see
+        // cpu_telemetry.h). Latched like gpu_temp_c rather than averaged: the
+        // helper updates at ~1 Hz, so averaging step holds adds no signal.
+        // The renderer's isfinite() guard surfaces NaN as "--".
+        float cpu_temp_c = std::numeric_limits<float>::quiet_NaN();
         bool  valid = false;            // false until the first refresh tick has finalised
         // Monotonic publish counter — bumped by OverlayAggregator on
         // every successful refresh tick. Lets the renderer cheaply
@@ -190,6 +197,18 @@ namespace openxr_api_layer::detail {
             m_latestVramUsed      = vram_used_bytes;
             m_latestVramBudget    = vram_budget_bytes;
             m_gotGpuTelemetry     = true;
+        }
+
+        // Push the latest CPU package temperature (from CpuTelemetryReader::
+        // poll()). Separate from pushGpuTelemetry because the two sources have
+        // independent lifecycles — the GPU temp is read in-process via NvAPI,
+        // the CPU temp comes from an out-of-process helper that may be absent
+        // (→ NaN, which re-publishes as NaN downstream and renders "--").
+        // Latched, not averaged, for the same ~1 Hz-source reason as the GPU
+        // side.
+        void pushCpuTelemetry(float cpu_temp_c) noexcept {
+            m_latestCpuTempC  = cpu_temp_c;
+            m_gotCpuTelemetry = true;
         }
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
@@ -371,6 +390,9 @@ namespace openxr_api_layer::detail {
             m_snapshot.gpu_temp_c        = m_latestGpuTempC;
             m_snapshot.vram_used_bytes   = m_latestVramUsed;
             m_snapshot.vram_budget_bytes = m_latestVramBudget;
+            // Same latch-not-average treatment as the GPU telemetry above.
+            // Stays NaN if no helper ever called pushCpuTelemetry → "--".
+            m_snapshot.cpu_temp_c        = m_latestCpuTempC;
 
             m_snapshot.valid = true;
             // Bump the version monotonically — starting at 1 the very
@@ -419,6 +441,10 @@ namespace openxr_api_layer::detail {
         uint64_t m_latestVramUsed = 0;
         uint64_t m_latestVramBudget = 0;
         bool     m_gotGpuTelemetry = false;
+        // Latest CPU package temperature from pushCpuTelemetry. NaN until a
+        // helper publishes — independent of the GPU telemetry latch above.
+        float    m_latestCpuTempC = std::numeric_limits<float>::quiet_NaN();
+        bool     m_gotCpuTelemetry = false;
 
         // Sliding window of frame_total_ns samples for P95 / P99 /
         // P99.9 computation. 4320 samples = 30 s @ 144 Hz / 48 s @

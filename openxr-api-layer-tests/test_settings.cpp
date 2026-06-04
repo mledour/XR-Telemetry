@@ -56,6 +56,7 @@ namespace {
         CHECK(p.settings.overlay.refresh_hz == 10);
         CHECK(p.settings.overlay.position == "head_top_right");
         CHECK(p.settings.overlay.scale == 1.0f);
+        CHECK_FALSE(p.settings.overlay.cpu_temp);
     }
 }
 
@@ -204,7 +205,8 @@ TEST_CASE("parseSettings: full overlay block parses every field") {
             "mode": "hotkey",
             "hotkey": { "key": "F12", "modifiers": ["alt"] },
             "refresh_hz": 20,
-            "position": "head_top_left"
+            "position": "head_top_left",
+            "cpu_temp": true
         }
     })");
     REQUIRE(p.error.empty());
@@ -213,6 +215,20 @@ TEST_CASE("parseSettings: full overlay block parses every field") {
     CHECK(formatHotkey(p.settings.overlay.hotkey) == "Alt+F12");
     CHECK(p.settings.overlay.refresh_hz == 20);
     CHECK(p.settings.overlay.position == "head_top_left");
+    CHECK(p.settings.overlay.cpu_temp);
+}
+
+TEST_CASE("parseSettings: overlay cpu_temp toggle (default off, opt-in, type-safe)") {
+    // Default off — the value needs an out-of-process helper the layer
+    // doesn't ship (see the overlay README / cpu_telemetry.h).
+    CHECK_FALSE(parseSettings("{}").settings.overlay.cpu_temp);
+    CHECK_FALSE(parseSettings(R"({"overlay":{}})").settings.overlay.cpu_temp);
+    // Explicit opt-in.
+    CHECK(parseSettings(R"({"overlay":{"cpu_temp":true}})").settings.overlay.cpu_temp);
+    CHECK_FALSE(parseSettings(R"({"overlay":{"cpu_temp":false}})").settings.overlay.cpu_temp);
+    // Wrong type → documented default (false), never an error.
+    CHECK_FALSE(parseSettings(R"({"overlay":{"cpu_temp":"yes"}})").settings.overlay.cpu_temp);
+    CHECK_FALSE(parseSettings(R"({"overlay":{"cpu_temp":1}})").settings.overlay.cpu_temp);
 }
 
 TEST_CASE("parseSettings: overlay defaults match the documented shipped template") {

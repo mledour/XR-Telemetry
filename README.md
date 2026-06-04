@@ -66,7 +66,8 @@ Full schema:
     "hotkey": { "key": "O", "modifiers": ["ctrl", "shift"] },
     "refresh_hz": 10,
     "position": "head_top_right",
-    "scale": 1.0
+    "scale": 1.0,
+    "cpu_temp": false
   }
 }
 ```
@@ -98,7 +99,7 @@ corner of your FOV. Two-column fpsVR-style layout.
 | Bottom | **GPU TEMP** | Temperature in °C from the active GPU sensor. |
 | Bottom | **GPU LOAD** | Utilisation % derived from `gpu_headroom_pct`. Cyan < 80 %, orange 80–89 %, red ≥ 90 %. |
 | Bottom | **VRAM** | `vram_used / vram_budget` as a %. Same tier colours as GPU LOAD. |
-| Bottom | **CPU TEMP** | `-- °C` until PawnIO support lands — Windows has no portable, anti-cheat-safe way to read CPU temperature without a driver. |
+| Bottom | **CPU TEMP** | CPU package temperature in °C. `-- °C` unless you both set `overlay.cpu_temp = true` **and** run the companion helper (see [CPU temperature](#cpu-temperature) below). Reading a CPU die temperature needs a kernel driver, which this in-game layer refuses to load — so the value is supplied by a separate process and the layer only reads it from shared memory. |
 | Bottom | **CPU LOAD** | Utilisation % derived from `headroom_pct`. Same tier colours as GPU LOAD. |
 
 **Bar colour code** (per-sample, not overall):
@@ -125,6 +126,7 @@ cap on a 90 Hz HMD).
 | `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
 | `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. |
 | `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
+| `cpu_temp` | bool | `false` | Opt in to the **CPU TEMP** cell. Off by default because the value comes from a separate helper this layer does NOT ship (see [CPU temperature](#cpu-temperature)). With it off, or the helper not running, the cell shows `-- °C`. When off the layer skips the shared-memory read entirely. |
 
 **Graphics-API support.** D3D11 hosts paint the HUD with GPU shaders (a
 prebuilt glyph atlas + instanced quads) straight into a BGRA8 swapchain.
@@ -142,6 +144,50 @@ The layer does NOT consume key presses (no `RegisterHotKey`), so a
 game binding on the same combo will fire alongside the layer toggle;
 pick a combo your game doesn't claim, or add `alt` to push into the
 under-used `Ctrl+Alt+Shift+letter` range.
+
+---
+
+## CPU temperature
+
+The **CPU TEMP** cell and the CSV's `cpu_temp_c` column are **opt-in and
+depend on a separate program** — this layer does not read CPU temperature
+itself.
+
+**Why.** Reading an Intel or AMD CPU die temperature requires ring-0 access
+(MSR on Intel, SMN/SMU on AMD), i.e. a kernel driver. This layer runs
+*inside the game process*, often alongside kernel anti-cheat, so it
+deliberately never loads such a driver — the GPU temperature it reads comes
+from a stock signed vendor DLL, but no equivalent driver-free path exists for
+the CPU. (See the project history for the full WinRing0 / PawnIO analysis.)
+
+**How it works.** A small, separately-installed **helper process** does the
+privileged read and publishes the temperature into a shared-memory block; the
+layer only ever maps that block **read-only** (a plain kernel-object lookup —
+no driver handle in the game process). When the toggle is on and a helper is
+publishing, the cell shows a live value; otherwise it shows `-- °C` and the
+CSV column is `nan`.
+
+**What you need to enable it:**
+
+1. Set `overlay.cpu_temp = true` in your settings (it's `false` by default).
+2. Run a helper that publishes to the shared section `Local\XrTelemetryCpu`
+   in the contract documented in
+   [`openxr-api-layer/utils/cpu_telemetry_shared.h`](openxr-api-layer/utils/cpu_telemetry_shared.h).
+   The reference helper is built on **LibreHardwareMonitorLib**, which reads
+   CPU temperature through **PawnIO ≥ 2.2.0** — the version whose signing
+   certificate is accepted by kernel anti-cheats such as FACEIT (older PawnIO
+   builds were blocked). The helper is **not shipped with this layer**; it is
+   a separate deliverable.
+
+The helper can start before or after the game — the layer reconnects to the
+section on its next poll, so the cell lights up mid-session when the helper
+appears, and falls back to `-- °C` (via a staleness check) if the helper is
+closed or crashes.
+
+> **Anti-cheat note.** PawnIO ≥ 2.2.0 is signed with a certificate that
+> current kernel anti-cheats accept, but it is still a kernel driver present
+> on the system. Running a hardware-monitoring helper is your choice; the
+> *layer itself* stays driver-free regardless.
 
 ---
 
@@ -163,13 +209,13 @@ comment='#')`.
 ### Sample
 
 ```csv
-frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes
-0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592
-1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592
-2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592
-3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592
-4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592
-5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592
+frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpu_temp_c
+0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592,58.0
+1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592,58.0
+2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592,58.5
+3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592,58.5
+4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592,59.0
+5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592,59.0
 …
 # session_end written=8124 dropped_try_lock=0 dropped_queue_full=0 dropped_disk_write=0
 ```
@@ -197,6 +243,7 @@ falls behind, but in practice drops are zero on healthy hardware).
 | `gpu_temp_c` | GPU temperature in °C, 1 decimal | Latched at the snapshot's refresh cadence. `nan` (pandas reads as `np.nan`) if the GPU vendor's sensor path is unavailable. |
 | `vram_used_bytes` | GPU dedicated memory currently allocated, bytes | From DXGI's local-memory budget query. `0` if the query failed. |
 | `vram_budget_bytes` | OS-suggested VRAM budget for the process, bytes | From the same DXGI query. The renderer uses this for the bottom-row VRAM percentage (`used / budget`). |
+| `cpu_temp_c` | CPU package temperature in °C, 1 decimal | Read from the companion helper's shared memory (see [CPU temperature](#cpu-temperature)). `nan` whenever `overlay.cpu_temp` is off or no helper is publishing — which is the default, since the layer ships no helper. |
 
 ### Anatomy of a frame cycle
 

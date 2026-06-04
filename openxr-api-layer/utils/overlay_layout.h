@@ -81,13 +81,14 @@ namespace openxr_api_layer::detail {
     //   └──────────────────────────────────────┴───────────────────┘
     //   GPU panel (3 cells)                    CPU panel (2 cells)
     //   gpu_temp_c   gpu_util_pct    vram_pct  cpu_temp_c  cpu_util_pct
-    //                gpu_util_fraction          (no CPU temp     cpu_util_fraction
-    //                                            source yet)
+    //                gpu_util_fraction                      cpu_util_fraction
     //
-    // The cpu_temp_c cell always renders "--" until PawnIO support
-    // lands in a follow-up PR (no anti-cheat-safe CPU temp source for
-    // an in-process layer otherwise — see the project history for the
-    // CPU-temp / WinRing0 / PawnIO analysis).
+    // The cpu_temp_c cell renders "--" unless an out-of-process helper is
+    // publishing the temperature into shared memory (see cpu_telemetry.h):
+    // reading a CPU die temperature needs ring-0 (MSR / SMN), which an
+    // anti-cheat-safe in-process layer must NOT do, so the privileged read
+    // lives in a separate signed helper (LibreHardwareMonitorLib + PawnIO
+    // >= 2.2.0). Without the helper installed the cell stays "--".
     struct OverlayDisplayValues {
         // Header bar
         std::string fps_instant      = "--";  // big white number
@@ -113,7 +114,7 @@ namespace openxr_api_layer::detail {
         // Bottom row — temperatures (integer °C, "--" sentinel when
         // source absent).
         std::string gpu_temp_c       = "--";
-        std::string cpu_temp_c       = "--";   // always "--" until PawnIO
+        std::string cpu_temp_c       = "--";   // "--" unless the helper publishes
 
         // Bottom row — utilisation percentages (drawn both as text
         // inside the gauge AND geometrically as an arc filling 0..N%
@@ -205,10 +206,11 @@ namespace openxr_api_layer::detail {
         v.cpu_app_ms       = fmtMsOneDecimal(snap.cpu_app_ms);
 
         v.gpu_temp_c       = fmtTempInt(snap.gpu_temp_c);
-        // cpu_temp_c intentionally stays "--": there's no anti-cheat-
-        // safe in-process CPU temp source until PawnIO lands in a
-        // follow-up PR.
-        v.cpu_temp_c       = "--";
+        // cpu_temp_c is NaN unless an out-of-process helper is publishing it
+        // (the layer reads it from shared memory, never via an in-process
+        // kernel driver — see cpu_telemetry.h). fmtTempInt renders NaN as
+        // "--", so the cell stays blank for users without the helper.
+        v.cpu_temp_c       = fmtTempInt(snap.cpu_temp_c);
 
         v.gpu_util_pct     = fmtPctInt(snap.gpu_utilisation_pct);
         v.cpu_util_pct     = fmtPctInt(snap.cpu_utilisation_pct);

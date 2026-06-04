@@ -90,6 +90,7 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     snap.cpu_frame_ms        = 7.4f;   // Render ms (per-cycle)
     snap.cpu_app_ms          = 4.3f;   // App ms (wait→end window)
     snap.gpu_temp_c          = 67.0f;
+    snap.cpu_temp_c          = 54.0f;   // helper publishing a reading
     snap.gpu_utilisation_pct = 92.0f;
     snap.cpu_utilisation_pct = 78.0f;
 
@@ -108,10 +109,10 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     CHECK(v.cpu_frametime_ms == "7.4");
     CHECK(v.cpu_app_ms       == "4.3");
 
-    // Bottom row temps — integer °C.
+    // Bottom row temps — integer °C. cpu_temp_c now tracks the snapshot
+    // (NaN → "--" when no helper publishes; here a helper set 54 °C).
     CHECK(v.gpu_temp_c == "67");
-    // cpu_temp_c is ALWAYS "--" until PawnIO lands.
-    CHECK(v.cpu_temp_c == "--");
+    CHECK(v.cpu_temp_c == "54");
 
     // Bottom row utilisation — integer percent + matching fraction.
     CHECK(v.gpu_util_pct == "92");
@@ -189,10 +190,29 @@ TEST_CASE("formatOverlayDisplayValues: gpu_temp_c NaN renders as '--'") {
     snap.gpu_temp_c  = std::numeric_limits<float>::quiet_NaN();
     const auto v = formatOverlayDisplayValues(snap);
     CHECK(v.gpu_temp_c == "--");
-    // The CPU temp is always "--" regardless of input (no in-process
-    // CPU temp source yet); same string, same width — keeps the
-    // gauges aligned across the bottom row.
+    // cpu_temp_c left at its NaN default (no helper) → "--", same width as
+    // the GPU placeholder so the bottom-row gauges stay aligned.
     CHECK(v.cpu_temp_c == "--");
+}
+
+TEST_CASE("formatOverlayDisplayValues: cpu_temp_c tracks the snapshot like gpu_temp_c") {
+    // Mirrors the gpu_temp_c cases — the CPU cell is no longer hardcoded:
+    // a helper-published value renders rounded, NaN / out-of-range → "--".
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+
+    snap.cpu_temp_c = std::numeric_limits<float>::quiet_NaN();  // no helper
+    CHECK(formatOverlayDisplayValues(snap).cpu_temp_c == "--");
+
+    snap.cpu_temp_c = 61.7f;   // → 62 (away-from-zero rounding)
+    CHECK(formatOverlayDisplayValues(snap).cpu_temp_c == "62");
+
+    snap.cpu_temp_c = 999.0f;  // bogus high → sentinel
+    CHECK(formatOverlayDisplayValues(snap).cpu_temp_c == "--");
+
+    snap.cpu_temp_c = -75.0f;  // bogus low → sentinel
+    CHECK(formatOverlayDisplayValues(snap).cpu_temp_c == "--");
 }
 
 TEST_CASE("formatOverlayDisplayValues: out-of-range temp clamps to '--' sentinel") {

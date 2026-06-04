@@ -50,6 +50,7 @@
 
 #include "layer.h"
 #include "telemetry_internals.h"
+#include "utils/cpu_telemetry.h"
 #include "utils/default_settings_template.h"
 #include "utils/gpu_telemetry.h"
 #include "utils/name_utils.h"
@@ -133,13 +134,14 @@ namespace openxr_api_layer {
                 }
                 // Column order is APPEND-ONLY for backward compat — analysis
                 // notebooks reference columns by name, so adding gpu_temp_c
-                // / vram_used_bytes / vram_budget_bytes at the END never
-                // breaks existing scripts. NaN gpu_temp_c renders as "nan"
-                // in the CSV; pandas reads it as a NaN float natively.
+                // / vram_used_bytes / vram_budget_bytes / cpu_temp_c at the
+                // END never breaks existing scripts. A NaN temperature renders
+                // as "nan" in the CSV; pandas reads it as a NaN float natively
+                // (cpu_temp_c is NaN whenever no helper is publishing).
                 m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
                           "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
                           "headroom_pct,gpu_headroom_pct,should_render,"
-                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes\n";
+                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpu_temp_c\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -320,7 +322,7 @@ namespace openxr_api_layer {
                         // which pandas reads as np.nan via read_csv.
                         m_file << fmt::format(
                             "{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{},"
-                            "{:.1f},{},{}\n",
+                            "{:.1f},{},{},{:.1f}\n",
                             rec.frame_index,
                             rec.timestamp_qpc,
                             rec.wait_block_ns,
@@ -335,7 +337,8 @@ namespace openxr_api_layer {
                             rec.should_render ? 1 : 0,
                             rec.gpu_temp_c,
                             rec.vram_used_bytes,
-                            rec.vram_budget_bytes);
+                            rec.vram_budget_bytes,
+                            rec.cpu_temp_c);
                     }
 
                     // Disk-error detection: if the stream went bad mid-batch
@@ -1678,6 +1681,25 @@ namespace openxr_api_layer {
                     "will be NaN / 0 for this session\n");
             }
 
+            // CPU package temperature reader. Opt-in (settings.overlay.cpu_temp):
+            // unlike the GPU side, the value comes from an OUT-OF-PROCESS helper
+            // (the layer ships none), so we only bother mapping the shared block
+            // when the user explicitly turned the cell on. When off we leave the
+            // unique_ptr null and the cell renders "--". init() returning false
+            // is NOT fatal — poll() lazily retries the connect, so a helper
+            // started after the game still lights up the cell mid-session.
+            if (m_settings.overlay.cpu_temp) {
+                m_cpuTelemetry = std::make_unique<detail::CpuTelemetryReader>();
+                if (m_cpuTelemetry->init()) {
+                    Log("xr_telemetry: CPU telemetry active (helper shared memory)\n");
+                } else {
+                    Log("xr_telemetry: CPU telemetry enabled but no helper found yet "
+                        "(needs a helper publishing to Local\\XrTelemetryCpu — "
+                        "LibreHardwareMonitorLib + PawnIO >= 2.2.0); cpu_temp_c "
+                        "will be NaN until it starts\n");
+                }
+            }
+
             // View space for the head-locked overlay quad. Created only
             // when the renderer materialised (no point if there's no
             // HUD to position). xrDestroySession releases it. If the
@@ -2099,6 +2121,25 @@ namespace openxr_api_layer {
                 }
             }
 
+            // CPU package temperature — same cadence as the GPU telemetry
+            // above, but its own poll-timestamp because the helper updates at
+            // ~1 Hz and the reader is independent (it may be polling a helper
+            // even on a Vulkan host where the GPU reader is inactive). The
+            // poll lazily (re)connects to the helper's shared memory, so this
+            // also picks up a helper launched mid-session. Skipped entirely
+            // when the cpu_temp toggle is off (m_cpuTelemetry stays null).
+            if (m_cpuTelemetry) {
+                const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
+                const int64_t pollInterval = std::max(
+                    m_overlay.refreshIntervalNs(),
+                    kGpuTelemetryMinPollIntervalNs);
+                if (nowNs - m_lastCpuTelemetryPollNs >= pollInterval) {
+                    m_lastCpuTelemetry = m_cpuTelemetry->poll();
+                    m_lastCpuTelemetryPollNs = nowNs;
+                    m_overlay.pushCpuTelemetry(m_lastCpuTelemetry.cpu_temp_c);
+                }
+            }
+
             FrameRecord rec{
                 frameIndex,
                 tEnd,
@@ -2115,6 +2156,7 @@ namespace openxr_api_layer {
                 m_lastGpuTelemetry.gpu_temp_c,
                 m_lastGpuTelemetry.vram_used_bytes,
                 m_lastGpuTelemetry.vram_budget_bytes,
+                m_lastCpuTelemetry.cpu_temp_c,
             };
 
             // GPU timestamps were already closed BEFORE the OpenXrApi call
@@ -2388,6 +2430,19 @@ namespace openxr_api_layer {
         // protects us from accidental hammering if a future setting
         // ever exposes a higher refresh rate.
         static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 100'000'000LL;
+
+        // CPU package temperature, read from an out-of-process helper's
+        // shared-memory block (see cpu_telemetry.h). Constructed in
+        // xrCreateSession ONLY when settings.overlay.cpu_temp is on — the
+        // value needs a kernel driver the layer refuses to load in-process,
+        // so it's strictly opt-in and depends on the user running the helper.
+        // Null when the toggle is off; poll() lazily connects so a helper
+        // started after the game still works. Reuses the GPU telemetry poll
+        // cadence (kGpuTelemetryMinPollIntervalNs) — the helper updates at
+        // ~1 Hz, so 10 Hz polling is already far more than enough.
+        std::unique_ptr<detail::CpuTelemetryReader> m_cpuTelemetry;
+        detail::CpuTelemetrySample m_lastCpuTelemetry{};
+        int64_t m_lastCpuTelemetryPollNs = 0;
     };
 
     // Singleton accessor used by framework/dispatch.cpp.

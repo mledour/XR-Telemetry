@@ -348,6 +348,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="pch.h" />
     <ClInclude Include="telemetry_internals.h" />
     <ClInclude Include="utils\chrome_shape_renderer.h" />
+    <ClInclude Include="utils\cpu_telemetry.h" />
+    <ClInclude Include="utils\cpu_telemetry_shared.h" />
     <ClInclude Include="utils\default_settings_template.h" />
     <ClInclude Include="utils\glyph_atlas.h" />
     <ClInclude Include="utils\glyph_atlas_renderer.h" />
@@ -369,6 +371,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="layer.cpp" />
     <ClCompile Include="utils\chrome_shape_renderer.cpp" />
+    <ClCompile Include="utils\cpu_telemetry.cpp" />
     <ClCompile Include="utils\glyph_atlas.cpp" />
     <ClCompile Include="utils\glyph_atlas_renderer.cpp" />
     <ClCompile Include="utils\gpu_telemetry.cpp" />

@@ -100,6 +100,12 @@ namespace openxr_api_layer::detail {
         float gpu_temp_c;          // NaN ⇒ source unavailable
         uint64_t vram_used_bytes;  // 0   ⇒ source unavailable (no real GPU reports 0)
         uint64_t vram_budget_bytes;
+        // CPU package temperature from the out-of-process helper (see
+        // cpu_telemetry.h). NaN ⇒ no helper publishing — the common case,
+        // since the layer ships no in-process CPU-temp source. Appended LAST
+        // to keep the CSV column order append-only (analysis scripts key by
+        // name). Same per-frame caching rationale as gpu_temp_c above.
+        float cpu_temp_c;          // NaN ⇒ source unavailable
     };
 
     // --- Time conversions ---------------------------------------------------

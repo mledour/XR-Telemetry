@@ -294,12 +294,16 @@ namespace {
     constexpr int kColGpuTempC = 12;
     constexpr int kColVramUsedBytes = 13;
     constexpr int kColVramBudgetBytes = 14;
-    constexpr int kColCount = 15;
+    // CPU package temperature appended in feat/cpu-telemetry. NaN in CI
+    // (no out-of-process helper publishing to Local\XrTelemetryCpu), but
+    // emitted every frame so the column count stays stable.
+    constexpr int kColCpuTempC = 15;
+    constexpr int kColCount = 16;
 
     const std::string kExpectedHeader =
         "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,"
         "frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,"
-        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes";
+        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpu_temp_c";
 
     // Stand-in OverlayRenderer for the overlay-integration tests. Records the
     // calls the layer makes (renderAndCompose / pushFrameSample) and hands

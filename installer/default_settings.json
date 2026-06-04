@@ -11,7 +11,7 @@
     }
   },
   "overlay": {
-    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position places the head-locked quad (head_top_right default, or head_top_left / head_top_center / head_center); scale (0.5-2.0) multiplies its size.",
+    "_comment": "In-headset HUD showing fps / avg fps / cpu+gpu frametime / cpu+gpu utilisation %. Off by default (opt-in feature). mode=auto displays the HUD for the whole session whenever enabled=true; mode=hotkey leaves it hidden until the user presses the configured combo, then toggles on/off. refresh_hz controls how often the displayed numbers update (1-60 Hz, clamped); 10 Hz matches fpsvr and is readable in motion. position places the head-locked quad (head_top_right default, or head_top_left / head_top_center / head_center); scale (0.5-2.0) multiplies its size. cpu_temp turns on the CPU package temperature cell, but the value is read from a SEPARATE signed helper (built on LibreHardwareMonitorLib + PawnIO >= 2.2.0) that this layer does NOT ship — without it the cell shows '--'. Leave it false unless you have installed and are running such a helper; see the README.",
     "enabled": false,
     "mode": "auto",
     "hotkey": {
@@ -21,6 +21,7 @@
     },
     "refresh_hz": 10,
     "position": "head_top_right",
-    "scale": 1.0
+    "scale": 1.0,
+    "cpu_temp": false
   }
 }

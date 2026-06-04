@@ -643,6 +643,50 @@ TEST_CASE("OverlayAggregator: pushGpuTelemetry uses LATEST value, not average") 
     CHECK(agg.snapshot().vram_used_bytes == 5'000'000'000ULL);
 }
 
+// =============================================================================
+// CPU telemetry — pushCpuTelemetry is the independent sibling of
+// pushGpuTelemetry: same latch-not-average contract, NaN when no helper, and
+// it must not disturb the GPU telemetry fields.
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: snapshot cpu_temp_c defaults to NaN without a helper") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK_FALSE(std::isfinite(agg.snapshot().cpu_temp_c));
+}
+
+TEST_CASE("OverlayAggregator: pushCpuTelemetry latches into next publish, latest wins") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushCpuTelemetry(/*cpu_temp_c=*/49.0f);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    // A newer reading mid-window — latched, not averaged.
+    agg.pushCpuTelemetry(63.0f);
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().cpu_temp_c == doctest::Approx(63.0f).epsilon(0.001));
+}
+
+TEST_CASE("OverlayAggregator: CPU and GPU telemetry latches are independent") {
+    // Pushing one must not perturb the other — they come from different
+    // sources (in-process NvAPI vs. out-of-process helper).
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushGpuTelemetry(70.0f, 4'000'000'000ULL, 8'000'000'000ULL);
+    agg.pushCpuTelemetry(58.0f);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().gpu_temp_c == doctest::Approx(70.0f).epsilon(0.001));
+    CHECK(agg.snapshot().cpu_temp_c == doctest::Approx(58.0f).epsilon(0.001));
+}
+
 TEST_CASE("OverlayAggregator: version is 1 after the first publish") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     CHECK(agg.snapshot().version == 0);

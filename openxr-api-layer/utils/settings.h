@@ -99,6 +99,15 @@ namespace openxr_api_layer::detail {
         // can't render a quad big enough to obscure the cockpit or
         // smaller than the font can be drawn legibly.
         float scale = 1.0f;
+        // Opt-in CPU package temperature in the bottom row's CPU TEMP cell.
+        // Default OFF: the value comes from an out-of-process helper
+        // (LibreHardwareMonitorLib + PawnIO >= 2.2.0) that the layer does NOT
+        // ship — see cpu_telemetry.h / the layer README. With the toggle off,
+        // or the helper not running, the cell renders "--". The toggle exists
+        // so a user who hasn't set up the helper isn't shown a permanently
+        // blank cell that looks broken — when off, the layer skips the
+        // shared-memory read entirely.
+        bool cpu_temp = false;
     };
 
     // Top-level settings struct.
@@ -211,6 +220,7 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.refresh_hz = 10;
         result.settings.overlay.position = "head_top_right";
         result.settings.overlay.scale = 1.0f;
+        result.settings.overlay.cpu_temp = false;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -332,6 +342,10 @@ namespace openxr_api_layer::detail {
             // 2.0 → double.
             const float rawScale = getFloatOr(ov, "scale", 1.0f);
             result.settings.overlay.scale = std::clamp(rawScale, 0.5f, 2.0f);
+
+            // Opt-in CPU temperature cell (default off — needs the external
+            // helper, see the struct comment). Wrong-typed value → default.
+            result.settings.overlay.cpu_temp = getBoolOr(ov, "cpu_temp", false);
         }
 
         return result;
