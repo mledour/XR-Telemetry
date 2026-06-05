@@ -291,9 +291,13 @@ namespace openxr_api_layer::detail {
         // Pushed further toward the corner than the original 0.22 / 0.14 so
         // the HUD hugs the edge of the FOV out of the box and gets less in
         // the way mid-game; the user dials it the rest of the way with
-        // offset_x / offset_y. With kBaseWidth 0.28 the quad's outer edge
-        // sits at ~0.30 + 0.14 = 0.44 m (~24° off-axis at 1 m), still well
-        // inside a typical ~±50° HMD FOV.
+        // offset_x / offset_y. By DEFAULT (offset 0) the quad's outer edge
+        // sits at ~0.30 + 0.14 = 0.44 m (~24° off-axis at 1 m), well inside
+        // a typical ~±50° HMD FOV. NOTE this is the default only — a user
+        // offset_x/_y (clamped to ±1.0 m by the parser) can deliberately
+        // push the centre out to ~1.30 m (~52°), past that comfortable
+        // bound; the clamp is the only guard, and dialing the HUD partly
+        // off-screen is the user's call.
         constexpr float kCornerOffX = 0.30f;
         constexpr float kCornerOffY = 0.18f;
 
