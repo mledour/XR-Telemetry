@@ -2367,8 +2367,7 @@ namespace openxr_api_layer::detail {
                 XrSpace space,
                 const XrPosef* anchorPose,
                 const OverlaySnapshot& snap,
-                const std::string& position,
-                float scale) override {
+                const OverlayGeometry& geo) override {
                 if (!m_ready || !snap.valid) return nullptr;
 
                 // 1. Acquire + wait the next swapchain image.
@@ -2478,27 +2477,17 @@ namespace openxr_api_layer::detail {
                 // 4. Build the composition layer pose. The immutable
                 //    fields (type, layerFlags, swapchain ref, imageRect)
                 //    were filled once in init(); here we write the space,
-                //    pose, and size that vary per frame.
+                //    pose, and size that vary per frame from the caller-
+                //    supplied geometry.
                 //
                 //    Two anchor modes share this path (see OverlayAnchor):
                 //      - head-locked  → `space` is the VIEW space, pose =
-                //        identity orientation + the settings position
-                //        offset (cached geometry below).
+                //        identity orientation + geo's position offset.
                 //      - world-locked → `space` is the LOCAL space and
                 //        `anchorPose` carries the world pose the caller
-                //        froze at activation; we take it verbatim and the
-                //        geometry only contributes the quad size.
-                //
-                //    position+scale are immutable after xrCreateInstance, so
-                //    the geometry is cached and recomputed only on change.
-                if (!m_geoValid || scale != m_geoScale ||
-                    position != m_geoPosition) {
-                    m_geo         = geometryForPosition(position, scale);
-                    m_geoPosition = position;
-                    m_geoScale    = scale;
-                    m_geoValid    = true;
-                }
-                applyQuadPose(m_quadLayer, space, anchorPose, m_geo);
+                //        froze at activation; we take it verbatim and geo
+                //        only contributes the quad size.
+                applyQuadPose(m_quadLayer, space, anchorPose, geo);
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
@@ -2772,12 +2761,9 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>    m_cpuRing;
             HistogramRing<kRingSize>    m_gpuRing;
             XrCompositionLayerQuad      m_quadLayer{};
-            // Cached geometryForPosition result — position/scale are immutable
-            // after init, so recompute only when they change (renderAndCompose).
-            OverlayGeometry             m_geo{};
-            std::string                 m_geoPosition;
-            float                       m_geoScale = 0.0f;
-            bool                        m_geoValid = false;
+            // Geometry (centre offset + size) arrives per frame in
+            // renderAndCompose — the caller owns it, computed once from the
+            // immutable overlay settings — so the renderer caches nothing.
             bool                        m_ready = false;
         };
 
@@ -2841,8 +2827,7 @@ namespace openxr_api_layer::detail {
                 XrSpace space,
                 const XrPosef* anchorPose,
                 const OverlaySnapshot& snap,
-                const std::string& position,
-                float scale) override {
+                const OverlayGeometry& geo) override {
                 if (!m_ready || !snap.valid) return nullptr;
 
                 uint32_t imageIdx = 0;
@@ -2946,19 +2931,11 @@ namespace openxr_api_layer::detail {
                 if (!painted) return nullptr;
 
                 // Immutable quad fields filled once in init(); per-frame
-                // writes the space + pose + size. Head-locked uses the
-                // position offset, world-locked takes the caller's frozen
-                // anchorPose (see the D3D11 path's longer comment).
-                // position+scale are immutable after xrCreateInstance, so the
-                // geometry is cached and recomputed only on change.
-                if (!m_geoValid || scale != m_geoScale ||
-                    position != m_geoPosition) {
-                    m_geo         = geometryForPosition(position, scale);
-                    m_geoPosition = position;
-                    m_geoScale    = scale;
-                    m_geoValid    = true;
-                }
-                applyQuadPose(m_quadLayer, space, anchorPose, m_geo);
+                // writes the space + pose + size from the caller-supplied
+                // geometry. Head-locked uses geo's position offset,
+                // world-locked takes the caller's frozen anchorPose (see the
+                // D3D11 path's longer comment).
+                applyQuadPose(m_quadLayer, space, anchorPose, geo);
 
                 return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quadLayer);
             }
@@ -3210,12 +3187,8 @@ namespace openxr_api_layer::detail {
             HistogramRing<kRingSize>              m_cpuRing;
             HistogramRing<kRingSize>              m_gpuRing;
             XrCompositionLayerQuad                m_quadLayer{};
-            // Cached geometryForPosition result — position/scale are immutable
-            // after init, so recompute only when they change.
-            OverlayGeometry                       m_geo{};
-            std::string                           m_geoPosition;
-            float                                 m_geoScale = 0.0f;
-            bool                                  m_geoValid = false;
+            // Geometry arrives per frame in renderAndCompose (caller-owned,
+            // computed once from the immutable settings) — no cache here.
             bool                                  m_ready = false;
         };
 

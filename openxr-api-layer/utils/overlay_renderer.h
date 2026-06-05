@@ -116,14 +116,16 @@ namespace openxr_api_layer::detail {
         // when nothing should be drawn this frame (snap.valid == false,
         // or any OpenXR / D3D call along the path failed).
         //
-        // `space` is the reference space the quad is attached to. When
-        // `anchorPose` is null (head-locked), the quad pose is the
-        // settings `position`/`scale` offset in that space (i.e. `space`
-        // is the VIEW space). When `anchorPose` is non-null (world-
-        // locked), `space` is the LOCAL space and the quad takes that
-        // pre-frozen pose verbatim — `position` then only feeds the quad
-        // SIZE via `scale` (the offset was baked into anchorPose by the
-        // caller at activation).
+        // `space` is the reference space the quad is attached to, and `geo`
+        // is the fully-resolved quad geometry (centre offset + size) the
+        // caller computed once from the immutable overlay settings — the
+        // renderer no longer re-derives it. When `anchorPose` is null
+        // (head-locked), the quad pose is `geo`'s position offset in that
+        // space (i.e. `space` is the VIEW space). When `anchorPose` is
+        // non-null (world-locked), `space` is the LOCAL space and the quad
+        // takes that pre-frozen pose verbatim — `geo` then only supplies the
+        // quad SIZE (the offset was baked into anchorPose by the caller at
+        // activation).
         //
         // The returned pointer is owned by the renderer; it stays valid
         // until the next renderAndCompose() call or destruction.
@@ -131,8 +133,7 @@ namespace openxr_api_layer::detail {
             XrSpace space,
             const XrPosef* anchorPose,
             const OverlaySnapshot& snap,
-            const std::string& position,
-            float scale) = 0;
+            const OverlayGeometry& geo) = 0;
     };
 
     // Factory: app uses D3D11 directly. `api` is the layer chain

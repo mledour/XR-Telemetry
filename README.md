@@ -68,7 +68,9 @@ Full schema:
     "refresh_hz": 10,
     "position": "head_top_right",
     "scale": 1.0,
-    "anchor": "head"
+    "anchor": "head",
+    "offset_x": 0.0,
+    "offset_y": 0.0
   }
 }
 ```
@@ -129,6 +131,8 @@ cap on a 90 Hz HMD).
 | `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
 | `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. With `anchor: "world"` this picks where the panel lands at the moment it's summoned. |
 | `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
+| `offset_x` | float | `0.0` | Fine-tune the HUD's horizontal placement, in metres at the 1 m quad distance, on top of `position`. `+` = right, `−` = left. The stock corner already hugs the edge; use this to push it further out (or back toward centre) without a rebuild. Clamped to `[-1.0, 1.0]`. |
+| `offset_y` | float | `0.0` | Same as `offset_x` but vertical: `+` = up, `−` = down. Clamped to `[-1.0, 1.0]`. |
 | `anchor` | string | `"head"` | Reference frame. `head` = the HUD is attached to the headset and follows your gaze (the stock behaviour). `world` = the HUD freezes in the play space in front of you the moment it turns on and stays there as you move and look around. It always hangs **upright** — a tilted head when it's summoned won't leave it pitched or rolled — but you aim its **height with your gaze**: look up as you summon it and it anchors higher, look down and it anchors lower. To re-centre a world-locked HUD, toggle it off and on again (auto mode: it re-anchors at the start of each session; hotkey mode: each time you press the combo to summon it). If the headset isn't tracking when it's summoned the panel waits for tracking, and falls back to head-locked after a couple of seconds rather than never appearing. Anything other than `world` falls back to `head`. |
 
 **Graphics-API support.** D3D11 hosts paint the HUD with GPU shaders (a

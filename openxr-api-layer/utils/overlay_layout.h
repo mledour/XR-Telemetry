@@ -264,24 +264,38 @@ namespace openxr_api_layer::detail {
     // contract as parseHotkey's unknown-key fallback.
     //
     // `scale` multiplies the default quad dimensions (already clamped to
-    // [0.5, 2.0] by parseSettings).
+    // [0.5, 2.0] by parseSettings). `offset_x` / `offset_y` are an extra
+    // view-space nudge in metres applied to the quad CENTRE on top of the
+    // preset corner (+X right, +Y up; already clamped to [-1, 1] by the
+    // parser). They let a user push the HUD further into a corner — or back
+    // off it — without a rebuild; the corner presets below are just the
+    // starting point.
     inline OverlayGeometry geometryForPosition(const std::string& position,
-                                                float scale) noexcept {
+                                                float scale,
+                                                float offset_x = 0.0f,
+                                                float offset_y = 0.0f) noexcept {
         // Aspect matches the renderer's kTexW × kTexH texture. Quad
         // dimensions chosen so pixel density stays square in the HMD:
         // width_m / height_m == kTexW / kTexH. At 1 m view-space
         // distance the quad covers a fixed horizontal FOV (kBaseWidth);
         // the vertical FOV tracks the texture aspect each time the
         // layout's vertical budget changes. Corner offsets are tuned
-        // so the quad's CORNER (not centre) still lands near the
-        // off-axis target.
+        // so the quad's CORNER (not centre) lands well off-axis, close
+        // to the edge of a comfortable reading zone — they're a starting
+        // point the user can fine-tune via offset_x / offset_y.
         constexpr float kBaseWidth  = 0.28f;
         constexpr float kBaseHeight = 0.162f;  // tracks kTexH/kTexW (see above) so
                                                // HMD pixels stay square; recompute
                                                // whenever the texture height changes.
         constexpr float kZ          = -1.0f;          // 1 m forward
-        constexpr float kCornerOffX = 0.22f;
-        constexpr float kCornerOffY = 0.14f;
+        // Pushed further toward the corner than the original 0.22 / 0.14 so
+        // the HUD hugs the edge of the FOV out of the box and gets less in
+        // the way mid-game; the user dials it the rest of the way with
+        // offset_x / offset_y. With kBaseWidth 0.28 the quad's outer edge
+        // sits at ~0.30 + 0.14 = 0.44 m (~24° off-axis at 1 m), still well
+        // inside a typical ~±50° HMD FOV.
+        constexpr float kCornerOffX = 0.30f;
+        constexpr float kCornerOffY = 0.18f;
 
         OverlayGeometry g;
         g.width_m  = kBaseWidth  * scale;
@@ -303,6 +317,10 @@ namespace openxr_api_layer::detail {
             g.pos_y = 0.0f;
         }
         // anything else → head_top_right (already set above)
+
+        // User nudge, applied last so it composes with any preset.
+        g.pos_x += offset_x;
+        g.pos_y += offset_y;
         return g;
     }
 

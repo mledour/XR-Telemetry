@@ -325,11 +325,12 @@ namespace {
                 XrSpace space,
                 const XrPosef* anchorPose,
                 const openxr_api_layer::detail::OverlaySnapshot& /*snap*/,
-                const std::string& /*position*/, float /*scale*/) override {
+                const openxr_api_layer::detail::OverlayGeometry& geo) override {
             ++renderAndComposeCalls;
             lastSpace = space;
             lastHadAnchorPose = (anchorPose != nullptr);
             if (anchorPose) lastAnchorPose = *anchorPose;
+            lastGeo = geo;
             return returnLayer
                 ? reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quad)
                 : nullptr;
@@ -347,6 +348,7 @@ namespace {
         XrSpace lastSpace = XR_NULL_HANDLE;
         bool    lastHadAnchorPose = false;
         XrPosef lastAnchorPose{};
+        openxr_api_layer::detail::OverlayGeometry lastGeo{};
         bool*   destroyedFlag = nullptr;
 
       private:
@@ -808,6 +810,8 @@ TEST_CASE("template constexpr matches installer/default_settings.json (no schema
     CHECK(a.overlay.position   == b.overlay.position);
     CHECK(a.overlay.scale      == b.overlay.scale);
     CHECK(a.overlay.anchor     == b.overlay.anchor);
+    CHECK(a.overlay.offset_x   == b.overlay.offset_x);
+    CHECK(a.overlay.offset_y   == b.overlay.offset_y);
 }
 
 // ----------------------------------------------------------------------------
@@ -1061,6 +1065,12 @@ TEST_CASE("overlay: head-locked attaches to the view space with no anchor pose")
     CHECK(mockPtr->lastSpace == viewSpace);
     CHECK_FALSE(mockPtr->lastHadAnchorPose);
     CHECK(mock::state().lastEndFrameQuadCount == 1);
+    // The layer resolved the geometry once and handed it through: default
+    // settings → the bumped head_top_right corner (pos_x pushed past the old
+    // 0.22) and the stock quad size.
+    CHECK(mockPtr->lastGeo.pos_x > 0.22f);
+    CHECK(mockPtr->lastGeo.pos_y > 0.14f);
+    CHECK(mockPtr->lastGeo.width_m == doctest::Approx(0.28f).epsilon(0.001));
 }
 
 // Regression: ~OpenXrLayer (instance teardown WITHOUT a prior xrDestroySession)
