@@ -361,20 +361,23 @@ namespace openxr_api_layer::detail {
     //              from xrLocateSpace(viewSpace, localSpace, …).
     //   `offset` — the quad CENTRE offset in the head's local frame, i.e.
     //              the geometryForPosition() {pos_x, pos_y, pos_z}.
-    // The panel takes the head's YAW only (so it faces the way the user was
-    // looking horizontally) and stays upright — pitch and roll are dropped
-    // so a glance down or a tilted head at the summon instant doesn't leave
-    // the panel permanently pitched/rolled. The offset is rotated by that
-    // same yaw and added to the head position, so the panel sits forward at
-    // a consistent height. The result is handed straight to
+    //
+    // ORIENTATION takes the head's YAW only, so the panel always hangs
+    // upright — a tilted head (roll) or a glance up/down at the summon
+    // instant never leaves the panel permanently pitched or rolled.
+    //
+    // POSITION, however, is placed along the head's FULL gaze (pitch
+    // included): the offset is rotated by the complete head orientation, so
+    // looking up when you summon the HUD anchors it higher and looking down
+    // anchors it lower. You aim the panel's height with your gaze, but it
+    // still ends up vertical and readable. The result is handed straight to
     // XrCompositionLayerQuad.pose and stays fixed in the play space until
     // the next anchor.
     inline OverlayPose composeAnchorPose(const OverlayPose& head,
                                          const OverlayVec3& offset) noexcept {
-        const OverlayQuat yaw = yawOnlyQuat(head.orientation);
-        const OverlayVec3 r = rotateByQuat(yaw, offset);
+        const OverlayVec3 r = rotateByQuat(head.orientation, offset);
         return {
-            yaw,
+            yawOnlyQuat(head.orientation),
             { head.position.x + r.x,
               head.position.y + r.y,
               head.position.z + r.z },
