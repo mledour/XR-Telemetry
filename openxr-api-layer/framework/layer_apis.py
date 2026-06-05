@@ -72,6 +72,10 @@ requested_functions = [
     # appends a composition layer to xrEndFrame.
     "xrCreateReferenceSpace",
     "xrDestroySpace",
+    # World-locked overlay anchor (overlay.anchor == world): xrEndFrame
+    # locates the VIEW space in the LOCAL space once at activation to
+    # freeze the HUD quad in the play space. Pure observation, no mutation.
+    "xrLocateSpace",
     "xrEnumerateSwapchainFormats",
     "xrCreateSwapchain",
     "xrDestroySwapchain",

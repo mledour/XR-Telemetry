@@ -178,6 +178,18 @@ namespace mock {
             return XR_SUCCESS;
         }
 
+        XrResult XRAPI_CALL m_xrLocateSpace(XrSpace space, XrSpace baseSpace,
+                                            XrTime /*time*/,
+                                            XrSpaceLocation* location) {
+            if (!location) return XR_ERROR_VALIDATION_FAILURE;
+            g_state.locateSpaceCallCount++;
+            g_state.lastLocateSpace = space;
+            g_state.lastLocateBaseSpace = baseSpace;
+            location->locationFlags = g_state.locateSpaceFlags;
+            location->pose = g_state.locateSpacePose;
+            return XR_SUCCESS;
+        }
+
         XrResult XRAPI_CALL m_xrEnumerateSwapchainFormats(XrSession /*session*/,
                                                          uint32_t capacity,
                                                          uint32_t* count,
@@ -315,6 +327,8 @@ namespace mock {
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrCreateReferenceSpace);
         else if (n == "xrDestroySpace")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrDestroySpace);
+        else if (n == "xrLocateSpace")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrLocateSpace);
         else if (n == "xrEnumerateSwapchainFormats")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrEnumerateSwapchainFormats);
         else if (n == "xrEnumerateSwapchainImages")

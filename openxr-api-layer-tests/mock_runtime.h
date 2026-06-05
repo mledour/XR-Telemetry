@@ -65,6 +65,18 @@ namespace mock {
         // wait_block_ns measurement captures this sleep.
         uint32_t waitFrameSleepMicros = 0;
 
+        // xrLocateSpace return value — the head (VIEW) pose in the LOCAL
+        // space the layer freezes a world-locked overlay against. Defaults
+        // to a fully-tracked identity-at-eye-height pose so the world-anchor
+        // path succeeds; a test can clear locateSpaceFlags to simulate lost
+        // tracking and assert the layer holds off drawing.
+        XrPosef locateSpacePose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.6f, 0.0f}};
+        XrSpaceLocationFlags locateSpaceFlags =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT |
+            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+            XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+
         // ---- Recorded outputs (what the layer submitted downstream) ---------
 
         // Last xrEndFrame payload that reached the mock runtime, deep-copied
@@ -90,6 +102,13 @@ namespace mock {
         // the head-locked view space is released on instance shutdown.
         uint32_t destroySpaceCallCount = 0;
         XrSpace  lastDestroyedSpace = XR_NULL_HANDLE;
+
+        // xrLocateSpace recording — the world-anchor test asserts the layer
+        // located the VIEW space against a non-null base (the LOCAL space)
+        // at activation.
+        uint32_t locateSpaceCallCount = 0;
+        XrSpace  lastLocateSpace = XR_NULL_HANDLE;       // the space being located
+        XrSpace  lastLocateBaseSpace = XR_NULL_HANDLE;   // the reference base
 
         // ---- Fake handle plumbing -------------------------------------------
 

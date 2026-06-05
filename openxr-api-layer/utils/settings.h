@@ -32,7 +32,7 @@
 //       "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
 //     },
 //     "overlay": { "enabled", "mode", "hotkey", "refresh_hz",
-//                  "position", "scale" }
+//                  "position", "scale", "anchor" }
 //   }
 //
 // Everything is permissive: missing fields fall back to the "preserve
@@ -65,6 +65,18 @@ namespace openxr_api_layer::detail {
     // the enum so the parser and the call sites stay symmetric.
     enum class LogMode { Auto, Hotkey };
     enum class OverlayMode { Auto, Hotkey };
+
+    // Reference frame the overlay quad is anchored to.
+    //   Head  — the quad is attached to the headset (XR_REFERENCE_SPACE_
+    //           TYPE_VIEW). It follows the gaze and stays in the same
+    //           corner of the FOV. This is the stock behaviour.
+    //   World — the quad is frozen in the play space (XR_REFERENCE_SPACE_
+    //           TYPE_LOCAL): it's anchored in front of the user at the
+    //           moment the overlay turns on and stays put as the head
+    //           moves. Toggling the overlay off then on re-centres it.
+    // The `position` string still selects the corner offset in both
+    // anchors — in World it's baked into the frozen pose at activation.
+    enum class OverlayAnchor { Head, World };
 
     // Parsed "log" block. `hotkey` is only consulted when mode == Hotkey, but
     // it's always populated from the JSON (or the default) so logs can show
@@ -99,6 +111,10 @@ namespace openxr_api_layer::detail {
         // can't render a quad big enough to obscure the cockpit or
         // smaller than the font can be drawn legibly.
         float scale = 1.0f;
+        // Reference frame the quad lives in. Defaults to Head so a config
+        // written before this field existed keeps the stock head-locked
+        // behaviour. Unknown strings fall back to "head".
+        OverlayAnchor anchor = OverlayAnchor::Head;
     };
 
     // Top-level settings struct.
@@ -211,6 +227,7 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.refresh_hz = 10;
         result.settings.overlay.position = "head_top_right";
         result.settings.overlay.scale = 1.0f;
+        result.settings.overlay.anchor = OverlayAnchor::Head;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -332,6 +349,17 @@ namespace openxr_api_layer::detail {
             // 2.0 → double.
             const float rawScale = getFloatOr(ov, "scale", 1.0f);
             result.settings.overlay.scale = std::clamp(rawScale, 0.5f, 2.0f);
+
+            // `anchor` selects the reference frame: "head" (default, the
+            // quad follows the headset) or "world" (the quad is frozen in
+            // the play space at activation). Same fallback contract as
+            // `mode`: only "world" switches away from head; anything else
+            // (missing, typo, wrong type) keeps the stock head-locked
+            // behaviour so an older config never changes meaning.
+            const std::string anchorStr = getStringOr(ov, "anchor", "head");
+            result.settings.overlay.anchor = iequalsAscii(anchorStr, "world")
+                ? OverlayAnchor::World
+                : OverlayAnchor::Head;
         }
 
         return result;

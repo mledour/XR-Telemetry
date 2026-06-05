@@ -46,6 +46,7 @@
 
 #include "histogram_ring.h"
 #include "overlay_aggregator.h"
+#include "overlay_layout.h"
 
 #include <memory>
 #include <string>
@@ -55,6 +56,23 @@ namespace openxr_api_layer {
 }
 
 namespace openxr_api_layer::detail {
+
+    // Field-for-field bridges between the OpenXR XrPosef and the OpenXR-free
+    // OverlayPose used by the pure pose math in overlay_layout.h. Kept here
+    // (an OpenXR-aware header) rather than in overlay_layout.h so that header
+    // stays buildable without the OpenXR SDK for the unit tests. Used by the
+    // layer's world-anchor freeze path and by the tests.
+    inline OverlayPose toOverlayPose(const XrPosef& p) noexcept {
+        return {{p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w},
+                {p.position.x, p.position.y, p.position.z}};
+    }
+    inline XrPosef toXrPosef(const OverlayPose& p) noexcept {
+        XrPosef out;
+        out.orientation = {p.orientation.x, p.orientation.y, p.orientation.z,
+                           p.orientation.w};
+        out.position = {p.position.x, p.position.y, p.position.z};
+        return out;
+    }
 
     // Abstract renderer interface. Holds the lifecycle the layer drives:
     //   1. ctor: bakes the glyph atlas (DirectWrite), creates the GPU
@@ -70,9 +88,11 @@ namespace openxr_api_layer::detail {
     //                        latest snapshot into the next swapchain
     //                        image, returns a pointer to the
     //                        XrCompositionLayerBaseHeader the caller
-    //                        appends to xrEndFrame's layer array. Pose
-    //                        is computed from the view-space passed in
-    //                        + the settings position/scale.
+    //                        appends to xrEndFrame's layer array. The
+    //                        quad is attached to the `space` passed in;
+    //                        in head-locked mode the pose is the settings
+    //                        position offset, in world-locked mode the
+    //                        caller passes a pre-frozen world pose.
     //   4. dtor: tears down all D3D + OpenXR resources before the
     //            session's device handle disappears.
     class OverlayRenderer {
@@ -96,10 +116,20 @@ namespace openxr_api_layer::detail {
         // when nothing should be drawn this frame (snap.valid == false,
         // or any OpenXR / D3D call along the path failed).
         //
+        // `space` is the reference space the quad is attached to. When
+        // `anchorPose` is null (head-locked), the quad pose is the
+        // settings `position`/`scale` offset in that space (i.e. `space`
+        // is the VIEW space). When `anchorPose` is non-null (world-
+        // locked), `space` is the LOCAL space and the quad takes that
+        // pre-frozen pose verbatim — `position` then only feeds the quad
+        // SIZE via `scale` (the offset was baked into anchorPose by the
+        // caller at activation).
+        //
         // The returned pointer is owned by the renderer; it stays valid
         // until the next renderAndCompose() call or destruction.
         virtual const XrCompositionLayerBaseHeader* renderAndCompose(
-            XrSpace viewSpace,
+            XrSpace space,
+            const XrPosef* anchorPose,
             const OverlaySnapshot& snap,
             const std::string& position,
             float scale) = 0;

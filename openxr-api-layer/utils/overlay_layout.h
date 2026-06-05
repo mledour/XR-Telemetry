@@ -306,6 +306,84 @@ namespace openxr_api_layer::detail {
         return g;
     }
 
+    // --- World-anchor pose math -------------------------------------------
+    //
+    // POD mirrors of XrVector3f / XrQuaternionf / XrPosef, field-for-field
+    // (XrPosef is { XrQuaternionf orientation; XrVector3f position; },
+    // XrQuaternionf is {x,y,z,w}, XrVector3f is {x,y,z}). Declared here
+    // — instead of using the OpenXR types — so this header stays buildable
+    // on macOS / Linux for the unit tests (see the file banner). The
+    // renderer copies field-by-field between these and the real Xr types.
+    struct OverlayVec3 { float x, y, z; };
+    struct OverlayQuat { float x, y, z, w; };
+    struct OverlayPose { OverlayQuat orientation; OverlayVec3 position; };
+
+    // Rotate a vector by a unit quaternion (the q·v·q⁻¹ sandwich, in the
+    // branch-free t = 2·(q.xyz × v) form). Used to express the head-local
+    // quad offset in world coordinates when freezing a world anchor.
+    inline OverlayVec3 rotateByQuat(const OverlayQuat& q,
+                                    const OverlayVec3& v) noexcept {
+        const float tx = 2.0f * (q.y * v.z - q.z * v.y);
+        const float ty = 2.0f * (q.z * v.x - q.x * v.z);
+        const float tz = 2.0f * (q.x * v.y - q.y * v.x);
+        return {
+            v.x + q.w * tx + (q.y * tz - q.z * ty),
+            v.y + q.w * ty + (q.z * tx - q.x * tz),
+            v.z + q.w * tz + (q.x * ty - q.y * tx),
+        };
+    }
+
+    // Strip a quaternion down to its yaw (rotation about world +Y) only,
+    // discarding pitch and roll, and return it normalised. This is the
+    // swing–twist "twist about Y" component: for a unit quaternion the
+    // twist about Y is (0, qy, 0, qw) renormalised. Used so a world-locked
+    // panel always hangs upright and level, no matter how the user's head
+    // was tilted at the instant it was summoned (looking down, head cocked).
+    //
+    // Renormalising here also means we never hand a non-unit orientation to
+    // XrCompositionLayerQuad.pose, even if the runtime returned a slightly
+    // drifted (non-unit) head orientation from xrLocateSpace.
+    //
+    // Degenerate case — qy and qw both ~0 (head rolled ~180° onto its side,
+    // so the yaw is undefined): fall back to identity (face +Z / world
+    // forward) rather than dividing by zero.
+    inline OverlayQuat yawOnlyQuat(const OverlayQuat& q) noexcept {
+        const float n = std::sqrt(q.y * q.y + q.w * q.w);
+        if (n < 1e-6f) {
+            return {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+        const float inv = 1.0f / n;
+        return {0.0f, q.y * inv, 0.0f, q.w * inv};
+    }
+
+    // Freeze the head-locked quad into a world-space pose at activation.
+    //   `head`   — the headset pose in the world (LOCAL) reference space,
+    //              from xrLocateSpace(viewSpace, localSpace, …).
+    //   `offset` — the quad CENTRE offset in the head's local frame, i.e.
+    //              the geometryForPosition() {pos_x, pos_y, pos_z}.
+    //
+    // ORIENTATION takes the head's YAW only, so the panel always hangs
+    // upright — a tilted head (roll) or a glance up/down at the summon
+    // instant never leaves the panel permanently pitched or rolled.
+    //
+    // POSITION, however, is placed along the head's FULL gaze (pitch
+    // included): the offset is rotated by the complete head orientation, so
+    // looking up when you summon the HUD anchors it higher and looking down
+    // anchors it lower. You aim the panel's height with your gaze, but it
+    // still ends up vertical and readable. The result is handed straight to
+    // XrCompositionLayerQuad.pose and stays fixed in the play space until
+    // the next anchor.
+    inline OverlayPose composeAnchorPose(const OverlayPose& head,
+                                         const OverlayVec3& offset) noexcept {
+        const OverlayVec3 r = rotateByQuat(head.orientation, offset);
+        return {
+            yawOnlyQuat(head.orientation),
+            { head.position.x + r.x,
+              head.position.y + r.y,
+              head.position.z + r.z },
+        };
+    }
+
     // Convert one histogram sample (nanoseconds) into a 0..1 normalised
     // bar height, given the highest sample currently in the ring. Used
     // by older fall-back paths; the current renderer uses

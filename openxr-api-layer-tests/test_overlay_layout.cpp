@@ -39,6 +39,12 @@ using openxr_api_layer::detail::OverlaySnapshot;
 using openxr_api_layer::detail::OverlayDisplayValues;
 using openxr_api_layer::detail::formatOverlayDisplayValues;
 using openxr_api_layer::detail::geometryForPosition;
+using openxr_api_layer::detail::OverlayVec3;
+using openxr_api_layer::detail::OverlayQuat;
+using openxr_api_layer::detail::OverlayPose;
+using openxr_api_layer::detail::rotateByQuat;
+using openxr_api_layer::detail::yawOnlyQuat;
+using openxr_api_layer::detail::composeAnchorPose;
 using openxr_api_layer::detail::normaliseBar;
 using openxr_api_layer::detail::BarTier;
 using openxr_api_layer::detail::barVisualForSample;
@@ -335,6 +341,121 @@ TEST_CASE("geometryForPosition: scale multiplies width and height") {
     // a 2× HUD still hug the same corner of the user's FOV.
     CHECK(half.pos_x == doctest::Approx(normal.pos_x).epsilon(0.001));
     CHECK(half.pos_y == doctest::Approx(normal.pos_y).epsilon(0.001));
+}
+
+// =============================================================================
+// rotateByQuat / composeAnchorPose — world-anchor pose math. Pure, runtime-
+// free; this is what freezes the head-locked quad into the play space when
+// overlay.anchor == world. A regression here puts the world-locked panel in
+// the wrong spot or facing the wrong way.
+// =============================================================================
+
+TEST_CASE("rotateByQuat: identity quaternion leaves the vector unchanged") {
+    const OverlayQuat ident{0.0f, 0.0f, 0.0f, 1.0f};
+    const OverlayVec3 v{0.3f, -1.2f, 0.7f};
+    const auto r = rotateByQuat(ident, v);
+    CHECK(r.x == doctest::Approx(v.x).epsilon(0.0001));
+    CHECK(r.y == doctest::Approx(v.y).epsilon(0.0001));
+    CHECK(r.z == doctest::Approx(v.z).epsilon(0.0001));
+}
+
+TEST_CASE("rotateByQuat: +90° about Y maps forward (-Z) to -X") {
+    // Right-handed rotation about +Y by +90°: -Z → -X.
+    constexpr float s = 0.70710678f;   // sin/cos of 45°
+    const OverlayQuat yaw90{0.0f, s, 0.0f, s};
+    const auto r = rotateByQuat(yaw90, {0.0f, 0.0f, -1.0f});
+    CHECK(r.x == doctest::Approx(-1.0f).epsilon(0.0001));
+    CHECK(r.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(r.z == doctest::Approx(0.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: identity head → orientation identity, position = head + offset") {
+    const OverlayPose head{{0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 1.5f, -2.0f}};
+    const OverlayVec3 offset{0.22f, 0.14f, -1.0f};
+    const auto a = composeAnchorPose(head, offset);
+    CHECK(a.orientation.x == doctest::Approx(0.0f));
+    CHECK(a.orientation.y == doctest::Approx(0.0f));
+    CHECK(a.orientation.z == doctest::Approx(0.0f));
+    CHECK(a.orientation.w == doctest::Approx(1.0f));
+    CHECK(a.position.x == doctest::Approx(1.0f + 0.22f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(1.5f + 0.14f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(-2.0f - 1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: rotated head places the offset in world space") {
+    // Head at origin, yawed +90° about Y. A quad 1 m "forward" in the
+    // head's local frame (offset -Z) must land 1 m along world -X, and
+    // keep the head's yaw so it still faces the user.
+    constexpr float s = 0.70710678f;
+    const OverlayPose head{{0.0f, s, 0.0f, s}, {0.0f, 0.0f, 0.0f}};
+    const auto a = composeAnchorPose(head, {0.0f, 0.0f, -1.0f});
+    CHECK(a.position.x == doctest::Approx(-1.0f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.y == doctest::Approx(s).epsilon(0.0001));
+    CHECK(a.orientation.w == doctest::Approx(s).epsilon(0.0001));
+}
+
+TEST_CASE("yawOnlyQuat: identity stays identity") {
+    const auto y = yawOnlyQuat({0.0f, 0.0f, 0.0f, 1.0f});
+    CHECK(y.x == doctest::Approx(0.0f));
+    CHECK(y.y == doctest::Approx(0.0f));
+    CHECK(y.z == doctest::Approx(0.0f));
+    CHECK(y.w == doctest::Approx(1.0f));
+}
+
+TEST_CASE("yawOnlyQuat: pure pitch (about X) collapses to identity") {
+    // 90° about X — no yaw component → upright (identity) panel.
+    constexpr float s = 0.70710678f;
+    const auto y = yawOnlyQuat({s, 0.0f, 0.0f, s});
+    CHECK(y.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.w == doctest::Approx(1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("yawOnlyQuat: keeps the yaw component and renormalises") {
+    // Pure +90° yaw must pass through unchanged and stay unit-length.
+    constexpr float s = 0.70710678f;
+    const auto y = yawOnlyQuat({0.0f, s, 0.0f, s});
+    CHECK(y.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.y == doctest::Approx(s).epsilon(0.0001));
+    CHECK(y.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(y.w == doctest::Approx(s).epsilon(0.0001));
+    const float norm = std::sqrt(y.x*y.x + y.y*y.y + y.z*y.z + y.w*y.w);
+    CHECK(norm == doctest::Approx(1.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: pitch raises/lowers the panel but keeps it upright") {
+    // Head looking straight UP (90° about X) at eye height. The panel must
+    // be upright (identity orientation — roll/pitch dropped from the
+    // orientation), but its POSITION follows the gaze: the 1 m forward
+    // offset now points up, so the panel anchors a metre HIGHER, not at eye
+    // level. This is the "aim its height with your gaze" behaviour (#10).
+    constexpr float s = 0.70710678f;
+    const OverlayPose head{{s, 0.0f, 0.0f, s}, {0.0f, 1.6f, 0.0f}};
+    const OverlayVec3 offset{0.0f, 0.0f, -1.0f};   // 1 m forward in head frame
+    const auto a = composeAnchorPose(head, offset);
+    // Upright panel (yaw-only orientation; pure pitch → identity).
+    CHECK(a.orientation.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.y == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.z == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.orientation.w == doctest::Approx(1.0f).epsilon(0.0001));
+    // Position followed the gaze upward: +1 m in Y, no longer 1 m forward.
+    CHECK(a.position.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(2.6f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(0.0f).epsilon(0.0001));
+}
+
+TEST_CASE("composeAnchorPose: level head places the panel forward at eye height") {
+    // Sanity counterpart: looking straight ahead, the panel sits 1 m forward
+    // at the head's height (no vertical shift) and upright.
+    const OverlayPose head{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.6f, 0.0f}};
+    const auto a = composeAnchorPose(head, {0.0f, 0.0f, -1.0f});
+    CHECK(a.position.x == doctest::Approx(0.0f).epsilon(0.0001));
+    CHECK(a.position.y == doctest::Approx(1.6f).epsilon(0.0001));
+    CHECK(a.position.z == doctest::Approx(-1.0f).epsilon(0.0001));
+    CHECK(a.orientation.w == doctest::Approx(1.0f).epsilon(0.0001));
 }
 
 // =============================================================================

@@ -1,8 +1,9 @@
 # XR Telemetry
 
 An OpenXR API layer for Windows that gives you two ways to see what
-your VR game is actually doing each frame: a **head-locked HUD** with
-live FPS / frametimes / GPU+CPU load, and a **per-frame CSV log**
+your VR game is actually doing each frame: an **in-headset HUD** with
+live FPS / frametimes / GPU+CPU load (head-locked or world-locked), and
+a **per-frame CSV log**
 covering every CPU and GPU segment of the OpenXR frame cycle. Both
 features are independent — you can run either, both, or neither.
 
@@ -66,7 +67,8 @@ Full schema:
     "hotkey": { "key": "O", "modifiers": ["ctrl", "shift"] },
     "refresh_hz": 10,
     "position": "head_top_right",
-    "scale": 1.0
+    "scale": 1.0,
+    "anchor": "head"
   }
 }
 ```
@@ -79,8 +81,10 @@ disabling the feature, so a typo never kills your session.
 
 ## Overlay
 
-The overlay is a head-locked HUD that follows your view at a fixed
-corner of your FOV. Two-column fpsVR-style layout.
+The overlay is a HUD in a corner of your FOV, two-column fpsVR-style
+layout. By default it's **head-locked** — it follows your view and
+stays in the same spot. You can also pin it **world-locked** so it
+freezes in the room in front of you (see `anchor` below).
 
 ![Overlay snapshot](screenshots/overlay_snapshot.png)
 
@@ -123,8 +127,9 @@ cap on a 90 Hz HMD).
 | `hotkey.key` | string | `"O"` | Main key. Recognised: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`. Punctuation is intentionally unsupported (locale-dependent). |
 | `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. Must match exactly — `Ctrl+Alt+Shift+O` does NOT trigger a `Ctrl+Shift+O` binding. |
 | `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
-| `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. |
+| `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. With `anchor: "world"` this picks where the panel lands at the moment it's summoned. |
 | `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
+| `anchor` | string | `"head"` | Reference frame. `head` = the HUD is attached to the headset and follows your gaze (the stock behaviour). `world` = the HUD freezes in the play space in front of you the moment it turns on and stays there as you move and look around. It always hangs **upright** — a tilted head when it's summoned won't leave it pitched or rolled — but you aim its **height with your gaze**: look up as you summon it and it anchors higher, look down and it anchors lower. To re-centre a world-locked HUD, toggle it off and on again (auto mode: it re-anchors at the start of each session; hotkey mode: each time you press the combo to summon it). If the headset isn't tracking when it's summoned the panel waits for tracking, and falls back to head-locked after a couple of seconds rather than never appearing. Anything other than `world` falls back to `head`. |
 
 **Graphics-API support.** D3D11 hosts paint the HUD with GPU shaders (a
 prebuilt glyph atlas + instanced quads) straight into a BGRA8 swapchain.

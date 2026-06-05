@@ -52,6 +52,7 @@
 #include <utils/default_settings_template.h>
 #include <utils/hotkey.h>
 #include <utils/name_utils.h>
+#include <utils/overlay_layout.h>
 #include <utils/overlay_renderer.h>
 #include <utils/settings.h>
 
@@ -321,10 +322,14 @@ namespace {
         }
 
         const XrCompositionLayerBaseHeader* renderAndCompose(
-                XrSpace /*viewSpace*/,
+                XrSpace space,
+                const XrPosef* anchorPose,
                 const openxr_api_layer::detail::OverlaySnapshot& /*snap*/,
                 const std::string& /*position*/, float /*scale*/) override {
             ++renderAndComposeCalls;
+            lastSpace = space;
+            lastHadAnchorPose = (anchorPose != nullptr);
+            if (anchorPose) lastAnchorPose = *anchorPose;
             return returnLayer
                 ? reinterpret_cast<const XrCompositionLayerBaseHeader*>(&m_quad)
                 : nullptr;
@@ -339,6 +344,9 @@ namespace {
         int     renderAndComposeCalls = 0;
         int64_t lastCpuPerCycleNs = 0;
         int64_t lastGpuTimeNs = 0;
+        XrSpace lastSpace = XR_NULL_HANDLE;
+        bool    lastHadAnchorPose = false;
+        XrPosef lastAnchorPose{};
         bool*   destroyedFlag = nullptr;
 
       private:
@@ -799,6 +807,7 @@ TEST_CASE("template constexpr matches installer/default_settings.json (no schema
     CHECK(a.overlay.refresh_hz == b.overlay.refresh_hz);
     CHECK(a.overlay.position   == b.overlay.position);
     CHECK(a.overlay.scale      == b.overlay.scale);
+    CHECK(a.overlay.anchor     == b.overlay.anchor);
 }
 
 // ----------------------------------------------------------------------------
@@ -868,6 +877,190 @@ TEST_CASE("overlay: renderAndCompose returning null injects nothing") {
     CHECK(mockPtr->renderAndComposeCalls >= 1);
     CHECK(mock::state().lastEndFrameLayerCount == 0);
     CHECK(mock::state().lastEndFrameQuadCount == 0);
+}
+
+// World-locked anchor: the layer locates the VIEW space in the LOCAL space
+// once at activation, freezes the quad pose, and hands the renderer the LOCAL
+// space + that pose. The frozen pose is the head pose ∘ the corner offset.
+TEST_CASE("overlay: world anchor freezes the quad pose in the local space") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayWorldTest");
+    auto* api = fx.startLayer("OverlayWorldTest");
+
+    const auto viewSpace  = reinterpret_cast<XrSpace>(0xBEEF);
+    const auto localSpace = reinterpret_cast<XrSpace>(0xCAFE);
+    auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
+    // Non-null localSpace flips the seam into world-anchor mode.
+    openxr_api_layer::ForceOverlayActiveForTest(
+        std::move(mock), viewSpace, localSpace);
+
+    driveOneFrame(api);
+
+    // It located VIEW relative to LOCAL (not the other way round).
+    CHECK(mock::state().locateSpaceCallCount == 1);
+    CHECK(mock::state().lastLocateSpace == viewSpace);
+    CHECK(mock::state().lastLocateBaseSpace == localSpace);
+
+    // The renderer was handed the LOCAL space + a frozen anchor pose.
+    CHECK(mockPtr->renderAndComposeCalls >= 1);
+    CHECK(mockPtr->lastSpace == localSpace);
+    REQUIRE(mockPtr->lastHadAnchorPose);
+
+    // The frozen pose equals composeAnchorPose(head, cornerOffset) for the
+    // mock's default head pose (identity orientation at 1.6 m eye height).
+    const auto geo = openxr_api_layer::detail::geometryForPosition("head_top_right", 1.0f);
+    const auto head = openxr_api_layer::detail::toOverlayPose(mock::state().locateSpacePose);
+    const auto expected = openxr_api_layer::detail::composeAnchorPose(
+        head, {geo.pos_x, geo.pos_y, geo.pos_z});
+    const auto& got = mockPtr->lastAnchorPose;
+    CHECK(got.position.x == doctest::Approx(expected.position.x).epsilon(0.0001));
+    CHECK(got.position.y == doctest::Approx(expected.position.y).epsilon(0.0001));
+    CHECK(got.position.z == doctest::Approx(expected.position.z).epsilon(0.0001));
+    CHECK(got.orientation.w == doctest::Approx(expected.orientation.w).epsilon(0.0001));
+
+    // The quad was injected, attached to the world frame.
+    CHECK(mock::state().lastEndFrameQuadCount == 1);
+}
+
+// World anchor freezes ONCE: subsequent frames reuse the frozen pose without
+// re-locating, so the panel stays put in the play space as the head moves.
+TEST_CASE("overlay: world anchor locates only once, then holds") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayWorldHoldTest");
+    auto* api = fx.startLayer("OverlayWorldHoldTest");
+
+    openxr_api_layer::ForceOverlayActiveForTest(
+        std::make_unique<MockOverlayRenderer>(),
+        reinterpret_cast<XrSpace>(0xBEEF), reinterpret_cast<XrSpace>(0xCAFE));
+
+    driveOneFrame(api);
+    driveOneFrame(api);
+    driveOneFrame(api);
+
+    // Anchored on frame 1; frames 2-3 reused the cached pose.
+    CHECK(mock::state().locateSpaceCallCount == 1);
+}
+
+// Untracked head pose at activation: the layer must NOT freeze to a garbage
+// pose. It holds off drawing and retries until tracking is valid.
+TEST_CASE("overlay: world anchor waits for a tracked pose before freezing") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayWorldUntrackedTest");
+    auto* api = fx.startLayer("OverlayWorldUntrackedTest");
+
+    // Simulate lost tracking: locate succeeds but no location bits are set.
+    mock::state().locateSpaceFlags = 0;
+
+    auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
+    openxr_api_layer::ForceOverlayActiveForTest(
+        std::move(mock), reinterpret_cast<XrSpace>(0xBEEF),
+        reinterpret_cast<XrSpace>(0xCAFE));
+
+    driveOneFrame(api);
+
+    // Pose wasn't valid → no freeze, no draw, no injection this frame.
+    CHECK(mockPtr->renderAndComposeCalls == 0);
+    CHECK(mock::state().lastEndFrameQuadCount == 0);
+
+    // Tracking comes back → the next frame anchors and draws.
+    mock::state().locateSpaceFlags =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+        XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    driveOneFrame(api);
+
+    CHECK(mockPtr->renderAndComposeCalls >= 1);
+    CHECK(mockPtr->lastHadAnchorPose);
+    CHECK(mock::state().lastEndFrameQuadCount == 1);
+}
+
+// A tracking BLIP keeps the *_VALID bits set (last-known / extrapolated pose)
+// but clears the *_TRACKED bits. The layer must require TRACKED and refuse to
+// freeze to that stale pose — the exact scenario the VALID-only gate missed.
+TEST_CASE("overlay: world anchor refuses a valid-but-not-tracked pose") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayWorldBlipTest");
+    auto* api = fx.startLayer("OverlayWorldBlipTest");
+
+    // VALID set, TRACKED clear — a runtime's "here's the last pose I knew".
+    mock::state().locateSpaceFlags =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+
+    auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
+    openxr_api_layer::ForceOverlayActiveForTest(
+        std::move(mock), reinterpret_cast<XrSpace>(0xBEEF),
+        reinterpret_cast<XrSpace>(0xCAFE));
+
+    driveOneFrame(api);
+
+    // It tried to locate but did NOT freeze or draw — the panel waits.
+    CHECK(mock::state().locateSpaceCallCount == 1);
+    CHECK(mockPtr->renderAndComposeCalls == 0);
+    CHECK(mock::state().lastEndFrameQuadCount == 0);
+}
+
+// If a tracked pose never arrives (e.g. a 3DoF/seated runtime), the world
+// anchor must not black-hole the HUD: after a timeout it logs once and
+// degrades to head-locked so the overlay still appears. Driven fast by making
+// each mock frame advance the predicted display time past the 2 s budget.
+TEST_CASE("overlay: world anchor times out and degrades to head-locked") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayWorldTimeoutTest");
+    auto* api = fx.startLayer("OverlayWorldTimeoutTest");
+
+    // Never tracked, and 1.5 s of predicted-display-time per frame so three
+    // frames cross the 2 s reanchor budget.
+    mock::state().locateSpaceFlags = 0;
+    mock::state().predictedDisplayPeriod = 1'500'000'000;   // 1.5 s/frame
+
+    const auto viewSpace = reinterpret_cast<XrSpace>(0xBEEF);
+    auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
+    openxr_api_layer::ForceOverlayActiveForTest(
+        std::move(mock), viewSpace, reinterpret_cast<XrSpace>(0xCAFE));
+
+    driveOneFrame(api);   // t0: start the clock, no tracking → skip
+    driveOneFrame(api);   // t0+1.5s: still inside budget → skip
+    driveOneFrame(api);   // t0+3.0s: past 2 s budget → give up, draw head-locked
+
+    // Gave up: drew head-locked (VIEW space, no anchor pose), quad injected,
+    // and it stopped trying to locate after the give-up.
+    CHECK(mockPtr->renderAndComposeCalls >= 1);
+    CHECK(mockPtr->lastSpace == viewSpace);
+    CHECK_FALSE(mockPtr->lastHadAnchorPose);
+    CHECK(mock::state().lastEndFrameQuadCount == 1);
+    CHECK(mock::state().locateSpaceCallCount == 3);   // tried each frame, then latched off
+
+    // A fourth frame must not re-locate — the give-up is sticky.
+    driveOneFrame(api);
+    CHECK(mock::state().locateSpaceCallCount == 3);
+}
+
+// Head-locked path (the default, and where world-anchor degrades when LOCAL
+// creation fails): never locates a space, attaches the quad to the VIEW space
+// with no frozen pose. Locks the refactored renderAndCompose contract.
+TEST_CASE("overlay: head-locked attaches to the view space with no anchor pose") {
+    TelemetryFixture fx;
+    fx.enableOverlay("OverlayHeadLockedTest");
+    auto* api = fx.startLayer("OverlayHeadLockedTest");
+
+    const auto viewSpace = reinterpret_cast<XrSpace>(0xBEEF);
+    auto mock = std::make_unique<MockOverlayRenderer>();
+    auto* mockPtr = mock.get();
+    // No localSpace ⇒ head-locked (the stock anchor=head behaviour).
+    openxr_api_layer::ForceOverlayActiveForTest(std::move(mock), viewSpace);
+
+    driveOneFrame(api);
+
+    CHECK(mock::state().locateSpaceCallCount == 0);
+    CHECK(mockPtr->lastSpace == viewSpace);
+    CHECK_FALSE(mockPtr->lastHadAnchorPose);
+    CHECK(mock::state().lastEndFrameQuadCount == 1);
 }
 
 // Regression: ~OpenXrLayer (instance teardown WITHOUT a prior xrDestroySession)
