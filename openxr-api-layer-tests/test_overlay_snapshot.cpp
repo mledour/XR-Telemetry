@@ -97,6 +97,7 @@ namespace {
         s.cpu_app_ms   = 4.3f;   // App ms
         s.cpu_utilisation_pct = 78.0f;
         s.gpu_utilisation_pct = 92.0f;
+        s.cpus_max_pct = 98.0f;  // busiest core — "CPUs LOAD" cell
         s.gpu_temp_c   = 67.0f;
         s.vram_used_bytes   = 6'080'000'000ULL;  // ≈ 5.66 GB
         s.vram_budget_bytes = 8'000'000'000ULL;  // 8 GB → 76 %
