@@ -601,10 +601,12 @@ namespace openxr_api_layer::detail {
                                     v.cpu_app_ms);
 
                 // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
-                // CPUs/CPU LOAD), 60/40 split. Tier colours follow
-                // gaugeTierForUtilisation. The CPU panel's first cell is
-                // "CPUs" (busiest-core utilisation) — a percentage cell,
-                // not a temperature, hence col0IsPercent=true below.
+                // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
+                // gaugeTierForUtilisation. BOTH CPU-panel cells are
+                // percentages: cell 0 = "CPU LOAD" (per-cycle CPU vs
+                // budget), cell 1 = "CPUs LOAD" (busiest single core).
+                // Cell 0 is a percentage, not a temperature, hence
+                // col0IsPercent=true below.
                 const float bottomCellW =
                     (kInnerR - kInnerL - kSectionGap) / 5.0f;
                 const float gpuPanelL = kInnerL;
@@ -620,13 +622,13 @@ namespace openxr_api_layer::detail {
                                  /*vramFraction=*/v.vram_fraction);
                 drawBottomPanel(cpuPanelL, bottomY,
                                  cpuPanelR, bottomY + kBottomHeight,
-                                 L"CPUs", L"CPU LOAD",
-                                 v.cpus_max_pct, v.cpu_util_pct,
-                                 v.cpu_util_fraction,
+                                 L"CPU LOAD", L"CPUs LOAD",
+                                 v.cpu_util_pct, v.cpus_max_pct,
+                                 /*utilFraction (cell 1 = CPUs)=*/v.cpus_max_fraction,
                                  /*vramValue=*/std::string{},
                                  /*vramFraction=*/0.0f,
                                  /*col0IsPercent=*/true,
-                                 /*col0Fraction=*/v.cpus_max_fraction);
+                                 /*col0Fraction (cell 0 = CPU LOAD)=*/v.cpu_util_fraction);
             }
 
             // -------- end static-tier helpers --------
@@ -1427,20 +1429,20 @@ namespace openxr_api_layer::detail {
             //
             //   GPU panel (3 cells):                CPU panel (2 cells):
             //   ┌─────────┬──────────┬──────┐      ┌──────────┬──────────┐
-            //   │GPU TEMP │GPU LOAD  │VRAM  │      │CPUs      │CPU LOAD  │
-            //   │ 67 °C   │ 92 %     │ 76 % │      │ 98 %     │ 78 %     │
+            //   │GPU TEMP │GPU LOAD  │VRAM  │      │CPU LOAD  │CPUs LOAD │
+            //   │ 67 °C   │ 92 %     │ 76 % │      │ 78 %     │ 98 %     │
             //   └─────────┴──────────┴──────┘      └──────────┴──────────┘
             //
-            // Labels (L"GPU TEMP" / L"CPUs" / L"GPU LOAD" / L"CPU LOAD")
+            // Labels (L"GPU TEMP" / L"GPU LOAD" / L"CPU LOAD" / L"CPUs LOAD")
             // are passed in as literals by the caller. The VRAM cell is
             // only rendered when `vramValue` is non-empty (the CPU panel
             // passes "" and skips the third column entirely — same code
-            // path, fewer columns). The first cell is a temperature on the
-            // GPU panel and the "CPUs" percentage on the CPU panel; see
+            // path, fewer columns). Cell 0 is a temperature on the GPU
+            // panel and a percentage ("CPU LOAD") on the CPU panel; see
             // col0IsPercent below.
             // Cell 0 of the panel is EITHER a temperature ("67 °C", white,
             // wide-glyph °C path — the GPU panel) OR a utilisation percent
-            // ("98 %", tier-coloured — the CPU panel's "CPUs" reading).
+            // ("78 %", tier-coloured — the CPU panel's "CPU LOAD" reading).
             // `col0IsPercent` selects between the two; `col0Fraction` is the
             // 0..1 tier input used only on the percent path.
             void drawBottomPanel(float l, float t,
@@ -1456,9 +1458,10 @@ namespace openxr_api_layer::detail {
                                   float col0Fraction = 0.0f) const {
                 drawPanelBg(l, t, r, b);
 
-                // Tier-colour helper: same logic for LOAD, VRAM and the
-                // CPU panel's "CPUs" cell. < 80 % = cyan default, 80–89 %
-                // = orange warning, ≥ 90 % = red critical. A TEMP value
+                // Tier-colour helper: same logic for LOAD, VRAM and both
+                // CPU-panel cells ("CPU LOAD" + "CPUs LOAD"). < 80 % = cyan
+                // default, 80–89 % = orange warning, ≥ 90 % = red critical.
+                // A TEMP value
                 // (GPU panel cell 0) stays white instead — no thermal-tier
                 // contract yet (would require knowing TjMax per SKU).
                 auto tierColor = [&](float fraction) -> const float* {
@@ -1478,7 +1481,7 @@ namespace openxr_api_layer::detail {
                                       kBottomSepInsetY);
 
                 // col0Label / loadLabel arrive pre-built as wide
-                // string literals (L"GPU TEMP", L"CPUs", L"CPU LOAD", …)
+                // string literals (L"GPU TEMP", L"CPU LOAD", L"CPUs LOAD", …)
                 // — see the comment at the drawBottomPanel call site in
                 // paint(). VRAM stays a singleton label ("VRAM")
                 // because it's implicitly GPU-side — no "GPU VRAM"
@@ -1580,7 +1583,8 @@ namespace openxr_api_layer::detail {
                 // regardless of how MSVC parses the surrounding
                 // bytes.
                 if (col0IsPercent) {
-                    // "CPUs" \u2014 utilisation percent, tier-coloured like LOAD.
+                    // CPU panel cell 0 ("CPU LOAD") \u2014 a utilisation percent,
+                    // tier-coloured like the LOAD cell.
                     drawCell(l, l + colW,
                               col0Label, col0Value, L" %",
                               tierColor(col0Fraction), /*useWideValue=*/false);

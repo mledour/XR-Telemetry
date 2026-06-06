@@ -104,8 +104,8 @@ freezes in the room in front of you (see `anchor` below).
 | Bottom | **GPU TEMP** | Temperature in °C from the active GPU sensor. |
 | Bottom | **GPU LOAD** | Utilisation % derived from `gpu_headroom_pct`. Cyan < 80 %, orange 80–89 %, red ≥ 90 %. |
 | Bottom | **VRAM** | `vram_used / vram_budget` as a %. Same tier colours as GPU LOAD. |
-| Bottom | **CPUs** | Utilisation % of the **busiest logical processor** (fpsVR's "CPUs"). Sampled system-wide via a documented user-mode NT call (`NtQuerySystemInformation`) — no driver, no elevation. A high **CPUs** next to a tame **CPU LOAD** is the classic single-thread-bound signature most VR titles hit. `--` only when the sampler couldn't initialise. Same tier colours as GPU LOAD. |
-| Bottom | **CPU LOAD** | Per-cycle CPU utilisation % derived from `headroom_pct` (the app's CPU work vs. the frame budget — distinct from the system-wide **CPUs** reading). Same tier colours as GPU LOAD. |
+| Bottom | **CPU LOAD** | Per-cycle CPU utilisation % derived from `headroom_pct` (the app's CPU work vs. the frame budget — distinct from the system-wide **CPUs LOAD** reading). Same tier colours as GPU LOAD. |
+| Bottom | **CPUs LOAD** | Utilisation % of the **busiest logical processor** (fpsVR's "CPUs"). Sampled system-wide via a documented user-mode NT call (`NtQuerySystemInformation`) — no driver, no elevation. A high **CPUs LOAD** next to a tame **CPU LOAD** is the classic single-thread-bound signature most VR titles hit. `--` only when the sampler couldn't initialise. Same tier colours as GPU LOAD. |
 
 **Bar colour code** (per-sample, not overall):
 

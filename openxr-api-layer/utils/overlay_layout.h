@@ -76,18 +76,24 @@ namespace openxr_api_layer::detail {
     //
     //   ── bottom row (2 panels, 60/40 split, 5 cells total) ────────
     //   ┌──────────────────────────────────────┬───────────────────┐
-    //   │ GPU TEMP │ GPU LOAD │ VRAM           │ CPUs     │ CPU LOAD│
-    //   │ 67 °C    │ 92 %     │ 76 %           │ 98 %     │ 78 %    │
+    //   │ GPU TEMP │ GPU LOAD │ VRAM           │ CPU LOAD │ CPUs LOAD│
+    //   │ 67 °C    │ 92 %     │ 76 %           │ 78 %     │ 98 %    │
     //   └──────────────────────────────────────┴───────────────────┘
     //   GPU panel (3 cells)                    CPU panel (2 cells)
-    //   gpu_temp_c   gpu_util_pct    vram_pct  cpus_max_pct cpu_util_pct
-    //                gpu_util_fraction         cpus_max_fraction
-    //                                                       cpu_util_fraction
+    //   gpu_temp_c   gpu_util_pct    vram_pct  cpu_util_pct cpus_max_pct
+    //                gpu_util_fraction         cpu_util_fraction
+    //                                                       cpus_max_fraction
     //
-    // The CPU panel's first cell is "CPUs": the utilisation of the
-    // BUSIEST logical processor (fpsVR's "CPUs"), sourced from
-    // CpuUsageReader via the snapshot's cpus_max_pct. It REPLACES the
-    // old "CPU TEMP" placeholder — CPU temperature needs ring-0 access
+    // The CPU panel shows TWO utilisation percentages side by side:
+    //   * "CPU LOAD"  — per-cycle CPU vs the frame budget (cpu_util_pct,
+    //                   = 100 − headroom; the layer's own frame-timing
+    //                   metric).
+    //   * "CPUs LOAD" — the BUSIEST logical processor's system-wide
+    //                   utilisation (fpsVR's "CPUs"), sourced from
+    //                   CpuUsageReader via cpus_max_pct.
+    // Together they make the single-thread-bound case obvious (high
+    // "CPUs LOAD", tame "CPU LOAD"). This pair REPLACES the old
+    // "CPU TEMP" placeholder — CPU temperature needs ring-0 access
     // (handled separately by the out-of-process helper design), whereas
     // per-core usage comes from a documented user-mode NT call we can
     // make in-process. cpus_max_pct renders "--" only when the source
@@ -115,14 +121,13 @@ namespace openxr_api_layer::detail {
         std::string cpu_app_ms       = "--.-";  // App ms (wait→end)
 
         // Bottom row — GPU temperature (integer °C, "--" sentinel when
-        // source absent). The CPU panel shows "CPUs" (busiest-core
-        // utilisation, cpus_max_pct below) in this slot instead of a
-        // temperature.
+        // source absent). The CPU panel has no temperature cell — both of
+        // its cells are utilisation percentages ("CPU LOAD" + "CPUs LOAD").
         std::string gpu_temp_c       = "--";
 
-        // Bottom row — "CPUs": busiest-core utilisation %, "--" when the
-        // CPU sampler has no reading (NaN). Replaces the old CPU TEMP
-        // placeholder.
+        // Bottom row — "CPUs LOAD": busiest-core utilisation %, "--" when
+        // the CPU sampler has no reading (NaN). Shown next to "CPU LOAD"
+        // in the CPU panel; replaces the old CPU TEMP placeholder.
         std::string cpus_max_pct     = "--";
 
         // Bottom row — utilisation percentages (drawn both as text
