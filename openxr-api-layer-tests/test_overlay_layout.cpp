@@ -74,13 +74,14 @@ TEST_CASE("formatOverlayDisplayValues: invalid snapshot → valid=false POD") {
     CHECK(v.cpu_frametime_ms == "--.-");
     CHECK(v.cpu_app_ms       == "--.-");
     CHECK(v.gpu_temp_c  == "--");
-    CHECK(v.cpu_temp_c  == "--");
+    CHECK(v.cpus_max_pct == "--");
     CHECK(v.gpu_util_pct == "--");
     CHECK(v.cpu_util_pct == "--");
     CHECK(v.vram_pct     == "--");
     CHECK(v.gpu_util_fraction == 0.0f);
     CHECK(v.cpu_util_fraction == 0.0f);
     CHECK(v.vram_fraction     == 0.0f);
+    CHECK(v.cpus_max_fraction == 0.0f);
 }
 
 TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
@@ -98,6 +99,7 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     snap.gpu_temp_c          = 67.0f;
     snap.gpu_utilisation_pct = 92.0f;
     snap.cpu_utilisation_pct = 78.0f;
+    snap.cpus_max_pct        = 98.0f;  // busiest single core
 
     const auto v = formatOverlayDisplayValues(snap);
     REQUIRE(v.valid);
@@ -114,10 +116,10 @@ TEST_CASE("formatOverlayDisplayValues: nominal snapshot populates every cell") {
     CHECK(v.cpu_frametime_ms == "7.4");
     CHECK(v.cpu_app_ms       == "4.3");
 
-    // Bottom row temps — integer °C.
+    // Bottom row — GPU temp (integer °C) and "CPUs" (busiest-core %).
     CHECK(v.gpu_temp_c == "67");
-    // cpu_temp_c is ALWAYS "--" until PawnIO lands.
-    CHECK(v.cpu_temp_c == "--");
+    CHECK(v.cpus_max_pct == "98");
+    CHECK(v.cpus_max_fraction == doctest::Approx(0.98f).epsilon(0.001));
 
     // Bottom row utilisation — integer percent + matching fraction.
     CHECK(v.gpu_util_pct == "92");
@@ -195,10 +197,42 @@ TEST_CASE("formatOverlayDisplayValues: gpu_temp_c NaN renders as '--'") {
     snap.gpu_temp_c  = std::numeric_limits<float>::quiet_NaN();
     const auto v = formatOverlayDisplayValues(snap);
     CHECK(v.gpu_temp_c == "--");
-    // The CPU temp is always "--" regardless of input (no in-process
-    // CPU temp source yet); same string, same width — keeps the
-    // gauges aligned across the bottom row.
-    CHECK(v.cpu_temp_c == "--");
+    // "CPUs" renders "--" when the sampler has no reading — NaN is the
+    // source-absent / no-baseline sentinel (CpuUsageReader didn't init,
+    // or this is the first poll). Same string, same width, so the bottom
+    // row stays aligned.
+    CHECK(v.cpus_max_pct == "--");
+    CHECK(v.cpus_max_fraction == 0.0f);
+}
+
+TEST_CASE("formatOverlayDisplayValues: CPUs cell formats, rounds, clamps, and falls back") {
+    OverlaySnapshot snap;
+    snap.valid = true;
+    snap.fps_instant = 90.0f;
+
+    // Nominal: rounds to nearest integer, fraction tracks the percent.
+    snap.cpus_max_pct = 87.4f;  // → 87
+    auto v = formatOverlayDisplayValues(snap);
+    CHECK(v.cpus_max_pct == "87");
+    CHECK(v.cpus_max_fraction == doctest::Approx(0.874f).epsilon(0.001));
+
+    // Pinned single core → "100 %", fraction saturates at 1.0.
+    snap.cpus_max_pct = 100.0f;
+    v = formatOverlayDisplayValues(snap);
+    CHECK(v.cpus_max_pct == "100");
+    CHECK(v.cpus_max_fraction == doctest::Approx(1.0f).epsilon(0.001));
+
+    // Source absent (NaN) → "--", fraction 0 so the gauge draws nothing.
+    snap.cpus_max_pct = std::numeric_limits<float>::quiet_NaN();
+    v = formatOverlayDisplayValues(snap);
+    CHECK(v.cpus_max_pct == "--");
+    CHECK(v.cpus_max_fraction == 0.0f);
+
+    // Defensive clamp if an out-of-range value somehow reaches the
+    // formatter (the reader already clamps to [0,100]).
+    snap.cpus_max_pct = 250.0f;
+    CHECK(formatOverlayDisplayValues(snap).cpus_max_fraction ==
+          doctest::Approx(1.0f).epsilon(0.001));
 }
 
 TEST_CASE("formatOverlayDisplayValues: out-of-range temp clamps to '--' sentinel") {

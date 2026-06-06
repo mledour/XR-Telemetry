@@ -149,6 +149,7 @@
     <!-- doctest driver + tests in this project. Add your own test_*.cpp
          files here — see test_example.cpp for the doctest pattern. -->
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="test_cpu_usage.cpp" />
     <ClCompile Include="test_example.cpp" />
     <ClCompile Include="test_gpu_telemetry.cpp" />
     <ClCompile Include="test_histogram_ring.cpp" />
@@ -175,6 +176,7 @@
          your layer with more .cpp files. -->
     <ClCompile Include="..\openxr-api-layer\layer.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\chrome_shape_renderer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\cpu_usage.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas_renderer.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\gpu_telemetry.cpp" />

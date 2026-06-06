@@ -53,6 +53,9 @@
     <ClInclude Include="utils\glyph_atlas_renderer.h">
       <Filter>Utilities</Filter>
     </ClInclude>
+    <ClInclude Include="utils\cpu_usage.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
     <ClInclude Include="utils\gpu_telemetry.h">
       <Filter>Utilities</Filter>
     </ClInclude>
@@ -110,6 +113,9 @@
       <Filter>Utilities</Filter>
     </ClCompile>
     <ClCompile Include="utils\glyph_atlas_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\cpu_usage.cpp">
       <Filter>Utilities</Filter>
     </ClCompile>
     <ClCompile Include="utils\gpu_telemetry.cpp">

@@ -76,18 +76,22 @@ namespace openxr_api_layer::detail {
     //
     //   ── bottom row (2 panels, 60/40 split, 5 cells total) ────────
     //   ┌──────────────────────────────────────┬───────────────────┐
-    //   │ GPU TEMP │ GPU LOAD │ VRAM           │ CPU TEMP │ CPU LOAD│
-    //   │ 67 °C    │ 92 %     │ 76 %           │ -- °C    │ 78 %    │
+    //   │ GPU TEMP │ GPU LOAD │ VRAM           │ CPUs     │ CPU LOAD│
+    //   │ 67 °C    │ 92 %     │ 76 %           │ 98 %     │ 78 %    │
     //   └──────────────────────────────────────┴───────────────────┘
     //   GPU panel (3 cells)                    CPU panel (2 cells)
-    //   gpu_temp_c   gpu_util_pct    vram_pct  cpu_temp_c  cpu_util_pct
-    //                gpu_util_fraction          (no CPU temp     cpu_util_fraction
-    //                                            source yet)
+    //   gpu_temp_c   gpu_util_pct    vram_pct  cpus_max_pct cpu_util_pct
+    //                gpu_util_fraction         cpus_max_fraction
+    //                                                       cpu_util_fraction
     //
-    // The cpu_temp_c cell always renders "--" until PawnIO support
-    // lands in a follow-up PR (no anti-cheat-safe CPU temp source for
-    // an in-process layer otherwise — see the project history for the
-    // CPU-temp / WinRing0 / PawnIO analysis).
+    // The CPU panel's first cell is "CPUs": the utilisation of the
+    // BUSIEST logical processor (fpsVR's "CPUs"), sourced from
+    // CpuUsageReader via the snapshot's cpus_max_pct. It REPLACES the
+    // old "CPU TEMP" placeholder — CPU temperature needs ring-0 access
+    // (handled separately by the out-of-process helper design), whereas
+    // per-core usage comes from a documented user-mode NT call we can
+    // make in-process. cpus_max_pct renders "--" only when the source
+    // is unavailable (NaN) — same isfinite() guard as the GPU cells.
     struct OverlayDisplayValues {
         // Header bar
         std::string fps_instant      = "--";  // big white number
@@ -110,10 +114,16 @@ namespace openxr_api_layer::detail {
         std::string cpu_frametime_ms = "--.-";  // Render ms
         std::string cpu_app_ms       = "--.-";  // App ms (wait→end)
 
-        // Bottom row — temperatures (integer °C, "--" sentinel when
-        // source absent).
+        // Bottom row — GPU temperature (integer °C, "--" sentinel when
+        // source absent). The CPU panel shows "CPUs" (busiest-core
+        // utilisation, cpus_max_pct below) in this slot instead of a
+        // temperature.
         std::string gpu_temp_c       = "--";
-        std::string cpu_temp_c       = "--";   // always "--" until PawnIO
+
+        // Bottom row — "CPUs": busiest-core utilisation %, "--" when the
+        // CPU sampler has no reading (NaN). Replaces the old CPU TEMP
+        // placeholder.
+        std::string cpus_max_pct     = "--";
 
         // Bottom row — utilisation percentages (drawn both as text
         // inside the gauge AND geometrically as an arc filling 0..N%
@@ -135,6 +145,10 @@ namespace openxr_api_layer::detail {
         float       gpu_util_fraction = 0.0f;
         float       cpu_util_fraction = 0.0f;
         float       vram_fraction     = 0.0f;
+        // Tier fraction (0..1) for the "CPUs" cell — same warning-tier
+        // colour ramp (cyan / orange / red) as LOAD / VRAM, since "CPUs"
+        // is also a utilisation percentage. 0 when the source is absent.
+        float       cpus_max_fraction = 0.0f;
 
         // True when at least the FPS field carries a real value. The
         // renderer can skip the text/gauge passes (but still paint the
@@ -205,10 +219,10 @@ namespace openxr_api_layer::detail {
         v.cpu_app_ms       = fmtMsOneDecimal(snap.cpu_app_ms);
 
         v.gpu_temp_c       = fmtTempInt(snap.gpu_temp_c);
-        // cpu_temp_c intentionally stays "--": there's no anti-cheat-
-        // safe in-process CPU temp source until PawnIO lands in a
-        // follow-up PR.
-        v.cpu_temp_c       = "--";
+        // "CPUs" — busiest-core utilisation. NaN (no sampler reading /
+        // source absent) flows through fmtPctInt as "--", same as any
+        // other percentage cell.
+        v.cpus_max_pct     = fmtPctInt(snap.cpus_max_pct);
 
         v.gpu_util_pct     = fmtPctInt(snap.gpu_utilisation_pct);
         v.cpu_util_pct     = fmtPctInt(snap.cpu_utilisation_pct);
@@ -218,6 +232,9 @@ namespace openxr_api_layer::detail {
             : 0.0f;
         v.cpu_util_fraction = std::isfinite(snap.cpu_utilisation_pct)
             ? std::clamp(snap.cpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
+            : 0.0f;
+        v.cpus_max_fraction = std::isfinite(snap.cpus_max_pct)
+            ? std::clamp(snap.cpus_max_pct / 100.0f, 0.0f, 1.0f)
             : 0.0f;
 
         // VRAM percentage of budget. Both bytes values come from

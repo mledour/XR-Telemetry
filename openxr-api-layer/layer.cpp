@@ -50,6 +50,7 @@
 
 #include "layer.h"
 #include "telemetry_internals.h"
+#include "utils/cpu_usage.h"
 #include "utils/default_settings_template.h"
 #include "utils/gpu_telemetry.h"
 #include "utils/name_utils.h"
@@ -1701,6 +1702,22 @@ namespace openxr_api_layer {
                     "will be NaN / 0 for this session\n");
             }
 
+            // CPU usage sampler for the overlay's "CPUs" cell (busiest
+            // logical-processor utilisation). Unlike the GPU reader this
+            // needs no adapter — it reads system-wide scheduler counters
+            // via a documented user-mode NT call (see cpu_usage.h). Kept
+            // alive regardless of init() outcome so the xrEndFrame poll
+            // site stays branchless on "is the reader alive"; poll()
+            // returns NaN (→ "--") on the rare host where it didn't init.
+            m_cpuUsage = std::make_unique<detail::CpuUsageReader>();
+            if (m_cpuUsage->init()) {
+                Log("xr_telemetry: CPU usage telemetry active (CPUs cell)\n");
+            } else {
+                Log("xr_telemetry: CPU usage telemetry unavailable "
+                    "(NtQuerySystemInformation did not resolve); the CPUs "
+                    "cell will show \"--\" for this session\n");
+            }
+
             // View space for the head-locked overlay quad. Created only
             // when the renderer materialised (no point if there's no
             // HUD to position). xrDestroySession releases it. If the
@@ -2215,6 +2232,37 @@ namespace openxr_api_layer {
                 }
             }
 
+            // Refresh the cached "CPUs" reading (busiest-core utilisation)
+            // on the SAME ~1 Hz cadence as the GPU poll, but on an
+            // independent gate so it stays alive on hosts where the GPU
+            // reader self-disabled (non-NVIDIA, no DXGI). CPU usage is a
+            // delta between two samples, so a ~1 Hz interval also gives the
+            // percentage a meaningful averaging window. The poll() itself
+            // is one NT call + a loop over ≤ 64 cores — cheap, but still
+            // gated off the per-frame path for the same reason the GPU poll
+            // is (it's a periodic frame-thread cost; see the GPU block).
+            if (m_cpuUsage && m_cpuUsage->isReady()) {
+                const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
+                const int64_t pollInterval = std::max(
+                    m_overlay.refreshIntervalNs(),
+                    kCpuUsageMinPollIntervalNs);
+                if (nowNs - m_lastCpuUsagePollNs >= pollInterval) {
+                    log::ScopedQpcSpan span;
+                    m_lastCpuUsage = m_cpuUsage->poll();
+                    if (span.enabled()) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "xr_telemetry_cpu_poll",
+                                          TLArg(span.elapsedNs(), "duration_ns"),
+                                          TLArg(frameIndex, "frame_index"));
+                    }
+                    m_lastCpuUsagePollNs = nowNs;
+                    // Latch into the aggregator so the next overlay refresh
+                    // publishes the fresh "CPUs" value. Pushed regardless of
+                    // m_overlayActive (cheap setter), same as the GPU push.
+                    m_overlay.pushCpuTelemetry(m_lastCpuUsage.cpus_max_pct);
+                }
+            }
+
             FrameRecord rec{
                 frameIndex,
                 tEnd,
@@ -2403,6 +2451,9 @@ namespace openxr_api_layer {
             m_gpuTelemetry.reset();
             m_lastGpuTelemetry = detail::GpuTelemetrySample{};
             m_lastGpuTelemetryPollNs = 0;
+            m_cpuUsage.reset();
+            m_lastCpuUsage = detail::CpuUsageSample{};
+            m_lastCpuUsagePollNs = 0;
             m_overlayRenderer.reset();
             if (m_viewSpace != XR_NULL_HANDLE) {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
@@ -2603,6 +2654,15 @@ namespace openxr_api_layer {
         std::unique_ptr<detail::GpuTelemetryReader> m_gpuTelemetry;
         detail::GpuTelemetrySample m_lastGpuTelemetry{};
         int64_t m_lastGpuTelemetryPollNs = 0;
+
+        // CPU usage sampler ("CPUs" cell = busiest logical-processor %).
+        // Polled on the frame thread at max(refresh, kCpuUsageMinPollIntervalNs)
+        // — see the poll site in xrEndFrame. The latest reading is cached so
+        // the value survives between polls; latched into the aggregator on
+        // each poll via pushCpuTelemetry.
+        std::unique_ptr<detail::CpuUsageReader> m_cpuUsage;
+        detail::CpuUsageSample m_lastCpuUsage{};
+        int64_t m_lastCpuUsagePollNs = 0;
         // 1 s — the minimum interval between GPU telemetry polls. NvAPI/DXGI
         // thermal + VRAM counters refresh at ~1 Hz on the driver side, so
         // polling faster returns identical values and just burns frame-thread
@@ -2616,6 +2676,15 @@ namespace openxr_api_layer {
         // at 60 (>= 16.6 ms) this 1 s floor now dominates for every refresh
         // rate, which is intended.
         static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 1'000'000'000LL;
+
+        // 1 s — the minimum interval between CPU usage polls. Two reasons,
+        // both pointing at ~1 Hz: (1) CPU utilisation is a delta between two
+        // samples, and a ~1 s window is what fpsVR-style "CPUs" readings use
+        // to stay readable rather than shimmering; (2) it keeps the NT query
+        // off all but ~1 frame per second, same frame-thread-cost argument as
+        // the GPU poll floor. A SEPARATE constant from the GPU one on purpose
+        // — they happen to coincide at 1 s today but track different facts.
+        static constexpr int64_t kCpuUsageMinPollIntervalNs = 1'000'000'000LL;
 
         // Minimum spacing between overlay percentile (P95/P99/P99.9) re-sorts,
         // passed to OverlayAggregator. ~1 Hz like the poll floor above, but for

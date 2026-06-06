@@ -704,6 +704,49 @@ TEST_CASE("OverlayAggregator: pushGpuTelemetry uses LATEST value, not average") 
     CHECK(agg.snapshot().vram_used_bytes == 5'000'000'000ULL);
 }
 
+// =============================================================================
+// CPU usage ("CPUs") — pushCpuTelemetry latches the busiest-core reading the
+// same way pushGpuTelemetry latches temperature. Same NaN-is-"no-source"
+// contract, same latch-not-average semantics.
+// =============================================================================
+
+TEST_CASE("OverlayAggregator: snapshot defaults to NaN CPUs with no source") {
+    // No pushCpuTelemetry call — cpus_max_pct must stay NaN even after a
+    // full refresh, so the renderer shows "--".
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK_FALSE(std::isfinite(agg.snapshot().cpus_max_pct));
+}
+
+TEST_CASE("OverlayAggregator: pushCpuTelemetry latches busiest-core % into publish") {
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushCpuTelemetry(/*cpus_max_pct=*/97.0f);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().cpus_max_pct == doctest::Approx(97.0f).epsilon(0.001));
+}
+
+TEST_CASE("OverlayAggregator: pushCpuTelemetry uses LATEST value, not average") {
+    // Same rationale as the GPU case: the value is already an interval
+    // delta, so we show the most recent poll rather than smearing it.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushCpuTelemetry(40.0f);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushCpuTelemetry(95.0f);  // a new spike mid-window
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK(agg.snapshot().cpus_max_pct == doctest::Approx(95.0f).epsilon(0.001));
+}
+
 TEST_CASE("OverlayAggregator: version is 1 after the first publish") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     CHECK(agg.snapshot().version == 0);
