@@ -1529,6 +1529,15 @@ namespace openxr_api_layer {
             m_overlay = detail::OverlayAggregator(overlayIntervalNs, m_qpcFrequency,
                                                   kPercentileRefreshIntervalNs);
 
+            // Resolve the quad geometry once — position / scale / offset are
+            // all immutable after this point (no live reload), so the centre
+            // offset + size never change for the session. Both the head-
+            // locked draw path and the world-anchor freeze reuse this.
+            m_overlayGeo = detail::geometryForPosition(m_settings.overlay.position,
+                                                       m_settings.overlay.scale,
+                                                       m_settings.overlay.offset_x,
+                                                       m_settings.overlay.offset_y);
+
             if (m_settings.overlay.enabled) {
                 if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
                     m_overlayActive = true;
@@ -2037,8 +2046,7 @@ namespace openxr_api_layer {
                 if (!skipDrawThisFrame) {
                     overlayLayer = m_overlayRenderer->renderAndCompose(
                         overlaySpace, anchorPose, m_overlay.snapshot(),
-                        m_settings.overlay.position,
-                        m_settings.overlay.scale);
+                        m_overlayGeo);
                 }
             }
 
@@ -2441,11 +2449,9 @@ namespace openxr_api_layer {
                 (loc.locationFlags & kTracked) != kTracked) {
                 return false;
             }
-            const detail::OverlayGeometry geo = detail::geometryForPosition(
-                m_settings.overlay.position, m_settings.overlay.scale);
             const detail::OverlayPose anchored = detail::composeAnchorPose(
                 detail::toOverlayPose(loc.pose),
-                {geo.pos_x, geo.pos_y, geo.pos_z});
+                {m_overlayGeo.pos_x, m_overlayGeo.pos_y, m_overlayGeo.pos_z});
             out = detail::toXrPosef(anchored);
             return true;
         }
@@ -2513,6 +2519,13 @@ namespace openxr_api_layer {
         detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
         bool m_overlayActive = false;
         std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+
+        // Quad geometry (centre offset + size), resolved once in
+        // xrCreateInstance from the immutable overlay settings (position /
+        // scale / offset_x / offset_y). The renderer no longer derives it;
+        // we hand it to renderAndCompose every frame and use its offset when
+        // freezing a world anchor.
+        detail::OverlayGeometry m_overlayGeo{};
 
         // View space (XR_REFERENCE_SPACE_TYPE_VIEW) — head-locked
         // reference frame the overlay quad lives in. Created at xrCreate

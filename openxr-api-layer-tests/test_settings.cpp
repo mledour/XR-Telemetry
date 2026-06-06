@@ -58,6 +58,8 @@ namespace {
         CHECK(p.settings.overlay.position == "head_top_right");
         CHECK(p.settings.overlay.scale == 1.0f);
         CHECK(p.settings.overlay.anchor == OverlayAnchor::Head);
+        CHECK(p.settings.overlay.offset_x == 0.0f);
+        CHECK(p.settings.overlay.offset_y == 0.0f);
     }
 }
 
@@ -242,6 +244,33 @@ TEST_CASE("parseSettings: overlay.anchor missing/typo/wrong-type falls back to h
               .settings.overlay.anchor == OverlayAnchor::Head);
     CHECK(parseSettings(R"({"overlay":{"anchor":42}})")
               .settings.overlay.anchor == OverlayAnchor::Head);
+}
+
+TEST_CASE("parseSettings: overlay.offset_x / offset_y read and default to 0") {
+    const auto p = parseSettings(R"({"overlay":{"offset_x":0.15,"offset_y":-0.2}})");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.offset_x == doctest::Approx(0.15f));
+    CHECK(p.settings.overlay.offset_y == doctest::Approx(-0.2f));
+    // Missing → 0 (no nudge).
+    const auto d = parseSettings(R"({"overlay":{}})");
+    CHECK(d.settings.overlay.offset_x == 0.0f);
+    CHECK(d.settings.overlay.offset_y == 0.0f);
+}
+
+TEST_CASE("parseSettings: overlay offsets clamp to [-1.0, 1.0] metres") {
+    CHECK(parseSettings(R"({"overlay":{"offset_x":5.0}})").settings.overlay.offset_x == 1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_x":-5.0}})").settings.overlay.offset_x == -1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":99}})").settings.overlay.offset_y == 1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":-99}})").settings.overlay.offset_y == -1.0f);
+    // In-range and integer-typed JSON pass through.
+    CHECK(parseSettings(R"({"overlay":{"offset_x":0.5}})").settings.overlay.offset_x
+              == doctest::Approx(0.5f));
+    CHECK(parseSettings(R"({"overlay":{"offset_y":0}})").settings.overlay.offset_y == 0.0f);
+}
+
+TEST_CASE("parseSettings: overlay offset wrong-type falls back to 0") {
+    CHECK(parseSettings(R"({"overlay":{"offset_x":"nope"}})").settings.overlay.offset_x == 0.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":true}})").settings.overlay.offset_y == 0.0f);
 }
 
 TEST_CASE("parseSettings: overlay defaults match the documented shipped template") {

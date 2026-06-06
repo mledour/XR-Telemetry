@@ -32,7 +32,8 @@
 //       "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
 //     },
 //     "overlay": { "enabled", "mode", "hotkey", "refresh_hz",
-//                  "position", "scale", "anchor" }
+//                  "position", "scale", "anchor",
+//                  "offset_x", "offset_y" }
 //   }
 //
 // Everything is permissive: missing fields fall back to the "preserve
@@ -115,6 +116,16 @@ namespace openxr_api_layer::detail {
         // written before this field existed keeps the stock head-locked
         // behaviour. Unknown strings fall back to "head".
         OverlayAnchor anchor = OverlayAnchor::Head;
+        // Fine-tune the quad CENTRE position, in metres at the 1 m quad
+        // distance, on top of whatever `position` selects. View-space axes:
+        // +X = right, +Y = up (so negative pushes left / down). Lets a user
+        // nudge the HUD further into a corner (or back off it) without a
+        // rebuild. Both default to 0 (no nudge) and are clamped to
+        // [-1.0, 1.0] m — ~±45° off-axis at 1 m, past which the quad would
+        // leave the FOV entirely. In world-locked mode the nudge is baked
+        // into the frozen pose at activation, same as `position`.
+        float offset_x = 0.0f;
+        float offset_y = 0.0f;
     };
 
     // Top-level settings struct.
@@ -228,6 +239,8 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.position = "head_top_right";
         result.settings.overlay.scale = 1.0f;
         result.settings.overlay.anchor = OverlayAnchor::Head;
+        result.settings.overlay.offset_x = 0.0f;
+        result.settings.overlay.offset_y = 0.0f;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -360,6 +373,15 @@ namespace openxr_api_layer::detail {
             result.settings.overlay.anchor = iequalsAscii(anchorStr, "world")
                 ? OverlayAnchor::World
                 : OverlayAnchor::Head;
+
+            // `offset_x` / `offset_y` nudge the quad centre in metres on top
+            // of `position`. Clamped to [-1.0, 1.0] m (~±45° at the 1 m quad
+            // distance) so a fat-fingered value can't fling the HUD out of
+            // the FOV. Missing / wrong-type → 0 (no nudge).
+            const float rawOffX = getFloatOr(ov, "offset_x", 0.0f);
+            const float rawOffY = getFloatOr(ov, "offset_y", 0.0f);
+            result.settings.overlay.offset_x = std::clamp(rawOffX, -1.0f, 1.0f);
+            result.settings.overlay.offset_y = std::clamp(rawOffY, -1.0f, 1.0f);
         }
 
         return result;

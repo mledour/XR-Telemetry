@@ -343,6 +343,41 @@ TEST_CASE("geometryForPosition: scale multiplies width and height") {
     CHECK(half.pos_y == doctest::Approx(normal.pos_y).epsilon(0.001));
 }
 
+TEST_CASE("geometryForPosition: offset_x / offset_y shift the centre, not the size") {
+    const auto base    = geometryForPosition("head_top_right", 1.0f);
+    const auto nudged  = geometryForPosition("head_top_right", 1.0f, 0.1f, -0.05f);
+    CHECK(nudged.pos_x == doctest::Approx(base.pos_x + 0.1f).epsilon(0.0001));
+    CHECK(nudged.pos_y == doctest::Approx(base.pos_y - 0.05f).epsilon(0.0001));
+    CHECK(nudged.pos_z == doctest::Approx(base.pos_z).epsilon(0.0001));
+    // Size is untouched by the nudge.
+    CHECK(nudged.width_m  == doctest::Approx(base.width_m).epsilon(0.0001));
+    CHECK(nudged.height_m == doctest::Approx(base.height_m).epsilon(0.0001));
+}
+
+TEST_CASE("geometryForPosition: negative offset_x pushes head_top_left further out") {
+    // Top-left sits at -X; a negative offset_x pushes it even further left
+    // (more negative), i.e. further into the corner.
+    const auto base   = geometryForPosition("head_top_left", 1.0f);
+    const auto pushed = geometryForPosition("head_top_left", 1.0f, -0.1f, 0.0f);
+    CHECK(pushed.pos_x == doctest::Approx(base.pos_x - 0.1f).epsilon(0.0001));
+    CHECK(pushed.pos_x < base.pos_x);
+}
+
+TEST_CASE("geometryForPosition: offset composes with head_center (zero preset)") {
+    // head_center is the (0,0) preset, so the offset IS the resulting centre.
+    const auto g = geometryForPosition("head_center", 1.0f, 0.2f, 0.15f);
+    CHECK(g.pos_x == doctest::Approx(0.2f).epsilon(0.0001));
+    CHECK(g.pos_y == doctest::Approx(0.15f).epsilon(0.0001));
+}
+
+TEST_CASE("geometryForPosition: default corner hugs the edge more than the old 0.22/0.14") {
+    // Regression guard for the default bump: the stock corner offset must
+    // stay pushed out toward the edge (was 0.22 / 0.14 before this change).
+    const auto g = geometryForPosition("head_top_right", 1.0f);
+    CHECK(g.pos_x > 0.22f);
+    CHECK(g.pos_y > 0.14f);
+}
+
 // =============================================================================
 // rotateByQuat / composeAnchorPose — world-anchor pose math. Pure, runtime-
 // free; this is what freezes the head-locked quad into the play space when
