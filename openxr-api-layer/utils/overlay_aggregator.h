@@ -226,7 +226,6 @@ namespace openxr_api_layer::detail {
         // aggregator cadence (~1 Hz), not per frame.
         void pushCpuTelemetry(float cpus_max_pct) noexcept {
             m_latestCpusMaxPct = cpus_max_pct;
-            m_gotCpuTelemetry  = true;
         }
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
@@ -490,7 +489,6 @@ namespace openxr_api_layer::detail {
         // sampler first reports (or forever, on the unlikely host where
         // NtQuerySystemInformation didn't resolve).
         float    m_latestCpusMaxPct = std::numeric_limits<float>::quiet_NaN();
-        bool     m_gotCpuTelemetry = false;
 
         // Sliding window of frame_total_ns samples for P95 / P99 /
         // P99.9 computation. 4320 samples = 30 s @ 144 Hz / 48 s @

@@ -42,6 +42,10 @@
 
 #include <cmath>
 
+#if defined(_WIN32)
+#include <windows.h>  // Sleep — let the per-core counters advance a tick
+#endif
+
 #include "utils/cpu_usage.h"
 
 using openxr_api_layer::detail::CpuUsageReader;
@@ -52,7 +56,6 @@ TEST_CASE("CpuUsageSample: default-constructed sample signals 'no data'") {
     // produced a reading. NaN is the source-absent / no-baseline sentinel
     // that formatOverlayDisplayValues turns into "--".
     CpuUsageSample s;
-    CHECK_FALSE(s.valid);
     CHECK(std::isnan(s.cpus_max_pct));
 }
 
@@ -69,11 +72,18 @@ TEST_CASE("CpuUsageReader: post-baseline poll yields a sane busiest-core %") {
     CpuUsageReader r;
     REQUIRE(r.init());  // init() already took the baseline sample
 
-    // First user-facing poll has a delta against the baseline. The exact
-    // utilisation is load-dependent, but it must be a finite percentage in
-    // [0, 100] (not NaN — that would mean "no reading").
+    // The per-core counters from NtQuerySystemInformation only advance at
+    // the system clock tick (~15.6 ms). init() and a poll() microseconds
+    // apart would read identical counters → every totalDelta == 0 → NaN.
+    // Sleep past a couple of ticks so at least one core accrues idle/busy
+    // time and the delta is real. Without this the assertion below fails
+    // on almost every run (it would pass only when a tick boundary happened
+    // to fall between the two reads).
+    Sleep(50);
+
+    // The exact utilisation is load-dependent, but it must now be a finite
+    // percentage in [0, 100] (not the NaN "no reading" sentinel).
     const CpuUsageSample s = r.poll();
-    CHECK(s.valid);
     REQUIRE(std::isfinite(s.cpus_max_pct));
     CHECK(s.cpus_max_pct >= 0.0f);
     CHECK(s.cpus_max_pct <= 100.0f);

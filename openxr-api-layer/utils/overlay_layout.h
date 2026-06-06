@@ -212,6 +212,12 @@ namespace openxr_api_layer::detail {
             }
             return std::string(buf);
         };
+        // A 0..100 percentage → the 0..1 fraction the circular gauges
+        // draw, clamped, with non-finite input collapsing to 0 (the arc
+        // geometry needs a real number). Shared by every gauge cell.
+        auto pctToFraction = [](float p) {
+            return std::isfinite(p) ? std::clamp(p / 100.0f, 0.0f, 1.0f) : 0.0f;
+        };
 
         v.fps_instant      = fmtFpsInt(snap.fps_instant);
         v.fps_avg          = fmtFpsInt(snap.fps_avg);
@@ -232,15 +238,9 @@ namespace openxr_api_layer::detail {
         v.gpu_util_pct     = fmtPctInt(snap.gpu_utilisation_pct);
         v.cpu_util_pct     = fmtPctInt(snap.cpu_utilisation_pct);
 
-        v.gpu_util_fraction = std::isfinite(snap.gpu_utilisation_pct)
-            ? std::clamp(snap.gpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
-            : 0.0f;
-        v.cpu_util_fraction = std::isfinite(snap.cpu_utilisation_pct)
-            ? std::clamp(snap.cpu_utilisation_pct / 100.0f, 0.0f, 1.0f)
-            : 0.0f;
-        v.cpus_max_fraction = std::isfinite(snap.cpus_max_pct)
-            ? std::clamp(snap.cpus_max_pct / 100.0f, 0.0f, 1.0f)
-            : 0.0f;
+        v.gpu_util_fraction = pctToFraction(snap.gpu_utilisation_pct);
+        v.cpu_util_fraction = pctToFraction(snap.cpu_utilisation_pct);
+        v.cpus_max_fraction = pctToFraction(snap.cpus_max_pct);
 
         // VRAM percentage of budget. Both bytes values come from
         // DXGI_QUERY_VIDEO_MEMORY_INFO. Guard: both must be non-zero

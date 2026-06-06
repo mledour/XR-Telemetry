@@ -1711,7 +1711,17 @@ namespace openxr_api_layer {
             // returns NaN (→ "--") on the rare host where it didn't init.
             m_cpuUsage = std::make_unique<detail::CpuUsageReader>();
             if (m_cpuUsage->init()) {
-                Log("xr_telemetry: CPU usage telemetry active (CPUs cell)\n");
+                if (m_cpuUsage->groupTruncated()) {
+                    // > 64 logical processors: we sample processor group 0
+                    // only, so "CPUs LOAD" can under-read a core pinned in
+                    // another group (Threadripper / dual-socket EPYC).
+                    Log("xr_telemetry: CPU usage telemetry active; host has "
+                        ">64 logical processors — sampling processor group 0 "
+                        "only, so \"CPUs LOAD\" may miss a core in another "
+                        "group\n");
+                } else {
+                    Log("xr_telemetry: CPU usage telemetry active (CPUs cell)\n");
+                }
             } else {
                 Log("xr_telemetry: CPU usage telemetry unavailable "
                     "(NtQuerySystemInformation did not resolve); the CPUs "
@@ -2182,6 +2192,11 @@ namespace openxr_api_layer {
             // pct against the resolved gpu_time_ns.
             const float gpuHeadroomPct = detail::computeGpuHeadroomPct(/*gpuTimeNs=*/0, periodNs);
 
+            // Shared "now" for both telemetry poll gates below — one
+            // QPC→ns conversion per frame, read by each gate's ~1 s
+            // interval check (rather than converting the same tEnd twice).
+            const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
+
             // Refresh the cached GPU telemetry (temp + VRAM) at the
             // aggregator's refresh cadence — drivers update these
             // counters at ~1 Hz, so polling NvAPI / DXGI per-frame at
@@ -2198,7 +2213,6 @@ namespace openxr_api_layer {
             // poll lands at ~1 Hz for every overlay refresh_hz: polling faster
             // only re-reads identical values.
             if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
-                const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
                 const int64_t pollInterval = std::max(
                     m_overlay.refreshIntervalNs(),
                     kGpuTelemetryMinPollIntervalNs);
@@ -2242,7 +2256,6 @@ namespace openxr_api_layer {
             // gated off the per-frame path for the same reason the GPU poll
             // is (it's a periodic frame-thread cost; see the GPU block).
             if (m_cpuUsage && m_cpuUsage->isReady()) {
-                const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
                 const int64_t pollInterval = std::max(
                     m_overlay.refreshIntervalNs(),
                     kCpuUsageMinPollIntervalNs);

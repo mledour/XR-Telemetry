@@ -72,19 +72,15 @@ namespace openxr_api_layer::detail {
     // POD result of one CpuUsageReader::poll() call.
     struct CpuUsageSample {
         // Busiest logical processor's utilisation, percent [0, 100], over
-        // the interval since the previous poll. NaN means "no reading":
-        // either the very first poll after init() (baseline only — a delta
-        // needs two samples) or the source is unavailable
-        // (NtQuerySystemInformation didn't resolve). The overlay's
-        // isfinite() guard in formatOverlayDisplayValues renders NaN as
-        // the "--" placeholder, keeping the cell at its fixed width.
+        // the interval since the previous poll. NaN is the single "no
+        // reading" sentinel: either the very first poll after init()
+        // (baseline only — a delta needs two samples), an interval too
+        // short for the per-core counters to advance, or the source is
+        // unavailable (NtQuerySystemInformation didn't resolve). Consumers
+        // (the overlay's isfinite() guard, the unit test) test
+        // std::isfinite(cpus_max_pct) — there is no separate validity flag
+        // to keep in sync.
         float cpus_max_pct = std::numeric_limits<float>::quiet_NaN();
-
-        // True when this poll produced a real delta-based reading. An
-        // immediate-consumer convenience (matches GpuTelemetrySample's
-        // *_valid flags); downstream POD consumers rely only on the NaN
-        // sentinel on cpus_max_pct.
-        bool valid = false;
     };
 
     // Polls per-core CPU utilisation and reports the busiest core. One
@@ -116,6 +112,14 @@ namespace openxr_api_layer::detail {
         // this the same way they gate on GpuTelemetryReader::isReady().
         bool isReady() const noexcept { return m_ready; }
 
+        // True when the host has more logical processors than a single
+        // processor group holds (> 64) and the sampler therefore covers
+        // group 0 only — the busiest-core reading can miss a core pinned
+        // in another group. Lets layer.cpp log the limitation once at
+        // session start (Threadripper / dual-socket EPYC). False on every
+        // ordinary ≤ 64-thread host.
+        bool groupTruncated() const noexcept { return m_groupTruncated; }
+
         // Single-shot poll. Reads the per-core counters, diffs them against
         // the previous sample, and returns the max busy% across all
         // logical processors. The first call after init()'s baseline
@@ -124,6 +128,13 @@ namespace openxr_api_layer::detail {
         CpuUsageSample poll() noexcept;
 
       private:
+        // Take the first sample for its side effect only — populate
+        // m_prev* and set m_haveBaseline — discarding the (NaN) result.
+        // Called once by init() so the first real poll() has a previous
+        // sample to diff against. Named so both init() and the poll path
+        // read clearly (vs. a bare `(void)poll()`).
+        void primeBaseline() noexcept;
+
         // Resolved NtQuerySystemInformation. Stored as void* so this header
         // stays <windows.h>-free; the .cpp casts it to the real signature.
         // nullptr until init() succeeds.
@@ -143,6 +154,8 @@ namespace openxr_api_layer::detail {
         // first poll from reporting a bogus delta against zeroed buffers.
         bool m_haveBaseline = false;
         bool m_ready = false;
+        // Set in init() when dwNumberOfProcessors > 64 (see groupTruncated()).
+        bool m_groupTruncated = false;
     };
 
 } // namespace openxr_api_layer::detail

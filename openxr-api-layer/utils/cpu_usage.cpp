@@ -102,24 +102,51 @@ namespace openxr_api_layer::detail {
             return false;
         }
         if (m_cpuCount > kMaxProcessors) {
+            // More logical processors than one group holds — we sample
+            // group 0 only. Flag it so layer.cpp can log the limitation
+            // once (the busiest core may live in an unsampled group).
             m_cpuCount = kMaxProcessors;
+            m_groupTruncated = true;
         }
 
-        m_prevIdle.assign(m_cpuCount, 0);
-        m_prevTotal.assign(m_cpuCount, 0);
+        try {
+            m_prevIdle.assign(m_cpuCount, 0);
+            m_prevTotal.assign(m_cpuCount, 0);
+        } catch (...) {
+            // .assign() can throw bad_alloc; in a noexcept function that
+            // would call std::terminate and kill the host game — against
+            // the layer's "degrade, never crash" rule. Bail to the
+            // disabled state instead (near-impossible for two ~512-byte
+            // vectors, but the rule is absolute).
+            m_ntQuerySystemInformation = nullptr;
+            return false;
+        }
         m_ready = true;
 
-        // Prime the baseline so the first user-facing poll() already has a
-        // previous sample to diff against (otherwise the HUD shows "--" for
-        // one full poll interval at session start). This first poll returns
-        // NaN — we discard it — but it populates m_prev* / m_haveBaseline.
-        (void)poll();
+        // Prime the baseline now so the first real poll() has a previous
+        // sample to diff against. NOTE: this does NOT guarantee a non-"--"
+        // first frame — the per-core counters only advance at the system
+        // tick (~15.6 ms) and the first real poll fires within a few ms of
+        // this baseline (layer.cpp's m_lastCpuUsagePollNs == 0 path), so
+        // that first reading is usually still NaN ("--") until a tick
+        // boundary passes (~1 s of polls). Priming is cheap insurance for
+        // slower poll cadences / the case where a tick happens to land
+        // between baseline and first poll.
+        primeBaseline();
         return true;
     }
 
+    void CpuUsageReader::primeBaseline() noexcept {
+        // First sample establishes m_prev* / m_haveBaseline only; its NaN
+        // return is intentionally discarded.
+        (void)poll();
+    }
+
     CpuUsageSample CpuUsageReader::poll() noexcept {
-        CpuUsageSample out;  // NaN, invalid by default
-        if (!m_ready || m_ntQuerySystemInformation == nullptr) {
+        CpuUsageSample out;  // NaN ("no reading") by default
+        // m_ready is only set true after m_ntQuerySystemInformation is
+        // confirmed non-null, so the readiness check alone is sufficient.
+        if (!m_ready) {
             return out;
         }
 
@@ -182,7 +209,6 @@ namespace openxr_api_layer::detail {
 
         if (any) {
             out.cpus_max_pct = std::clamp(maxPct, 0.0f, 100.0f);
-            out.valid = true;
         }
         return out;
     }
