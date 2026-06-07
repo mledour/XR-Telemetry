@@ -2215,16 +2215,14 @@ namespace openxr_api_layer {
             // poll lands at ~1 Hz for every overlay refresh_hz: polling faster
             // only re-reads identical values.
             if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
-                const int64_t pollInterval = std::max(
-                    m_overlay.refreshIntervalNs(),
-                    kGpuTelemetryMinPollIntervalNs);
-                if (nowNs - m_lastGpuTelemetryPollNs >= pollInterval) {
+                pollGated(nowNs, m_lastGpuTelemetryPollNs,
+                          kGpuTelemetryMinPollIntervalNs, [&] {
                     // Spike decomposition (perf/overlay-spike-instrumentation):
                     // poll() runs on the frame thread at the GPU-telemetry
-                    // cadence — now ~1 Hz (see kGpuTelemetryMinPollIntervalNs)
-                    // — so it surfaces as one of the periodic target_us
-                    // contributors. ScopedQpcSpan times just the poll() call
-                    // and is a no-op unless a trace session is listening.
+                    // cadence — ~1 Hz (see kGpuTelemetryMinPollIntervalNs) — so
+                    // it surfaces as one of the periodic target_us contributors.
+                    // ScopedQpcSpan times just the poll() call and is a no-op
+                    // unless a trace session is listening.
                     log::ScopedQpcSpan span;
                     m_lastGpuTelemetry = m_gpuTelemetry->poll();
                     if (span.enabled()) {
@@ -2233,7 +2231,6 @@ namespace openxr_api_layer {
                                           TLArg(span.elapsedNs(), "duration_ns"),
                                           TLArg(frameIndex, "frame_index"));
                     }
-                    m_lastGpuTelemetryPollNs = nowNs;
                     // Forward to the aggregator so the next overlay refresh
                     // publishes the fresh reading. Pushed on every poll
                     // regardless of m_overlayActive: gating it on the overlay
@@ -2245,23 +2242,19 @@ namespace openxr_api_layer {
                         m_lastGpuTelemetry.gpu_temp_c,
                         m_lastGpuTelemetry.vram_used_bytes,
                         m_lastGpuTelemetry.vram_budget_bytes);
-                }
+                });
             }
 
-            // Refresh the cached "CPUs" reading (busiest-core utilisation)
-            // on the SAME ~1 Hz cadence as the GPU poll, but on an
-            // independent gate so it stays alive on hosts where the GPU
-            // reader self-disabled (non-NVIDIA, no DXGI). CPU usage is a
-            // delta between two samples, so a ~1 Hz interval also gives the
-            // percentage a meaningful averaging window. The poll() itself
-            // is one NT call + a loop over ≤ 64 cores — cheap, but still
-            // gated off the per-frame path for the same reason the GPU poll
-            // is (it's a periodic frame-thread cost; see the GPU block).
+            // Refresh the cached "CPUs" reading (busiest-core utilisation) on
+            // the SAME ~1 Hz cadence (via pollGated), but on an INDEPENDENT
+            // cursor so it stays alive on hosts where the GPU reader
+            // self-disabled (non-NVIDIA, no DXGI). CPU usage is a delta between
+            // two samples, so a ~1 Hz interval also gives the percentage a
+            // meaningful averaging window. The poll() itself is one NT call +
+            // a loop over ≤ 64 cores.
             if (m_cpuUsage && m_cpuUsage->isReady()) {
-                const int64_t pollInterval = std::max(
-                    m_overlay.refreshIntervalNs(),
-                    kCpuUsageMinPollIntervalNs);
-                if (nowNs - m_lastCpuUsagePollNs >= pollInterval) {
+                pollGated(nowNs, m_lastCpuUsagePollNs,
+                          kCpuUsageMinPollIntervalNs, [&] {
                     log::ScopedQpcSpan span;
                     m_lastCpuUsage = m_cpuUsage->poll();
                     if (span.enabled()) {
@@ -2270,12 +2263,11 @@ namespace openxr_api_layer {
                                           TLArg(span.elapsedNs(), "duration_ns"),
                                           TLArg(frameIndex, "frame_index"));
                     }
-                    m_lastCpuUsagePollNs = nowNs;
                     // Latch into the aggregator so the next overlay refresh
-                    // publishes the fresh "CPUs" value. Pushed regardless of
-                    // m_overlayActive (cheap setter), same as the GPU push.
+                    // publishes the fresh "CPUs" value (cheap setter, pushed
+                    // regardless of m_overlayActive, same as the GPU push).
                     m_overlay.pushCpuTelemetry(m_lastCpuUsage.cpus_max_pct);
-                }
+                });
             }
 
             FrameRecord rec{
@@ -2370,6 +2362,28 @@ namespace openxr_api_layer {
             LARGE_INTEGER c;
             QueryPerformanceCounter(&c);
             return c.QuadPart;
+        }
+
+        // Cadence gate shared by the GPU and CPU telemetry polls in
+        // xrEndFrame. Runs `doPoll` at most once per
+        // max(overlay refresh, minIntervalNs): `nowNs` is the frame clock,
+        // `lastPollNs` the per-reader cursor (advanced in place only when a
+        // poll actually fires). Keeps the "how often do we poll" policy in
+        // one place; the caller's lambda owns the reader-specific work — the
+        // poll() call, the ScopedQpcSpan + TraceLoggingWrite (the ETW event
+        // name must be a compile-time literal, so it can't be a parameter),
+        // and the aggregator push. `doPoll` is invoked synchronously, so a
+        // by-reference capture of frame-local state is safe.
+        template <typename PollFn>
+        void pollGated(int64_t nowNs, int64_t& lastPollNs,
+                       int64_t minIntervalNs, PollFn&& doPoll) {
+            const int64_t interval =
+                std::max(m_overlay.refreshIntervalNs(), minIntervalNs);
+            if (nowNs - lastPollNs < interval) {
+                return;
+            }
+            doPoll();
+            lastPollNs = nowNs;
         }
 
         // GPU-side helpers ------------------------------------------------
