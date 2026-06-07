@@ -228,6 +228,23 @@ namespace openxr_api_layer::detail {
             m_latestCpusMaxPct = cpus_max_pct;
         }
 
+        // Forget the latched GPU + CPU telemetry readings, returning them to
+        // their "no source" sentinels (NaN temp / 0 VRAM / NaN CPUs). Called
+        // from releaseSessionScopedResources when the session's readers are
+        // torn down: the aggregator itself spans sessions (so FPS / frametime
+        // history survives a session boundary), but these latched values are
+        // tied to the now-destroyed readers. Without this, a *next* session
+        // whose reader never reports would keep republishing the previous
+        // session's value instead of "--". The next publish after a real poll
+        // overwrites these again. Frame-stat accumulators / percentile rings
+        // are deliberately NOT touched here.
+        void resetTelemetryLatches() noexcept {
+            m_latestGpuTempC   = std::numeric_limits<float>::quiet_NaN();
+            m_latestVramUsed   = 0;
+            m_latestVramBudget = 0;
+            m_latestCpusMaxPct = std::numeric_limits<float>::quiet_NaN();
+        }
+
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
         // is its final value, not the in-flight 0). The aggregator
         // accumulates internally; the snapshot is refreshed when the QPC

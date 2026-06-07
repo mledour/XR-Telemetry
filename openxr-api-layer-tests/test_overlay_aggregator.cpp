@@ -747,6 +747,33 @@ TEST_CASE("OverlayAggregator: pushCpuTelemetry uses LATEST value, not average") 
     CHECK(agg.snapshot().cpus_max_pct == doctest::Approx(95.0f).epsilon(0.001));
 }
 
+TEST_CASE("OverlayAggregator: resetTelemetryLatches clears GPU+CPU to 'no source'") {
+    // Models a session boundary: a session reports telemetry, the session
+    // releases (resetTelemetryLatches), then a NEXT session publishes frames
+    // WITHOUT its reader ever reporting. The latched values must fall back to
+    // the "no source" sentinels (NaN / 0), not republish the prior session's.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushGpuTelemetry(70.0f, 4'000'000'000ULL, 8'000'000'000ULL);
+    agg.pushCpuTelemetry(95.0f);
+    agg.pushFrame(makeRecord(0, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    agg.pushFrame(makeRecord(120'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    REQUIRE(std::isfinite(agg.snapshot().gpu_temp_c));
+    REQUIRE(std::isfinite(agg.snapshot().cpus_max_pct));
+
+    agg.resetTelemetryLatches();
+    // A further publish with no new pushGpu/CpuTelemetry must show sentinels.
+    agg.pushFrame(makeRecord(240'000'000, 4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64, 55));
+    REQUIRE(agg.snapshot().valid);
+    CHECK_FALSE(std::isfinite(agg.snapshot().gpu_temp_c));
+    CHECK(agg.snapshot().vram_used_bytes == 0);
+    CHECK(agg.snapshot().vram_budget_bytes == 0);
+    CHECK_FALSE(std::isfinite(agg.snapshot().cpus_max_pct));
+}
+
 TEST_CASE("OverlayAggregator: version is 1 after the first publish") {
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     CHECK(agg.snapshot().version == 0);

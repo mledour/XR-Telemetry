@@ -2470,6 +2470,11 @@ namespace openxr_api_layer {
             m_cpuUsage.reset();
             m_lastCpuUsage = detail::CpuUsageSample{};
             m_lastCpuUsagePollNs = 0;
+            // The aggregator spans sessions (FPS / frametime history is kept),
+            // but the GPU + CPU telemetry latches are tied to the readers we
+            // just reset — clear them so a next session whose reader never
+            // reports shows "--" rather than this session's stale value.
+            m_overlay.resetTelemetryLatches();
             m_overlayRenderer.reset();
             if (m_viewSpace != XR_NULL_HANDLE) {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
