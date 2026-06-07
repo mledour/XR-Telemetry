@@ -100,6 +100,12 @@ namespace openxr_api_layer::detail {
         float gpu_temp_c;          // NaN ⇒ source unavailable
         uint64_t vram_used_bytes;  // 0   ⇒ source unavailable (no real GPU reports 0)
         uint64_t vram_budget_bytes;
+        // CPU usage — busiest logical-processor utilisation %, the overlay's
+        // "CPUs LOAD". Cached/latched like the GPU sensors above (the sampler
+        // polls ~1 Hz; every frame in the window logs the same value). NaN ⇒
+        // source unavailable. Appended LAST so the CSV column order stays
+        // backward-compatible (see the CsvWriter header comment).
+        float cpus_max_pct;        // NaN ⇒ source unavailable
     };
 
     // --- Time conversions ---------------------------------------------------

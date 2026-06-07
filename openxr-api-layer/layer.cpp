@@ -135,13 +135,14 @@ namespace openxr_api_layer {
                 }
                 // Column order is APPEND-ONLY for backward compat — analysis
                 // notebooks reference columns by name, so adding gpu_temp_c
-                // / vram_used_bytes / vram_budget_bytes at the END never
-                // breaks existing scripts. NaN gpu_temp_c renders as "nan"
-                // in the CSV; pandas reads it as a NaN float natively.
+                // / vram_used_bytes / vram_budget_bytes / cpus_max_pct at the
+                // END never breaks existing scripts. NaN gpu_temp_c /
+                // cpus_max_pct render as "nan" in the CSV; pandas reads them
+                // as NaN floats natively.
                 m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
                           "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
                           "headroom_pct,gpu_headroom_pct,should_render,"
-                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes\n";
+                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -317,12 +318,12 @@ namespace openxr_api_layer {
                         // fmt::format here is fine — we're on the writer
                         // thread, not the frame thread. Output a single
                         // line per frame; bool as 0/1 for Pandas friendliness.
-                        // gpu_temp_c uses %.1f; NaN renders as the platform's
-                        // canonical "nan" token (libfmt mirrors snprintf),
-                        // which pandas reads as np.nan via read_csv.
+                        // gpu_temp_c / cpus_max_pct use %.1f; NaN renders as
+                        // the platform's canonical "nan" token (libfmt mirrors
+                        // snprintf), which pandas reads as np.nan via read_csv.
                         m_file << fmt::format(
                             "{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{},"
-                            "{:.1f},{},{}\n",
+                            "{:.1f},{},{},{:.1f}\n",
                             rec.frame_index,
                             rec.timestamp_qpc,
                             rec.wait_block_ns,
@@ -337,7 +338,8 @@ namespace openxr_api_layer {
                             rec.should_render ? 1 : 0,
                             rec.gpu_temp_c,
                             rec.vram_used_bytes,
-                            rec.vram_budget_bytes);
+                            rec.vram_budget_bytes,
+                            rec.cpus_max_pct);
                     }
 
                     // Disk-error detection: if the stream went bad mid-batch
@@ -2292,6 +2294,7 @@ namespace openxr_api_layer {
                 m_lastGpuTelemetry.gpu_temp_c,
                 m_lastGpuTelemetry.vram_used_bytes,
                 m_lastGpuTelemetry.vram_budget_bytes,
+                m_lastCpuUsage.cpus_max_pct,
             };
 
             // GPU timestamps were already closed BEFORE the OpenXrApi call
