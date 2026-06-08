@@ -104,8 +104,8 @@ freezes in the room in front of you (see `anchor` below).
 | Bottom | **GPU TEMP** | Temperature in °C from the active GPU sensor. |
 | Bottom | **GPU LOAD** | Utilisation % derived from `gpu_headroom_pct`. Cyan < 80 %, orange 80–89 %, red ≥ 90 %. |
 | Bottom | **VRAM** | `vram_used / vram_budget` as a %. Same tier colours as GPU LOAD. |
-| Bottom | **CPU TEMP** | `-- °C` until PawnIO support lands — Windows has no portable, anti-cheat-safe way to read CPU temperature without a driver. |
-| Bottom | **CPU LOAD** | Utilisation % derived from `headroom_pct`. Same tier colours as GPU LOAD. |
+| Bottom | **CPU LOAD** | Per-cycle CPU utilisation % derived from `headroom_pct` (the app's CPU work vs. the frame budget — distinct from the system-wide **CPUs LOAD** reading). Same tier colours as GPU LOAD. |
+| Bottom | **CPUs LOAD** | Utilisation % of the **busiest logical processor** (fpsVR's "CPUs"). Sampled system-wide via a documented user-mode NT call (`NtQuerySystemInformation`) — no driver, no elevation. A high **CPUs LOAD** next to a tame **CPU LOAD** is the classic single-thread-bound signature most VR titles hit. `--` only when the sampler couldn't initialise. Same tier colours as GPU LOAD. |
 
 **Bar colour code** (per-sample, not overall):
 
@@ -172,13 +172,13 @@ comment='#')`.
 ### Sample
 
 ```csv
-frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes
-0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592
-1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592
-2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592
-3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592
-4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592
-5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592
+frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct
+0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592,nan
+1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592,96.2
+2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592,95.8
+3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592,97.1
+4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592,96.5
+5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592,95.9
 …
 # session_end written=8124 dropped_try_lock=0 dropped_queue_full=0 dropped_disk_write=0
 ```
@@ -206,6 +206,7 @@ falls behind, but in practice drops are zero on healthy hardware).
 | `gpu_temp_c` | GPU temperature in °C, 1 decimal | Latched at the snapshot's refresh cadence. `nan` (pandas reads as `np.nan`) if the GPU vendor's sensor path is unavailable. |
 | `vram_used_bytes` | GPU dedicated memory currently allocated, bytes | From DXGI's local-memory budget query. `0` if the query failed. |
 | `vram_budget_bytes` | OS-suggested VRAM budget for the process, bytes | From the same DXGI query. The renderer uses this for the bottom-row VRAM percentage (`used / budget`). |
+| `cpus_max_pct` | Busiest logical processor's utilisation %, 1 decimal | The overlay's **CPUs LOAD**. Latched at the sampler's ~1 Hz poll cadence (system-wide, via `NtQuerySystemInformation`). `nan` until the first reading and on hosts where the sampler couldn't initialise. A high `cpus_max_pct` with a tame `headroom_pct` is the single-thread-bound signature. |
 
 ### Anatomy of a frame cycle
 

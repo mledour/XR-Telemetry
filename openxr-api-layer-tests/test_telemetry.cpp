@@ -295,12 +295,17 @@ namespace {
     constexpr int kColGpuTempC = 12;
     constexpr int kColVramUsedBytes = 13;
     constexpr int kColVramBudgetBytes = 14;
-    constexpr int kColCount = 15;
+    // CPU usage column appended in feat/overlay-cpus-max-core — the "CPUs
+    // LOAD" reading. NaN in CI (the mock_runtime fixture never wires a real
+    // CPU sampler / the first frames have no baseline delta), but still
+    // emitted every frame so the column count stays stable.
+    constexpr int kColCpusMaxPct = 15;
+    constexpr int kColCount = 16;
 
     const std::string kExpectedHeader =
         "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,"
         "frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,"
-        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes";
+        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct";
 
     // Stand-in OverlayRenderer for the overlay-integration tests. Records the
     // calls the layer makes (renderAndCompose / pushFrameSample) and hands

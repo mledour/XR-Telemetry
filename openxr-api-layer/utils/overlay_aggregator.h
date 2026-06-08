@@ -79,6 +79,15 @@ namespace openxr_api_layer::detail {
         float gpu_frame_ms = 0;         // mean(gpu_time_ns) / 1e6
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
+        // System-wide utilisation of the BUSIEST logical processor over the
+        // last poll interval — the fpsVR "CPUs" reading. Distinct from
+        // cpu_utilisation_pct (which is frame-timing-derived, per-cycle CPU
+        // vs budget): a high cpus_max_pct with a tame cpu_utilisation_pct is
+        // the single-thread-bound signature. Latched from CpuUsageReader via
+        // pushCpuTelemetry (NOT averaged over the window — it's already an
+        // interval delta). NaN ⇒ source unavailable / no baseline yet; the
+        // format helper renders that as "--".
+        float cpus_max_pct = std::numeric_limits<float>::quiet_NaN();
         float target_fps = 0;           // 1e9 / mean(period_ns), the runtime's predicted display rate
         // FPS percentiles over a sliding window (kPercentileWindowSize
         // samples — 30 s @ 144 Hz). Computed by sorting the recent
@@ -206,6 +215,34 @@ namespace openxr_api_layer::detail {
             m_latestVramUsed      = vram_used_bytes;
             m_latestVramBudget    = vram_budget_bytes;
             m_gotGpuTelemetry     = true;
+        }
+
+        // Push the latest "CPUs" reading (busiest-core utilisation %) from
+        // CpuUsageReader::poll(). Same latch-not-average rationale as
+        // pushGpuTelemetry: the value is already an interval delta, so the
+        // snapshot carries the most recent poll verbatim. NaN is accepted
+        // (and re-published as NaN); the format helper substitutes "--".
+        // Decoupled from pushFrame() because the CPU sampler polls at the
+        // aggregator cadence (~1 Hz), not per frame.
+        void pushCpuTelemetry(float cpus_max_pct) noexcept {
+            m_latestCpusMaxPct = cpus_max_pct;
+        }
+
+        // Forget the latched GPU + CPU telemetry readings, returning them to
+        // their "no source" sentinels (NaN temp / 0 VRAM / NaN CPUs). Called
+        // from releaseSessionScopedResources when the session's readers are
+        // torn down: the aggregator itself spans sessions (so FPS / frametime
+        // history survives a session boundary), but these latched values are
+        // tied to the now-destroyed readers. Without this, a *next* session
+        // whose reader never reports would keep republishing the previous
+        // session's value instead of "--". The next publish after a real poll
+        // overwrites these again. Frame-stat accumulators / percentile rings
+        // are deliberately NOT touched here.
+        void resetTelemetryLatches() noexcept {
+            m_latestGpuTempC   = std::numeric_limits<float>::quiet_NaN();
+            m_latestVramUsed   = 0;
+            m_latestVramBudget = 0;
+            m_latestCpusMaxPct = std::numeric_limits<float>::quiet_NaN();
         }
 
         // Push one fully-resolved FrameRecord (post-GPU-patch — gpu_time_ns
@@ -404,6 +441,12 @@ namespace openxr_api_layer::detail {
             m_snapshot.vram_used_bytes   = m_latestVramUsed;
             m_snapshot.vram_budget_bytes = m_latestVramBudget;
 
+            // Latch the latest "CPUs" reading too — same reasoning as the
+            // GPU telemetry above (it's an interval delta, not something to
+            // average across the refresh window). Stays NaN until the CPU
+            // sampler reports, so the renderer falls back to "--" cleanly.
+            m_snapshot.cpus_max_pct      = m_latestCpusMaxPct;
+
             m_snapshot.valid = true;
             // Bump the version monotonically — starting at 1 the very
             // first time so the renderer's default-zero cache always
@@ -458,6 +501,11 @@ namespace openxr_api_layer::detail {
         uint64_t m_latestVramUsed = 0;
         uint64_t m_latestVramBudget = 0;
         bool     m_gotGpuTelemetry = false;
+        // Latest "CPUs" (busiest-core %) reading from pushCpuTelemetry.
+        // Latched, not averaged — see pushCpuTelemetry. NaN until the CPU
+        // sampler first reports (or forever, on the unlikely host where
+        // NtQuerySystemInformation didn't resolve).
+        float    m_latestCpusMaxPct = std::numeric_limits<float>::quiet_NaN();
 
         // Sliding window of frame_total_ns samples for P95 / P99 /
         // P99.9 computation. 4320 samples = 30 s @ 144 Hz / 48 s @

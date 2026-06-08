@@ -49,6 +49,7 @@
 #include <cmath>
 #include <cstring>     // std::memcpy for constant-buffer uploads
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
+#include <initializer_list>  // drawBottomPanel takes a cell descriptor list
 #include <string>
 #include <vector>
 
@@ -601,28 +602,30 @@ namespace openxr_api_layer::detail {
                                     v.cpu_app_ms);
 
                 // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
-                // CPU TEMP/LOAD), 60/40 split. Tier colours follow
-                // gaugeTierForUtilisation.
+                // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
+                // gaugeTierForUtilisation. The GPU panel leads with a TEMP
+                // cell; the CPU panel is two utilisation percentages —
+                // "CPU LOAD" (per-cycle CPU vs budget) next to "CPUs LOAD"
+                // (busiest single core). Each panel is described by its
+                // cells (see BottomCell / drawBottomPanel).
                 const float bottomCellW =
                     (kInnerR - kInnerL - kSectionGap) / 5.0f;
                 const float gpuPanelL = kInnerL;
                 const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
                 const float cpuPanelL = gpuPanelR + kSectionGap;
                 const float cpuPanelR = kInnerR;
+                using Cell = BottomCell;
                 drawBottomPanel(gpuPanelL, bottomY,
-                                 gpuPanelR, bottomY + kBottomHeight,
-                                 L"GPU TEMP", L"GPU LOAD",
-                                 v.gpu_temp_c, v.gpu_util_pct,
-                                 v.gpu_util_fraction,
-                                 /*vramValue=*/v.vram_pct,
-                                 /*vramFraction=*/v.vram_fraction);
+                                 gpuPanelR, bottomY + kBottomHeight, {
+                    Cell{L"GPU TEMP", v.gpu_temp_c,  BottomCellKind::Temp,    0.0f},
+                    Cell{L"GPU LOAD", v.gpu_util_pct, BottomCellKind::Percent, v.gpu_util_fraction},
+                    Cell{L"VRAM",     v.vram_pct,     BottomCellKind::Percent, v.vram_fraction},
+                });
                 drawBottomPanel(cpuPanelL, bottomY,
-                                 cpuPanelR, bottomY + kBottomHeight,
-                                 L"CPU TEMP", L"CPU LOAD",
-                                 v.cpu_temp_c, v.cpu_util_pct,
-                                 v.cpu_util_fraction,
-                                 /*vramValue=*/std::string{},
-                                 /*vramFraction=*/0.0f);
+                                 cpuPanelR, bottomY + kBottomHeight, {
+                    Cell{L"CPU LOAD",  v.cpu_util_pct, BottomCellKind::Percent, v.cpu_util_fraction},
+                    Cell{L"CPUs LOAD", v.cpus_max_pct, BottomCellKind::Percent, v.cpus_max_fraction},
+                });
             }
 
             // -------- end static-tier helpers --------
@@ -1423,31 +1426,45 @@ namespace openxr_api_layer::detail {
             //
             //   GPU panel (3 cells):                CPU panel (2 cells):
             //   ┌─────────┬──────────┬──────┐      ┌──────────┬──────────┐
-            //   │GPU TEMP │GPU LOAD  │VRAM  │      │CPU TEMP  │CPU LOAD  │
-            //   │ 67 °C   │ 92 %     │ 76 % │      │ -- °C    │ 78 %     │
+            //   │GPU TEMP │GPU LOAD  │VRAM  │      │CPU LOAD  │CPUs LOAD │
+            //   │ 67 °C   │ 92 %     │ 76 % │      │ 78 %     │ 98 %     │
             //   └─────────┴──────────┴──────┘      └──────────┴──────────┘
             //
-            // `prefix` is L"GPU" or L"CPU"; TEMP / LOAD labels are
-            // built by appending L" TEMP" / L" LOAD". The VRAM cell
-            // is only rendered when `vramValue` is non-empty (the
-            // CPU panel passes "" and skips the third column
-            // entirely — same code path, fewer columns).
-            void drawBottomPanel(float l, float t,
-                                  float r, float b,
-                                  const wchar_t* tempLabel,
-                                  const wchar_t* loadLabel,
-                                  const std::string& tempValue,
-                                  const std::string& utilValue,
-                                  float utilFraction,
-                                  const std::string& vramValue,
-                                  float vramFraction) const {
+            // Each cell is described by a {label, value, kind, fraction}
+            // BottomCell; labels are wide literals (L"GPU TEMP" /
+            // L"GPU LOAD" / L"VRAM" / L"CPU LOAD" / L"CPUs LOAD"). The number
+            // of cells the caller passes sets the column count (3 on the GPU
+            // panel, 2 on the CPU panel); `kind` selects temperature vs
+            // percentage styling per cell.
+            //
+            // One cell of a bottom panel. `kind` selects the value styling:
+            //   Temp    -> degrees-C suffix, white, wide-glyph path (the GPU
+            //              panel's temperature cell; `fraction` ignored).
+            //   Percent -> " %" suffix, tier-coloured by `fraction`, ASCII
+            //              (GPU LOAD / VRAM / CPU LOAD / CPUs LOAD).
+            enum class BottomCellKind { Temp, Percent };
+            struct BottomCell {
+                const wchar_t* label;
+                std::string    value;
+                BottomCellKind kind;
+                float          fraction;  // tier input; ignored when kind == Temp
+            };
+
+            // Draw equally-sized cells across [l,r] x [t,b], one per
+            // descriptor (2 for the CPU panel, 3 for the GPU panel). The
+            // panel sizes the columns, paints the separators, and styles each
+            // cell from its kind. Both callers stay declarative and a future
+            // panel can add/reorder cells without churning this signature.
+            void drawBottomPanel(float l, float t, float r, float b,
+                                  std::initializer_list<BottomCell> cells) const {
                 drawPanelBg(l, t, r, b);
 
-                // Tier-colour helper: same logic for LOAD and VRAM.
-                // < 80 % = cyan default, 80–89 % = orange warning,
-                // ≥ 90 % = red critical. The TEMP value stays white
-                // (no thermal-tier contract yet — would require
-                // knowing TjMax per SKU).
+                // Tier-colour helper: same logic for LOAD, VRAM and both
+                // CPU-panel cells ("CPU LOAD" + "CPUs LOAD"). < 80 % = cyan
+                // default, 80–89 % = orange warning, ≥ 90 % = red critical.
+                // A TEMP value
+                // (GPU panel cell 0) stays white instead — no thermal-tier
+                // contract yet (would require knowing TjMax per SKU).
                 auto tierColor = [&](float fraction) -> const float* {
                     const BarTier tier = gaugeTierForUtilisation(fraction);
                     if (tier == BarTier::Red)    return kColorGaugeRed;
@@ -1455,22 +1472,20 @@ namespace openxr_api_layer::detail {
                     return kColorAccentCyan;
                 };
 
-                const bool hasVram = !vramValue.empty();
-                const int  numCols = hasVram ? 3 : 2;
-                const float colW   = (r - l) / static_cast<float>(numCols);
+                const int numCols = static_cast<int>(cells.size());
+                if (numCols == 0) return;
+                const float colW = (r - l) / static_cast<float>(numCols);
 
                 // Vertical separators between cells, each a 1-px-wide
                 // thin rect on the chrome-shapes batch.
                 drawColumnSeparators(l, t, b, colW, /*count=*/numCols - 1,
                                       kBottomSepInsetY);
 
-                // tempLabel / loadLabel arrive pre-built as wide
-                // string literals (L"GPU TEMP", L"CPU LOAD", …) — see
-                // the comment at the drawBottomPanel call site in
-                // paint(). VRAM stays a singleton label ("VRAM")
-                // because it's implicitly GPU-side — no "GPU VRAM"
-                // because that would be redundant and use a full
-                // extra word of horizontal space.
+                // Cell labels arrive as wide string literals in each
+                // descriptor (see the call site in paint()). VRAM is a
+                // singleton label ("VRAM", not "GPU VRAM") because it's
+                // implicitly GPU-side and the extra word would waste
+                // horizontal space.
 
                 // Cell layout — label anchored near the top, metric
                 // paragraph-centred in the region BELOW the label (not
@@ -1566,18 +1581,29 @@ namespace openxr_api_layer::detail {
                 // question — the wide literal is exactly L"°"
                 // regardless of how MSVC parses the surrounding
                 // bytes.
-                drawCell(l, l + colW,
-                          tempLabel, tempValue, L" \u00B0C",
-                          kColorTextWhite, /*useWideValue=*/true);
-                // Cell 1 — <prefix> LOAD / "92 %"
-                drawCell(l + colW, l + colW * 2.0f,
-                          loadLabel, utilValue, L" %",
-                          tierColor(utilFraction), /*useWideValue=*/false);
-                // Cell 2 — VRAM / "76 %" (GPU panel only)
-                if (hasVram) {
-                    drawCell(l + colW * 2.0f, r,
-                              L"VRAM", vramValue, L" %",
-                              tierColor(vramFraction), /*useWideValue=*/false);
+                // Lay the cells out left-to-right. The last column uses the
+                // panel's own right edge `r` (not l + colW*numCols) so FP
+                // rounding of colW never leaves a seam at the border.
+                int colIdx = 0;
+                for (const BottomCell& cell : cells) {
+                    const float cellL = l + colW * static_cast<float>(colIdx);
+                    const float cellR = (colIdx + 1 == numCols)
+                                            ? r
+                                            : l + colW * static_cast<float>(colIdx + 1);
+                    if (cell.kind == BottomCellKind::Temp) {
+                        // Wide-glyph path, white. The L" \u00B0C" escape (not a
+                        // literal degree byte) sidesteps MSVC's CP1252 source
+                        // reading \u2014 see the encoding note above.
+                        drawCell(cellL, cellR, cell.label, cell.value,
+                                  L" \u00B0C", kColorTextWhite,
+                                  /*useWideValue=*/true);
+                    } else {
+                        // Percent: ASCII " %" suffix, tier-coloured.
+                        drawCell(cellL, cellR, cell.label, cell.value,
+                                  L" %", tierColor(cell.fraction),
+                                  /*useWideValue=*/false);
+                    }
+                    ++colIdx;
                 }
             }
 
