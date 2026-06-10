@@ -28,12 +28,13 @@
 // ID2D1RenderTarget.
 //
 // The overlay paints in two tiers:
-//   - Static tier (expensive): outer frame, header, panel titles + current
-//     numeric values, bottom row. Only needs refreshing when the aggregator
-//     republishes (~10 Hz) — its data is snapshot-driven.
-//   - Dynamic tier (cheap-ish): the two histogram regions. The ring buffers
-//     are fed every frame (pushFrameSample at the host's 90-144 Hz), so the
-//     bars must repaint every frame to scroll smoothly.
+//   - Static tier: outer frame, header, panel titles + current numeric
+//     values, bottom row. Snapshot-driven — only needs rebuilding when the
+//     aggregator republishes (~10 Hz), so it is cadence-gated rather than
+//     redrawn per frame.
+//   - Dynamic tier: the two histogram regions. The ring buffers are fed every
+//     frame (pushFrameSample at the host's 90-144 Hz), so the bars must
+//     repaint every frame to scroll smoothly.
 //
 // paint() owns a PaintCadence, asks needStaticPaint() whether this frame
 // needs the static tier, draws accordingly, then calls commitPaint() to
