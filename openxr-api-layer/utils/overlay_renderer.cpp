@@ -477,8 +477,8 @@ namespace openxr_api_layer::detail {
             // tiers gated by m_tier (see the m_tier member doc):
             //   * Static  (labels / titles + chrome shapes) — laid out
             //     once and cached, re-baked only when the structure key
-            //     changes. The costly ~50-glyph label layout + the shape
-            //     emission happen here, off the per-bump path.
+            //     changes. The ~50-glyph label layout + the shape emission
+            //     happen here, off the per-bump path.
             //   * Dynamic (the changing values) — re-laid-out every call,
             //     into the glyph renderer's separate dynamic scratch.
             // The caller flushes the combined scratches into the target
@@ -2230,11 +2230,14 @@ namespace openxr_api_layer::detail {
         // chrome shapes (frame / panels / separators), text (labels +
         // values), then the two histogram panels on top.
         //
-        // Two cost tiers, gated by needStaticPaint:
+        // Two paint tiers, gated by needStaticPaint:
         //   * Static REBUILD (cadence-gated, ~10 Hz): paintChromeOnly
-        //     rebuilds the chrome-shape + text scratches — the heavy CPU
-        //     tier (string formatting + the value glyph layout). Cadence-
-        //     gated regardless of target.
+        //     rebuilds the chrome-shape + text scratches (string formatting +
+        //     the value glyph layout). Heavier than the per-frame flush below,
+        //     so it is gated to the publish cadence — though profiling
+        //     (xr_telemetry_chrome_rebuild) ranked it the SMALLEST of the
+        //     three cadenced contributors to the target_us spike, well behind
+        //     the aggregator's percentile sort.
         //   * Per-frame FLUSH + bars: the cached scratches are re-uploaded
         //     and the bars redrawn every frame (cheap — Map-DISCARD + a few
         //     DrawInstanced; the static-label cache keeps the chrome scratch
@@ -2268,19 +2271,18 @@ namespace openxr_api_layer::detail {
             const bool needStatic = needStaticPaint(
                 cadence, snap.version, kChromeWatchdogFrames);
 
-            // Chrome rebuild (the heavy CPU tier: string formatting +
-            // ~80 glyph lookups + the two instanced uploads' scratch)
-            // is always cadence-gated to ~10 Hz, regardless of target.
+            // Chrome rebuild: string formatting + value-glyph layout, always
+            // cadence-gated to ~10 Hz regardless of target. Per the tier note
+            // above it is the lightest of the three cadenced spike
+            // contributors — not the hotspot the old "heavy tier" name implied.
             bool ok = true;
             if (needStatic) {
                 // Spike decomposition (perf/overlay-spike-instrumentation):
-                // the chrome rebuild is the cadence-gated heavy CPU tier
-                // (value string formatting + value-glyph layout). Time it as
-                // a discrete ETW span so the bench harness can split the
-                // ~10 Hz target_us spike into its three contributors —
-                // {chrome rebuild | aggregator publish | GPU poll}. Gated on
-                // IsTraceEnabled(): a session with no ETW listener pays
-                // nothing (no QPC reads, no event).
+                // time the rebuild as a discrete ETW span so the bench harness
+                // can split the ~10 Hz target_us spike into its three
+                // contributors — {chrome rebuild | aggregator publish | GPU
+                // poll}. ScopedQpcSpan is a no-op unless a trace session is
+                // listening (no QPC reads, no event emitted).
                 log::ScopedQpcSpan span;
                 ok = core.paintChromeOnly(&gpuText, &gpuShapes, snap);
                 if (span.enabled()) {
