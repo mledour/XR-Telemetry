@@ -142,7 +142,8 @@ namespace openxr_api_layer {
                 m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
                           "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
                           "headroom_pct,gpu_headroom_pct,should_render,"
-                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct\n";
+                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct,"
+                          "render_ns\n";
                 m_file.flush();
                 m_path = path;
                 m_stopping = false;  // defensive: clear from any prior stop()
@@ -323,7 +324,7 @@ namespace openxr_api_layer {
                         // snprintf), which pandas reads as np.nan via read_csv.
                         m_file << fmt::format(
                             "{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{},"
-                            "{:.1f},{},{},{:.1f}\n",
+                            "{:.1f},{},{},{:.1f},{}\n",
                             rec.frame_index,
                             rec.timestamp_qpc,
                             rec.wait_block_ns,
@@ -339,7 +340,8 @@ namespace openxr_api_layer {
                             rec.gpu_temp_c,
                             rec.vram_used_bytes,
                             rec.vram_budget_bytes,
-                            rec.cpus_max_pct);
+                            rec.cpus_max_pct,
+                            rec.render_ns);
                     }
 
                     // Disk-error detection: if the stream went bad mid-batch
@@ -1852,8 +1854,14 @@ namespace openxr_api_layer {
             }
             const int64_t tBegin = QpcNow();
             const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            const int64_t tBeginExit = QpcNow();
             if (XR_SUCCEEDED(result)) {
                 m_tBegin.store(tBegin, std::memory_order_relaxed);
+                // tBeginExit = right AFTER the runtime's xrBeginFrame returns.
+                // render_ns is measured from here (not tBegin) so it excludes
+                // the runtime's begin call — matching OpenXR Toolkit's render
+                // CPU. See the render_ns computation in xrEndFrame.
+                m_tBeginExit.store(tBeginExit, std::memory_order_relaxed);
                 // Only open a GPU timer slot if we have a valid wait pair.
                 // Without one, xrEndFrame's first-frame guard skips the
                 // FrameRecord push but our GpuTimer slot would still be
@@ -2131,15 +2139,31 @@ namespace openxr_api_layer {
                 return result;
             }
 
-            const int64_t waitBlockNs = detail::qpcToNs(tWaitOut - tWaitIn, m_qpcFrequency);
-            const int64_t appCpuNs = detail::qpcToNs(tEnd - tWaitOut, m_qpcFrequency);
-            // pre_begin_ns splits app_cpu_ns into the housekeeping window
-            // (Wait→Begin) and the actual render submission (Begin→End).
-            // Gated on tBegin > 0 because xrBeginFrame may be skipped on
-            // some session-transition frames; report 0 then so the user
-            // can filter.
-            const int64_t preBeginNs =
-                (tBegin > tWaitOut) ? detail::qpcToNs(tBegin - tWaitOut, m_qpcFrequency) : 0;
+            // All four per-frame windows go through qpcDeltaNsOrZero, which
+            // returns 0 for a stale / out-of-order anchor (a skipped
+            // xrWaitFrame / xrBeginFrame leaves last cycle's value behind) —
+            // one skip contract instead of three ad-hoc inline checks.
+            const int64_t waitBlockNs = detail::qpcDeltaNsOrZero(tWaitIn, tWaitOut, m_qpcFrequency);
+            const int64_t appCpuNs    = detail::qpcDeltaNsOrZero(tWaitOut, tEnd, m_qpcFrequency);
+            // pre_begin_ns: the Wait→Begin housekeeping window (a sub-part of
+            // app_cpu_ns). 0 when xrBeginFrame was skipped this cycle.
+            const int64_t preBeginNs  = detail::qpcDeltaNsOrZero(tWaitOut, tBegin, m_qpcFrequency);
+
+            // render_ns: the app's own render-recording window, Begin-exit →
+            // End (xrBeginFrame returning to the app → xrEndFrame entry),
+            // EXCLUDING the runtime's xrBeginFrame call — matches OpenXR
+            // Toolkit's "render CPU" (it starts its render timer after the
+            // downstream xrBeginFrame returns).
+            //
+            // exchange(0) is load-and-clear: it consumes THIS cycle's
+            // begin-exit and resets the anchor to 0, so a cycle where
+            // xrBeginFrame was skipped (session transition, wait-less app)
+            // reads 0 — not a STALE anchor from a prior cycle. Without the
+            // reset, a fresh tEnd minus a stale begin-exit would span more
+            // than one frame and exceed the per-cycle App total, breaking the
+            // Render ≤ App invariant.
+            const int64_t tBeginExit = m_tBeginExit.exchange(0, std::memory_order_relaxed);
+            const int64_t renderNs    = detail::qpcDeltaNsOrZero(tBeginExit, tEnd, m_qpcFrequency);
 
             // Full-cycle duration: end-to-end wall clock of the previous
             // frame. This is what fpsVR / OpenXR Toolkit / PresentMon
@@ -2287,6 +2311,7 @@ namespace openxr_api_layer {
                 m_lastGpuTelemetry.vram_used_bytes,
                 m_lastGpuTelemetry.vram_budget_bytes,
                 m_lastCpuUsage.cpus_max_pct,
+                renderNs,
             };
 
             // GPU timestamps were already closed BEFORE the OpenXrApi call
@@ -2559,6 +2584,7 @@ namespace openxr_api_layer {
         std::atomic<int64_t> m_tWaitIn{0};
         std::atomic<int64_t> m_tWaitOut{0};
         std::atomic<int64_t> m_tBegin{0};
+        std::atomic<int64_t> m_tBeginExit{0};
         // Previous frame's tEnd (QPC ticks). Used by xrEndFrame to compute
         // frame_total_ns = tEnd - tEndPrev, which captures the post-end
         // app work (sim/physics/AI) that wait→end alone misses. Updated

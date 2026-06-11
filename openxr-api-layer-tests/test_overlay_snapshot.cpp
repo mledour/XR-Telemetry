@@ -93,8 +93,8 @@ namespace {
         s.fps_p99_9   =  98.0f;
         s.target_fps  = 144.0f;
         s.gpu_frame_ms = 6.7f;
-        s.cpu_frame_ms = 7.4f;   // Render ms
-        s.cpu_app_ms   = 4.3f;   // App ms
+        s.cpu_frame_ms   = 7.4f;   // CPU FRAMETIME total (per-cycle)
+        s.cpu_render_ms  = 2.7f;   // Render (Begin-exit → End)
         s.cpu_utilisation_pct = 78.0f;
         s.gpu_utilisation_pct = 92.0f;
         s.cpus_max_pct = 98.0f;  // busiest core — "CPUs LOAD" cell

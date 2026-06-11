@@ -100,12 +100,23 @@ freezes in the room in front of you (see `anchor` below).
 | Header | **P99** | 99 % of frames hit at least this FPS. The worst 1 % drop below. |
 | Header | **P99.9** | The single worst ~0.1 % — typically a handful of specific spike frames in the window. Matches fpsVR / SteamVR "Frame Timing" convention. |
 | GPU Frametime ms | **`6.7 ms`** + bars | Mean GPU time spent on the app's `xrBeginFrame → xrEndFrame` draws over the refresh window. Bars: 120-sample rolling histogram, one bar per frame. Y axis spans `0..2× period`; the white midline marks the budget. |
-| CPU Frametime ms | **`App X.X ms / Render Y.Y ms`** + bars | **App** = wait→end window (`app_cpu_ns` — render submission + housekeeping). **Render** = full per-cycle CPU (`frame_total - wait_block` — includes game sim / physics / input poll BETWEEN frames). The gap between them is the work `App` alone can't see. |
+| CPU Frametime ms | **`Render X.X ms / App X.X ms`** + bars | **App** = the per-cycle total (`frame_total - wait_block`) — the same number OpenXR Toolkit / fpsVR / PresentMon call *app CPU* (hence the label), and what drives CPU LOAD. **Render** = the app's render-recording window (`render_ns` — `xrBeginFrame` returning to the app → `xrEndFrame`), matching OXRT's *render CPU*. Render is a sub-part of App; the rest (the app's pre-render / between-frames work + the runtime's begin/end calls) isn't broken out. |
 | Bottom | **GPU TEMP** | Temperature in °C from the active GPU sensor. |
 | Bottom | **GPU LOAD** | Utilisation % derived from `gpu_headroom_pct`. Cyan < 80 %, orange 80–89 %, red ≥ 90 %. |
 | Bottom | **VRAM** | `vram_used / vram_budget` as a %. Same tier colours as GPU LOAD. |
 | Bottom | **CPU LOAD** | Per-cycle CPU utilisation % derived from `headroom_pct` (the app's CPU work vs. the frame budget — distinct from the system-wide **CPUs LOAD** reading). Same tier colours as GPU LOAD. |
 | Bottom | **CPUs LOAD** | Utilisation % of the **busiest logical processor** (fpsVR's "CPUs"). Sampled system-wide via a documented user-mode NT call (`NtQuerySystemInformation`) — no driver, no elevation. A high **CPUs LOAD** next to a tame **CPU LOAD** is the classic single-thread-bound signature most VR titles hit. `--` only when the sampler couldn't initialise. Same tier colours as GPU LOAD. |
+
+**CPU breakdown — comparing to OpenXR Toolkit.** Both terms map 1:1 to
+OXRT's two CPU read-outs: **App** = OXRT *app CPU* (the full per-cycle
+time), and **Render** = OXRT *render CPU* (the app's own render-recording
+between `xrBeginFrame` and `xrEndFrame`). Render is measured from *after*
+the downstream `xrBeginFrame` returns, so — exactly like OXRT — it
+excludes the runtime's begin call (which can be ~0.5 ms on a young
+runtime). Render is always ≤ App; the difference is the app's pre-render
+/ between-frames work plus the runtime's begin/end calls, which aren't
+broken out. Caveat: a passive layer only sees the OpenXR-calling thread,
+so neither number includes simulation the engine runs on other threads.
 
 **Bar colour code** (per-sample, not overall):
 
@@ -172,13 +183,13 @@ comment='#')`.
 ### Sample
 
 ```csv
-frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct
-0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592,nan
-1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592,96.2
-2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592,95.8
-3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592,97.1
-4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592,96.5
-5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592,95.9
+frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct,render_ns
+0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592,nan,5797878
+1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592,96.2,5873972
+2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592,95.8,5847335
+3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592,97.1,5854974
+4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592,96.5,5856692
+5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592,95.9,5863827
 …
 # session_end written=8124 dropped_try_lock=0 dropped_queue_full=0 dropped_disk_write=0
 ```
@@ -207,6 +218,7 @@ falls behind, but in practice drops are zero on healthy hardware).
 | `vram_used_bytes` | GPU dedicated memory currently allocated, bytes | From DXGI's local-memory budget query. `0` if the query failed. |
 | `vram_budget_bytes` | OS-suggested VRAM budget for the process, bytes | From the same DXGI query. The renderer uses this for the bottom-row VRAM percentage (`used / budget`). |
 | `cpus_max_pct` | Busiest logical processor's utilisation %, 1 decimal | The overlay's **CPUs LOAD**. Latched at the sampler's ~1 Hz poll cadence (system-wide, via `NtQuerySystemInformation`). `nan` until the first reading and on hosts where the sampler couldn't initialise. A high `cpus_max_pct` with a tame `headroom_pct` is the single-thread-bound signature. |
+| `render_ns` | `tEnd − tBeginExit` | **App render-recording.** `xrBeginFrame` returning to the app → `xrEndFrame` entry — the app's own draw submission, EXCLUDING the runtime's `xrBeginFrame` call. Matches OpenXR Toolkit's *render CPU* and is surfaced in the overlay as **Render**. Tighter than the derived `app_cpu_ns − pre_begin_ns`, which also counts the runtime begin call. Appended last (after `cpus_max_pct`) to keep the column order stable. |
 
 ### Anatomy of a frame cycle
 
@@ -239,13 +251,14 @@ GPU timeline (parallel, may overlap with the next CPU frame):
                                                                           ↓ xrEndFrame
 ```
 
-Two derived segments aren't stored as their own columns — compute them
-in analysis when you need them:
+The app's draw-submission window is stored directly as `render_ns`
+(`xrBeginFrame` returning → `xrEndFrame`, excluding the runtime's begin
+call — the overlay's **Render**, = OXRT *render CPU*). The looser
+`app_cpu_ns − pre_begin_ns` measures the same window but also counts the
+runtime's `xrBeginFrame` call.
 
-- `render_submission_ns = app_cpu_ns − pre_begin_ns`
-  — time the app spent inside `xrBeginFrame → xrEndFrame` submitting
-  draw calls. Heavy submission paths (lots of draws, state changes,
-  GPU-queue stalls) light this up.
+One segment isn't stored — compute it in analysis when you need it:
+
 - `post_end_ns = frame_total_ns − wait_block_ns − pre_begin_ns − app_cpu_ns − end_frame_ns`
   — time spent OUTSIDE OpenXR calls (game simulation, physics, AI,
   scripting, event polling). `app_cpu_ns` alone can't see this — it
@@ -257,7 +270,7 @@ in analysis when you need them:
 |---|---|---|
 | App feels stuttery | `frame_total_ns > period_ns × 1.5` rows | Missed deadlines. Drill into which segment dominates. |
 | **CPU-bound vs GPU-bound** | Average `headroom_pct` vs `gpu_headroom_pct` | Whichever is **lower** is your bottleneck. Both low + similar = balanced at the limit, optimise both. Only CPU low = simplify sim / submission. Only GPU low = drop shader complexity / resolution. |
-| Render-thread heavy | `app_cpu_ns − pre_begin_ns` close to `period_ns` | Too many draw calls / state changes / GPU-queue stalls. Profile with PIX / RenderDoc. |
+| Render-thread heavy | `render_ns` close to `period_ns` | Too many draw calls / state changes / GPU-queue stalls. Profile with PIX / RenderDoc. |
 | Sim heavy | `frame_total_ns − wait_block_ns − app_cpu_ns − end_frame_ns` dominates | Physics / AI / scripting between frames is the bottleneck — game-logic thread, not the renderer. |
 | Runtime overhead | `end_frame_ns > ~1 ms` consistently | The runtime itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) usually moves this number. |
 | Healthy session | `wait_block_ns ≈ period_ns × 0.3`, `frame_total_ns ≈ period_ns` | App finishes early, runtime throttles, equilibrium. |

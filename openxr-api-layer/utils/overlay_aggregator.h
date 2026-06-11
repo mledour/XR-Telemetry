@@ -65,17 +65,16 @@ namespace openxr_api_layer::detail {
         // CSV's `headroom_pct` column, so the displayed time and util%
         // are coherent. Falls back to app_cpu_ns on the first frame
         // (no previous cycle yet), same as xrEndFrame does for
-        // headroom computation. Surfaced in the HUD as "Render ms" —
-        // it's the full per-cycle CPU cost (app work + endframe call +
-        // pre-begin housekeeping).
+        // headroom computation. Surfaced in the HUD as the prominent "App"
+        // total — the full per-cycle CPU cost, identical to what OpenXR
+        // Toolkit / fpsVR / PresentMon call "app CPU". Its render-submission
+        // portion is broken out as Render (below).
         float cpu_frame_ms = 0;
-        // App-only CPU time — the wait→end window (rec.app_cpu_ns).
-        // Surfaced as "App ms" alongside Render ms in the CPU
-        // frametime panel. The difference (Render − App) tells the
-        // user how much of the per-cycle CPU is OpenXR overhead vs
-        // their own game logic / submission code, which is the
-        // diagnostic value the design asks for.
-        float cpu_app_ms = 0;
+        // Render — mean(rec.render_ns): the app's render-recording window
+        // (Begin-exit → End), EXCLUDING the runtime's xrBeginFrame call.
+        // Matches OpenXR Toolkit's "render CPU". A genuine sub-part of
+        // cpu_frame_ms. Surfaced as "Render".
+        float cpu_render_ms = 0;
         float gpu_frame_ms = 0;         // mean(gpu_time_ns) / 1e6
         float cpu_utilisation_pct = 0;  // 100 - mean(headroom_pct), clamped [0, 100]
         float gpu_utilisation_pct = 0;  // 100 - mean(gpu_headroom_pct), clamped [0, 100]
@@ -266,7 +265,7 @@ namespace openxr_api_layer::detail {
                 ? (rec.frame_total_ns - rec.wait_block_ns)
                 : rec.app_cpu_ns;
             m_sumCpuNs        += perCycleCpuNs;
-            m_sumAppCpuNs     += rec.app_cpu_ns;
+            m_sumRenderNs     += rec.render_ns;
             m_sumGpuNs        += rec.gpu_time_ns;
             m_sumFrameTotalNs += rec.frame_total_ns;
             m_sumPeriodNs     += rec.period_ns;
@@ -334,9 +333,9 @@ namespace openxr_api_layer::detail {
             const float avgFrameTotal = static_cast<float>(m_sumFrameTotalNs) / countF;
             m_snapshot.fps_avg = avgFrameTotal > 0.0f ? 1.0e9f / avgFrameTotal : 0.0f;
 
-            m_snapshot.cpu_frame_ms = (static_cast<float>(m_sumCpuNs)    / countF) / 1.0e6f;
-            m_snapshot.cpu_app_ms   = (static_cast<float>(m_sumAppCpuNs) / countF) / 1.0e6f;
-            m_snapshot.gpu_frame_ms = (static_cast<float>(m_sumGpuNs)    / countF) / 1.0e6f;
+            m_snapshot.cpu_frame_ms   = (static_cast<float>(m_sumCpuNs)     / countF) / 1.0e6f;
+            m_snapshot.cpu_render_ms = (static_cast<float>(m_sumRenderNs) / countF) / 1.0e6f;
+            m_snapshot.gpu_frame_ms   = (static_cast<float>(m_sumGpuNs)     / countF) / 1.0e6f;
 
             const float avgPeriod = static_cast<float>(m_sumPeriodNs) / countF;
             m_snapshot.target_fps = avgPeriod > 0.0f ? 1.0e9f / avgPeriod : 0.0f;
@@ -459,7 +458,7 @@ namespace openxr_api_layer::detail {
             // than `lastRefreshNs + intervalNs` to avoid catch-up bursts
             // after a stall (a few hundred ms of GPU work would otherwise
             // queue several pending refreshes back-to-back).
-            m_sumCpuNs = m_sumAppCpuNs = m_sumGpuNs = m_sumFrameTotalNs = m_sumPeriodNs = 0;
+            m_sumCpuNs = m_sumRenderNs = m_sumGpuNs = m_sumFrameTotalNs = m_sumPeriodNs = 0;
             m_sumHeadroomPct = m_sumGpuHeadroomPct = 0.0;
             m_count = 0;
             m_lastRefreshNs = nowNs;
@@ -476,8 +475,8 @@ namespace openxr_api_layer::detail {
         int64_t m_percentileIntervalNs = 0;
         int64_t m_lastPercentileNs = 0;
         bool    m_percentilesPrimed = false;
-        int64_t m_sumCpuNs = 0;     // per-cycle (frame_total - wait_block) — Render ms
-        int64_t m_sumAppCpuNs = 0;  // wait→end window (rec.app_cpu_ns) — App ms
+        int64_t m_sumCpuNs = 0;      // per-cycle (frame_total - wait_block) — CPU FRAMETIME total
+        int64_t m_sumRenderNs = 0;   // rec.render_ns (Begin-exit → End) — Render
         int64_t m_sumGpuNs = 0;
         int64_t m_sumFrameTotalNs = 0;
         int64_t m_sumPeriodNs = 0;
