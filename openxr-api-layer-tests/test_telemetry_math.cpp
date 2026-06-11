@@ -45,6 +45,7 @@
 
 using openxr_api_layer::detail::FrameRecord;
 using openxr_api_layer::detail::qpcToNs;
+using openxr_api_layer::detail::qpcDeltaNsOrZero;
 using openxr_api_layer::detail::gpuTimestampDeltaToNs;
 using openxr_api_layer::detail::gpuTimestampPairToNs;
 using openxr_api_layer::detail::computeCpuHeadroomPct;
@@ -101,6 +102,26 @@ TEST_CASE("qpcToNs: realistic 11.11 ms frame at 10 MHz QPC") {
 TEST_CASE("qpcToNs: freq <= 0 returns 0 (defensive guard)") {
     CHECK(qpcToNs(12'345, 0) == 0);
     CHECK(qpcToNs(12'345, -1) == 0);
+}
+
+// qpcDeltaNsOrZero — guarded delta for the per-frame windows in xrEndFrame
+// (wait_block / app_cpu / pre_begin / render). Returns 0 for an invalid or
+// out-of-order anchor so a skipped wait/begin can't yield a bogus over-a-
+// frame span (the staleness that would otherwise break Render ≤ App).
+
+TEST_CASE("qpcDeltaNsOrZero: forward-ordered delta equals qpcToNs of the difference") {
+    CHECK(qpcDeltaNsOrZero(1'000, 1'000 + 111'111, 10'000'000)
+          == qpcToNs(111'111, 10'000'000));
+}
+
+TEST_CASE("qpcDeltaNsOrZero: from <= 0 returns 0 (uninitialised / cleared anchor)") {
+    CHECK(qpcDeltaNsOrZero(0, 12'345, 10'000'000) == 0);
+    CHECK(qpcDeltaNsOrZero(-5, 12'345, 10'000'000) == 0);
+}
+
+TEST_CASE("qpcDeltaNsOrZero: to <= from returns 0 (stale / out-of-order anchor)") {
+    CHECK(qpcDeltaNsOrZero(20'000, 10'000, 10'000'000) == 0);  // stale > fresh
+    CHECK(qpcDeltaNsOrZero(10'000, 10'000, 10'000'000) == 0);  // equal endpoints
 }
 
 TEST_CASE("qpcToNs: no overflow on long intervals (10 minutes at 10 MHz)") {

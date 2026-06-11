@@ -123,7 +123,7 @@ namespace openxr_api_layer::detail {
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
         //   - GPU FRAMETIME MS panel with histogram + current value
-        //   - CPU FRAMETIME MS panel with histogram + App / Render split
+        //   - CPU FRAMETIME MS panel with histogram + Render / App compound
         //   - bottom row split into two panels (60 / 40):
         //       GPU panel = TEMP / LOAD / VRAM (3 cells)
         //       CPU panel = TEMP / LOAD       (2 cells)
@@ -242,11 +242,6 @@ namespace openxr_api_layer::detail {
         constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
         // Labels and section titles render in Rajdhani SemiBold.
         constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
-        constexpr float kFontMsCompound   = 18.0f;  // CPU panel compound string
-                                                     // ("App X ms / Render Y ms") —
-                                                     // matches kFontMs so the GPU
-                                                     // and CPU read-outs share the
-                                                     // same visual weight.
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
                                                      // single biggest text on
                                                      // the HUD, primary anchor.
@@ -326,9 +321,13 @@ namespace openxr_api_layer::detail {
         constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::BarlowItalic,    32, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
-        constexpr GpuTextFormat kFmtMsCompoundGpu  {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
+        // CPU frametime panel: Render + App (the per-cycle total) as one
+        // right-aligned compound. 17 px — the smallest size baked in
+        // kSizes, and both faces ARE baked there. The two "X.X ms" terms
+        // fit the 360 px value rect (see drawFrametimePanel's CPU branch).
+        constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
 
         // -------- GPU text colours ----------------------------------------
         //
@@ -594,12 +593,17 @@ namespace openxr_api_layer::detail {
                                     gpuPanelY + kFrametimeHeight,
                                     L"GPU FRAMETIME MS",
                                     v.gpu_frametime_ms,
-                                    /*secondaryValue=*/std::string{});
+                                    /*breakdown=*/std::string{});
+                // CPU panel: build the Render term here; drawFrametimePanel
+                // appends the per-cycle total (labelled "App") and renders
+                // the pair as one right-aligned compound.
+                const std::string cpuBreakdown =
+                    "Render " + v.cpu_render_ms + " ms";
                 drawFrametimePanel(kInnerL, cpuPanelY, kInnerR,
                                     cpuPanelY + kFrametimeHeight,
                                     L"CPU FRAMETIME MS",
                                     v.cpu_frametime_ms,
-                                    v.cpu_app_ms);
+                                    cpuBreakdown);
 
                 // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
                 // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
@@ -935,8 +939,8 @@ namespace openxr_api_layer::detail {
             //                      the optional chiffres brush. This is
             //                      what lets the CPU compound paint "X.X
             //                      ms" entirely in cyan including the
-            //                      upright " ms", while "App" / " /
-            //                      Render " labels stay in the base
+            //                      upright " ms", while "Render" / " /
+            //                      App " labels stay in the base
             //                      brush (white).
             struct ValueRun {
                 UINT32 brushStart;
@@ -955,7 +959,7 @@ namespace openxr_api_layer::detail {
             // wstring; ASCII strings never carry it). A prefix-only
             // span (no unit) is emitted as a value run only when it
             // contains at least one digit — otherwise stray dashes or
-            // dots in label copy ("App", " / Render ") would falsely
+            // dots in label copy ("Render", " / App ") would falsely
             // pull into a value run. A unit-only span never happens
             // because we walk the prefix first.
             //
@@ -1040,8 +1044,8 @@ namespace openxr_api_layer::detail {
             // The base `color` paints non-value characters. When
             // `chiffresColor` is non-null, BOTH the digit and unit
             // portions of every value run flip to it — used by the CPU
-            // compound so "X.X ms" reads in cyan while "App" / " /
-            // Render " labels stay in white. When `unitFontSize > 0`,
+            // compound so "X.X ms" reads in cyan while "Render" / " /
+            // App " labels stay in white. When `unitFontSize > 0`,
             // the unit portion of every value run shrinks to that size
             // while the digit portion stays at the base size — used by
             // the bottom panel to render " °C" / " %" at the small
@@ -1130,8 +1134,8 @@ namespace openxr_api_layer::detail {
             //
             // `chiffresColor` (optional): when non-null, every value
             // run's brush range (italic + unit) flips to this colour.
-            // Used by the CPU compound "App {x} ms / Render {y} ms"
-            // so labels stay white and values render cyan.
+            // Used by the CPU compound "Render {x} ms / App {y} ms"
+            // so labels stay white, values cyan.
             //
             // `unitSizePx` (optional): when > 0, the unit range of
             // every value run renders at this size; the italic and
@@ -1346,7 +1350,7 @@ namespace openxr_api_layer::detail {
                                      float r, float b,
                                      const wchar_t* title,
                                      const std::string& currentValue,
-                                     const std::string& secondaryValue) const {
+                                     const std::string& breakdown) const {
                 drawPanelBg(l, t, r, b);
 
                 // Title bar — top inner padding. Title row paddings
@@ -1359,26 +1363,23 @@ namespace openxr_api_layer::detail {
                     r - kSectionInnerPad, titleB);
                 drawLabel(kFmtSectionTitleGpu, title, titleRect, kColorTextWhite);
 
-                // Current value (top-right). Two shapes depending on
-                // whether `secondaryValue` is empty:
+                // Current value(s) on the title row, right-aligned.
+                // Two shapes, selected by whether `breakdown` is empty:
                 //
-                //   GPU panel (secondaryValue == "")   : "6.7 ms"
-                //   CPU panel (secondaryValue == "4.3"): "App 4.3 ms / Render 7.4 ms"
+                //   GPU panel (breakdown == "") : just "6.7 ms".
+                //   CPU panel (breakdown != "") : one compound,
+                //       "Render X ms / App Y ms" — the Render term, then
+                //       the per-cycle total labelled "App" (currentValue,
+                //       = OXRT "app CPU").
                 //
-                // Both panels go through drawValueAscii: digit runs
-                // flip to Barlow Medium Italic and the rest stays in
-                // the base format (Rajdhani SemiBold upright). The GPU
-                // panel uses a single cyan brush — "6.7" italic Barlow
-                // cyan + " ms" upright Rajdhani cyan. The CPU compound
-                // passes two brushes so only the "App" / " / Render "
-                // label copy renders in white; each "X.X ms" value run
-                // (digit + unit) picks up the chiffres brush in cyan.
-                // Value rect shares the title rect's vertical bounds
-                // (titleT → titleB) so paragraph CENTER places the
-                // value baseline at the same line as the title — both
-                // fonts are now at kFontMs / kFontMsCompound /
-                // kFontSectionTitle = 18 px so the line metrics match.
-                if (secondaryValue.empty()) {
+                // Both go through drawValueAscii: every "X.X ms" run's
+                // digits flip to Barlow italic and pick up the cyan
+                // chiffres brush, while label copy ("Render", " / App",
+                // …) stays upright Rajdhani in white. The
+                // value rect shares the title rect's vertical bounds
+                // (titleT → titleB) so the baseline lands on the title
+                // line.
+                if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
                     // ms" value run; digit prefix italic Barlow, " ms"
@@ -1390,21 +1391,25 @@ namespace openxr_api_layer::detail {
                     drawValueAscii(kFmtMsValueGpu, s, valueRect,
                                     kColorAccentCyan);
                 } else {
-                    // CPU panel: compound "App {x} ms / Render {y} ms".
-                    // drawValueAscii finds the two "X.X ms" value runs
-                    // and paints them in cyan (digits italic Barlow,
-                    // " ms" upright Rajdhani — same colour, different
-                    // font). "App" and " / Render " stay upright
-                    // Rajdhani in white via the base colour.
+                    // CPU panel: the Render term (the app's render-recording,
+                    // = OXRT "render CPU") then the per-cycle total labelled
+                    // "App" (= OXRT "app CPU"). One right-aligned compound;
+                    // each "X.X ms" run renders cyan, the labels and the " / "
+                    // separator white. Render is a sub-part of App; the gap
+                    // (Wait→Begin work + runtime begin/end calls + between-
+                    // frames) is not broken out.
+                    //
+                    // Width: 360 px (left edge ~332 px) comfortably fits the
+                    // two terms even at double-digit ms — e.g. "Render 22.1 ms
+                    // / App 41.5 ms" ≈ 250 px — well clear of the title.
                     const std::string compound =
-                        "App " + secondaryValue + " ms / Render "
-                        + currentValue + " ms";
+                        breakdown + " / App " + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
-                        r - kSectionInnerPad - 320.0f, titleT,
+                        r - kSectionInnerPad - 360.0f, titleT,
                         r - kSectionInnerPad,          titleB);
-                    drawValueAscii(kFmtMsCompoundGpu, compound, valueRect,
-                                    kColorTextWhite,     // "App" / "/ Render"
-                                    kColorAccentCyan);   // value runs
+                    drawValueAscii(kFmtCpuBreakdownGpu, compound, valueRect,
+                                    kColorTextWhite,     // "Render" / " / App" labels
+                                    kColorAccentCyan);   // the two value runs
                 }
 
                 // Histogram region is intentionally left untouched

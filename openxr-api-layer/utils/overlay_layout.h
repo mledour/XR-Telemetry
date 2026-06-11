@@ -70,8 +70,8 @@ namespace openxr_api_layer::detail {
     //   <histogram >
     //
     //   ── CPU frametime panel ───────────────────────────────────────
-    //   CPU FRAMETIME MS        App ms 4.3 ms / Render ms 7.4 ms
-    //                            cpu_app_ms_str   cpu_frametime_ms
+    //   CPU FRAMETIME MS              Render 2.7 ms / App 4.1 ms
+    //                                 cpu_render_ms   cpu_frametime_ms
     //   <histogram>
     //
     //   ── bottom row (2 panels, 60/40 split, 5 cells total) ────────
@@ -110,15 +110,13 @@ namespace openxr_api_layer::detail {
                                                 // window (see aggregator
                                                 // for the window math)
 
-        // Frametime panel current-value labels (top-right of each
-        // panel — the histogram itself takes the rest of the space).
-        // GPU panel only shows the per-cycle GPU time. CPU panel
-        // shows BOTH the per-cycle CPU (= "Render ms") AND the
-        // app-only window (= "App ms"); the difference is the OpenXR
-        // overhead, which is the diagnostic value the design surfaces.
+        // Frametime panel current-value labels. GPU panel shows just the
+        // per-cycle GPU time. CPU panel shows the per-cycle total labelled
+        // "App" (cpu_frametime_ms, = OXRT "app CPU") with its render-
+        // submission portion broken out as "Render" (= OXRT "render CPU").
         std::string gpu_frametime_ms = "--.-";
-        std::string cpu_frametime_ms = "--.-";  // Render ms
-        std::string cpu_app_ms       = "--.-";  // App ms (wait→end)
+        std::string cpu_frametime_ms = "--.-";  // App — per-cycle total
+        std::string cpu_render_ms    = "--.-";  // Render (Begin-exit → End)
 
         // Bottom row — GPU temperature (integer °C, "--" sentinel when
         // source absent). The CPU panel has no temperature cell — both of
@@ -227,7 +225,7 @@ namespace openxr_api_layer::detail {
 
         v.gpu_frametime_ms = fmtMsOneDecimal(snap.gpu_frame_ms);
         v.cpu_frametime_ms = fmtMsOneDecimal(snap.cpu_frame_ms);
-        v.cpu_app_ms       = fmtMsOneDecimal(snap.cpu_app_ms);
+        v.cpu_render_ms    = fmtMsOneDecimal(snap.cpu_render_ms);
 
         v.gpu_temp_c       = fmtTempInt(snap.gpu_temp_c);
         // "CPUs" — busiest-core utilisation. NaN (no sampler reading /

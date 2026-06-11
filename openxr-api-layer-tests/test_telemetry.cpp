@@ -300,12 +300,14 @@ namespace {
     // CPU sampler / the first frames have no baseline delta), but still
     // emitted every frame so the column count stays stable.
     constexpr int kColCpusMaxPct = 15;
-    constexpr int kColCount = 16;
+    constexpr int kColRenderNs = 16;
+    constexpr int kColCount = 17;
 
     const std::string kExpectedHeader =
         "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,"
         "frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,"
-        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct";
+        "should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct,"
+        "render_ns";
 
     // Stand-in OverlayRenderer for the overlay-integration tests. Records the
     // calls the layer makes (renderAndCompose / pushFrameSample) and hands
@@ -496,6 +498,8 @@ TEST_CASE("telemetry: one frame produces one CSV data row + footer") {
     CHECK(cells[kColShouldRender] == "1");                   // shouldRender = XR_TRUE
     // First frame has no previous tEnd → frame_total_ns is reported as 0.
     CHECK(std::stoll(cells[kColFrameTotalNs]) == 0);
+    // render_ns (Begin-exit → End) is non-negative (0 if begin was skipped).
+    CHECK(std::stoll(cells[kColRenderNs]) >= 0);
 }
 
 // ----------------------------------------------------------------------------

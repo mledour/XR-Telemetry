@@ -47,7 +47,8 @@ namespace {
     // wait_block_ns matters because cpu_frame_ms is computed as
     // (frame_total - wait_block), so tests asserting specific cpu_frame_ms
     // values need to set both. Defaults to 0 for tests that only care
-    // about fps or refresh cadence.
+    // about fps or refresh cadence. render_ns feeds cpu_render_ms (the
+    // app's Begin-exit→End render window); default 0.
     FrameRecord makeRecord(int64_t qpc_ticks,
                             int64_t app_cpu_ns,
                             int64_t gpu_time_ns,
@@ -55,7 +56,8 @@ namespace {
                             int64_t period_ns,
                             float headroom_pct,
                             float gpu_headroom_pct,
-                            int64_t wait_block_ns = 0) {
+                            int64_t wait_block_ns = 0,
+                            int64_t render_ns = 0) {
         FrameRecord r{};
         r.timestamp_qpc   = qpc_ticks;
         r.app_cpu_ns      = app_cpu_ns;
@@ -65,6 +67,7 @@ namespace {
         r.headroom_pct    = headroom_pct;
         r.gpu_headroom_pct = gpu_headroom_pct;
         r.wait_block_ns   = wait_block_ns;
+        r.render_ns       = render_ns;
         return r;
     }
 }
@@ -124,15 +127,9 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
     REQUIRE(agg.snapshot().valid);
     const auto& s = agg.snapshot();
     CHECK(s.cpu_frame_ms == doctest::Approx(4.0f).epsilon(0.001));
-    // cpu_app_ms = rec.app_cpu_ns averaged across the window. With
-    // app_cpu_ns = 4'000'000 on every frame, the App ms reads 4.0 —
-    // matches the per-cycle 4ms in this fixture because we set
-    // wait_block such that the two metrics happen to align. In real
-    // workloads, app_cpu_ns (= wait→end) is typically SMALLER than
-    // per-cycle (= frame_total − wait_block), because per-cycle
-    // includes the endframe call + pre-begin housekeeping on top of
-    // the wait→end window.
-    CHECK(s.cpu_app_ms   == doctest::Approx(4.0f).epsilon(0.001));
+    // render_ns defaults to 0 in this fixture, so cpu_render_ms = 0; the
+    // dedicated render tests below exercise non-zero values.
+    CHECK(s.cpu_render_ms == doctest::Approx(0.0f).epsilon(0.001));
     CHECK(s.gpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
     // 1e9 / 11.111e6 ≈ 90 fps.
     CHECK(s.fps_avg     == doctest::Approx(90.0f).epsilon(0.05));
@@ -147,32 +144,47 @@ TEST_CASE("OverlayAggregator: refresh fires once interval is crossed") {
 // Moving average — values are averaged across the window, not the latest.
 // =============================================================================
 
-TEST_CASE("OverlayAggregator: cpu_app_ms is independent of cpu_frame_ms") {
-    // App ms = rec.app_cpu_ns (wait→end window).
-    // Render ms (= cpu_frame_ms) = frame_total - wait_block (per-cycle).
+TEST_CASE("OverlayAggregator: cpu_render_ms is the mean of rec.render_ns, < App") {
+    // Render (= cpu_render_ms) = mean(rec.render_ns): the app's render-
+    // recording window (Begin-exit → End). A genuine sub-part of the
+    // per-cycle App total (cpu_frame_ms = frame_total - wait_block).
     //
-    // The two diverge whenever endframe / pre-begin overhead is
-    // non-trivial. This test fixes BOTH values explicitly and
-    // verifies the aggregator publishes them independently.
-    //
-    //   frame_total = 11.111 ms
-    //   wait_block  = 6.111 ms  → per_cycle (Render) = 5.000 ms
-    //   app_cpu     = 3.500 ms
-    //   → overhead  = Render - App = 1.500 ms (endframe + pre_begin)
+    //   render_ns   = 2.700 ms
+    //   frame_total = 11.111 ms, wait_block = 6.111 ms → App = 5.000 ms
     OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
     agg.pushFrame(makeRecord(0,
                               /*app_cpu=*/3'500'000, 5'000'000,
                               11'111'111, 11'111'111, 64.0f, 55.0f,
-                              /*wait_block=*/6'111'111));
+                              /*wait_block=*/6'111'111,
+                              /*render_ns=*/2'700'000));
     agg.pushFrame(makeRecord(120'000'000,
                               /*app_cpu=*/3'500'000, 5'000'000,
                               11'111'111, 11'111'111, 64.0f, 55.0f,
-                              /*wait_block=*/6'111'111));
+                              /*wait_block=*/6'111'111,
+                              /*render_ns=*/2'700'000));
     REQUIRE(agg.snapshot().valid);
     const auto& s = agg.snapshot();
-    CHECK(s.cpu_frame_ms == doctest::Approx(5.0f).epsilon(0.001));
-    CHECK(s.cpu_app_ms   == doctest::Approx(3.5f).epsilon(0.001));
-    CHECK(s.cpu_app_ms < s.cpu_frame_ms);  // ordering contract
+    CHECK(s.cpu_frame_ms  == doctest::Approx(5.0f).epsilon(0.001));
+    CHECK(s.cpu_render_ms == doctest::Approx(2.7f).epsilon(0.001));
+    CHECK(s.cpu_render_ms < s.cpu_frame_ms);  // Render is a sub-part of App
+}
+
+TEST_CASE("OverlayAggregator: cpu_render_ms averages rec.render_ns over the window") {
+    // render_ns varies frame to frame → cpu_render_ms is the window mean.
+    OverlayAggregator agg(/*refreshIntervalNs=*/100'000'000LL);
+    agg.pushFrame(makeRecord(0,
+                              /*app_cpu=*/4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111,
+                              /*render_ns=*/1'000'000));
+    agg.pushFrame(makeRecord(120'000'000,
+                              /*app_cpu=*/4'000'000, 5'000'000,
+                              11'111'111, 11'111'111, 64.0f, 55.0f,
+                              /*wait_block=*/7'111'111,
+                              /*render_ns=*/3'000'000));
+    REQUIRE(agg.snapshot().valid);
+    // mean(1.0 ms, 3.0 ms) = 2.0 ms.
+    CHECK(agg.snapshot().cpu_render_ms == doctest::Approx(2.0f).epsilon(0.001));
 }
 
 TEST_CASE("OverlayAggregator: first frame with frame_total_ns=0 falls back to app_cpu_ns") {

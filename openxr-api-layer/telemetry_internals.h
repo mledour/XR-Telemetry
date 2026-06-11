@@ -106,6 +106,12 @@ namespace openxr_api_layer::detail {
         // source unavailable. Appended LAST so the CSV column order stays
         // backward-compatible (see the CsvWriter header comment).
         float cpus_max_pct;        // NaN ⇒ source unavailable
+        // The app's render-recording window: tEnd - tBeginExit (xrBeginFrame
+        // returning to the app → xrEndFrame entry). EXCLUDES the runtime's
+        // xrBeginFrame call, so it matches what OpenXR Toolkit reports as
+        // "render CPU". Surfaced in the overlay as "Render". Appended LAST to
+        // keep the CSV column order backward-compatible.
+        int64_t render_ns;
     };
 
     // --- Time conversions ---------------------------------------------------
@@ -125,6 +131,20 @@ namespace openxr_api_layer::detail {
         const int64_t whole = ticks / freq;
         const int64_t rem = ticks % freq;
         return whole * 1'000'000'000LL + (rem * 1'000'000'000LL) / freq;
+    }
+
+    // QPC delta → ns with a built-in "skipped / abnormal frame" guard:
+    // returns 0 unless the start anchor looks valid (from > 0) AND the
+    // interval is forward-ordered (to > from). Centralises the skip contract
+    // for the per-frame windows computed in xrEndFrame (wait_block, app_cpu,
+    // pre_begin, render) so a stale or out-of-order anchor — e.g. a timestamp
+    // left over from a prior cycle when xrWaitFrame / xrBeginFrame was skipped
+    // — collapses to 0 the same way everywhere, instead of three ad-hoc
+    // inline checks. (Notably: render must reject a 0/stale begin-exit anchor,
+    // else a fresh tEnd minus a stale anchor spans more than one frame and
+    // exceeds the per-cycle total, breaking Render ≤ App.)
+    inline int64_t qpcDeltaNsOrZero(int64_t from, int64_t to, int64_t freq) noexcept {
+        return (from > 0 && to > from) ? qpcToNs(to - from, freq) : 0;
     }
 
     // D3D11 GPU timestamp delta ticks → nanoseconds, with the same split-

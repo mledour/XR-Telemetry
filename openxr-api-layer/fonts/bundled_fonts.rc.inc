@@ -102,7 +102,7 @@
 //
 // Mixed bundle, two families, two purposes:
 //   - Rajdhani SemiBold (600) by Indian Type Foundry — used UPRIGHT for
-//     all labels, section titles, and the "App" / "Render" portions of
+//     all labels, section titles, and the "Render" / "App" labels of
 //     the CPU panel's compound string. Narrower, technical-feeling
 //     grotesque; reads as crisp small-cap labels at 14-22 px.
 //   - Barlow Medium Italic (500) by The Barlow Project Authors — used
