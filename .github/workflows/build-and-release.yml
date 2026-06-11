@@ -193,6 +193,11 @@ jobs:
           "LAYER_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build ${{ matrix.configuration }} | x64
+        # id consumed by the artifact steps' `steps.build.outcome == 'success'`
+        # gate near the end of the job — that's what lets a downstream test
+        # failure still upload artifacts while a *build* failure correctly
+        # skips them (nothing to package).
+        id: build
         run: >-
           msbuild "${{ env.SOLUTION }}"
           /p:Configuration=${{ matrix.configuration }}
@@ -297,7 +302,13 @@ jobs:
       #     or a real HMD. This is the bar every PR must clear.
       # The binary is built by the same msbuild invocation as the layer DLL
       # (it's a second project in the .sln) and drops alongside the DLL in
-      # bin\x64\<config>\. A non-zero exit fails the job.
+      # bin\x64\<config>\. A non-zero exit fails the job — the red X is
+      # preserved on the PR — but it no longer blocks artifact delivery:
+      # the staging, installer and upload steps near the end of the job are
+      # gated on `steps.build.outcome == 'success' && !cancelled()` instead
+      # of the implicit success(), so they still run after a snapshot/test
+      # failure. The job uploads the Debug/Release ZIPs and the Setup.exe,
+      # then ends failed.
       - name: Run unit + integration tests (${{ matrix.configuration }} | x64)
         shell: pwsh
         run: |
@@ -809,12 +820,25 @@ jobs:
       # Produces a single Setup.exe that installs the DLL + JSON manifest
       # to Program Files (correct ACLs for sandboxed identities), registers
       # the layer in HKLM, and creates an Add/Remove Programs uninstaller.
+      # ---- Artifact pipeline: runs even when the test step above failed ---
+      #
+      # Every step from here to the end of the job is gated on
+      #   steps.build.outcome == 'success' && !cancelled()
+      # rather than the implicit success() GitHub injects when an `if:` omits
+      # a status function. The `!cancelled()` is what disables that implicit
+      # success() gate; `steps.build.outcome == 'success'` then narrows it
+      # back down so we build/stage/upload ONLY when the compile produced
+      # binaries. Net effect:
+      #   - build OK + tests pass   -> artifacts upload (as before)
+      #   - build OK + tests FAIL   -> artifacts STILL upload, job ends red
+      #   - build FAILS             -> skipped (nothing to package)
+      #   - run cancelled           -> skipped
       - name: Install Inno Setup
-        if: matrix.configuration == 'Release'
+        if: steps.build.outcome == 'success' && !cancelled() && matrix.configuration == 'Release'
         run: choco install innosetup -y --no-progress
 
       - name: Build installer
-        if: matrix.configuration == 'Release'
+        if: steps.build.outcome == 'success' && !cancelled() && matrix.configuration == 'Release'
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
@@ -835,8 +859,13 @@ jobs:
       # which would invalidate any pre-existing signature.
       - name: Sign installer (Certum SimplySign)
         # should_sign already implies matrix.configuration == 'Release',
-        # so no additional matrix gate is needed here.
-        if: steps.signing.outputs.should_sign == 'true'
+        # so no additional matrix gate is needed here. The build-outcome /
+        # !cancelled() gate matches the surrounding artifact steps so a
+        # failing snapshot test on a tag build still signs the installer.
+        # The release job stays gated behind `needs: build`, which a failed
+        # build job won't satisfy — so no GitHub Release is cut on red even
+        # though the signed Setup.exe is available as a run artifact.
+        if: steps.build.outcome == 'success' && !cancelled() && steps.signing.outputs.should_sign == 'true'
         shell: pwsh
         env:
           CERTUM_USERNAME:        ${{ secrets.CERTUM_USERNAME }}
@@ -846,7 +875,7 @@ jobs:
           .\scripts\Sign-Artifact.ps1 -Path "bin\installer\*.exe"
 
       - name: Upload installer artifact
-        if: matrix.configuration == 'Release'
+        if: steps.build.outcome == 'success' && !cancelled() && matrix.configuration == 'Release'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.LAYER_NAME }}-Setup-x64
@@ -859,6 +888,7 @@ jobs:
       # We do NOT zip here — actions/upload-artifact@v4 zips on its own, and
       # pre-zipping would double-wrap the payload.
       - name: Stage artifacts
+        if: steps.build.outcome == 'success' && !cancelled()
         shell: pwsh
         run: |
           $configuration = "${{ matrix.configuration }}"
@@ -904,6 +934,7 @@ jobs:
       # Pointing at the stage directory (not a pre-made ZIP) gives us a
       # clean single-level ZIP: `<name>.zip` → DLL + PDB + JSON + PS1 at root.
       - name: Upload build artifact
+        if: steps.build.outcome == 'success' && !cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.LAYER_NAME }}-${{ matrix.configuration }}-x64
