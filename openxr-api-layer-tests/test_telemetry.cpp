@@ -759,6 +759,47 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
 }
 
 // ----------------------------------------------------------------------------
+// 9b. Suspend branch: overlay in HOTKEY mode but never activated (with log
+//     off) is NOT a full bypass — overlay.enabled=true keeps the layer live so
+//     it can still poll the activation hotkey — but with neither the CSV
+//     (m_recording) nor the HUD (m_overlayActive) consuming frames, the
+//     per-frame telemetry is suspended (collecting == false). The invariant
+//     that MUST survive that suspension: xrEndFrame is still forwarded every
+//     frame, or the app would stop submitting to the compositor. We can't
+//     observe the CPU-cost drop from here; we guard the correctness floor
+//     (forwarding) and the absence of a CSV. ForceOverlayActiveForTest is
+//     deliberately NOT called, so m_overlayActive stays false.
+// ----------------------------------------------------------------------------
+TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still forwards frames") {
+    TelemetryFixture fix;
+
+    const auto perAppPath = fix.tempDir() / "suspendtest_settings.json";
+    {
+        std::ofstream out(perAppPath);
+        REQUIRE(out.is_open());
+        out << R"({"overlay":{"enabled":true,"mode":"hotkey"}})";
+    }
+
+    auto* api = fix.startLayer("SuspendTest");
+
+    constexpr int kFrames = 5;
+    for (int i = 0; i < kFrames; ++i) {
+        driveOneFrame(api);
+    }
+    openxr_api_layer::ResetInstance();
+
+    // The frame submission must reach the runtime on every frame even while
+    // our telemetry is suspended — this is the regression guard.
+    CHECK(mock::state().waitFrameCallCount == kFrames);
+    CHECK(mock::state().beginFrameCallCount == kFrames);
+    CHECK(mock::state().endFrameCallCount == kFrames);
+
+    // Log is off, so nothing should land on disk regardless of the overlay.
+    const auto csv = findSessionCsv(fix.sessionsDir());
+    CHECK(!csv.has_value());
+}
+
+// ----------------------------------------------------------------------------
 // 10. Drift check: the in-binary `kBuiltInDefaultSettings` constexpr (the
 //     fallback the layer ships when the installer never ran) MUST parse
 //     to the same TelemetrySettings as installer/default_settings.json
