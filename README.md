@@ -20,23 +20,41 @@ and run it. The installer registers the layer under `HKLM` so every
 OpenXR runtime on the machine picks it up, and creates an Add/Remove
 Programs entry for clean uninstall.
 
-The overlay (HUD) and the CSV log are both **off by default** — until
-you enable at least one in `settings.json`, the layer is a pure
-pass-through. See Settings below.
+The overlay (HUD) and the CSV log both ship **enabled in hotkey mode** —
+armed but dormant. Nothing is drawn and no CSV is written until
+you press the toggle in-game (`Ctrl+Shift+O` for the overlay,
+`Ctrl+Shift+T` for the log). See Settings below to make a feature
+always-on (`auto`) or turn it off entirely.
 
 ## Quickstart
 
 1. Install via `Setup.exe`. It drops a default `settings.json` into
    `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`.
-2. Edit `settings.json` and flip `log.enabled = true` and/or
-   `overlay.enabled = true`.
-3. Launch your OpenXR game. With `log` on, a CSV appears in
-   `…\sessions\` (one per OpenXR session). With `overlay` on, the
-   HUD shows in the top-right of your FOV.
+2. Launch your OpenXR game. Both features ship enabled in hotkey mode, so
+   nothing shows yet — press `Ctrl+Shift+O` to toggle the overlay (it
+   appears in the top-right of your FOV) and `Ctrl+Shift+T` to start/stop a
+   CSV recording (files land in `…\sessions\`).
+3. Want a feature always-on instead of hotkey-toggled? Edit `settings.json`
+   and set its `mode` to `"auto"`. To turn a feature off entirely, set its
+   `enabled` to `false`.
 
-Prefer to keep both dormant and toggle from inside the game? Set
-`mode = "hotkey"` on either feature, then press `Ctrl+Shift+T` (log)
-or `Ctrl+Shift+O` (overlay) while the game has focus.
+Until you toggle something on, the layer just polls for the hotkeys a few
+times a second — no CSV, no HUD, negligible overhead.
+
+## Disabling the layer
+
+Because the loader injects this DLL into **every** OpenXR app on the
+machine, there are two ways to make it stand down without uninstalling:
+
+- **Fully inert (loader level).** Set the environment variable
+  `DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry=1` (the manifest's
+  `disable_environment`). The OpenXR loader then never loads the layer into
+  the process at all — the safest option if a game or its anti-cheat
+  misbehaves with any third-party layer present.
+- **Pure pass-through (settings level).** Set both `log.enabled` and
+  `overlay.enabled` to `false` in `settings.json`. The DLL still loads but
+  every call forwards straight through — no hotkeys polled, no
+  instrumentation.
 
 ## Settings
 
@@ -57,13 +75,13 @@ Full schema:
 ```json
 {
   "log": {
-    "enabled": false,
-    "mode": "auto",
+    "enabled": true,
+    "mode": "hotkey",
     "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
   },
   "overlay": {
-    "enabled": false,
-    "mode": "auto",
+    "enabled": true,
+    "mode": "hotkey",
     "hotkey": { "key": "O", "modifiers": ["ctrl", "shift"] },
     "refresh_hz": 10,
     "position": "head_top_right",
@@ -135,8 +153,8 @@ cap on a 90 Hz HMD).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch. The HUD never paints uninvited — opt in via this flag, or summon it temporarily via the hotkey (see below). |
-| `mode` | string | `"auto"` | `auto` = HUD visible the whole session when `enabled=true`. `hotkey` = HUD hidden until the user presses the combo, toggles on/off on each subsequent press. |
+| `enabled` | bool | `true` | Master switch. Ships **on** in hotkey mode, so the HUD never paints uninvited — it stays hidden until you press the combo. Set `false` to disable the overlay entirely. |
+| `mode` | string | `"hotkey"` | `hotkey` (the default) = HUD hidden until you press the combo, toggles on/off on each subsequent press. `auto` = HUD visible the whole session when `enabled=true`. |
 | `hotkey.key` | string | `"O"` | Main key. Recognised: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`. Punctuation is intentionally unsupported (locale-dependent). |
 | `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. Must match exactly — `Ctrl+Alt+Shift+O` does NOT trigger a `Ctrl+Shift+O` binding. |
 | `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
@@ -286,8 +304,8 @@ computing GPU averages.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch for the CSV. `false` (the default) skips writing entirely; combined with `overlay.enabled=false` (also the default), the layer is a pure pass-through. |
-| `mode` | string | `"auto"` | `auto` = one CSV per session, opened at session start and closed at session end. `hotkey` = no CSV until the user presses the combo; each press starts/stops a recording window (one fresh file per window — short sessions don't merge into one giant log). |
+| `enabled` | bool | `true` | Master switch for the CSV. Ships **on** in hotkey mode (no file is written until you press the combo). Set `false` to skip logging entirely; with both `log.enabled` and `overlay.enabled` set to `false` the layer is a pure pass-through. |
+| `mode` | string | `"hotkey"` | `hotkey` (the default) = no CSV until you press the combo; each press starts/stops a recording window (one fresh file per window — short sessions don't merge into one giant log). `auto` = one CSV per session, opened at session start and closed at session end. |
 | `hotkey.key` | string | `"T"` | Main key. Same set of recognised names as the overlay hotkey. |
 | `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers. Same set as the overlay hotkey. |
 

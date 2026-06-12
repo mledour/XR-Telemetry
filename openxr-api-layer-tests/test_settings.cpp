@@ -31,6 +31,7 @@
 #include <doctest/doctest.h>
 
 #include "utils/settings.h"
+#include "utils/default_settings_template.h"
 
 using openxr_api_layer::detail::parseSettings;
 using openxr_api_layer::detail::ParsedSettings;
@@ -42,11 +43,15 @@ using openxr_api_layer::detail::defaultOverlayHotkey;
 using openxr_api_layer::detail::formatHotkey;
 
 namespace {
-    // The defaults documented in installer/default_settings.json:
-    // log.enabled=false, log.mode=auto, log.hotkey=Ctrl+Shift+T,
-    // overlay.enabled=false, overlay.mode=auto, overlay.hotkey=Ctrl+Shift+O,
-    // overlay.refresh_hz=10, overlay.position=head_top_right.
-    void checkDocumentedDefaults(const ParsedSettings& p) {
+    // The parser's missing-field FALLBACK (safety) defaults — what an empty
+    // or partial config resolves to: log.enabled=false, log.mode=auto,
+    // log.hotkey=Ctrl+Shift+T, overlay.enabled=false, overlay.mode=auto,
+    // overlay.hotkey=Ctrl+Shift+O, overlay.refresh_hz=10,
+    // overlay.position=head_top_right. NOTE: the SHIPPED template
+    // (installer/default_settings.json) intentionally differs — it ships log
+    // and overlay enabled in hotkey mode; the fallback stays disabled so a
+    // partial/malformed config never silently arms a feature.
+    void checkFallbackDefaults(const ParsedSettings& p) {
         CHECK(p.error.empty());
         CHECK_FALSE(p.settings.log.enabled);
         CHECK(p.settings.log.mode == LogMode::Auto);
@@ -68,15 +73,36 @@ namespace {
 // =============================================================================
 
 TEST_CASE("parseSettings: empty input → documented defaults, no error") {
-    checkDocumentedDefaults(parseSettings(""));
+    checkFallbackDefaults(parseSettings(""));
 }
 
 TEST_CASE("parseSettings: empty object → documented defaults, no error") {
-    checkDocumentedDefaults(parseSettings("{}"));
+    checkFallbackDefaults(parseSettings("{}"));
 }
 
 TEST_CASE("parseSettings: comment-only object → documented defaults") {
-    checkDocumentedDefaults(parseSettings(R"({ "_comment": "hi" })"));
+    checkFallbackDefaults(parseSettings(R"({ "_comment": "hi" })"));
+}
+
+// =============================================================================
+// Shipped template — the headline default (distinct from the fallback above).
+// =============================================================================
+
+TEST_CASE("parseSettings: the shipped template arms log + overlay in hotkey mode") {
+    // The fallback tests above lock what an ABSENT block resolves to
+    // (disabled). This locks the opposite end: the in-binary template
+    // kBuiltInDefaultSettings — and, via the no-schema-drift test in
+    // test_telemetry.cpp, installer/default_settings.json — ships BOTH
+    // features enabled in HOTKEY mode. Without this, a revert to
+    // enabled=false/auto passes the whole suite green (the drift test only
+    // checks the two templates agree; the fallback tests only check the
+    // parser's missing-field defaults).
+    const auto p = parseSettings(openxr_api_layer::detail::kBuiltInDefaultSettings);
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Hotkey);
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
 }
 
 // =============================================================================
@@ -154,7 +180,7 @@ TEST_CASE("parseSettings: bare key with no modifiers parses cleanly") {
 TEST_CASE("parseSettings: log.enabled with non-bool falls back to default") {
     const auto p = parseSettings(R"({ "log": { "enabled": "yes please" } })");
     CHECK(p.error.empty());
-    CHECK_FALSE(p.settings.log.enabled);  // default false (opt-in)
+    CHECK_FALSE(p.settings.log.enabled);  // fallback is false (safety default)
 }
 
 TEST_CASE("parseSettings: log.mode with non-string falls back to default") {
@@ -273,9 +299,10 @@ TEST_CASE("parseSettings: overlay offset wrong-type falls back to 0") {
     CHECK(parseSettings(R"({"overlay":{"offset_y":true}})").settings.overlay.offset_y == 0.0f);
 }
 
-TEST_CASE("parseSettings: overlay defaults match the documented shipped template") {
-    // Asserting defaults explicitly here so an accidental change to
-    // defaults forces an update to BOTH the parser and the README.
+TEST_CASE("parseSettings: empty overlay block resolves to the safe disabled fallback") {
+    // Locks the parser FALLBACK for an absent overlay block (safety default:
+    // disabled/auto). Distinct from the SHIPPED template, which arms the
+    // overlay in hotkey mode — see default_settings_template.h.
     const auto p = parseSettings("{}");
     REQUIRE(p.error.empty());
     CHECK_FALSE(p.settings.overlay.enabled);
@@ -409,5 +436,5 @@ TEST_CASE("parseSettings: unknown top-level keys are tolerated") {
         "log": {}, "future_feature": true, "x": [1, 2]
     })");
     CHECK(p.error.empty());
-    CHECK_FALSE(p.settings.log.enabled);  // empty log{} → opt-in default
+    CHECK_FALSE(p.settings.log.enabled);  // empty log{} → disabled (fallback)
 }

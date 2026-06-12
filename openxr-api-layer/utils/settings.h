@@ -36,8 +36,8 @@
 //                  "offset_x", "offset_y" }
 //   }
 //
-// Everything is permissive: missing fields fall back to the "preserve
-// current behaviour" defaults (log enabled, auto mode, default hotkey).
+// Everything is permissive: missing fields fall back to the safe
+// defaults (log disabled, auto mode, default hotkey).
 // A malformed file returns the same defaults plus an error string the
 // caller can log — we NEVER throw / abort because of bad settings; the
 // layer's contract is to keep the host process alive (CLAUDE.md rule 9).
@@ -83,9 +83,12 @@ namespace openxr_api_layer::detail {
     // it's always populated from the JSON (or the default) so logs can show
     // the bound combo regardless of mode.
     //
-    // Defaults are deliberately opt-in: enabled=false. A fresh install does
-    // nothing until the user explicitly turns the CSV on (or the overlay),
-    // so the layer never silently leaves artefacts on disk.
+    // Parser FALLBACK for an absent/malformed "log" block: enabled=false.
+    // Safety default — a partial or corrupt config never silently arms
+    // logging. NOTE: distinct from the SHIPPED template
+    // (default_settings_template.h / installer/default_settings.json), which
+    // ships enabled=true in HOTKEY mode (armed but dormant); a fresh install
+    // still writes nothing to disk until the user presses the hotkey.
     struct LogSettings {
         bool enabled = false;
         LogMode mode = LogMode::Auto;
@@ -97,9 +100,11 @@ namespace openxr_api_layer::detail {
     // head_top_left / head_top_center / head_center; unknown values fall
     // back to head_top_right), and a `scale` multiplier.
     //
-    // Defaults are deliberately opt-in: enabled=false. A user upgrading
-    // from a pre-overlay layer gets the same CSV-only behaviour they had
-    // before, and the HUD never appears uninvited.
+    // Parser FALLBACK for an absent/malformed "overlay" block: enabled=false.
+    // Safety default — a partial or corrupt config never silently arms the
+    // HUD. NOTE: distinct from the SHIPPED template, which ships enabled=true
+    // in HOTKEY mode; the HUD still never appears uninvited because hotkey
+    // mode stays hidden until the user presses the combo.
     struct OverlaySettings {
         bool enabled = false;
         OverlayMode mode = OverlayMode::Auto;

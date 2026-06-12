@@ -1609,11 +1609,11 @@ namespace openxr_api_layer {
             // singleton (OpenComposite probe-then-real, or any host that
             // re-initialises without an intervening xrDestroyInstance)
             // must NOT re-run our bootstrap: re-reading settings keyed
-            // on a possibly different applicationName could flip
-            // m_bypassApiLayer mid-session and silently halt CSV row
-            // appends from the next frame onwards (the file would stay
-            // open from the first init, but every per-frame override
-            // would pass-through on the new flag). The base-class
+            // on a possibly different applicationName would re-key
+            // m_appName / m_settings onto the second app and rebuild the
+            // overlay aggregator from scratch (discarding the session's
+            // accumulated history), and could flip m_bypassApiLayer /
+            // recording state mid-session. The base-class
             // forward above has already given the loader a result; we
             // just preserve layer state and exit.
             if (m_layerInitialized) {
@@ -1647,8 +1647,8 @@ namespace openxr_api_layer {
             // Load the per-app settings file (bootstrap from the global
             // template if missing). bootstrapAndLoadSettings always
             // returns a usable struct, even on filesystem or parse
-            // failure — defaults preserve the original always-on
-            // behaviour.
+            // failure — the fallback leaves both features disabled, so a
+            // broken config degrades to a safe pass-through.
             const auto parsed = bootstrapAndLoadSettings(
                 openxr_api_layer::localAppData, appName);
             m_settings = parsed.settings;
