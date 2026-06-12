@@ -51,9 +51,9 @@ namespace openxr_api_layer::detail {
     // Snapshot → pre-formatted strings for the new fpsVR-redesign HUD.
     // The renderer never calls snprintf at draw time — it only paints
     // pre-formatted cells. Numeric fields (the *_fraction members) are
-    // exposed alongside the string versions so the circular gauges can
-    // draw the arc geometry directly without re-parsing the percentage
-    // text.
+    // exposed alongside the string versions so the renderer can colour
+    // each cell by its warning tier from a [0,1] number, without
+    // re-parsing the percentage text.
     //
     // Empty / default-constructed when the snapshot is still invalid
     // (caller skips text drawing in that case).
@@ -128,9 +128,8 @@ namespace openxr_api_layer::detail {
         // in the CPU panel; replaces the old CPU TEMP placeholder.
         std::string cpus_max_pct     = "--";
 
-        // Bottom row — utilisation percentages (drawn both as text
-        // inside the gauge AND geometrically as an arc filling 0..N%
-        // of a 270° dial).
+        // Bottom row — utilisation percentages (drawn as text, tinted
+        // by the warning tier — see tierForUtilisation).
         std::string gpu_util_pct     = "--";
         std::string cpu_util_pct     = "--";
 
@@ -144,7 +143,7 @@ namespace openxr_api_layer::detail {
         // Tier fractions (0..1) drive the warning-tier text colour
         // for LOAD and VRAM in the bottom panels — same cyan / orange
         // / red palette as the histogram bars, same thresholds via
-        // gaugeTierForUtilisation (0.80 / 0.90).
+        // tierForUtilisation (0.80 / 0.90).
         float       gpu_util_fraction = 0.0f;
         float       cpu_util_fraction = 0.0f;
         float       vram_fraction     = 0.0f;
@@ -154,7 +153,7 @@ namespace openxr_api_layer::detail {
         float       cpus_max_fraction = 0.0f;
 
         // True when at least the FPS field carries a real value. The
-        // renderer can skip the text/gauge passes (but still paint the
+        // renderer can skip the text pass (but still paint the
         // frame/background) on the very first ~100 ms of a session
         // before the aggregator publishes the first snapshot.
         bool        valid = false;
@@ -210,9 +209,9 @@ namespace openxr_api_layer::detail {
             }
             return std::string(buf);
         };
-        // A 0..100 percentage → the 0..1 fraction the circular gauges
-        // draw, clamped, with non-finite input collapsing to 0 (the arc
-        // geometry needs a real number). Shared by every gauge cell.
+        // A 0..100 percentage → a clamped 0..1 fraction, with non-finite
+        // input collapsing to 0. Drives the warning-tier text colour;
+        // shared by every utilisation cell.
         auto pctToFraction = [](float p) {
             return std::isfinite(p) ? std::clamp(p / 100.0f, 0.0f, 1.0f) : 0.0f;
         };
@@ -451,9 +450,8 @@ namespace openxr_api_layer::detail {
     //   ratio < 0.90 → Orange  (10–20 % headroom — warning)
     //   ratio ≥ 0.90 → Red     ( < 10 % headroom — critical)
     //
-    // The same tiering drives the circular utilisation gauge's fill
-    // colour in the bottom panels — see drawCircularGauge in the
-    // renderer.
+    // The same tiering drives the LOAD / VRAM / CPUs text colour in the
+    // bottom panels — see tierForUtilisation below.
     enum class BarTier { Green, Orange, Red };
 
     struct BarVisual {
@@ -507,13 +505,13 @@ namespace openxr_api_layer::detail {
         return {height, tier};
     }
 
-    // Reuse the same tiering for the circular utilisation gauge in
-    // the bottom panels — keeps the visual language coherent (a bar
-    // turning orange next to a gauge turning red reads as "GPU was
-    // borderline last second, now it's pinned"). The input here is
+    // Reuse the same tiering for the LOAD / VRAM / CPUs values in the
+    // bottom panels — keeps the visual language coherent (a histogram
+    // bar turning orange next to a LOAD value turning red reads as "GPU
+    // was borderline last second, now it's pinned"). The input here is
     // a 0..1 utilisation FRACTION (not a frametime ratio), but the
     // semantics are the same: 0.80–0.89 = orange, 0.90+ = red.
-    inline BarTier gaugeTierForUtilisation(float fraction) noexcept {
+    inline BarTier tierForUtilisation(float fraction) noexcept {
         if (!(fraction >= 0.0f)) return BarTier::Green;  // NaN → green default
         if (fraction >= 0.90f) return BarTier::Red;
         if (fraction >= 0.80f) return BarTier::Orange;
