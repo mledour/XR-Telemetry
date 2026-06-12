@@ -1737,9 +1737,93 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // Build the GPU timer + GPU-telemetry reader (temp / VRAM) from the
+        // graphics binding stashed at xrCreateSession. Idempotent:
+        // m_gpuInitAttempted latches the one build attempt per session (so a
+        // dormant -> active -> idle -> active hotkey cycle never rebuilds;
+        // cleared per session in releaseSessionScopedResources). Called eagerly
+        // at xrCreateSession for Auto mode, lazily from xrEndFrame the first
+        // time the CSV log or overlay is summoned for Hotkey — so an
+        // un-activated hotkey session never creates query heaps on the app's
+        // device/queue, QIs the DXGI adapter, or inits NvAPI. Mirrors
+        // ensureOverlayResources. Any throw is contained inside the C-ABI frame
+        // it's called from (xrCreateSession / xrEndFrame) and degrades to
+        // "gpu_time_ns / temp / VRAM unavailable this session".
+        void ensureGpuInstrumentation() {
+            if (m_gpuInitAttempted) {
+                return;  // one build attempt per session
+            }
+            m_gpuInitAttempted = true;
+            try {
+                // The adapter for the telemetry reader is re-derived from the
+                // stashed device (the binding kind is implied by which pointer
+                // is non-null — xrCreateSession stashes exactly one). ComPtr
+                // drops the refcount at scope exit; GpuTelemetryReader::init
+                // takes its own via QI, so we don't hold it long-term.
+                ComPtr<IDXGIAdapter> dxgiAdapter;
+                if (m_d3d11Device) {
+                    auto timer = std::make_unique<D3D11GpuTimer>();
+                    if (timer->init(m_d3d11Device.Get())) {
+                        m_gpuTimer = std::move(timer);
+                        Log("xr_telemetry: D3D11 GPU timer active\n");
+                    } else {
+                        Log("xr_telemetry: D3D11 binding found but query creation failed; "
+                            "gpu_time_ns will be 0 for this session\n");
+                    }
+                    // Walk ID3D11Device -> IDXGIDevice -> IDXGIAdapter.
+                    ComPtr<IDXGIDevice> dxgiDevice;
+                    if (SUCCEEDED(m_d3d11Device->QueryInterface(
+                            __uuidof(IDXGIDevice),
+                            reinterpret_cast<void**>(dxgiDevice.GetAddressOf())))) {
+                        dxgiDevice->GetAdapter(dxgiAdapter.GetAddressOf());
+                    }
+                } else if (m_d3d12Device && m_d3d12Queue) {
+                    auto timer = std::make_unique<D3D12GpuTimer>();
+                    if (timer->init(m_d3d12Device.Get(), m_d3d12Queue.Get())) {
+                        m_gpuTimer = std::move(timer);
+                        Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
+                    } else {
+                        Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
+                            "creation failed; gpu_time_ns will be 0 for this session\n");
+                    }
+                    // ID3D12Device::GetAdapterLuid -> IDXGIFactory4::EnumAdapterByLuid.
+                    const LUID luid = m_d3d12Device->GetAdapterLuid();
+                    ComPtr<IDXGIFactory4> factory;
+                    if (SUCCEEDED(::CreateDXGIFactory1(
+                            __uuidof(IDXGIFactory4),
+                            reinterpret_cast<void**>(factory.GetAddressOf())))) {
+                        factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter),
+                                                    reinterpret_cast<void**>(
+                                                        dxgiAdapter.GetAddressOf()));
+                    }
+                }
+
+                // GPU telemetry reader (temp + VRAM). Best-effort: even with a
+                // null adapter (Vulkan / OpenGL host), init() still tries NvAPI
+                // for temperature. Kept live regardless of outcome so the
+                // xrEndFrame poll site stays branchless on "is the reader alive".
+                m_gpuTelemetry = std::make_unique<detail::GpuTelemetryReader>();
+                m_gpuTelemetry->init(dxgiAdapter.Get());
+                if (m_gpuTelemetry->isReady()) {
+                    Log("xr_telemetry: GPU telemetry active (NvAPI / DXGI VRAM)\n");
+                } else {
+                    Log("xr_telemetry: GPU telemetry unavailable (non-NVIDIA host "
+                        "and/or DXGI VRAM not supported); gpu_temp_c / vram_used_bytes "
+                        "will be NaN / 0 for this session\n");
+                }
+            } catch (...) {
+                Log("xr_telemetry: GPU instrumentation init threw — gpu_time_ns / "
+                    "temp / VRAM unavailable this session\n");
+            }
+        }
+
         // ---- xrCreateSession ----------------------------------------------
         // Inspects createInfo->next for a graphics binding we support and
-        // stands up the matching GPU timer:
+        // STASHES it (device / queue). The GPU timer + telemetry reader are
+        // NOT built here — ensureGpuInstrumentation() builds them from the
+        // stashed binding (eagerly for Auto, lazily on first activation for
+        // Hotkey), so an un-activated hotkey session never touches the app's
+        // graphics device or NvAPI. Supported bindings:
         //
         //   D3D11 → D3D11GpuTimer (D3D11 timestamp queries on the app's
         //           immediate context)
@@ -1775,66 +1859,20 @@ namespace openxr_api_layer {
             // xrEndFrame, which uses stack memory not tied to any
             // particular session handle.
             m_loggedLayerCapExceeded = false;
-            // Stash an IDXGIAdapter for the GpuTelemetryReader. Built from
-            // whichever graphics binding the app supplied — D3D11 hands us
-            // the device directly, D3D12 forces a small EnumAdapterByLuid
-            // dance via IDXGIFactory4. ComPtr drops the refcount when this
-            // scope exits; GpuTelemetryReader::init takes its own via QI
-            // so we don't need to hold the DXGIAdapter long-term.
-            ComPtr<IDXGIAdapter> dxgiAdapter;
-
+            // Detect the app's graphics binding and STASH the device / queue.
+            // We must read createInfo->next here (it isn't valid later), but we
+            // do NOT build the GPU timer or telemetry reader yet — that's
+            // ensureGpuInstrumentation()'s job, run eagerly below for Auto or
+            // lazily on first activation for Hotkey, so an un-activated hotkey
+            // session never touches the app's graphics device or NvAPI. The
+            // binding kind is implied by which stashed pointer is non-null
+            // (mutually exclusive); the same stash also feeds the lazy overlay
+            // renderer (ensureOverlayResources).
             if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
-                auto timer = std::make_unique<D3D11GpuTimer>();
-                if (timer->init(d3d11->device)) {
-                    m_gpuTimer = std::move(timer);
-                    Log("xr_telemetry: D3D11 GPU timer active\n");
-                } else {
-                    Log("xr_telemetry: D3D11 binding found but query creation failed; "
-                        "gpu_time_ns will be 0 for this session\n");
-                }
-                // Stash the binding so the overlay renderer can be built from
-                // it — eagerly below for Auto mode, or lazily on first
-                // activation for Hotkey mode (ensureOverlayResources). The
-                // binding kind is implied by which pointer is non-null.
                 m_d3d11Device = d3d11->device;
-                // D3D11 path: walk ID3D11Device → IDXGIDevice → IDXGIAdapter.
-                // Same pattern overlay_renderer.cpp uses to find the
-                // adapter for its private BGRA device.
-                ComPtr<IDXGIDevice> dxgiDevice;
-                if (d3d11->device &&
-                    SUCCEEDED(d3d11->device->QueryInterface(
-                        __uuidof(IDXGIDevice),
-                        reinterpret_cast<void**>(dxgiDevice.GetAddressOf())))) {
-                    dxgiDevice->GetAdapter(dxgiAdapter.GetAddressOf());
-                }
             } else if (const auto* d3d12 = findD3D12Binding(createInfo->next)) {
-                auto timer = std::make_unique<D3D12GpuTimer>();
-                if (timer->init(d3d12->device, d3d12->queue)) {
-                    m_gpuTimer = std::move(timer);
-                    Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
-                } else {
-                    Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
-                        "creation failed; gpu_time_ns will be 0 for this session\n");
-                }
-                // Stash the binding (see the D3D11 path): built eagerly below
-                // for Auto, lazily on first activation for Hotkey.
                 m_d3d12Device = d3d12->device;
                 m_d3d12Queue = d3d12->queue;
-                // D3D12 path: ID3D12Device::GetAdapterLuid → IDXGIFactory4::
-                // EnumAdapterByLuid. The factory is short-lived (released
-                // when its ComPtr drops at scope exit), DXGIAdapter held
-                // long enough for GpuTelemetryReader::init to QI from it.
-                if (d3d12->device) {
-                    const LUID luid = d3d12->device->GetAdapterLuid();
-                    ComPtr<IDXGIFactory4> factory;
-                    if (SUCCEEDED(::CreateDXGIFactory1(
-                            __uuidof(IDXGIFactory4),
-                            reinterpret_cast<void**>(factory.GetAddressOf())))) {
-                        factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter),
-                                                    reinterpret_cast<void**>(
-                                                        dxgiAdapter.GetAddressOf()));
-                    }
-                }
             } else {
                 Log("xr_telemetry: no D3D11 or D3D12 binding in xrCreateSession.next "
                     "(Vulkan / OpenGL / null); gpu_time_ns will be 0 for this session\n");
@@ -1842,27 +1880,6 @@ namespace openxr_api_layer {
                     Log("xr_telemetry: overlay disabled — Vulkan / OpenGL hosts not "
                         "supported by the renderer (CSV writing still active)\n");
                 }
-            }
-
-            // GPU telemetry reader (temp + VRAM). Best-effort: even if
-            // dxgiAdapter is null (Vulkan / OpenGL host with no D3D
-            // binding), init() still tries NvAPI for temperature. The
-            // returned bool only matters for diagnostics — we keep
-            // the unique_ptr live either way so xrEndFrame's poll()
-            // call site can stay branchless on "is the reader alive".
-            //
-            // Logged outcomes are coarse on purpose (one line, one of
-            // four states) so a support report immediately tells us
-            // whether the temp+VRAM fields will be populated for this
-            // session. fpsVR's diagnostic does roughly the same.
-            m_gpuTelemetry = std::make_unique<detail::GpuTelemetryReader>();
-            m_gpuTelemetry->init(dxgiAdapter.Get());
-            if (m_gpuTelemetry->isReady()) {
-                Log("xr_telemetry: GPU telemetry active (NvAPI / DXGI VRAM)\n");
-            } else {
-                Log("xr_telemetry: GPU telemetry unavailable (non-NVIDIA host "
-                    "and/or DXGI VRAM not supported); gpu_temp_c / vram_used_bytes "
-                    "will be NaN / 0 for this session\n");
             }
 
             // CPU usage sampler for the overlay's "CPUs" cell (busiest
@@ -1889,6 +1906,16 @@ namespace openxr_api_layer {
                 Log("xr_telemetry: CPU usage telemetry unavailable "
                     "(NtQuerySystemInformation did not resolve); the CPUs "
                     "cell will show \"--\" for this session\n");
+            }
+
+            // GPU instrumentation: built now if a feature is already active
+            // (Auto mode → m_recording / m_overlayActive were set at
+            // xrCreateInstance), else deferred to first activation for Hotkey
+            // via ensureGpuInstrumentation() in xrEndFrame — so an un-activated
+            // hotkey session never creates query heaps on the app's device,
+            // QIs the DXGI adapter, or inits NvAPI.
+            if (m_recording || m_overlayActive) {
+                ensureGpuInstrumentation();
             }
 
             // Overlay resources: built now for Auto (HUD up from the first
@@ -2081,6 +2108,16 @@ namespace openxr_api_layer {
             // Idempotent; a one-time ~frame hitch on first activation.
             if (m_overlayActive && !m_overlayRenderer) {
                 ensureOverlayResources(session);
+            }
+
+            // Lazy GPU instrumentation (Hotkey mode): the GPU timer + telemetry
+            // reader aren't built until the CSV log or overlay is first
+            // summoned, so a dormant hotkey session never touches the app's
+            // graphics device or NvAPI. The GPU timer's beginFrame is in
+            // xrBeginFrame, so the first GPU-measured frame is the one after
+            // activation — the same one-frame build hitch the renderer has.
+            if (collecting && !m_gpuInitAttempted) {
+                ensureGpuInstrumentation();
             }
 
             // CLOSE THE GPU TIMESTAMP WINDOW BEFORE FORWARDING.
@@ -2648,6 +2685,7 @@ namespace openxr_api_layer {
             m_d3d12Device.Reset();
             m_d3d12Queue.Reset();
             m_overlayInitAttempted = false;
+            m_gpuInitAttempted = false;
             if (m_viewSpace != XR_NULL_HANDLE) {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
                 m_viewSpace = XR_NULL_HANDLE;
@@ -2786,6 +2824,12 @@ namespace openxr_api_layer {
         ComPtr<ID3D12Device> m_d3d12Device;
         ComPtr<ID3D12CommandQueue> m_d3d12Queue;
         bool m_overlayInitAttempted = false;
+
+        // Sibling latch for the GPU timer + telemetry reader, built by
+        // ensureGpuInstrumentation(): true once a build has been attempted this
+        // session, so the dormant -> active hotkey path attempts it exactly
+        // once. Cleared per session in releaseSessionScopedResources.
+        bool m_gpuInitAttempted = false;
 
         // True between this frame's xrBeginFrame opening a GPU timer slot and
         // xrEndFrame closing it. The open/close straddle the in-EndFrame hotkey
