@@ -222,7 +222,7 @@ TEST_CASE("formatOverlayDisplayValues: CPUs cell formats, rounds, clamps, and fa
     CHECK(v.cpus_max_pct == "100");
     CHECK(v.cpus_max_fraction == doctest::Approx(1.0f).epsilon(0.001));
 
-    // Source absent (NaN) → "--", fraction 0 so the gauge draws nothing.
+    // Source absent (NaN) → "--", fraction 0 (no tier colour applied).
     snap.cpus_max_pct = std::numeric_limits<float>::quiet_NaN();
     v = formatOverlayDisplayValues(snap);
     CHECK(v.cpus_max_pct == "--");
@@ -286,8 +286,8 @@ TEST_CASE("formatOverlayDisplayValues: non-finite floats become placeholder stri
     CHECK(noBadToken(v.gpu_temp_c));
     CHECK(noBadToken(v.gpu_util_pct));
     CHECK(noBadToken(v.cpu_util_pct));
-    // Utilisation gauge fractions snap to 0 on non-finite — the
-    // renderer's arc geometry needs a [0,1] number.
+    // Utilisation fractions snap to 0 on non-finite — the tier-colour
+    // logic needs a finite [0,1] number.
     CHECK(v.gpu_util_fraction == 0.0f);
     CHECK(v.cpu_util_fraction == 0.0f);
 }
@@ -639,35 +639,35 @@ TEST_CASE("budgetLineFraction: at the bar-tip position for ratio=1.0 (1/6 from t
 }
 
 // =============================================================================
-// gaugeTierForUtilisation — drives the circular gauge's fill colour.
+// tierForUtilisation — drives the LOAD / VRAM / CPUs text colour.
 // Same threshold semantics as barVisualForSample's bar tier, but the input is
 // a utilisation FRACTION (0..1) rather than a frametime/budget ratio. Same
 // boundaries: 0.80 = warning (Orange), 0.90 = critical (Red).
 // =============================================================================
 
-using openxr_api_layer::detail::gaugeTierForUtilisation;
+using openxr_api_layer::detail::tierForUtilisation;
 
-TEST_CASE("gaugeTierForUtilisation: <80 % → green (default healthy state)") {
-    CHECK(gaugeTierForUtilisation(0.0f)  == BarTier::Green);
-    CHECK(gaugeTierForUtilisation(0.5f)  == BarTier::Green);
-    CHECK(gaugeTierForUtilisation(0.79f) == BarTier::Green);
+TEST_CASE("tierForUtilisation: <80 % → green (default healthy state)") {
+    CHECK(tierForUtilisation(0.0f)  == BarTier::Green);
+    CHECK(tierForUtilisation(0.5f)  == BarTier::Green);
+    CHECK(tierForUtilisation(0.79f) == BarTier::Green);
 }
 
-TEST_CASE("gaugeTierForUtilisation: 80–89 % → orange (warning)") {
-    CHECK(gaugeTierForUtilisation(0.80f) == BarTier::Orange);
-    CHECK(gaugeTierForUtilisation(0.85f) == BarTier::Orange);
-    CHECK(gaugeTierForUtilisation(0.89f) == BarTier::Orange);
+TEST_CASE("tierForUtilisation: 80–89 % → orange (warning)") {
+    CHECK(tierForUtilisation(0.80f) == BarTier::Orange);
+    CHECK(tierForUtilisation(0.85f) == BarTier::Orange);
+    CHECK(tierForUtilisation(0.89f) == BarTier::Orange);
 }
 
-TEST_CASE("gaugeTierForUtilisation: ≥ 90 % → red (critical)") {
-    CHECK(gaugeTierForUtilisation(0.90f) == BarTier::Red);
-    CHECK(gaugeTierForUtilisation(0.95f) == BarTier::Red);
-    CHECK(gaugeTierForUtilisation(1.00f) == BarTier::Red);
+TEST_CASE("tierForUtilisation: ≥ 90 % → red (critical)") {
+    CHECK(tierForUtilisation(0.90f) == BarTier::Red);
+    CHECK(tierForUtilisation(0.95f) == BarTier::Red);
+    CHECK(tierForUtilisation(1.00f) == BarTier::Red);
     // Even out-of-range values stay clamped to the worst tier.
-    CHECK(gaugeTierForUtilisation(2.50f) == BarTier::Red);
+    CHECK(tierForUtilisation(2.50f) == BarTier::Red);
 }
 
-TEST_CASE("gaugeTierForUtilisation: NaN defaults to green (safe default)") {
+TEST_CASE("tierForUtilisation: NaN defaults to green (safe default)") {
     const float kNan = std::numeric_limits<float>::quiet_NaN();
-    CHECK(gaugeTierForUtilisation(kNan) == BarTier::Green);
+    CHECK(tierForUtilisation(kNan) == BarTier::Green);
 }

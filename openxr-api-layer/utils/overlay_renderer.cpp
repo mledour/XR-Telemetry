@@ -339,7 +339,7 @@ namespace openxr_api_layer::detail {
         constexpr float kColorTextWhite[4]  = {0.969f, 0.969f, 0.969f, 1.00f};  // m_brushTextWhite
         constexpr float kColorAccentCyan[4] = {0.098f, 0.820f, 0.851f, 1.00f};  // m_brushAccentCyan
         constexpr float kColorOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};  // m_brushOrange
-        constexpr float kColorGaugeRed[4]   = {1.000f, 0.196f, 0.235f, 1.00f};  // m_brushGaugeRed
+        constexpr float kColorTierRed[4]    = {1.000f, 0.196f, 0.235f, 1.00f};  // red warning tier
 
         // -------- GPU chrome-shape colours ---------------------------------
         //
@@ -607,7 +607,7 @@ namespace openxr_api_layer::detail {
 
                 // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
                 // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
-                // gaugeTierForUtilisation. The GPU panel leads with a TEMP
+                // tierForUtilisation. The GPU panel leads with a TEMP
                 // cell; the CPU panel is two utilisation percentages —
                 // "CPU LOAD" (per-cycle CPU vs budget) next to "CPUs LOAD"
                 // (busiest single core). Each panel is described by its
@@ -1426,7 +1426,7 @@ namespace openxr_api_layer::detail {
             // value below. The LOAD and VRAM values are tier-
             // coloured (cyan / orange / red) so the user gets the
             // headroom signal at a glance — same palette and same
-            // gaugeTierForUtilisation thresholds as the histogram
+            // tierForUtilisation thresholds as the histogram
             // bars.
             //
             //   GPU panel (3 cells):                CPU panel (2 cells):
@@ -1471,8 +1471,8 @@ namespace openxr_api_layer::detail {
                 // (GPU panel cell 0) stays white instead — no thermal-tier
                 // contract yet (would require knowing TjMax per SKU).
                 auto tierColor = [&](float fraction) -> const float* {
-                    const BarTier tier = gaugeTierForUtilisation(fraction);
-                    if (tier == BarTier::Red)    return kColorGaugeRed;
+                    const BarTier tier = tierForUtilisation(fraction);
+                    if (tier == BarTier::Red)    return kColorTierRed;
                     if (tier == BarTier::Orange) return kColorOrange;
                     return kColorAccentCyan;
                 };
