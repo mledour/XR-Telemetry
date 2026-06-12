@@ -73,7 +73,7 @@ Three repos in the lineage:
    signing, Inno Setup installer, doctest + mock runtime, D3D12
    support in `pch.h`, and the post-clone init script on top of
    mbucchia's framework. Framework code is untouched.
-3. **This repo (`OpenXR-Layer-XrTelemetry`)** — the actual layer,
+3. **This repo (`XR-Telemetry`)** — the actual layer,
    spun off from (2) via the GitHub "Use this template" button. Adds
    the layer-specific logic in `layer.cpp` / `utils/*` and tests in
    `openxr-api-layer-tests/test_*.cpp`.
