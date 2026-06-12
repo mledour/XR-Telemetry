@@ -51,7 +51,7 @@ namespace openxr_api_layer::utils::chrome_shapes {
     //     buffers / RTV against the passed target texture.
     //   * One paint is:
     //         beginBatch();
-    //         addRect / addOutline (any number);
+    //         addRect (any number);
     //         flush();
     //     beginBatch clears the scratch vector; addRect appends one
     //     QuadInstance; flush DISCARD-maps the dynamic instance buffer,
@@ -68,6 +68,40 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // closed — there is no D2D fallback). The layer never crashes the
     // host for a chrome-rendering miss.
     // ===================================================================
+    // ---- Shared overlay_quad per-instance layout --------------------
+    //
+    // ONE source of truth for the quad instance + its D3D11 input layout,
+    // shared by this Renderer AND HistogramBarRenderer (overlay_renderer.cpp)
+    // so the two pipelines that feed the same overlay_quad shader can't
+    // drift. Mirrors overlay_quad.hlsli's QuadVSInput byte-for-byte:
+    //   rect(16) + color(16) + borderColor(16) + radius(4) + borderWidth(4)
+    //   + pad(8) = 64 B. QUAD_PARAMS (offset 48) packs {radius, borderWidth}
+    //   into its .xy; .zw (pad) is unread.
+    struct QuadInstance {
+        float rect[4];         // x, y, w, h (px, top-left origin)
+        float color[4];        // fill colour, straight-alpha
+        float borderColor[4];  // border-ring colour (used when borderWidth > 0)
+        float radius;          // corner radius px; 0 = sharp
+        float borderWidth;     // border ring px; 0 = no border
+        float pad[2];          // → the QUAD_PARAMS float4 slot at offset 48
+    };
+    static_assert(sizeof(QuadInstance) == 64,
+                   "QuadInstance must match overlay_quad.hlsli's QuadVSInput "
+                   "per-instance layout byte-for-byte");
+
+    inline constexpr D3D11_INPUT_ELEMENT_DESC kQuadInputLayout[] = {
+        {"POSITION",          0, DXGI_FORMAT_R32G32_FLOAT,       0,  0,
+         D3D11_INPUT_PER_VERTEX_DATA,   0},
+        {"QUAD_RECT",         0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,  0,
+         D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"QUAD_COLOR",        0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+         D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"QUAD_BORDER_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32,
+         D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"QUAD_PARAMS",       0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48,
+         D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    };
+
     class Renderer {
       public:
         // RTV is supplied per-flush by the caller, not stored — so one
@@ -96,14 +130,17 @@ namespace openxr_api_layer::utils::chrome_shapes {
         void addRect(float x, float y, float w, float h,
                      const float color[4], float cornerRadius = 0.0f);
 
-        // 1-px (or thicker, via `strokeWidth`) outline around an
-        // axis-aligned rect, rendered as 4 thin filled rects. Top
-        // and bottom run full width; the two side strokes are inset
-        // by strokeWidth so they don't double-paint the corner
-        // pixels (alpha-correct on a single layer; cosmetic on
-        // straight-alpha against an opaque BG).
-        void addOutline(float x, float y, float w, float h,
-                        float strokeWidth, const float color[4]);
+        // Rounded filled rect with an optional border ring, both via the
+        // quad shader's SDF. `fillColor` is the (possibly translucent)
+        // interior; `borderColor` paints a ring `borderWidth` px wide just
+        // inside the rounded outline (borderWidth <= 0 → no ring).
+        // `cornerRadius` is clamped in-shader to half the shorter side.
+        // Unlike two nested rects this is ONE quad, so a translucent fill
+        // keeps its alpha — nothing opaque is drawn behind it.
+        void addRoundedRect(float x, float y, float w, float h,
+                            const float fillColor[4],
+                            const float borderColor[4],
+                            float borderWidth, float cornerRadius);
 
         // Flush: sets full pipeline state on the immediate context
         // (targeting `rtv`) and emits one DrawInstanced for all queued
@@ -114,18 +151,6 @@ namespace openxr_api_layer::utils::chrome_shapes {
         bool flush(ID3D11RenderTargetView* rtv);
 
       private:
-        // Must match overlay_quad.hlsli's QuadVSInput per-instance
-        // layout byte-for-byte (16 + 16 = 32 bytes).
-        struct QuadInstance {
-            float rect[4];
-            float color[4];
-            float radius;     // corner radius in px; 0 = sharp
-            float pad[3];     // pads to the float4 slot QUAD_RADIUS sits in
-        };
-        static_assert(sizeof(QuadInstance) == 48,
-                       "QuadInstance must match HLSL per-instance "
-                       "layout in overlay_quad.hlsli");
-
         // overlay_quad's cbuffer carries only texSize. It's set once
         // at init from the target texture's dimensions; never refreshed
         // since the shim is fixed-size for the renderer's lifetime.

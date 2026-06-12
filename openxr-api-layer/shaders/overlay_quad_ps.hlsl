@@ -23,8 +23,9 @@
 // =============================================================================
 // overlay_quad_ps.hlsl — pixel shader for the solid-colour quad pass.
 // Compiled offline (ps_4_0) by FxCompile. Straight passthrough of the
-// per-instance colour (radius == 0), or an anti-aliased rounded-rectangle
-// when radius > 0; the blend state does the alpha compositing either way.
+// per-instance fill colour when radius == 0 and borderWidth == 0, else an
+// anti-aliased rounded rectangle with an optional border ring; the blend
+// state does the alpha compositing either way.
 // =============================================================================
 
 #include "overlay_quad.hlsli"
@@ -40,20 +41,36 @@ float sdRoundBox(float2 p, float2 halfSize, float r)
 
 float4 PSMain(QuadVSOutput i) : SV_TARGET
 {
-    // radius <= 0 → plain rectangle, identical to the old passthrough.
-    // Every sharp quad (bars, grid, separators, budget line) takes this
-    // branch and is byte-for-byte unchanged; only the rounded panels and
+    const float radius      = i.rb.x;
+    const float borderWidth = i.rb.y;
+
+    // No rounding AND no border → plain rectangle, byte-for-byte the old
+    // passthrough. Every sharp quad (bars, grid, separators, budget line)
+    // takes this branch unchanged; only rounded / stroked panels and the
     // outer frame fall through to the SDF path below.
-    if (i.radius <= 0.0f)
+    if (radius <= 0.0f && borderWidth <= 0.0f)
         return i.color;
 
     // Clamp the radius to half the shorter side so an over-large value
     // degrades to a stadium/pill instead of an inverted SDF.
-    float r   = min(i.radius, min(i.halfsz.x, i.halfsz.y));
-    float d   = sdRoundBox(i.local, i.halfsz, r);
-    float aa  = max(fwidth(d), 1e-5f);   // ~1-px anti-alias band
-    float cov = saturate(0.5f - d / aa); // 1 inside → 0 outside the rounded edge
-    float4 c  = i.color;
-    c.a *= cov;
+    const float r  = min(radius, min(i.halfsz.x, i.halfsz.y));
+    const float d  = sdRoundBox(i.local, i.halfsz, r);
+    const float aa = max(fwidth(d), 1e-5f);        // ~1-px anti-alias band
+
+    // Outer coverage: 1 inside the rounded outline, fading to 0 across the
+    // ~1px AA band at the edge — this rounds (alpha-clips) the corners.
+    const float outerCov = saturate(0.5f - d / aa);
+
+    float4 c = i.color;                             // fill (may be translucent)
+    if (borderWidth > 0.0f)
+    {
+        // Border ring: the outer `borderWidth` px take the border colour,
+        // the interior takes the fill. ONE quad — the translucent fill has
+        // nothing opaque behind it, so its alpha is preserved (the body
+        // stays see-through; the border carries its own alpha).
+        const float fillCov = saturate(0.5f - (d + borderWidth) / aa);
+        c = lerp(i.borderColor, i.color, fillCov);
+    }
+    c.a *= outerCov;
     return c;
 }

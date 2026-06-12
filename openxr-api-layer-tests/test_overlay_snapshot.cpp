@@ -160,11 +160,12 @@ namespace {
     // Decode a PNG (any pixel format) into a 32bpp BGRA byte buffer.
     // BGRA — not PBGRA — to dodge the alpha-premultiplied-vs-straight
     // mismatch that WIC's PNG decoder produces depending on whether
-    // the encoder side wrote a tRNS chunk. PBGRA == BGRA when alpha
-    // is 0xFF (which our HUD is for the opaque pixels), so this
-    // matches the test's render-side PBGRA byte-for-byte; the
-    // transparent corners outside the chamfered frame have alpha 0
-    // in both buffers and zero RGB, also matching.
+    // the encoder side wrote a tRNS chunk. Both the golden and the
+    // freshly-rendered image are decoded through THIS same path, so the
+    // convention cancels in the byte-for-byte compare regardless of a
+    // pixel's alpha — including the rounded frame/panel corners, whose
+    // anti-aliased edges carry fractional alpha (not just 0x00 / 0xFF),
+    // and the fully-transparent area outside the rounded frame.
     bool decodePngToBgra(IWICImagingFactory* wic, const wchar_t* path,
                          std::vector<BYTE>& outPixels,
                          UINT& outW, UINT& outH) {

@@ -78,19 +78,11 @@ namespace openxr_api_layer::utils::chrome_shapes {
                 g_overlay_quad_ps, sizeof(g_overlay_quad_ps),
                 nullptr, m_ps.GetAddressOf()))) return false;
 
-        // Mirror HistogramBarRenderer's quad input layout exactly.
-        const D3D11_INPUT_ELEMENT_DESC il[] = {
-            {"POSITION",    0, DXGI_FORMAT_R32G32_FLOAT,       0,  0,
-             D3D11_INPUT_PER_VERTEX_DATA,   0},
-            {"QUAD_RECT",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,  0,
-             D3D11_INPUT_PER_INSTANCE_DATA, 1},
-            {"QUAD_COLOR",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
-             D3D11_INPUT_PER_INSTANCE_DATA, 1},
-            {"QUAD_RADIUS", 0, DXGI_FORMAT_R32_FLOAT,          1, 32,
-             D3D11_INPUT_PER_INSTANCE_DATA, 1},
-        };
+        // Shared with HistogramBarRenderer — see overlay_quad_layout
+        // (QuadInstance + kQuadInputLayout) in chrome_shape_renderer.h —
+        // so the two overlay_quad pipelines can't drift.
         if (FAILED(m_device->CreateInputLayout(
-                il, _countof(il),
+                kQuadInputLayout, _countof(kQuadInputLayout),
                 g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
                 m_layout.GetAddressOf())))
             return false;
@@ -172,19 +164,20 @@ namespace openxr_api_layer::utils::chrome_shapes {
         m_scratch.push_back(q);
     }
 
-    void Renderer::addOutline(float x, float y, float w, float h,
-                               float strokeWidth, const float color[4]) {
-        if (strokeWidth <= 0.0f) return;
-        // Top + bottom strokes run the full width; the side strokes
-        // are inset by `strokeWidth` so they butt against the
-        // horizontals without overlapping. On opaque BG (every chrome
-        // colour we paint is alpha=1) this is purely cosmetic, but
-        // it stays consistent if a future translucent stroke colour
-        // ever ships.
-        addRect(x,             y,             w,            strokeWidth,  color);  // top
-        addRect(x,             y + h - strokeWidth, w,      strokeWidth,  color);  // bottom
-        addRect(x,             y + strokeWidth,     strokeWidth, h - 2 * strokeWidth, color); // left
-        addRect(x + w - strokeWidth, y + strokeWidth, strokeWidth, h - 2 * strokeWidth, color); // right
+    void Renderer::addRoundedRect(float x, float y, float w, float h,
+                                   const float fillColor[4],
+                                   const float borderColor[4],
+                                   float borderWidth, float cornerRadius) {
+        if (!m_ready || w <= 0.0f || h <= 0.0f) return;
+        QuadInstance q{};
+        q.rect[0]  = x; q.rect[1]  = y; q.rect[2]  = w; q.rect[3]  = h;
+        q.color[0] = fillColor[0]; q.color[1] = fillColor[1];
+        q.color[2] = fillColor[2]; q.color[3] = fillColor[3];
+        q.borderColor[0] = borderColor[0]; q.borderColor[1] = borderColor[1];
+        q.borderColor[2] = borderColor[2]; q.borderColor[3] = borderColor[3];
+        q.radius      = cornerRadius > 0.0f ? cornerRadius : 0.0f;
+        q.borderWidth = borderWidth  > 0.0f ? borderWidth  : 0.0f;
+        m_scratch.push_back(q);
     }
 
     bool Renderer::flush(ID3D11RenderTargetView* rtv) {

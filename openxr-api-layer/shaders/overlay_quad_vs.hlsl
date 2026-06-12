@@ -44,13 +44,14 @@ QuadVSOutput VSMain(QuadVSInput v)
     o.pos = float4(px / texSize.x * 2.0f - 1.0f,
                    1.0f - py / texSize.y * 2.0f,
                    0.0f, 1.0f);
-    o.color = v.color;
+    o.color       = v.color;
+    o.borderColor = v.borderColor;
     // Rounded-rect SDF inputs (texture pixels). `local` is this vertex's
-    // offset from the rect centre and interpolates per-pixel; halfsz /
-    // radius are per-instance constants the PS reads to evaluate the
-    // signed distance.
+    // offset from the rect centre and interpolates per-pixel; halfsz and
+    // rb (corner radius, border width) are per-instance constants the PS
+    // reads to evaluate the signed distance and the border ring.
     o.halfsz = v.rect.zw * 0.5f;
     o.local  = float2(px, py) - (v.rect.xy + o.halfsz);
-    o.radius = v.radius;
+    o.rb     = v.params.xy;
     return o;
 }
