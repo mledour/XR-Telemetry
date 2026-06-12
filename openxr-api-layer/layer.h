@@ -69,6 +69,12 @@ namespace openxr_api_layer {
         std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace,
         XrSpace localSpace = XR_NULL_HANDLE);
 
+    // Test-only seam: read the layer singleton's monotonic frame counter. Used
+    // to assert that an un-activated hotkey overlay suspends per-frame
+    // collection — a suspended frame never advances the counter. No effect in
+    // production (never called).
+    uint64_t FrameIndexForTest();
+
     // The path where the DLL is loaded from (e.g. to find a data file
     // shipped next to the DLL in the install directory).
     extern std::filesystem::path dllHome;

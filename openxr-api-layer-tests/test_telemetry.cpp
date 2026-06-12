@@ -766,9 +766,10 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
 //     per-frame telemetry is suspended (collecting == false). The invariant
 //     that MUST survive that suspension: xrEndFrame is still forwarded every
 //     frame, or the app would stop submitting to the compositor. We can't
-//     observe the CPU-cost drop from here; we guard the correctness floor
-//     (forwarding) and the absence of a CSV. ForceOverlayActiveForTest is
-//     deliberately NOT called, so m_overlayActive stays false.
+//     measure the CPU-cost drop directly, but we DO check a proxy for it: a
+//     suspended frame early-returns before the m_frameIndex fetch_add, so the
+//     counter must not advance (FrameIndexForTest). ForceOverlayActiveForTest
+//     is deliberately NOT called, so m_overlayActive stays false.
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still forwards frames") {
     TelemetryFixture fix;
@@ -786,13 +787,21 @@ TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still 
     for (int i = 0; i < kFrames; ++i) {
         driveOneFrame(api);
     }
-    openxr_api_layer::ResetInstance();
 
-    // The frame submission must reach the runtime on every frame even while
-    // our telemetry is suspended — this is the regression guard.
+    // Proxy for "collection was suspended": a suspended frame early-returns
+    // before the m_frameIndex fetch_add, so the counter must not have advanced
+    // across kFrames. Deleting the collecting gate would route these frames
+    // through the collecting path and bump the counter — failing this check.
+    // (Read before ResetInstance tears the singleton down.)
+    CHECK(openxr_api_layer::FrameIndexForTest() == 0);
+
+    // The frame submission must still reach the runtime on every frame even
+    // while our telemetry is suspended.
     CHECK(mock::state().waitFrameCallCount == kFrames);
     CHECK(mock::state().beginFrameCallCount == kFrames);
     CHECK(mock::state().endFrameCallCount == kFrames);
+
+    openxr_api_layer::ResetInstance();
 
     // Log is off, so nothing should land on disk regardless of the overlay.
     const auto csv = findSessionCsv(fix.sessionsDir());
