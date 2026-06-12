@@ -1294,6 +1294,183 @@ namespace openxr_api_layer {
             requestReanchor();
         }
 
+        // Test-only: current value of the monotonic frame counter. Lets a test
+        // assert the suspend gate actually skipped collection — a suspended
+        // frame early-returns before the fetch_add in xrEndFrame, so the
+        // counter stays put. See FrameIndexForTest in layer.h.
+        uint64_t frameIndexForTest() const {
+            return m_frameIndex.load(std::memory_order_relaxed);
+        }
+
+        // Build the overlay renderer + its reference spaces from the graphics
+        // binding stashed at xrCreateSession. Idempotent: returns immediately
+        // if the renderer is already up, or if a build attempt already ran this
+        // session (so a failure neither retries nor re-logs every frame —
+        // m_overlayInitAttempted is cleared per session in
+        // releaseSessionScopedResources). Called eagerly at xrCreateSession for
+        // overlay.mode == Auto, and lazily from xrEndFrame the first time the
+        // HUD is summoned for overlay.mode == Hotkey, so an un-activated hotkey
+        // session never spins up the renderer's private D3D device. Contains
+        // every throw/failure inside the C-ABI frame it's called from
+        // (xrCreateSession / xrEndFrame are extern-"C" boundaries) and degrades
+        // to "no overlay this session" rather than unwinding across the ABI.
+        void ensureOverlayResources(XrSession session) {
+            if (m_overlayRenderer) {
+                return;  // already built this session — nothing to do
+            }
+            if (m_overlayInitAttempted) {
+                // A prior build attempt this session already failed (renderer is
+                // null). Don't retry — and keep m_overlayActive cleared so a
+                // REPEAT hotkey press can't re-pin collecting=true for a HUD that
+                // can never draw (each press flips m_overlayActive true again).
+                m_overlayActive = false;
+                return;
+            }
+            m_overlayInitAttempted = true;
+            try {
+                // Binding kind is implied by which pointer is non-null
+                // (xrCreateSession stashes exactly one; mutually exclusive).
+                if (m_d3d11Device) {
+                    m_overlayRenderer = detail::makeD3D11OverlayRenderer(
+                        this, session, m_d3d11Device.Get());
+                } else if (m_d3d12Device && m_d3d12Queue) {
+                    m_overlayRenderer = detail::makeD3D12OverlayRenderer(
+                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get());
+                }
+            } catch (...) {
+                m_overlayRenderer.reset();
+                Log("xr_telemetry: overlay disabled — renderer init threw "
+                    "(out of memory?)\n");
+            }
+            if (!m_overlayRenderer) {
+                Log("xr_telemetry: overlay unavailable this session — no usable "
+                    "D3D11/D3D12 binding or renderer init failed\n");
+                // Drop the active flag so a HUD that can't be built doesn't pin
+                // collecting = (m_recording || m_overlayActive) true for the
+                // whole session — that would run the full per-frame pipeline at
+                // 90-144 Hz for a HUD that can never draw, defeating the idle
+                // optimisation. The draw path is already null-guarded; this just
+                // lets the collecting gate fall back to suspend.
+                m_overlayActive = false;
+                return;
+            }
+
+            // View space for the head-locked overlay quad (was inline in
+            // xrCreateSession). xrDestroySession releases it. If the base call
+            // fails, drop the renderer and stay inactive for this session.
+            XrReferenceSpaceCreateInfo viewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+            viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+            viewSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            viewSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+            if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                    session, &viewSpaceInfo, &m_viewSpace))) {
+                Log("xr_telemetry: overlay disabled — xrCreateReferenceSpace(VIEW) "
+                    "failed for this session\n");
+                m_overlayRenderer.reset();
+                m_viewSpace = XR_NULL_HANDLE;
+                m_overlayActive = false;  // don't pin collecting=true (see above)
+                return;
+            }
+
+            // World-locked anchor: also create a LOCAL space to freeze the quad
+            // into. Only when the user asked for it — a head-locked session has
+            // no use for it. If LOCAL creation fails we fall back to head-locked
+            // (m_localSpace stays NULL; the xrEndFrame anchor path checks for
+            // it) rather than dropping the overlay.
+            if (m_settings.overlay.anchor == detail::OverlayAnchor::World) {
+                XrReferenceSpaceCreateInfo localSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+                localSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                localSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+                if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                        session, &localSpaceInfo, &m_localSpace))) {
+                    Log("xr_telemetry: overlay anchor=world unavailable — "
+                        "xrCreateReferenceSpace(LOCAL) failed; falling back to "
+                        "head-locked for this session\n");
+                    m_localSpace = XR_NULL_HANDLE;
+                }
+            }
+            // No requestReanchor() here: m_needsReanchor is already true at
+            // every session start (member default + the reset in
+            // releaseSessionScopedResources), and the hotkey toggle re-centres
+            // on each activation. Reanchoring here too double-fired on the first
+            // hotkey activation (toggle + build, same frame).
+        }
+
+        // Poll the log + overlay hotkey combos and apply their edges. Called
+        // from xrEndFrame behind the ~kHotkeyPollIntervalNs throttle (so the
+        // GetAsyncKeyState calls inside pollHotkeyPressed don't run every
+        // frame). The edge detectors fire exactly once per press regardless of
+        // sample rate. Runs even while collection is suspended — this is how an
+        // un-activated hotkey session detects its activation press.
+        void pollAndApplyHotkeys() {
+            // Log hotkey: toggle the recorder. Edge cases handled by callees:
+            //   - m_csv.start() returning false (read-only LOCALAPPDATA, disk
+            //     full) leaves m_recording = false and the next press retries.
+            //     We log once per failure so a broken setup is visible.
+            //   - m_csv.stop() during a pending GPU result: the resolved
+            //     FrameRecord drains into a now-closed CsvWriter and push()
+            //     silently no-ops. No leak.
+            if (m_settings.log.enabled &&
+                m_settings.log.mode == detail::LogMode::Hotkey) {
+                if (m_hotkeyDetector.tick(pollHotkeyPressed(m_settings.log.hotkey))) {
+                    if (!m_recording) {
+                        m_csvPath = buildSessionCsvPath(m_appName);
+                        if (m_csv.start(m_csvPath)) {
+                            m_recording = true;
+                            Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                             "recording started, writing to {}\n",
+                                             m_csvPath.string()));
+                        } else {
+                            ErrorLog(fmt::format("xr_telemetry: hotkey pressed but "
+                                                  "could not open {} — recording NOT started\n",
+                                                  m_csvPath.string()));
+                        }
+                    } else {
+                        // deleteIfEmpty=false: in hotkey mode, an empty
+                        // recording is the user's explicit signal "did my
+                        // binding fire?" — keep the header+footer file so
+                        // they can confirm in the sessions/ folder.
+                        m_csv.stop(/*deleteIfEmpty=*/false);
+                        // Read the count AFTER stop() joins the writer —
+                        // m_written is non-atomic and the writer may still be
+                        // draining when we enter stop().
+                        const uint64_t written = m_csv.written();
+                        m_recording = false;
+                        Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                         "recording stopped ({} frames written to {})\n",
+                                         written, m_csvPath.string()));
+                    }
+                }
+            }
+
+            // Same rising-edge pattern for the overlay hotkey. Independent
+            // from the log hotkey: a user can have both running in mode=
+            // hotkey with separate combos. m_overlayHotkeyDetector keeps
+            // its own latch so a press for one doesn't fire the other.
+            //
+            // No file I/O on this toggle — it just flips m_overlayActive; the
+            // renderer is built lazily (ensureOverlayResources) on the same
+            // frame back in xrEndFrame once m_overlayActive goes true.
+            if (m_settings.overlay.enabled &&
+                m_settings.overlay.mode == detail::OverlayMode::Hotkey) {
+                if (m_overlayHotkeyDetector.tick(
+                        pollHotkeyPressed(m_settings.overlay.hotkey))) {
+                    m_overlayActive = !m_overlayActive;
+                    // Rising edge → re-centre a world-locked panel in front
+                    // of the user. This is the (intentional) re-center
+                    // gesture: toggle the HUD off then on to reposition it.
+                    // No-op for head-locked (the draw path ignores the
+                    // request when m_localSpace is NULL).
+                    if (m_overlayActive) {
+                        requestReanchor();
+                    }
+                    Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
+                                     m_overlayActive ? "ENABLED" : "DISABLED"));
+                }
+            }
+        }
+
         // SINGLETON LIFETIME — this destructor runs from
         // ResetInstance() (auto-generated xrDestroyInstance), so the
         // application's threads are still alive and the writer thread can
@@ -1615,21 +1792,11 @@ namespace openxr_api_layer {
                     Log("xr_telemetry: D3D11 binding found but query creation failed; "
                         "gpu_time_ns will be 0 for this session\n");
                 }
-                if (m_settings.overlay.enabled) {
-                    // Construction runs the renderer's init(), which allocates
-                    // and logs (fmt::format) — both can throw. This runs inside
-                    // xrCreateSession (an extern-"C" boundary), so contain any
-                    // throw and degrade to no-overlay rather than unwinding
-                    // across the ABI.
-                    try {
-                        m_overlayRenderer = detail::makeD3D11OverlayRenderer(
-                            this, *session, d3d11->device);
-                    } catch (...) {
-                        m_overlayRenderer.reset();
-                        Log("xr_telemetry: overlay disabled — D3D11 renderer "
-                            "init threw (out of memory?)\n");
-                    }
-                }
+                // Stash the binding so the overlay renderer can be built from
+                // it — eagerly below for Auto mode, or lazily on first
+                // activation for Hotkey mode (ensureOverlayResources). The
+                // binding kind is implied by which pointer is non-null.
+                m_d3d11Device = d3d11->device;
                 // D3D11 path: walk ID3D11Device → IDXGIDevice → IDXGIAdapter.
                 // Same pattern overlay_renderer.cpp uses to find the
                 // adapter for its private BGRA device.
@@ -1649,18 +1816,10 @@ namespace openxr_api_layer {
                     Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
                         "creation failed; gpu_time_ns will be 0 for this session\n");
                 }
-                if (m_settings.overlay.enabled) {
-                    // See the D3D11 path: contain any init() throw inside the
-                    // xrCreateSession C-ABI boundary, degrade to no-overlay.
-                    try {
-                        m_overlayRenderer = detail::makeD3D12OverlayRenderer(
-                            this, *session, d3d12->device, d3d12->queue);
-                    } catch (...) {
-                        m_overlayRenderer.reset();
-                        Log("xr_telemetry: overlay disabled — D3D12 renderer "
-                            "init threw (out of memory?)\n");
-                    }
-                }
+                // Stash the binding (see the D3D11 path): built eagerly below
+                // for Auto, lazily on first activation for Hotkey.
+                m_d3d12Device = d3d12->device;
+                m_d3d12Queue = d3d12->queue;
                 // D3D12 path: ID3D12Device::GetAdapterLuid → IDXGIFactory4::
                 // EnumAdapterByLuid. The factory is short-lived (released
                 // when its ComPtr drops at scope exit), DXGIAdapter held
@@ -1732,52 +1891,15 @@ namespace openxr_api_layer {
                     "cell will show \"--\" for this session\n");
             }
 
-            // View space for the head-locked overlay quad. Created only
-            // when the renderer materialised (no point if there's no
-            // HUD to position). xrDestroySession releases it. If the
-            // base call fails, the layer keeps running but the overlay
-            // stays inactive.
-            if (m_overlayRenderer) {
-                XrReferenceSpaceCreateInfo viewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-                viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-                viewSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-                viewSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
-                if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
-                        *session, &viewSpaceInfo, &m_viewSpace))) {
-                    Log("xr_telemetry: overlay disabled — xrCreateReferenceSpace(VIEW) "
-                        "failed for this session\n");
-                    m_overlayRenderer.reset();
-                    m_viewSpace = XR_NULL_HANDLE;
-                }
-
-                // World-locked anchor: also create a LOCAL space to freeze
-                // the quad into. Only when the user asked for it — a head-
-                // locked session has no use for it. If LOCAL creation fails
-                // we fall back to head-locked (m_localSpace stays NULL; the
-                // xrEndFrame anchor path checks for it) rather than dropping
-                // the overlay — the HUD is more useful head-locked than
-                // gone.
-                if (m_viewSpace != XR_NULL_HANDLE &&
-                    m_settings.overlay.anchor == detail::OverlayAnchor::World) {
-                    XrReferenceSpaceCreateInfo localSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-                    localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
-                    localSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-                    localSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
-                    if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
-                            *session, &localSpaceInfo, &m_localSpace))) {
-                        // Fall back to head-locked: m_localSpace stays NULL,
-                        // which is exactly what the xrEndFrame draw path
-                        // treats as "head mode" — so the leftover anchor==World
-                        // setting and any pending reanchor request are inert,
-                        // never consulted without a non-null m_localSpace.
-                        Log("xr_telemetry: overlay anchor=world unavailable — "
-                            "xrCreateReferenceSpace(LOCAL) failed; falling back to "
-                            "head-locked for this session\n");
-                        m_localSpace = XR_NULL_HANDLE;
-                    }
-                    // Force a fresh anchor on the first frame of this session.
-                    requestReanchor();
-                }
+            // Overlay resources: built now for Auto (HUD up from the first
+            // frame), or deferred to first activation for Hotkey
+            // (ensureOverlayResources, called from xrEndFrame) so an
+            // un-activated hotkey session never spins up the renderer's private
+            // D3D device. The view + local spaces moved into that helper so
+            // both the eager and lazy paths create them alongside the renderer.
+            if (m_settings.overlay.enabled &&
+                m_settings.overlay.mode == detail::OverlayMode::Auto) {
+                ensureOverlayResources(*session);
             }
             return result;
         }
@@ -1876,10 +1998,19 @@ namespace openxr_api_layer {
                 // xrWaitFrame. The OpenXR spec forbids the wait-less
                 // pattern anyway, but a hostile or buggy app would
                 // otherwise silently shift gpu_time_ns by one frame.
-                if (m_gpuTimer && m_tWaitOut.load(std::memory_order_relaxed) > 0) {
+                // Open a GPU slot only when something will consume the timing
+                // (m_recording || m_overlayActive) — a suspended idle-hotkey
+                // frame opens none. m_gpuSlotOpenThisFrame records whether we
+                // opened one so xrEndFrame closes EXACTLY this frame's slot,
+                // regardless of how the in-EndFrame hotkey poll later flips that
+                // predicate (see the resolve gate in xrEndFrame).
+                m_gpuSlotOpenThisFrame = false;
+                if (m_gpuTimer && (m_recording || m_overlayActive) &&
+                    m_tWaitOut.load(std::memory_order_relaxed) > 0) {
                     // peek m_frameIndex without incrementing — xrEndFrame
                     // does the fetch_add and uses the SAME value.
                     m_gpuTimer->beginFrame(m_frameIndex.load(std::memory_order_relaxed));
+                    m_gpuSlotOpenThisFrame = true;
                 }
             }
             return result;
@@ -1916,81 +2047,41 @@ namespace openxr_api_layer {
                 return OpenXrApi::xrEndFrame(session, frameEndInfo);
             }
 
-            // Hotkey mode: poll the configured combo once per frame, BEFORE
-            // any timing capture. The edge detector returns true exactly
-            // on the low→high transition, so a held key fires once even
-            // if the game runs at 120 Hz. Toggling the recorder is cheap
-            // — open/close start/stop the writer thread for that window.
-            //
-            // Edge cases handled by callees:
-            //   - m_csv.start() returning false (read-only LOCALAPPDATA,
-            //     disk full) leaves m_recording = false and the next
-            //     press will try again. We log once per failure so a
-            //     broken setup is visible in the support log.
-            //   - m_csv.stop() during a pending GPU result: the
-            //     resolved FrameRecord drains into a now-closed
-            //     CsvWriter and push() silently no-ops. No leak.
-            if (m_settings.log.enabled &&
-                m_settings.log.mode == detail::LogMode::Hotkey) {
-                if (m_hotkeyDetector.tick(pollHotkeyPressed(m_settings.log.hotkey))) {
-                    if (!m_recording) {
-                        m_csvPath = buildSessionCsvPath(m_appName);
-                        if (m_csv.start(m_csvPath)) {
-                            m_recording = true;
-                            Log(fmt::format("xr_telemetry: hotkey pressed — "
-                                             "recording started, writing to {}\n",
-                                             m_csvPath.string()));
-                        } else {
-                            ErrorLog(fmt::format("xr_telemetry: hotkey pressed but "
-                                                  "could not open {} — recording NOT started\n",
-                                                  m_csvPath.string()));
-                        }
-                    } else {
-                        // deleteIfEmpty=false: in hotkey mode, an empty
-                        // recording is the user's explicit signal "did my
-                        // binding fire?" — keep the header+footer file so
-                        // they can confirm in the sessions/ folder.
-                        m_csv.stop(/*deleteIfEmpty=*/false);
-                        // Read the count AFTER stop() joins the writer —
-                        // m_written is non-atomic and the writer may still be
-                        // draining when we enter stop().
-                        const uint64_t written = m_csv.written();
-                        m_recording = false;
-                        Log(fmt::format("xr_telemetry: hotkey pressed — "
-                                         "recording stopped ({} frames written to {})\n",
-                                         written, m_csvPath.string()));
-                    }
-                }
-            }
-
-            // Same rising-edge pattern for the overlay hotkey. Independent
-            // from the log hotkey: a user can have both running in mode=
-            // hotkey with separate combos. m_overlayHotkeyDetector keeps
-            // its own latch so a press for one doesn't fire the other.
-            //
-            // No file I/O on this toggle — it just flips m_overlayActive.
-            // The Log() on toggle is on a user-initiated rising edge
-            // (not every frame), so the per-frame DBWinMutex concern
-            // documented above doesn't apply.
-            if (m_settings.overlay.enabled &&
-                m_settings.overlay.mode == detail::OverlayMode::Hotkey) {
-                if (m_overlayHotkeyDetector.tick(
-                        pollHotkeyPressed(m_settings.overlay.hotkey))) {
-                    m_overlayActive = !m_overlayActive;
-                    // Rising edge → re-centre a world-locked panel in front
-                    // of the user. This is the (intentional) re-center
-                    // gesture: toggle the HUD off then on to reposition it.
-                    // No-op for head-locked (the draw path ignores the
-                    // request when m_localSpace is NULL).
-                    if (m_overlayActive) {
-                        requestReanchor();
-                    }
-                    Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
-                                     m_overlayActive ? "ENABLED" : "DISABLED"));
-                }
+            // Hotkey combos, throttled to ~kHotkeyPollIntervalNs via the shared
+            // dueForPoll() gate. A deliberate press is held far longer than the
+            // interval, so we still catch the rising edge while dropping the
+            // GetAsyncKeyState win32k round-trip from 90-144 Hz to ~20 Hz.
+            // pollNowNs is a throttle-only clock, kept separate from tEnd below
+            // so tEnd keeps its exact "app xrEndFrame entry" meaning (and
+            // endFrameNs stays uncontaminated). Runs even while collection is
+            // suspended — it's how an un-activated hotkey session detects its
+            // activation press.
+            const int64_t pollNowNs = detail::qpcToNs(QpcNow(), m_qpcFrequency);
+            if (dueForPoll(pollNowNs, m_lastHotkeyPollNs, kHotkeyPollIntervalNs)) {
+                pollAndApplyHotkeys();
             }
 
             const int64_t tEnd = QpcNow();
+
+            // Collection gate. The per-frame telemetry feeds two consumers: the
+            // CSV (m_recording) and the HUD aggregator/renderer
+            // (m_overlayActive). When NEITHER is summoned — the steady state of
+            // an un-activated hotkey session — we skip the GPU-timestamp resolve
+            // below and every record-building step after the forward, which
+            // brings the idle cost back down to the disabled-overlay profile.
+            // xrEndFrame itself is still forwarded unconditionally (it's the
+            // app's frame submission); only OUR telemetry is gated.
+            const bool collecting = m_recording || m_overlayActive;
+
+            // Lazy overlay build (overlay.mode == Hotkey): the renderer + its
+            // private D3D device aren't created until the HUD is first summoned.
+            // This also covers a fresh session that inherited m_overlayActive ==
+            // true from a prior one (the renderer is session-scoped — released
+            // at xrDestroySession — but m_overlayActive deliberately is not).
+            // Idempotent; a one-time ~frame hitch on first activation.
+            if (m_overlayActive && !m_overlayRenderer) {
+                ensureOverlayResources(session);
+            }
 
             // CLOSE THE GPU TIMESTAMP WINDOW BEFORE FORWARDING.
             //
@@ -2015,8 +2106,19 @@ namespace openxr_api_layer {
             // appGpuTimer.stop() position. The runtime's xrEndFrame
             // commands queue AFTER ours and are excluded from the
             // measurement.
-            const auto resolved =
-                m_gpuTimer ? m_gpuTimer->endFrameAndResolveOldest() : std::nullopt;
+            // Close the GPU slot IFF this frame's xrBeginFrame opened one —
+            // pairing on m_gpuSlotOpenThisFrame, NOT on the end-time
+            // `collecting`. The open and close straddle the hotkey poll, so
+            // gating the close on a freshly-sampled predicate could leave a slot
+            // open across an idle gap (deactivate→idle→reactivate) and resolve a
+            // multi-second delta onto the resume frame. The flag is true only
+            // when m_gpuTimer is non-null, so the deref is safe. `resolved` is
+            // consumed only in the collecting path below.
+            const bool gpuSlotOpen = m_gpuSlotOpenThisFrame;
+            m_gpuSlotOpenThisFrame = false;
+            const auto resolved = gpuSlotOpen
+                ? m_gpuTimer->endFrameAndResolveOldest()
+                : std::nullopt;
 
             // Render the overlay (if active + ready) and build a
             // modified XrFrameEndInfo that appends our quad to the
@@ -2119,6 +2221,15 @@ namespace openxr_api_layer {
             }
 
             const XrResult result = OpenXrApi::xrEndFrame(session, effectiveInfo);
+
+            // Suspended (neither recording nor HUD active): skip all timing
+            // capture and FrameRecord work for this frame. Keep m_tEndPrev
+            // current so the first frame after re-activation measures a single
+            // inter-frame interval, not the whole idle gap.
+            if (!collecting) {
+                m_tEndPrev.store(tEnd, std::memory_order_relaxed);
+                return result;
+            }
             // end_frame_ns isolates the runtime + downstream layers' work
             // inside xrEndFrame (layer composition, projection correction,
             // compositor handoff). Useful for diagnosing runtime overhead —
@@ -2399,16 +2510,28 @@ namespace openxr_api_layer {
         // name must be a compile-time literal, so it can't be a parameter),
         // and the aggregator push. `doPoll` is invoked synchronously, so a
         // by-reference capture of frame-local state is safe.
+        // Fixed-interval poll gate: returns true (and advances lastPollNs) iff
+        // at least intervalNs has elapsed since lastPollNs. The shared primitive
+        // behind both the hotkey-poll throttle (fixed cadence, runs while
+        // suspended — see xrEndFrame) and pollGated() below (telemetry polls,
+        // whose effective interval also folds in the overlay refresh rate). All
+        // callers work in ns off the same QPC→ns conversion — one clock unit.
+        static bool dueForPoll(int64_t nowNs, int64_t& lastPollNs,
+                               int64_t intervalNs) {
+            if (nowNs - lastPollNs < intervalNs) {
+                return false;
+            }
+            lastPollNs = nowNs;
+            return true;
+        }
+
         template <typename PollFn>
         void pollGated(int64_t nowNs, int64_t& lastPollNs,
                        int64_t minIntervalNs, PollFn&& doPoll) {
-            const int64_t interval =
-                std::max(m_overlay.refreshIntervalNs(), minIntervalNs);
-            if (nowNs - lastPollNs < interval) {
-                return;
+            if (dueForPoll(nowNs, lastPollNs,
+                           std::max(m_overlay.refreshIntervalNs(), minIntervalNs))) {
+                doPoll();
             }
-            doPoll();
-            lastPollNs = nowNs;
         }
 
         // GPU-side helpers ------------------------------------------------
@@ -2515,6 +2638,16 @@ namespace openxr_api_layer {
             // reports shows "--" rather than this session's stale value.
             m_overlay.resetTelemetryLatches();
             m_overlayRenderer.reset();
+            // Lazy-overlay binding stash is session-scoped: drop the device /
+            // queue refs and clear the attempt latch so the NEXT session
+            // re-stashes from its own xrCreateSession and may retry the build.
+            // m_overlayActive is deliberately NOT reset here (it spans sessions)
+            // — a session that inherits it rebuilds the renderer lazily on its
+            // first xrEndFrame.
+            m_d3d11Device.Reset();
+            m_d3d12Device.Reset();
+            m_d3d12Queue.Reset();
+            m_overlayInitAttempted = false;
             if (m_viewSpace != XR_NULL_HANDLE) {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
                 m_viewSpace = XR_NULL_HANDLE;
@@ -2631,6 +2764,36 @@ namespace openxr_api_layer {
         detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
         bool m_overlayActive = false;
         std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+
+        // Hotkey-poll throttle (see kHotkeyPollIntervalNs). ns timestamp of the
+        // last poll (0 = never, so the first frame polls), gated through the
+        // shared dueForPoll() helper — same ns unit + idiom as the telemetry
+        // polls, no separate clock unit.
+        int64_t m_lastHotkeyPollNs = 0;
+
+        // Lazy overlay construction for overlay.mode == Hotkey. The renderer
+        // and its private D3D device are NOT built at xrCreateSession in hotkey
+        // mode — only on the first frame the HUD is actually summoned — so a
+        // hotkey session that's never activated never spins up that device (nor
+        // the driver worker threads behind it). The graphics binding is stashed
+        // here at xrCreateSession to rebuild from; the binding KIND is implied
+        // by which pointer is non-null (D3D11 XOR D3D12 — xrCreateSession
+        // stashes exactly one). Released, and the attempt latch cleared, in
+        // releaseSessionScopedResources() so the next session re-stashes and may
+        // retry. m_overlayInitAttempted gates a failed (or completed) build so
+        // we neither retry nor re-log it every frame.
+        ComPtr<ID3D11Device> m_d3d11Device;
+        ComPtr<ID3D12Device> m_d3d12Device;
+        ComPtr<ID3D12CommandQueue> m_d3d12Queue;
+        bool m_overlayInitAttempted = false;
+
+        // True between this frame's xrBeginFrame opening a GPU timer slot and
+        // xrEndFrame closing it. The open/close straddle the in-EndFrame hotkey
+        // poll, so we pair them on THIS flag — never on a freshly-sampled
+        // `collecting` — otherwise a deactivate→idle→reactivate cycle could
+        // leave a slot open across the idle gap and resolve a multi-second
+        // delta onto the resume frame.
+        bool m_gpuSlotOpenThisFrame = false;
 
         // Quad geometry (centre offset + size), resolved once in
         // xrCreateInstance from the immutable overlay settings (position /
@@ -2755,6 +2918,16 @@ namespace openxr_api_layer {
         // but track different facts (a slow-moving statistic vs. the driver
         // counter cadence), so they must be free to move independently.
         static constexpr int64_t kPercentileRefreshIntervalNs = 1'000'000'000LL;
+
+        // Hotkey-poll cadence. The log + overlay hotkeys are level-triggered
+        // combos detected with GetAsyncKeyState — a win32k round-trip we'd
+        // otherwise pay on EVERY xrEndFrame (90-144 Hz). A deliberate combo
+        // press is held far longer than this, so sampling at ~20 Hz still
+        // catches the rising edge while cutting the GetAsyncKeyState traffic
+        // ~5-7x. 50 ms = worst-case activation latency, imperceptible for a
+        // HUD / recording toggle. (The edge detector still fires exactly once
+        // per press; throttling only changes how often we sample its input.)
+        static constexpr int64_t kHotkeyPollIntervalNs = 50'000'000LL;  // ~20 Hz
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
@@ -2791,6 +2964,10 @@ namespace openxr_api_layer {
             XrSpace localSpace) {
         static_cast<OpenXrLayer*>(GetInstance())
             ->forceOverlayActiveForTest(std::move(renderer), viewSpace, localSpace);
+    }
+
+    uint64_t FrameIndexForTest() {
+        return static_cast<OpenXrLayer*>(GetInstance())->frameIndexForTest();
     }
 
     // dllHome / localAppData are defined in framework/entry.cpp for the

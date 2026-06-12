@@ -759,6 +759,56 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
 }
 
 // ----------------------------------------------------------------------------
+// 9b. Suspend branch: overlay in HOTKEY mode but never activated (with log
+//     off) is NOT a full bypass — overlay.enabled=true keeps the layer live so
+//     it can still poll the activation hotkey — but with neither the CSV
+//     (m_recording) nor the HUD (m_overlayActive) consuming frames, the
+//     per-frame telemetry is suspended (collecting == false). The invariant
+//     that MUST survive that suspension: xrEndFrame is still forwarded every
+//     frame, or the app would stop submitting to the compositor. We can't
+//     measure the CPU-cost drop directly, but we DO check a proxy for it: a
+//     suspended frame early-returns before the m_frameIndex fetch_add, so the
+//     counter must not advance (FrameIndexForTest). ForceOverlayActiveForTest
+//     is deliberately NOT called, so m_overlayActive stays false.
+// ----------------------------------------------------------------------------
+TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still forwards frames") {
+    TelemetryFixture fix;
+
+    const auto perAppPath = fix.tempDir() / "suspendtest_settings.json";
+    {
+        std::ofstream out(perAppPath);
+        REQUIRE(out.is_open());
+        out << R"({"overlay":{"enabled":true,"mode":"hotkey"}})";
+    }
+
+    auto* api = fix.startLayer("SuspendTest");
+
+    constexpr int kFrames = 5;
+    for (int i = 0; i < kFrames; ++i) {
+        driveOneFrame(api);
+    }
+
+    // Proxy for "collection was suspended": a suspended frame early-returns
+    // before the m_frameIndex fetch_add, so the counter must not have advanced
+    // across kFrames. Deleting the collecting gate would route these frames
+    // through the collecting path and bump the counter — failing this check.
+    // (Read before ResetInstance tears the singleton down.)
+    CHECK(openxr_api_layer::FrameIndexForTest() == 0);
+
+    // The frame submission must still reach the runtime on every frame even
+    // while our telemetry is suspended.
+    CHECK(mock::state().waitFrameCallCount == kFrames);
+    CHECK(mock::state().beginFrameCallCount == kFrames);
+    CHECK(mock::state().endFrameCallCount == kFrames);
+
+    openxr_api_layer::ResetInstance();
+
+    // Log is off, so nothing should land on disk regardless of the overlay.
+    const auto csv = findSessionCsv(fix.sessionsDir());
+    CHECK(!csv.has_value());
+}
+
+// ----------------------------------------------------------------------------
 // 10. Drift check: the in-binary `kBuiltInDefaultSettings` constexpr (the
 //     fallback the layer ships when the installer never ran) MUST parse
 //     to the same TelemetrySettings as installer/default_settings.json
