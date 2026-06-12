@@ -1001,7 +1001,7 @@ jobs:
             ### Install (installer)
             1. Download the `...-Setup.exe` above.
             2. Run it — admin elevation is handled automatically.
-            3. The layer is installed to `C:\Program Files\OpenXR-Layer-xr_telemetry\`
+            3. The layer is installed to `C:\Program Files\XR-Telemetry\`
                and registered with the OpenXR loader.
 
             ### Install (manual / ZIP)

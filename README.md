@@ -15,7 +15,7 @@ observes timings and (optionally) composites its own quad on top.
 ## Install
 
 Download the latest `Setup.exe` from
-[Releases](https://github.com/mledour/OpenXR-Layer-XrTelemetry/releases)
+[Releases](https://github.com/mledour/XR-Telemetry/releases)
 and run it. The installer registers the layer under `HKLM` so every
 OpenXR runtime on the machine picks it up, and creates an Add/Remove
 Programs entry for clean uninstall.
