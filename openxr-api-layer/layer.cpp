@@ -1777,14 +1777,20 @@ namespace openxr_api_layer {
                             reinterpret_cast<void**>(dxgiDevice.GetAddressOf())))) {
                         dxgiDevice->GetAdapter(dxgiAdapter.GetAddressOf());
                     }
-                } else if (m_d3d12Device && m_d3d12Queue) {
-                    auto timer = std::make_unique<D3D12GpuTimer>();
-                    if (timer->init(m_d3d12Device.Get(), m_d3d12Queue.Get())) {
-                        m_gpuTimer = std::move(timer);
-                        Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
-                    } else {
-                        Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
-                            "creation failed; gpu_time_ns will be 0 for this session\n");
+                } else if (m_d3d12Device) {
+                    // Gate the timer on the queue but the adapter only on the
+                    // device: a (non-conformant) D3D12 binding with a null queue
+                    // still gets VRAM/temp via the adapter — only the GPU timer
+                    // drops out, instead of losing telemetry for the session.
+                    if (m_d3d12Queue) {
+                        auto timer = std::make_unique<D3D12GpuTimer>();
+                        if (timer->init(m_d3d12Device.Get(), m_d3d12Queue.Get())) {
+                            m_gpuTimer = std::move(timer);
+                            Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
+                        } else {
+                            Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
+                                "creation failed; gpu_time_ns will be 0 for this session\n");
+                        }
                     }
                     // ID3D12Device::GetAdapterLuid -> IDXGIFactory4::EnumAdapterByLuid.
                     const LUID luid = m_d3d12Device->GetAdapterLuid();
@@ -2097,8 +2103,11 @@ namespace openxr_api_layer {
             // below and every record-building step after the forward, which
             // brings the idle cost back down to the disabled-overlay profile.
             // xrEndFrame itself is still forwarded unconditionally (it's the
-            // app's frame submission); only OUR telemetry is gated.
-            const bool collecting = m_recording || m_overlayActive;
+            // app's frame submission); only OUR telemetry is gated. `collecting`
+            // is captured AFTER the lazy overlay build below: a failed overlay
+            // activation clears m_overlayActive, and capturing before it would
+            // leave `collecting` stale-true and spin up the GPU/NvAPI pipeline
+            // for a session that can't draw.
 
             // Lazy overlay build (overlay.mode == Hotkey): the renderer + its
             // private D3D device aren't created until the HUD is first summoned.
@@ -2109,6 +2118,10 @@ namespace openxr_api_layer {
             if (m_overlayActive && !m_overlayRenderer) {
                 ensureOverlayResources(session);
             }
+
+            // Collection gate, evaluated now that any failed activation has
+            // settled m_overlayActive (see above).
+            const bool collecting = m_recording || m_overlayActive;
 
             // Lazy GPU instrumentation (Hotkey mode): the GPU timer + telemetry
             // reader aren't built until the CSV log or overlay is first
@@ -2686,6 +2699,13 @@ namespace openxr_api_layer {
             m_d3d12Queue.Reset();
             m_overlayInitAttempted = false;
             m_gpuInitAttempted = false;
+            // Clear the GPU-slot pairing flag too: with the timer now built
+            // lazily, a slot left open by an abandoned frame (xrBeginFrame with
+            // no paired xrEndFrame) must not survive into a session whose timer
+            // is still null — xrEndFrame's resolve derefs m_gpuTimer when this
+            // flag is set, and the "flag set ⟹ timer non-null" invariant now
+            // holds only if we reset it per session here.
+            m_gpuSlotOpenThisFrame = false;
             if (m_viewSpace != XR_NULL_HANDLE) {
                 OpenXrApi::xrDestroySpace(m_viewSpace);
                 m_viewSpace = XR_NULL_HANDLE;
