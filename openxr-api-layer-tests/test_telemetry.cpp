@@ -118,15 +118,15 @@ namespace {
         // bootstrap path.
         const std::filesystem::path& tempDir() const { return m_tempDir; }
 
-        // Pre-write a per-app settings file that explicitly enables log
-        // writing. The in-binary default and the installer template both
-        // ship `log.enabled = false` (opt-in feature, matches the
-        // overlay convention), so any test that needs the layer to
-        // produce a CSV must call this BEFORE startLayer. The file
-        // basename comes from sanitizeForFilename so the bypass-style
-        // hand-rolled path (`bypasstest_settings.json`) and this helper
-        // stay in lockstep with what the layer's resolvePerAppConfigPath
-        // looks up.
+        // Pre-write a per-app settings file that turns log writing on in AUTO
+        // mode. The shipped template enables log in HOTKEY mode (armed but
+        // dormant — no CSV until a keypress), so a test that needs a
+        // deterministic CSV without simulating a hotkey must pre-write its own
+        // per-app file: `{"log":{"enabled":true}}` enables it and the omitted
+        // `mode` falls back to auto, so the CSV opens at session start. The
+        // file basename comes from sanitizeForFilename so the bypass-style
+        // hand-rolled path (`bypasstest_settings.json`) and this helper stay in
+        // lockstep with what the layer's resolvePerAppConfigPath looks up.
         void enableLog(const char* appName) {
             const auto perAppPath = m_tempDir /
                 (openxr_api_layer::sanitizeForFilename(appName) + "_settings.json");
@@ -135,11 +135,12 @@ namespace {
             out << R"({"log":{"enabled":true}})";
         }
 
-        // Like enableLog, but flips overlay.enabled. Without at least one
-        // feature enabled the layer runs as a pure pass-through
-        // (m_bypassApiLayer — see xrCreateInstance), so xrEndFrame returns
-        // before the overlay block. The overlay-integration tests need a
-        // live xrEndFrame; the renderer itself is supplied via
+        // Like enableLog, but flips overlay.enabled (mode falls back to auto).
+        // A per-app config with BOTH features disabled makes the layer a pure
+        // pass-through (m_bypassApiLayer — see xrCreateInstance) and xrEndFrame
+        // returns before the overlay block; enabling the overlay keeps
+        // xrEndFrame live. The overlay-integration tests need that live
+        // xrEndFrame; the renderer itself is supplied via
         // ForceOverlayActiveForTest, not built from a graphics binding.
         void enableOverlay(const char* appName) {
             const auto perAppPath = m_tempDir /
@@ -609,9 +610,9 @@ TEST_CASE("telemetry: double xrCreateInstance on the same singleton survives") {
     // ResetInstance has fired), so this hits the same OpenXrLayer twice —
     // exactly the OC pattern. The layer's m_layerInitialized guard early-
     // returns on the second call without re-running the settings bootstrap
-    // (which would otherwise flip m_bypassApiLayer to true under the opt-in
-    // default, since no per-app settings file exists for "SecondInit", and
-    // silently halt CSV row appends from the next frame on). Defence in
+    // (which would otherwise re-resolve settings under a different app name,
+    // "SecondInit", with no per-app file — disrupting the in-flight
+    // "FirstInit" recording). Defence in
     // depth: CsvWriter::start is idempotent too — even if the layer guard
     // ever regressed, the second start() is a no-op rather than
     // std::terminate via thread reassignment.
@@ -660,6 +661,16 @@ TEST_CASE("telemetry: should_render XR_FALSE is recorded as 0 in the CSV") {
 // ----------------------------------------------------------------------------
 TEST_CASE("telemetry: layer is pure pass-through w.r.t. downstream call counts") {
     TelemetryFixture fix;
+
+    // Explicitly disable BOTH features so this is a true bypass
+    // (m_bypassApiLayer) regardless of the shipped template — which now ships
+    // both enabled in hotkey mode (live-but-suspended, not a bypass).
+    {
+        std::ofstream out(fix.tempDir() / "passthroughapp_settings.json");
+        REQUIRE(out.is_open());
+        out << R"({"log":{"enabled":false},"overlay":{"enabled":false}})";
+    }
+
     auto* api = fix.startLayer("PassThroughApp");
 
     constexpr int kFrames = 7;
