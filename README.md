@@ -21,7 +21,7 @@ OpenXR runtime on the machine picks it up, and creates an Add/Remove
 Programs entry for clean uninstall.
 
 The overlay (HUD) and the CSV log both ship **enabled in hotkey mode** —
-armed but dormant. Nothing is drawn and nothing is written to disk until
+armed but dormant. Nothing is drawn and no CSV is written until
 you press the toggle in-game (`Ctrl+Shift+O` for the overlay,
 `Ctrl+Shift+T` for the log). See Settings below to make a feature
 always-on (`auto`) or turn it off entirely.
@@ -38,8 +38,23 @@ always-on (`auto`) or turn it off entirely.
    and set its `mode` to `"auto"`. To turn a feature off entirely, set its
    `enabled` to `false`.
 
-Until you toggle something on, the layer just polls the hotkeys once per
-frame — no CSV, no HUD, negligible overhead.
+Until you toggle something on, the layer just polls for the hotkeys a few
+times a second — no CSV, no HUD, negligible overhead.
+
+## Disabling the layer
+
+Because the loader injects this DLL into **every** OpenXR app on the
+machine, there are two ways to make it stand down without uninstalling:
+
+- **Fully inert (loader level).** Set the environment variable
+  `DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry=1` (the manifest's
+  `disable_environment`). The OpenXR loader then never loads the layer into
+  the process at all — the safest option if a game or its anti-cheat
+  misbehaves with any third-party layer present.
+- **Pure pass-through (settings level).** Set both `log.enabled` and
+  `overlay.enabled` to `false` in `settings.json`. The DLL still loads but
+  every call forwards straight through — no hotkeys polled, no
+  instrumentation.
 
 ## Settings
 

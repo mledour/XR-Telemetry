@@ -31,6 +31,7 @@
 #include <doctest/doctest.h>
 
 #include "utils/settings.h"
+#include "utils/default_settings_template.h"
 
 using openxr_api_layer::detail::parseSettings;
 using openxr_api_layer::detail::ParsedSettings;
@@ -50,7 +51,7 @@ namespace {
     // (installer/default_settings.json) intentionally differs — it ships log
     // and overlay enabled in hotkey mode; the fallback stays disabled so a
     // partial/malformed config never silently arms a feature.
-    void checkDocumentedDefaults(const ParsedSettings& p) {
+    void checkFallbackDefaults(const ParsedSettings& p) {
         CHECK(p.error.empty());
         CHECK_FALSE(p.settings.log.enabled);
         CHECK(p.settings.log.mode == LogMode::Auto);
@@ -72,15 +73,36 @@ namespace {
 // =============================================================================
 
 TEST_CASE("parseSettings: empty input → documented defaults, no error") {
-    checkDocumentedDefaults(parseSettings(""));
+    checkFallbackDefaults(parseSettings(""));
 }
 
 TEST_CASE("parseSettings: empty object → documented defaults, no error") {
-    checkDocumentedDefaults(parseSettings("{}"));
+    checkFallbackDefaults(parseSettings("{}"));
 }
 
 TEST_CASE("parseSettings: comment-only object → documented defaults") {
-    checkDocumentedDefaults(parseSettings(R"({ "_comment": "hi" })"));
+    checkFallbackDefaults(parseSettings(R"({ "_comment": "hi" })"));
+}
+
+// =============================================================================
+// Shipped template — the headline default (distinct from the fallback above).
+// =============================================================================
+
+TEST_CASE("parseSettings: the shipped template arms log + overlay in hotkey mode") {
+    // The fallback tests above lock what an ABSENT block resolves to
+    // (disabled). This locks the opposite end: the in-binary template
+    // kBuiltInDefaultSettings — and, via the no-schema-drift test in
+    // test_telemetry.cpp, installer/default_settings.json — ships BOTH
+    // features enabled in HOTKEY mode. Without this, a revert to
+    // enabled=false/auto passes the whole suite green (the drift test only
+    // checks the two templates agree; the fallback tests only check the
+    // parser's missing-field defaults).
+    const auto p = parseSettings(openxr_api_layer::detail::kBuiltInDefaultSettings);
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Hotkey);
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
 }
 
 // =============================================================================

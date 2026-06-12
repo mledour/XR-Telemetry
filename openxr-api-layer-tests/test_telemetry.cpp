@@ -118,21 +118,26 @@ namespace {
         // bootstrap path.
         const std::filesystem::path& tempDir() const { return m_tempDir; }
 
-        // Pre-write a per-app settings file that turns log writing on in AUTO
-        // mode. The shipped template enables log in HOTKEY mode (armed but
-        // dormant — no CSV until a keypress), so a test that needs a
-        // deterministic CSV without simulating a hotkey must pre-write its own
-        // per-app file: `{"log":{"enabled":true}}` enables it and the omitted
-        // `mode` falls back to auto, so the CSV opens at session start. The
-        // file basename comes from sanitizeForFilename so the bypass-style
-        // hand-rolled path (`bypasstest_settings.json`) and this helper stay in
-        // lockstep with what the layer's resolvePerAppConfigPath looks up.
-        void enableLog(const char* appName) {
+        // Write a per-app settings file at <tempDir>/<slug>_settings.json,
+        // deriving the slug from appName via the same sanitizeForFilename the
+        // layer's resolvePerAppConfigPath uses — so a test's pre-written file
+        // and the name it later passes to startLayer can never drift apart.
+        void writePerApp(const char* appName, const char* jsonBody) {
             const auto perAppPath = m_tempDir /
                 (openxr_api_layer::sanitizeForFilename(appName) + "_settings.json");
             std::ofstream out(perAppPath);
             REQUIRE(out.is_open());
-            out << R"({"log":{"enabled":true}})";
+            out << jsonBody;
+        }
+
+        // Convenience wrapper over writePerApp: turns log writing on in AUTO
+        // mode. The shipped template enables log in HOTKEY mode (armed but
+        // dormant — no CSV until a keypress), so a test that needs a
+        // deterministic CSV without simulating a hotkey pre-writes its own
+        // per-app file — `{"log":{"enabled":true}}` enables it and the omitted
+        // `mode` falls back to auto, so the CSV opens at session start.
+        void enableLog(const char* appName) {
+            writePerApp(appName, R"({"log":{"enabled":true}})");
         }
 
         // Like enableLog, but flips overlay.enabled (mode falls back to auto).
@@ -143,11 +148,7 @@ namespace {
         // xrEndFrame; the renderer itself is supplied via
         // ForceOverlayActiveForTest, not built from a graphics binding.
         void enableOverlay(const char* appName) {
-            const auto perAppPath = m_tempDir /
-                (openxr_api_layer::sanitizeForFilename(appName) + "_settings.json");
-            std::ofstream out(perAppPath);
-            REQUIRE(out.is_open());
-            out << R"({"overlay":{"enabled":true}})";
+            writePerApp(appName, R"({"overlay":{"enabled":true}})");
         }
 
         // Common setup: wire the singleton to the mock runtime and call
@@ -610,9 +611,9 @@ TEST_CASE("telemetry: double xrCreateInstance on the same singleton survives") {
     // ResetInstance has fired), so this hits the same OpenXrLayer twice —
     // exactly the OC pattern. The layer's m_layerInitialized guard early-
     // returns on the second call without re-running the settings bootstrap
-    // (which would otherwise re-resolve settings under a different app name,
-    // "SecondInit", with no per-app file — disrupting the in-flight
-    // "FirstInit" recording). Defence in
+    // (which would otherwise re-key m_appName / m_settings onto "SecondInit"
+    // and rebuild the overlay aggregator, discarding the session's
+    // accumulated history). Defence in
     // depth: CsvWriter::start is idempotent too — even if the layer guard
     // ever regressed, the second start() is a no-op rather than
     // std::terminate via thread reassignment.
@@ -662,14 +663,14 @@ TEST_CASE("telemetry: should_render XR_FALSE is recorded as 0 in the CSV") {
 TEST_CASE("telemetry: layer is pure pass-through w.r.t. downstream call counts") {
     TelemetryFixture fix;
 
-    // Explicitly disable BOTH features so this is a true bypass
-    // (m_bypassApiLayer) regardless of the shipped template — which now ships
-    // both enabled in hotkey mode (live-but-suspended, not a bypass).
-    {
-        std::ofstream out(fix.tempDir() / "passthroughapp_settings.json");
-        REQUIRE(out.is_open());
-        out << R"({"log":{"enabled":false},"overlay":{"enabled":false}})";
-    }
+    // Force a real bypass (m_bypassApiLayer) by disabling BOTH features, so
+    // this exercises the pass-through path rather than the armed-by-default
+    // template. The call-count invariant below holds in BOTH bypass and
+    // live-but-suspended hotkey mode, so it documents intent more than it
+    // proves bypass — the no-CSV bypass guarantee itself is covered by the
+    // dedicated log.enabled=false test.
+    fix.writePerApp("PassThroughApp",
+                    R"({"log":{"enabled":false},"overlay":{"enabled":false}})");
 
     auto* api = fix.startLayer("PassThroughApp");
 
@@ -737,14 +738,8 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
     TelemetryFixture fix;
 
     // Pre-write the per-app file BEFORE startLayer so bootstrapAndLoad
-    // Settings finds it and skips the template copy. The slug rule
-    // matches sanitizeForFilename: "BypassTest" → "bypasstest".
-    const auto perAppPath = fix.tempDir() / "bypasstest_settings.json";
-    {
-        std::ofstream out(perAppPath);
-        REQUIRE(out.is_open());
-        out << R"({"log":{"enabled":false}})";
-    }
+    // Settings finds it and skips the template copy.
+    fix.writePerApp("BypassTest", R"({"log":{"enabled":false}})");
 
     auto* api = fix.startLayer("BypassTest");
 
@@ -785,12 +780,7 @@ TEST_CASE("telemetry: log.enabled=false in per-app settings disables CSV writing
 TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still forwards frames") {
     TelemetryFixture fix;
 
-    const auto perAppPath = fix.tempDir() / "suspendtest_settings.json";
-    {
-        std::ofstream out(perAppPath);
-        REQUIRE(out.is_open());
-        out << R"({"overlay":{"enabled":true,"mode":"hotkey"}})";
-    }
+    fix.writePerApp("SuspendTest", R"({"overlay":{"enabled":true,"mode":"hotkey"}})");
 
     auto* api = fix.startLayer("SuspendTest");
 
@@ -825,8 +815,8 @@ TEST_CASE("telemetry: un-activated overlay hotkey suspends collection but still 
 //     to the same TelemetrySettings as installer/default_settings.json
 //     (the file the installer drops). Without this guarantee a ZIP user
 //     and an installer user get different first-run behaviour — exactly
-//     the silent split the README's "Robustness contract" section
-//     promises NOT to ship. Comments and whitespace are ignored (we
+//     the silent split this drift test exists to prevent. Comments and
+//     whitespace are ignored (we
 //     compare the PARSED structs, not the byte stream).
 //
 //     Resolves the installer file at runtime by navigating up from the

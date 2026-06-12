@@ -36,8 +36,8 @@
 //                  "offset_x", "offset_y" }
 //   }
 //
-// Everything is permissive: missing fields fall back to the "preserve
-// current behaviour" defaults (log enabled, auto mode, default hotkey).
+// Everything is permissive: missing fields fall back to the safe
+// defaults (log disabled, auto mode, default hotkey).
 // A malformed file returns the same defaults plus an error string the
 // caller can log — we NEVER throw / abort because of bad settings; the
 // layer's contract is to keep the host process alive (CLAUDE.md rule 9).
