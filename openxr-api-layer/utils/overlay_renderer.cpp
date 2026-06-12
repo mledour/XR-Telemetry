@@ -573,11 +573,12 @@ namespace openxr_api_layer::detail {
                 const float cpuPanelY = gpuPanelY + kFrametimeHeight + kSectionGap;
                 const float bottomY   = cpuPanelY + kFrametimeHeight + kSectionGap;
 
-                // Outer frame: a filled rect + 1-px outline (the 12-px
-                // chamfer was dropped when chrome shapes moved to the
-                // GPU quad shader — sharp corners, see chrome_shape_
-                // renderer.h). drawChamferedRect keeps the historical
-                // name + signature so the geometry intent stays legible.
+                // Outer frame: a rounded filled rect + 1-px rounded
+                // border (the 12-px chamfer was dropped in the D2D→GPU
+                // migration; the quad shader's SDF path now rounds the
+                // corners — see chrome_shape_renderer.h). drawChamferedRect
+                // keeps the historical name + signature so the call still
+                // reads as "the outer frame".
                 const D2D1_RECT_F frameOuter = D2D1::RectF(
                     kOuterPad, kOuterPad,
                     static_cast<float>(kTexW) - kOuterPad,
@@ -1612,43 +1613,50 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // Panel background — flat dark-blue panel with a 1-px
-            // separator stroke on the inside. Used for the header,
-            // both frametime panels, and the bottom row pair.
-            // Earlier iterations added top-edge bevel highlight,
-            // bottom-edge bevel shadow, and a low-alpha diagonal
-            // carbon-fibre hatch for a "raised metal" industrial
-            // look; all three were dropped in favour of a flat panel.
-            //
-            // Sharp corners: the 4-px D2D rounding has no exact GPU
-            // equivalent in the quad shader (tradeoff documented +
-            // accepted in the chrome-shape migration). One fill rect +
-            // one 1-px outline = 5 quads per panel, on the chrome-
-            // shapes batch.
+            // Rounded corner radii (texture pixels) for the chrome. The
+            // shader clamps each to half the shorter side, so one value is
+            // safe on the tall frametime panels and the short bottom cells
+            // alike. Set to 0 to restore the old sharp corners.
+            static constexpr float kPanelCornerRadius = 10.0f;
+            static constexpr float kFrameCornerRadius = 16.0f;
+
+            // Panel background — flat dark-blue panel with a 1-px separator
+            // border and rounded corners. Used for the header, both
+            // frametime panels, and the bottom row pair. Drawn as a single
+            // stroked rounded rect (addRoundedRect) — fill + a 1-px border
+            // ring in one quad via the shader SDF, so a translucent fill
+            // would keep its alpha (nothing opaque behind it). (Earlier iterations
+            // tried bevels / a carbon-fibre hatch; dropped for a flat
+            // panel. Corners were sharp after the D2D→GPU migration until
+            // the quad shader gained a rounded-rect SDF path.)
             void drawPanelBg(float l, float t, float r, float b) const {
                 if (m_tier != PaintTier::Static) return;   // chrome shape
-                m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
-                m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
+                m_chromeShapes->addRoundedRect(l, t, r - l, b - t,
+                                                /*fill=*/kColorPanelBg,
+                                                /*border=*/kColorSeparator,
+                                                /*borderWidth=*/1.0f,
+                                                /*radius=*/kPanelCornerRadius);
             }
 
-            // Outer frame. Historically a chamfered (cut-corner)
-            // octagon; the chamfer was dropped when chrome shapes moved
-            // to the GPU quad shader (no exact equivalent without a
-            // custom polygon pass). Now a plain filled rect + 1-px
-            // outline. Kept the name + rect/stroke signature so the
-            // call site in drawChrome reads as "the outer frame".
+            // Outer frame. Historically a chamfered (cut-corner) octagon,
+            // then a plain rect after the GPU migration; now a rounded rect
+            // via the quad-shader SDF — one stroked rounded rect
+            // (addRoundedRect): translucent bg fill + an opaque frame-line
+            // border ring in a single quad. Kept the name + signature so the
+            // drawChrome call site still reads as "the outer frame". The
+            // target is cleared transparent, so the rounded outer corners
+            // fall to alpha 0 — the overlay's corners are see-through (the
+            // VR scene shows through), not black.
             void drawChamferedRect(const D2D1_RECT_F& rect,
                                      float strokeWidth) const {
                 if (m_tier != PaintTier::Static) return;   // chrome shape
-                m_chromeShapes->addRect(rect.left, rect.top,
-                                          rect.right - rect.left,
-                                          rect.bottom - rect.top,
-                                          kColorBg);
-                m_chromeShapes->addOutline(rect.left, rect.top,
-                                            rect.right - rect.left,
-                                            rect.bottom - rect.top,
-                                            strokeWidth,
-                                            kColorFrameLine);
+                m_chromeShapes->addRoundedRect(rect.left, rect.top,
+                                                rect.right - rect.left,
+                                                rect.bottom - rect.top,
+                                                /*fill=*/kColorBg,
+                                                /*border=*/kColorFrameLine,
+                                                /*borderWidth=*/strokeWidth,
+                                                /*radius=*/kFrameCornerRadius);
             }
 
             // Static-tier column separators: `count` thin 1-px vertical
@@ -1834,16 +1842,13 @@ namespace openxr_api_layer::detail {
                         m_barsLayout.GetAddressOf())))
                     return fail("CreateInputLayout (bars)");
 
-                const D3D11_INPUT_ELEMENT_DESC quadIL[] = {
-                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
-                     D3D11_INPUT_PER_VERTEX_DATA,   0},
-                    {"QUAD_RECT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
-                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
-                    {"QUAD_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
-                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
-                };
+                // Shared layout — see overlay_quad_layout in
+                // chrome_shape_renderer.h. Same instance struct + element
+                // descs ChromeShapeRenderer uses, so the two overlay_quad
+                // pipelines stay in lockstep.
                 if (FAILED(m_device->CreateInputLayout(
-                        quadIL, _countof(quadIL),
+                        chrome_shapes::kQuadInputLayout,
+                        _countof(chrome_shapes::kQuadInputLayout),
                         g_overlay_quad_vs, sizeof(g_overlay_quad_vs),
                         m_quadLayout.GetAddressOf())))
                     return fail("CreateInputLayout (quad)");
@@ -2105,7 +2110,11 @@ namespace openxr_api_layer::detail {
             // Mirror cbuffer layout: 7×float4 registers (112 B) for bars,
             // 1×float4 register (16 B) for quads.
             struct BarInstance  { float xLeft; float height; uint32_t tier; };
-            struct QuadInstance { float rect[4]; float color[4]; };
+            // The quad instance layout is shared with ChromeShapeRenderer —
+            // see overlay_quad_layout (QuadInstance + kQuadInputLayout) in
+            // chrome_shape_renderer.h — so the two overlay_quad pipelines
+            // (chrome shapes + this bg/grid/budget pass) can't drift.
+            using QuadInstance = chrome_shapes::QuadInstance;
             struct BarConstants {
                 float texSize[2]; float histoTL[2]; float histoBR[2];
                 float barWidth; float dashHeight;
@@ -2119,6 +2128,8 @@ namespace openxr_api_layer::detail {
             static_assert(sizeof(QuadConstants) == 16,
                           "QuadConstants must mirror HLSL cbuffer packing "
                           "(1 × float4 = 16 B) — see overlay_quad.hlsli");
+            // QuadInstance's size assert lives with the shared definition
+            // in chrome_shape_renderer.h (overlay_quad_layout).
 
             static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
 
