@@ -51,15 +51,15 @@ namespace openxr_api_layer::utils::glyph_atlas {
 
         // -------- Family-name resolution -------------------------------
         //
-        // Walks the custom collection first (Barlow / Rajdhani live
+        // Walks the custom collection first (Quantico / Rajdhani live
         // there) and falls back to the system collection. Returns null
         // ComPtr on miss — caller logs and continues.
         //
         // Lookup strategy: exact match first, then case-sensitive
         // prefix match. The prefix fallback handles the case where
         // DirectWrite enumerates a bundled font under its WWS / legacy
-        // family name (e.g. "Barlow Medium") rather than the
-        // typographic family ("Barlow") declared by the TTF's `name`
+        // family name (e.g. "Quantico Italic") rather than the
+        // typographic family ("Quantico") declared by the TTF's `name`
         // table. The D2D CreateTextFormat path is more forgiving and
         // tolerates the mismatch silently, but FindFamilyName is exact;
         // without the prefix fallback the atlas build silently fails
@@ -83,7 +83,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
             // Prefix match. Walks the family list and picks the first
             // entry whose locale-0 name starts with `familyName` + ' '.
             // The trailing space avoids spurious matches (e.g. "Bar"
-            // accidentally matching "Barlow Medium"). Cheap — both the
+            // accidentally matching "Quantico Italic"). Cheap — both the
             // custom collection and our requested names stay tiny.
             const std::size_t reqLen = std::wcslen(familyName);
             const UINT32 famCount = coll->GetFontFamilyCount();
@@ -130,7 +130,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // Picks the closest font in the family matching the (weight,
         // style) the format uses, then opens a font face and reads
         // design metrics. The two style buckets we use are:
-        //   Barlow Italic  → weight MEDIUM, style ITALIC
+        //   Quantico Italic → weight NORMAL (Regular), style ITALIC
         //   Rajdhani Upright → weight SEMI_BOLD, style NORMAL
         bool resolveFace(
             IDWriteFactory*          factory,
@@ -179,8 +179,8 @@ namespace openxr_api_layer::utils::glyph_atlas {
         };
         FaceStyle styleFor(GlyphFace face) {
             switch (face) {
-            case GlyphFace::BarlowItalic:
-                return { DWRITE_FONT_WEIGHT_MEDIUM,    DWRITE_FONT_STYLE_ITALIC };
+            case GlyphFace::QuanticoItalic:
+                return { DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_FONT_STYLE_ITALIC };
             case GlyphFace::RajdhaniUpright:
             default:
                 return { DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL };
@@ -190,7 +190,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // -------- Pick the right family for a face --------------------
         const wchar_t* familyFor(GlyphFace face, const BuildSpec& spec) {
             switch (face) {
-            case GlyphFace::BarlowItalic:    return spec.familyChiffres;
+            case GlyphFace::QuanticoItalic:    return spec.familyChiffres;
             case GlyphFace::RajdhaniUpright:
             default:                          return spec.familyLabels;
             }

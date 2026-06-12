@@ -259,7 +259,7 @@ Bundled fonts (openxr-api-layer/fonts/*.ttf)
 ---------------------------------------------
 
     Copyright 2014 The Rajdhani Project Authors (https://github.com/itfoundry/rajdhani)
-    Copyright 2017 The Barlow Project Authors (https://github.com/jpt/barlow)
+    Copyright (c) 2011, Matthew Desmond (http://www.madtype.com | mattdesmond@gmail.com), with Reserved Font Name "Quantico"
 
     SIL Open Font License, Version 1.1. The full license text covering both
     families is shipped at openxr-api-layer/fonts/OFL.txt.

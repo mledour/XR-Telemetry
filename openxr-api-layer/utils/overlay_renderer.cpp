@@ -317,8 +317,8 @@ namespace openxr_api_layer::detail {
         // Mirror the m_fmt* IDWriteTextFormat lineup from
         // CoreRenderer::init. Kept at namespace scope (no member-class
         // qualification needed at the leaf call sites).
-        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::BarlowItalic,    52, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::BarlowItalic,    32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::QuanticoItalic,    52, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::QuanticoItalic,    32, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
@@ -384,7 +384,7 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Load the BUNDLED Barlow font (Medium + Medium Italic,
+                // Load the BUNDLED Quantico font (Italic only,
                 // subset to digits / ASCII letters / °/µ/× / punctuation).
                 // The TTF files live as RT_BUNDLED_FONT resources in the
                 // DLL (see fonts/bundled_fonts.rc.inc); we feed their
@@ -395,16 +395,16 @@ namespace openxr_api_layer::detail {
                 // falling back to system fonts.
                 //
                 // Why bundle two families: design lands on a true italic
-                // for the chiffres (Barlow Medium Italic) but keeps the
+                // for the chiffres (Quantico Italic) but keeps the
                 // labels and section titles in the original technical-
                 // grotesque feel (Rajdhani SemiBold upright). Synthesising
                 // italic via DWRITE_FONT_STYLE_OBLIQUE on a non-italic
                 // face produces a sheared geometric look that's
                 // noticeably uglier than a real italic cut, so we ship
-                // Barlow-MediumItalic.ttf for the italic chiffres.
+                // Quantico-Italic.ttf for the italic chiffres.
                 // Rajdhani is brought back specifically because its
                 // narrower upright glyphs read crisper for short caps
-                // labels ("FPS", "GPU TEMP", "VRAM") than Barlow's
+                // labels ("FPS", "GPU TEMP", "VRAM") than Quantico's
                 // wider Medium would.
                 //
                 // On failure (resource missing, factory QI fails,
@@ -414,7 +414,7 @@ namespace openxr_api_layer::detail {
                 // The fallback face is upright-only, so the chiffres
                 // render upright instead of italic. Graceful degrade —
                 // never crash the host process for a cosmetic font.
-                const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
+                const wchar_t* kFamilyChiffres = L"Quantico";   // italic chiffres
                 const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
@@ -639,7 +639,7 @@ namespace openxr_api_layer::detail {
 
             // -------- Glyph-atlas BuildSpec assembly + bake -----------------
             //
-            // Bakes Barlow Medium Italic + Rajdhani SemiBold (with system
+            // Bakes Quantico Italic + Rajdhani SemiBold (with system
             // Bahnschrift fallback) at every pixel size any IDWriteTextFormat
             // above uses. The charset is wide enough to cover everything the
             // overlay ever renders — see findValueRuns / drawChrome /
@@ -649,7 +649,7 @@ namespace openxr_api_layer::detail {
             //     97-char printable range, conservatively wide so we don't
             //     re-bake every time a label string changes) + ° (U+00B0)
             //     for the temperature unit suffix.
-            //   Barlow italic   (kFamilyChiffres): digits 0-9 plus '.' (the
+            //   Quantico italic   (kFamilyChiffres): digits 0-9 plus '.' (the
             //     period appears between digits in "12.34" / "6.7 ms" and
             //     stays inside the italic range — see findValueRuns). Minus
             //     '-' is leading-only today and stays upright Rajdhani, but
@@ -682,7 +682,7 @@ namespace openxr_api_layer::detail {
                     // glyph fallback by looking up ' ' at the same
                     // (face, sizePx). Without it any out-of-set glyph
                     // collapses to advance 0 instead of leaving a clean
-                    // gap. Today the BarlowItalic-base formats only
+                    // gap. Today the QuanticoItalic-base formats only
                     // draw digits / '.' / '-', so out-of-set glyphs
                     // don't occur — defensive only.
                     L' ',
@@ -714,7 +714,7 @@ namespace openxr_api_layer::detail {
                 for (uint16_t sz : kSizes) {
                     spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
                                               sz, rajdhaniSet});
-                    spec.requests.push_back({glyph_atlas::GlyphFace::BarlowItalic,
+                    spec.requests.push_back({glyph_atlas::GlyphFace::QuanticoItalic,
                                               sz, barlowItalicSet});
                 }
 
@@ -736,7 +736,7 @@ namespace openxr_api_layer::detail {
             // in either binary) into a custom IDWriteFontCollection.
             // The collection holds two families:
             //   ID 200 → Rajdhani SemiBold (labels + section titles)
-            //   ID 201 → Barlow Medium Italic (chiffres)
+            //   ID 201 → Quantico Italic (chiffres)
             // DirectWrite reads the family + style from each TTF's
             // `name` table, so the loader code below is family-
             // agnostic and just adds the two files to the same set.
@@ -844,8 +844,8 @@ namespace openxr_api_layer::detail {
                     // AddFontFile internally handles all faces in
                     // the file (single face per file for our subsets
                     // — Rajdhani-SemiBold.ttf is one upright face in
-                    // the Rajdhani family, Barlow-MediumItalic.ttf is
-                    // one italic face in the Barlow family — but the
+                    // the Rajdhani family, Quantico-Italic.ttf is
+                    // one italic face in the Quantico family — but the
                     // API is robust either way; DirectWrite reads
                     // each file's `name` table to know which family /
                     // weight / style face it contains).
@@ -928,7 +928,7 @@ namespace openxr_api_layer::detail {
             // overrides.
             //
             // Three independently-applied sub-ranges:
-            //   italic[Start,Len]  digits-only sub-range; flips to Barlow
+            //   italic[Start,Len]  digits-only sub-range; flips to Quantico
             //                      Medium Italic. Empty (italicLen == 0)
             //                      when the prefix is dash/dot-only —
             //                      e.g. the "--" / "--.-" placeholders.
@@ -1036,7 +1036,7 @@ namespace openxr_api_layer::detail {
 
             // Render a value string with mixed per-range styling.
             //
-            // Digit characters flip to Barlow Medium Italic; the rest
+            // Digit characters flip to Quantico Italic; the rest
             // (including unit suffixes like " ms" / " °C" / " %") stays
             // in `baseFmt`'s family + style — typically Rajdhani
             // SemiBold upright. Auto-detects digit and unit ranges from
@@ -1054,7 +1054,7 @@ namespace openxr_api_layer::detail {
             //
             // Mixed-style value rendering — thin forwarder onto the GPU
             // value emitter. Walks findValueRuns inside drawValueTextGpu
-            // to flip digit ranges to Barlow Italic, optionally shrink
+            // to flip digit ranges to Quantico Italic, optionally shrink
             // the unit suffix, and optionally recolour the value runs
             // (chiffresColor). `unitFontSize` stays float at the call
             // sites (it's a kFont* constant); the atlas is keyed on
@@ -1202,7 +1202,7 @@ namespace openxr_api_layer::detail {
                         if (chiffresColor) a.color = chiffresColor;
                         if (i >= run.italicStart &&
                             i <  run.italicStart + run.italicLen) {
-                            a.face = glyph_atlas::GlyphFace::BarlowItalic;
+                            a.face = glyph_atlas::GlyphFace::QuanticoItalic;
                         }
                         if (unitSizePx &&
                             i >= run.unitStart &&
@@ -1278,8 +1278,8 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (kInnerR - kInnerL). Barlow Medium Italic kFontBigNumber=52 px
-            // on "142" measures ~95-100 px (Barlow is wider than the
+            // (kInnerR - kInnerL). Quantico Italic kFontBigNumber=52 px
+            // on "142" measures ~95-100 px (Quantico is wider than the
             // previous Rajdhani Bold ~78 px, italic slant adds a few
             // px more). kFontTinyLabel=17 px upright Medium labels
             // stay well under 50 px even for "P99.9". Comfortable
@@ -1374,7 +1374,7 @@ namespace openxr_api_layer::detail {
                 //       = OXRT "app CPU").
                 //
                 // Both go through drawValueAscii: every "X.X ms" run's
-                // digits flip to Barlow italic and pick up the cyan
+                // digits flip to Quantico italic and pick up the cyan
                 // chiffres brush, while label copy ("Render", " / App",
                 // …) stays upright Rajdhani in white. The
                 // value rect shares the title rect's vertical bounds
@@ -1383,7 +1383,7 @@ namespace openxr_api_layer::detail {
                 if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
-                    // ms" value run; digit prefix italic Barlow, " ms"
+                    // ms" value run; digit prefix italic Quantico, " ms"
                     // upright Rajdhani, both cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
@@ -1518,7 +1518,7 @@ namespace openxr_api_layer::detail {
                                             labelY + 22.0f),
                                kColorTextWhite);
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
-                    // prefix flips to Barlow Italic via drawValueWide /
+                    // prefix flips to Quantico Italic via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
                     // unit suffix (" °C" / " %" / " GB") keeps the base
                     // family/style AND shrinks to kFontTempUnit — a

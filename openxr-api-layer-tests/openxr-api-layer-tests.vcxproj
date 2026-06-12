@@ -195,7 +195,7 @@
          the subset is regenerated. They are NOT copied to the output dir
          — rc.exe bakes their bytes directly into the EXE's resource table. -->
     <None Include="..\openxr-api-layer\fonts\Rajdhani-SemiBold.ttf" />
-    <None Include="..\openxr-api-layer\fonts\Barlow-MediumItalic.ttf" />
+    <None Include="..\openxr-api-layer\fonts\Quantico-Italic.ttf" />
   </ItemGroup>
   <ItemGroup>
     <!-- RT_BUNDLED_FONT resources (IDs 200 / 201). See header comment in

@@ -51,13 +51,13 @@ namespace openxr_api_layer::utils::glyph_atlas {
     //
     // Faces:
     //   Only two cuts are baked. Match the format split in
-    //   CoreRenderer::init() (overlay_renderer.cpp): Barlow Medium Italic
+    //   CoreRenderer::init() (overlay_renderer.cpp): Quantico Italic
     //   for the chiffres, Rajdhani SemiBold upright for labels / titles /
     //   units. Adding a face means rasterizing a new working set at every
     //   used size — keep this small.
     //
     // Working set:
-    //   * BarlowItalic: digits 0-9 plus '.' — see findValueRuns() in
+    //   * QuanticoItalic: digits 0-9 plus '.' — see findValueRuns() in
     //     overlay_renderer.cpp. The leading '-' stays upright Rajdhani.
     //   * RajdhaniUpright: ASCII 0x20..0x7E plus the small Unicode set
     //     used in unit suffixes (°, µ, ×). Conservatively wide — keeps
@@ -82,7 +82,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // 4 bits in the packed GlyphKey, so this enum can grow to 16 faces if
     // we ever ship a third cut (heavier weight for an "alert" tier, e.g.).
     enum class GlyphFace : uint8_t {
-        BarlowItalic    = 0,   // digits + '.' on the value chiffres
+        QuanticoItalic    = 0,   // digits + '.' on the value chiffres
         RajdhaniUpright = 1,   // everything else (labels, titles, units)
     };
 
@@ -178,13 +178,13 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // duplicate the in-memory loader plumbing.
     //
     // `familyChiffres` / `familyLabels` decouple us from the actual
-    // family names: today they're L"Barlow" / L"Rajdhani"; on fallback
+    // family names: today they're L"Quantico" / L"Rajdhani"; on fallback
     // (bundled load failed) both flip to L"Bahnschrift" and the atlas
     // still builds, just with synthesised oblique on the italic face.
     struct BuildSpec {
         Microsoft::WRL::ComPtr<IDWriteFactory>         dwriteFactory;
         Microsoft::WRL::ComPtr<IDWriteFontCollection>  fontCollection;   // may be null → use system
-        const wchar_t*                                  familyChiffres = L"Barlow";
+        const wchar_t*                                  familyChiffres = L"Quantico";
         const wchar_t*                                  familyLabels   = L"Rajdhani";
 
         // Atlas dimensions. Square power-of-two. 1024 fits today's

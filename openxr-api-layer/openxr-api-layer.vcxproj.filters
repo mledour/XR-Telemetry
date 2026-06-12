@@ -158,7 +158,7 @@
     <None Include="shaders\overlay_text.hlsli">
       <Filter>Assets</Filter>
     </None>
-    <None Include="fonts\Barlow-MediumItalic.ttf">
+    <None Include="fonts\Quantico-Italic.ttf">
       <Filter>Assets</Filter>
     </None>
     <None Include="fonts\Rajdhani-SemiBold.ttf">
