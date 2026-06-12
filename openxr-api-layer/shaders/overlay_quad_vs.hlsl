@@ -45,5 +45,12 @@ QuadVSOutput VSMain(QuadVSInput v)
                    1.0f - py / texSize.y * 2.0f,
                    0.0f, 1.0f);
     o.color = v.color;
+    // Rounded-rect SDF inputs (texture pixels). `local` is this vertex's
+    // offset from the rect centre and interpolates per-pixel; halfsz /
+    // radius are per-instance constants the PS reads to evaluate the
+    // signed distance.
+    o.halfsz = v.rect.zw * 0.5f;
+    o.local  = float2(px, py) - (v.rect.xy + o.halfsz);
+    o.radius = v.radius;
     return o;
 }

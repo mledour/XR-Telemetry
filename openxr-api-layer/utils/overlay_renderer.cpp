@@ -1612,43 +1612,52 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            // Panel background — flat dark-blue panel with a 1-px
-            // separator stroke on the inside. Used for the header,
-            // both frametime panels, and the bottom row pair.
-            // Earlier iterations added top-edge bevel highlight,
-            // bottom-edge bevel shadow, and a low-alpha diagonal
-            // carbon-fibre hatch for a "raised metal" industrial
-            // look; all three were dropped in favour of a flat panel.
-            //
-            // Sharp corners: the 4-px D2D rounding has no exact GPU
-            // equivalent in the quad shader (tradeoff documented +
-            // accepted in the chrome-shape migration). One fill rect +
-            // one 1-px outline = 5 quads per panel, on the chrome-
-            // shapes batch.
+            // Rounded corner radii (texture pixels) for the chrome. The
+            // shader clamps each to half the shorter side, so one value is
+            // safe on the tall frametime panels and the short bottom cells
+            // alike. Set to 0 to restore the old sharp corners.
+            static constexpr float kPanelCornerRadius = 10.0f;
+            static constexpr float kFrameCornerRadius = 16.0f;
+
+            // Panel background — flat dark-blue panel with a 1-px separator
+            // border and rounded corners. Used for the header, both
+            // frametime panels, and the bottom row pair. Drawn as two
+            // nested rounded rects: the border-coloured rect, then the fill
+            // inset by the 1-px stroke with its radius reduced to match, so
+            // the border follows the rounded corner. (Earlier iterations
+            // tried bevels / a carbon-fibre hatch; dropped for a flat
+            // panel. Corners were sharp after the D2D→GPU migration until
+            // the quad shader gained a rounded-rect SDF path.)
             void drawPanelBg(float l, float t, float r, float b) const {
                 if (m_tier != PaintTier::Static) return;   // chrome shape
-                m_chromeShapes->addRect(l, t, r - l, b - t, kColorPanelBg);
-                m_chromeShapes->addOutline(l, t, r - l, b - t, 1.0f, kColorSeparator);
+                constexpr float s = 1.0f;                  // border stroke (px)
+                const float w = r - l, h = b - t;
+                m_chromeShapes->addRect(l, t, w, h,
+                                         kColorSeparator, kPanelCornerRadius);
+                m_chromeShapes->addRect(l + s, t + s, w - 2.0f * s, h - 2.0f * s,
+                                         kColorPanelBg, kPanelCornerRadius - s);
             }
 
-            // Outer frame. Historically a chamfered (cut-corner)
-            // octagon; the chamfer was dropped when chrome shapes moved
-            // to the GPU quad shader (no exact equivalent without a
-            // custom polygon pass). Now a plain filled rect + 1-px
-            // outline. Kept the name + rect/stroke signature so the
-            // call site in drawChrome reads as "the outer frame".
+            // Outer frame. Historically a chamfered (cut-corner) octagon,
+            // then a plain rect after the GPU migration; now a rounded rect
+            // via the quad-shader SDF. Two nested rounded rects (frame-line
+            // border + bg fill inset by the stroke), same idea as
+            // drawPanelBg. Kept the name + rect/stroke signature so the
+            // drawChrome call site still reads as "the outer frame". The
+            // target is cleared transparent, so the rounded outer corners
+            // fall to alpha 0 — the overlay's corners are see-through (the
+            // VR scene shows through), not black.
             void drawChamferedRect(const D2D1_RECT_F& rect,
                                      float strokeWidth) const {
                 if (m_tier != PaintTier::Static) return;   // chrome shape
-                m_chromeShapes->addRect(rect.left, rect.top,
-                                          rect.right - rect.left,
-                                          rect.bottom - rect.top,
-                                          kColorBg);
-                m_chromeShapes->addOutline(rect.left, rect.top,
-                                            rect.right - rect.left,
-                                            rect.bottom - rect.top,
-                                            strokeWidth,
-                                            kColorFrameLine);
+                const float l = rect.left, t = rect.top;
+                const float w = rect.right - rect.left;
+                const float h = rect.bottom - rect.top;
+                const float s = strokeWidth;
+                m_chromeShapes->addRect(l, t, w, h,
+                                         kColorFrameLine, kFrameCornerRadius);
+                m_chromeShapes->addRect(l + s, t + s, w - 2.0f * s, h - 2.0f * s,
+                                         kColorBg, kFrameCornerRadius - s);
             }
 
             // Static-tier column separators: `count` thin 1-px vertical
@@ -1835,11 +1844,13 @@ namespace openxr_api_layer::detail {
                     return fail("CreateInputLayout (bars)");
 
                 const D3D11_INPUT_ELEMENT_DESC quadIL[] = {
-                    {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
+                    {"POSITION",    0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,
                      D3D11_INPUT_PER_VERTEX_DATA,   0},
-                    {"QUAD_RECT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
+                    {"QUAD_RECT",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0,
                      D3D11_INPUT_PER_INSTANCE_DATA, 1},
-                    {"QUAD_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+                    {"QUAD_COLOR",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+                     D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                    {"QUAD_RADIUS", 0, DXGI_FORMAT_R32_FLOAT,          1, 32,
                      D3D11_INPUT_PER_INSTANCE_DATA, 1},
                 };
                 if (FAILED(m_device->CreateInputLayout(
@@ -2105,7 +2116,10 @@ namespace openxr_api_layer::detail {
             // Mirror cbuffer layout: 7×float4 registers (112 B) for bars,
             // 1×float4 register (16 B) for quads.
             struct BarInstance  { float xLeft; float height; uint32_t tier; };
-            struct QuadInstance { float rect[4]; float color[4]; };
+            // rect + color + corner radius (px; 0 = sharp) + pad to the
+            // float4 slot QUAD_RADIUS occupies. Mirrors overlay_quad.hlsli
+            // and chrome_shape_renderer's QuadInstance byte-for-byte.
+            struct QuadInstance { float rect[4]; float color[4]; float radius; float pad[3]; };
             struct BarConstants {
                 float texSize[2]; float histoTL[2]; float histoBR[2];
                 float barWidth; float dashHeight;
@@ -2119,6 +2133,9 @@ namespace openxr_api_layer::detail {
             static_assert(sizeof(QuadConstants) == 16,
                           "QuadConstants must mirror HLSL cbuffer packing "
                           "(1 × float4 = 16 B) — see overlay_quad.hlsli");
+            static_assert(sizeof(QuadInstance) == 48,
+                          "QuadInstance must mirror overlay_quad.hlsli's "
+                          "per-instance layout (rect + color + radius)");
 
             static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
 

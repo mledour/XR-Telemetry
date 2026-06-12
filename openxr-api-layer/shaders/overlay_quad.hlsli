@@ -45,12 +45,17 @@ struct QuadVSInput
     float2 corner : POSITION;   // unit-quad corner (0,0)-(1,1), per-vertex
 
     // Per-instance:
-    float4 rect   : QUAD_RECT;  // (x, y, width, height) in pixels (top-left origin)
-    float4 color  : QUAD_COLOR; // straight-alpha RGBA
+    float4 rect   : QUAD_RECT;   // (x, y, width, height) in pixels (top-left origin)
+    float4 color  : QUAD_COLOR;  // straight-alpha RGBA
+    float  radius : QUAD_RADIUS; // corner radius in pixels; 0 = sharp (passthrough)
 };
 
 struct QuadVSOutput
 {
     float4 pos   : SV_POSITION;
     float4 color : COLOR0;
+    // Rounded-rect SDF inputs — only consulted by the PS when radius > 0.
+    float2 local                  : TEXCOORD0;  // pixel offset from the rect centre
+    nointerpolation float2 halfsz : TEXCOORD1;  // rect half-size in pixels
+    nointerpolation float  radius : TEXCOORD2;  // corner radius in pixels
 };

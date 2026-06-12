@@ -80,11 +80,13 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
         // Mirror HistogramBarRenderer's quad input layout exactly.
         const D3D11_INPUT_ELEMENT_DESC il[] = {
-            {"POSITION",   0, DXGI_FORMAT_R32G32_FLOAT,       0,  0,
+            {"POSITION",    0, DXGI_FORMAT_R32G32_FLOAT,       0,  0,
              D3D11_INPUT_PER_VERTEX_DATA,   0},
-            {"QUAD_RECT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,  0,
+            {"QUAD_RECT",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,  0,
              D3D11_INPUT_PER_INSTANCE_DATA, 1},
-            {"QUAD_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+            {"QUAD_COLOR",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+             D3D11_INPUT_PER_INSTANCE_DATA, 1},
+            {"QUAD_RADIUS", 0, DXGI_FORMAT_R32_FLOAT,          1, 32,
              D3D11_INPUT_PER_INSTANCE_DATA, 1},
         };
         if (FAILED(m_device->CreateInputLayout(
@@ -159,13 +161,14 @@ namespace openxr_api_layer::utils::chrome_shapes {
     }
 
     void Renderer::addRect(float x, float y, float w, float h,
-                            const float color[4]) {
+                            const float color[4], float cornerRadius) {
         if (!m_ready || w <= 0.0f || h <= 0.0f) return;
         QuadInstance q{};
         q.rect[0]  = x;     q.rect[1]  = y;
         q.rect[2]  = w;     q.rect[3]  = h;
         q.color[0] = color[0]; q.color[1] = color[1];
         q.color[2] = color[2]; q.color[3] = color[3];
+        q.radius   = cornerRadius > 0.0f ? cornerRadius : 0.0f;
         m_scratch.push_back(q);
     }
 

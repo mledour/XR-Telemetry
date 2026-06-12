@@ -39,12 +39,12 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // DrawLine inside CoreRenderer's drawChrome path with one
     // DrawInstanced call against the existing overlay_quad shaders.
     //
-    // After the sharp-corners decision (frame chamfer + panel rounded
-    // corners both dropped to plain rectangles), every chrome shape
-    // becomes a sequence of filled axis-aligned quads:
-    //   * panel BG:        1 fill rect + 4 thin outline rects
-    //   * outer frame:     1 fill rect + 4 thin outline rects
-    //   * column separator: 1 thin rect
+    // Every chrome shape is a sequence of filled axis-aligned quads, each
+    // optionally corner-rounded by the quad shader's SDF (radius 0 = sharp,
+    // byte-for-byte the old plain rect):
+    //   * panel BG:        2 nested rounded rects (1-px border + inset fill)
+    //   * outer frame:     2 nested rounded rects (border + inset fill)
+    //   * column separator: 1 thin sharp rect
     //
     // Lifecycle mirrors glyph_atlas::Renderer:
     //   * init(device, ctx, target) primes shaders / input layout /
@@ -60,8 +60,8 @@ namespace openxr_api_layer::utils::chrome_shapes {
     //
     // Re-uses the offline-compiled `overlay_quad_vs` / `overlay_quad_ps`
     // bytecode the HistogramBarRenderer already pulls in — same shader,
-    // same per-instance layout (rect + color), so an HLSL tweak lands
-    // for both call sites at once.
+    // same per-instance layout (rect + color + corner radius), so an HLSL
+    // tweak lands for both call sites at once.
     //
     // Failure semantics: init returns false on any D3D11 creation
     // failure; the caller logs and disables the overlay entirely (fail-
@@ -89,8 +89,12 @@ namespace openxr_api_layer::utils::chrome_shapes {
         // Filled axis-aligned rect. `color` is straight-alpha RGBA.
         // The pointer is read immediately into the scratch vector, so
         // the caller can let `color` point at a temporary.
+        // `cornerRadius` (pixels) rounds the four corners via the quad
+        // shader's SDF path; 0 (the default) keeps the old sharp rect,
+        // byte-for-byte. The shader clamps the radius to half the shorter
+        // side, so an over-large value just yields a stadium.
         void addRect(float x, float y, float w, float h,
-                     const float color[4]);
+                     const float color[4], float cornerRadius = 0.0f);
 
         // 1-px (or thicker, via `strokeWidth`) outline around an
         // axis-aligned rect, rendered as 4 thin filled rects. Top
@@ -115,8 +119,10 @@ namespace openxr_api_layer::utils::chrome_shapes {
         struct QuadInstance {
             float rect[4];
             float color[4];
+            float radius;     // corner radius in px; 0 = sharp
+            float pad[3];     // pads to the float4 slot QUAD_RADIUS sits in
         };
-        static_assert(sizeof(QuadInstance) == 32,
+        static_assert(sizeof(QuadInstance) == 48,
                        "QuadInstance must match HLSL per-instance "
                        "layout in overlay_quad.hlsli");
 
