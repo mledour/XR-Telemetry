@@ -633,7 +633,7 @@ namespace openxr_api_layer::detail {
             //     for the temperature unit suffix.
             //   Rajdhani   (kFamilyChiffres): digits 0-9 plus '.' (the
             //     period appears between digits in "12.34" / "6.7 ms" and
-            //     stays inside the italic range — see findValueRuns). Minus
+            //     stays inside the chiffres range — see findValueRuns). Minus
             //     '-' is leading-only today and stays upright Rajdhani, but
             //     we still bake it as cheap insurance.
             //
@@ -823,10 +823,9 @@ namespace openxr_api_layer::detail {
                     // Analyze validates the file is a recognised
                     // font format before we add it to the set;
                     // AddFontFile internally handles all faces in
-                    // the file (single face per file for our subsets
-                    // — Rajdhani-SemiBold.ttf is one upright face in
-                    // the Rajdhani family, Rajdhani-MediumItalic.ttf is
-                    // one italic face in the Rajdhani family — but the
+                    // the file (single face per file for our subset —
+                    // Rajdhani-SemiBold.ttf is one upright face in the
+                    // Rajdhani family — but the
                     // API is robust either way; DirectWrite reads
                     // each file's `name` table to know which family /
                     // weight / style face it contains).
@@ -909,8 +908,8 @@ namespace openxr_api_layer::detail {
             // overrides.
             //
             // Three independently-applied sub-ranges:
-            //   italic[Start,Len]  digits-only sub-range; flips to Rajdhani
-            //                      Medium Italic. Empty (italicLen == 0)
+            //   chiffres[Start,Len] digits-only sub-range; uses the Chiffres
+            //                      face (Rajdhani SemiBold). Empty (chiffresLen == 0)
             //                      when the prefix is dash/dot-only —
             //                      e.g. the "--" / "--.-" placeholders.
             //   unit[Start,Len]    leading-space + unit chars; receives
@@ -927,8 +926,8 @@ namespace openxr_api_layer::detail {
             struct ValueRun {
                 UINT32 brushStart;
                 UINT32 brushLen;
-                UINT32 italicStart;
-                UINT32 italicLen;
+                UINT32 chiffresStart;
+                UINT32 chiffresLen;
                 UINT32 unitStart;
                 UINT32 unitLen;
             };
@@ -945,9 +944,9 @@ namespace openxr_api_layer::detail {
             // pull into a value run. A unit-only span never happens
             // because we walk the prefix first.
             //
-            // The italic sub-range is the smallest range covering all
+            // The chiffres sub-range is the smallest range covering all
             // digits inside the prefix (digits + interior dots, but
-            // not surrounding dashes). For "-5.2" the italic range is
+            // not surrounding dashes). For "-5.2" the chiffres range is
             // "5.2" — the leading dash stays upright Rajdhani.
             template <typename CharT>
             static std::vector<ValueRun>
@@ -1005,8 +1004,8 @@ namespace openxr_api_layer::detail {
                         ValueRun run{};
                         run.brushStart  = prefixStart;
                         run.brushLen    = (unitStart + unitLen) - prefixStart;
-                        run.italicStart = hasDigit ? firstDigit : prefixStart;
-                        run.italicLen   = hasDigit ? (lastDigit - firstDigit + 1) : 0;
+                        run.chiffresStart = hasDigit ? firstDigit : prefixStart;
+                        run.chiffresLen   = hasDigit ? (lastDigit - firstDigit + 1) : 0;
                         run.unitStart   = unitStart;
                         run.unitLen     = unitLen;
                         runs.push_back(run);
@@ -1109,18 +1108,18 @@ namespace openxr_api_layer::detail {
             }
 
             // Mixed-style value rendering — the GPU equivalent of
-            // drawValueWide. Walks findValueRuns to identify italic
+            // drawValueWide. Walks findValueRuns to identify the chiffres
             // (digit) and unit ranges per value run, then segments the
             // string into maximal runs of constant (face, sizePx,
             // color) attributes. One drawRun call per segment.
             //
             // `chiffresColor` (optional): when non-null, every value
-            // run's brush range (italic + unit) flips to this colour.
+            // run's brush range (chiffres + unit) flips to this colour.
             // Used by the CPU compound "Render {x} ms / App {y} ms"
             // so labels stay white, values cyan.
             //
             // `unitSizePx` (optional): when > 0, the unit range of
-            // every value run renders at this size; the italic and
+            // every value run renders at this size; the chiffres and
             // surrounding base text stay at baseFmt.sizePx. Used by
             // the bottom panel to render "67 °C" / "92 %" with a
             // smaller °C / % than the digit prefix.
@@ -1181,8 +1180,8 @@ namespace openxr_api_layer::detail {
                         if (i < run.brushStart) continue;
                         if (i >= run.brushStart + run.brushLen) continue;
                         if (chiffresColor) a.color = chiffresColor;
-                        if (i >= run.italicStart &&
-                            i <  run.italicStart + run.italicLen) {
+                        if (i >= run.chiffresStart &&
+                            i <  run.chiffresStart + run.chiffresLen) {
                             a.face = glyph_atlas::GlyphFace::Chiffres;
                         }
                         if (unitSizePx &&
@@ -1361,7 +1360,7 @@ namespace openxr_api_layer::detail {
                 if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
-                    // ms" value run; digit prefix italic Rajdhani, " ms"
+                    // ms" value run; digit prefix Rajdhani, " ms"
                     // upright Rajdhani, both cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
