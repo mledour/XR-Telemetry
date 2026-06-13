@@ -317,16 +317,17 @@ namespace openxr_api_layer::detail {
         // Mirror the m_fmt* IDWriteTextFormat lineup from
         // CoreRenderer::init. Kept at namespace scope (no member-class
         // qualification needed at the leaf call sites).
-        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::Chiffres,    52, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::Chiffres,    32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::RajdhaniUpright, 52, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::RajdhaniUpright, 32, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
         // CPU frametime panel: Render + App (the per-cycle total) as one
         // right-aligned compound. 17 px — the smallest size baked in
-        // kSizes, and both faces ARE baked there. The two "X.X ms" terms
-        // fit the 360 px value rect (see drawFrametimePanel's CPU branch).
+        // kSizes, so the Rajdhani face IS baked there. The two "X.X ms"
+        // terms fit the 360 px value rect (see drawFrametimePanel's CPU
+        // branch).
         constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
 
         // -------- GPU text colours ----------------------------------------
@@ -385,29 +386,22 @@ namespace openxr_api_layer::detail {
                 }
 
                 // Load the BUNDLED Rajdhani font (SemiBold upright; the
-                // atlas bakes ASCII for labels + digits/'.' for the value
-                // chiffres). The TTF lives as an RT_BUNDLED_FONT resource
-                // in the DLL (see fonts/bundled_fonts.rc.inc); we feed its
-                // bytes into an IDWriteInMemoryFontFileLoader and build a
-                // custom IDWriteFontCollection around it. The glyph atlas
-                // builder (buildGlyphAtlas below) resolves the faces
-                // through this collection by family name, never falling
-                // back to system fonts.
+                // atlas bakes the printable-ASCII set, which covers both
+                // the labels and the value digits). The TTF lives as an
+                // RT_BUNDLED_FONT resource in the DLL (see
+                // fonts/bundled_fonts.rc.inc); we feed its bytes into an
+                // IDWriteInMemoryFontFileLoader and build a custom
+                // IDWriteFontCollection around it. The glyph atlas builder
+                // (buildGlyphAtlas below) resolves the face through this
+                // collection by family name, never falling back to system
+                // fonts.
                 //
-                // One typeface for everything: the value chiffres (FPS,
+                // One typeface for everything: the value digits (FPS,
                 // frametimes, °C, %, ms) and the labels / section titles
                 // all render in Rajdhani SemiBold UPRIGHT, with hierarchy
-                // from size (52 px big number vs 17 px labels), not a
-                // second font.
-                //
-                // NOTE: the atlas still keeps a separate "Chiffres"
-                // GlyphFace that now resolves to the same Rajdhani SemiBold
-                // as RajdhaniUpright — i.e. redundant. It's retained to
-                // avoid reworking the value-run path (findValueRuns /
-                // drawValue); the digit sub-range is tracked by
-                // chiffresStart/chiffresLen (for colour + size),
-                // independent of the face. Could be collapsed into
-                // RajdhaniUpright later.
+                // from size (52 px big number vs 17 px labels) and colour,
+                // not a second font. The atlas bakes a single GlyphFace
+                // (RajdhaniUpright) — there is no separate digit face.
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the custom
@@ -415,19 +409,17 @@ namespace openxr_api_layer::detail {
                 // system default — Bahnschrift on Win10+, also upright.
                 // Graceful degrade — never crash the host process for a
                 // cosmetic font.
-                const wchar_t* kFamilyChiffres = L"Rajdhani";  // value digits
-                const wchar_t* kFamilyLabels   = L"Rajdhani"; // labels + titles
+                const wchar_t* kFamilyLabels = L"Rajdhani";  // labels, titles, digits
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
                                                  m_customFontCollection)) {
                     // Fallback: leave m_customFontCollection null and let
                     // DirectWrite resolve against system fonts — Bahnschrift
-                    // on Win10+ for both roles, upright like Rajdhani. The
-                    // chiffres face requests SEMI_BOLD upright, so the
-                    // fallback is a clean upright substitute. Graceful
-                    // degrade — a cosmetic font miss never crashes the host.
-                    kFamilyChiffres = L"Bahnschrift";
-                    kFamilyLabels   = L"Bahnschrift";
+                    // on Win10+, upright like Rajdhani. The face requests
+                    // SEMI_BOLD upright, so the fallback is a clean upright
+                    // substitute. Graceful degrade — a cosmetic font miss
+                    // never crashes the host.
+                    kFamilyLabels = L"Bahnschrift";
                 } else {
                     customCollection = m_customFontCollection.Get();
                 }
@@ -437,8 +429,7 @@ namespace openxr_api_layer::detail {
                 // / D3D12 renderers, snapshot test) fail-close — the
                 // overlay is disabled rather than crashing the host.
                 // There is no D2D fallback anymore (Task 17 removed it).
-                if (!buildGlyphAtlas(kFamilyChiffres, kFamilyLabels,
-                                      customCollection)) {
+                if (!buildGlyphAtlas(kFamilyLabels, customCollection)) {
                     Log("xr_telemetry: glyph atlas build failed — "
                         "overlay will be disabled\n");
                     m_atlasReady = false;
@@ -637,12 +628,11 @@ namespace openxr_api_layer::detail {
             //   Rajdhani upright (kFamilyLabels): ASCII 0x20..0x7E (the
             //     97-char printable range, conservatively wide so we don't
             //     re-bake every time a label string changes) + ° (U+00B0)
-            //     for the temperature unit suffix.
-            //   Rajdhani   (kFamilyChiffres): digits 0-9 plus '.' (the
-            //     period appears between digits in "12.34" / "6.7 ms" and
-            //     stays inside the chiffres range — see findValueRuns). Minus
-            //     '-' is leading-only today and stays upright Rajdhani, but
-            //     we still bake it as cheap insurance.
+            //     for the temperature unit suffix. The printable range
+            //     already covers the value digits (0-9), '.' (appears
+            //     between digits in "12.34" / "6.7 ms"), and the leading
+            //     '-', so the numbers bake from the same set as the labels
+            //     — no separate digit face.
             //
             // Sizes are the union of every kFont* constant used in
             // makeFormat() above: 17 (tiny label), 18 (ms / section title),
@@ -655,8 +645,7 @@ namespace openxr_api_layer::detail {
             // through a separate drawRun call. Baking the size adds
             // ~3 KB of atlas pixels and removes a layout-divergence
             // gotcha between paths.
-            bool buildGlyphAtlas(const wchar_t*         familyChiffres,
-                                  const wchar_t*         familyLabels,
+            bool buildGlyphAtlas(const wchar_t*         familyLabels,
                                   IDWriteFontCollection* collection) {
                 static constexpr uint16_t kSizes[] = {17, 18, 19, 32, 43, 52};
 
@@ -665,46 +654,30 @@ namespace openxr_api_layer::detail {
                 for (wchar_t c = 0x20; c <= 0x7E; ++c) rajdhaniSet.push_back(c);
                 rajdhaniSet.push_back(static_cast<wchar_t>(0x00B0));  // °
 
-                std::vector<wchar_t> chiffresSet = {
-                    // Space is included on purpose: fallbackAdvance()
-                    // in glyph_atlas_renderer.cpp resolves the missing-
-                    // glyph fallback by looking up ' ' at the same
-                    // (face, sizePx). Without it any out-of-set glyph
-                    // collapses to advance 0 instead of leaving a clean
-                    // gap. Today the Chiffres-base formats only
-                    // draw digits / '.' / '-', so out-of-set glyphs
-                    // don't occur — defensive only.
-                    L' ',
-                    L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
-                    L'8', L'9', L'.', L'-'
-                };
-
                 glyph_atlas::BuildSpec spec{};
                 spec.dwriteFactory  = m_dwriteFactory;
                 // Custom collection may be null on the system-fallback
                 // path; resolveFace inside glyph_atlas::build handles
                 // both cases.
                 spec.fontCollection = collection;
-                spec.familyChiffres = familyChiffres;
                 spec.familyLabels   = familyLabels;
-                // 1024×2048 R8 = 2 MB — fits all 6 sizes × 2 faces × full
+                // 1024×2048 R8 = 2 MB — fits all 6 sizes of the full
                 // ASCII set with comfortable slack after the kSizes
-                // expansion to {17, 18, 19, 32, 43, 52}. 1024×1024 was
-                // overflowing shelf-pack on a real HMD run; the 19-px
-                // shelf landed past the bottom edge and build returned
-                // false. Doubling the vertical extent costs 1 MB of
-                // bitmap memory at init (uploaded into the GPU texture
-                // and then dropped from RAM) and zero per-frame cost.
+                // expansion to {17, 18, 19, 32, 43, 52}. 1024×1024
+                // overflowed shelf-pack back when a second face was baked
+                // alongside this one; the 19-px shelf landed past the
+                // bottom edge and build returned false. One face leaves
+                // ample room now, but the spare 1 MB of init-time bitmap
+                // memory (uploaded into the GPU texture and then dropped
+                // from RAM) costs nothing per frame — keep the headroom.
                 spec.atlasWidthPx   = 1024;
                 spec.atlasHeightPx  = 2048;
                 spec.padding        = 1;
 
-                spec.requests.reserve(_countof(kSizes) * 2);
+                spec.requests.reserve(_countof(kSizes));
                 for (uint16_t sz : kSizes) {
                     spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
                                               sz, rajdhaniSet});
-                    spec.requests.push_back({glyph_atlas::GlyphFace::Chiffres,
-                                              sz, chiffresSet});
                 }
 
                 if (!glyph_atlas::build(spec, m_atlas)) return false;
@@ -914,17 +887,13 @@ namespace openxr_api_layer::detail {
             // drawValueAscii to apply per-range font / brush / size
             // overrides.
             //
-            // Three independently-applied sub-ranges:
-            //   chiffres[Start,Len] digits-only sub-range; uses the Chiffres
-            //                      face (Rajdhani SemiBold). Empty (chiffresLen == 0)
-            //                      when the prefix is dash/dot-only —
-            //                      e.g. the "--" / "--.-" placeholders.
+            // Two independently-applied sub-ranges:
             //   unit[Start,Len]    leading-space + unit chars; receives
             //                      the optional `unitFontSize` override.
             //                      Empty when the prefix has no unit
             //                      suffix (pure-digit "142" FPS string).
             //   brush[Start,Len]   whole value (prefix + unit); receives
-            //                      the optional chiffres brush. This is
+            //                      the optional accent brush. This is
             //                      what lets the CPU compound paint "X.X
             //                      ms" entirely in cyan including the
             //                      upright " ms", while "Render" / " /
@@ -933,8 +902,6 @@ namespace openxr_api_layer::detail {
             struct ValueRun {
                 UINT32 brushStart;
                 UINT32 brushLen;
-                UINT32 chiffresStart;
-                UINT32 chiffresLen;
                 UINT32 unitStart;
                 UINT32 unitLen;
             };
@@ -981,15 +948,9 @@ namespace openxr_api_layer::detail {
                     if (i >= n) break;
 
                     const UINT32 prefixStart = i;
-                    UINT32 firstDigit = 0;
-                    UINT32 lastDigit  = 0;
                     bool hasDigit = false;
                     while (i < n && isValuePrefix(s[i])) {
-                        if (isDigit(s[i])) {
-                            if (!hasDigit) firstDigit = i;
-                            lastDigit = i;
-                            hasDigit = true;
-                        }
+                        if (isDigit(s[i])) hasDigit = true;
                         ++i;
                     }
                     const UINT32 prefixEnd = i;
@@ -1011,8 +972,6 @@ namespace openxr_api_layer::detail {
                         ValueRun run{};
                         run.brushStart  = prefixStart;
                         run.brushLen    = (unitStart + unitLen) - prefixStart;
-                        run.chiffresStart = hasDigit ? firstDigit : prefixStart;
-                        run.chiffresLen   = hasDigit ? (lastDigit - firstDigit + 1) : 0;
                         run.unitStart   = unitStart;
                         run.unitLen     = unitLen;
                         runs.push_back(run);
@@ -1115,18 +1074,20 @@ namespace openxr_api_layer::detail {
             }
 
             // Mixed-style value rendering — the GPU equivalent of
-            // drawValueWide. Walks findValueRuns to identify the chiffres
-            // (digit) and unit ranges per value run, then segments the
+            // drawValueWide. Walks findValueRuns to identify the unit
+            // range and the value extent per run, then segments the
             // string into maximal runs of constant (face, sizePx,
-            // color) attributes. One drawRun call per segment.
+            // color) attributes. One drawRun call per segment. (Face is
+            // uniform today — a single Rajdhani cut — so segments split
+            // only on size / colour.)
             //
             // `chiffresColor` (optional): when non-null, every value
-            // run's brush range (chiffres + unit) flips to this colour.
+            // run's brush range (digits + unit) flips to this colour.
             // Used by the CPU compound "Render {x} ms / App {y} ms"
             // so labels stay white, values cyan.
             //
             // `unitSizePx` (optional): when > 0, the unit range of
-            // every value run renders at this size; the chiffres and
+            // every value run renders at this size; the digits and
             // surrounding base text stay at baseFmt.sizePx. Used by
             // the bottom panel to render "67 °C" / "92 %" with a
             // smaller °C / % than the digit prefix.
@@ -1150,7 +1111,7 @@ namespace openxr_api_layer::detail {
                 // Sanity-check the caller's unitSizePx against the
                 // atlas — only sizes that were baked at init have
                 // glyphs to sample. Today the bottom-panel call sites
-                // pass 19 (which IS baked alongside the chiffres sizes),
+                // pass 19 (which IS baked at init like every value size),
                 // but if a future caller hands in an unbaked size every
                 // glyph in the unit range misses m_glyphs and silently
                 // collapses to fallbackAdvance(). Clamp to the base
@@ -1187,10 +1148,6 @@ namespace openxr_api_layer::detail {
                         if (i < run.brushStart) continue;
                         if (i >= run.brushStart + run.brushLen) continue;
                         if (chiffresColor) a.color = chiffresColor;
-                        if (i >= run.chiffresStart &&
-                            i <  run.chiffresStart + run.chiffresLen) {
-                            a.face = glyph_atlas::GlyphFace::Chiffres;
-                        }
                         if (unitSizePx &&
                             i >= run.unitStart &&
                             i <  run.unitStart + run.unitLen) {
@@ -1357,18 +1314,18 @@ namespace openxr_api_layer::detail {
                 //       the per-cycle total labelled "App" (currentValue,
                 //       = OXRT "app CPU").
                 //
-                // Both go through drawValueAscii: every "X.X ms" run's
-                // digits flip to Rajdhani and pick up the cyan
-                // chiffres brush, while label copy ("Render", " / App",
-                // …) stays upright Rajdhani in white. The
+                // Both go through drawValueAscii: every "X.X ms" run
+                // picks up the cyan accent brush, while label copy
+                // ("Render", " / App", …) stays white. All of it renders
+                // in one upright Rajdhani cut — digits and labels alike. The
                 // value rect shares the title rect's vertical bounds
                 // (titleT → titleB) so the baseline lands on the title
                 // line.
                 if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
-                    // ms" value run; digit prefix Rajdhani, " ms"
-                    // upright Rajdhani, both cyan.
+                    // ms" value run; the whole thing renders upright
+                    // Rajdhani in cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 160.0f, titleT,

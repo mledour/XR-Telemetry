@@ -100,14 +100,14 @@
 // Resource IDs. Stay ≥ 200 to leave headroom for future icons / dialogs
 // in the layer's .rc.in (Windows-shell convention puts those at 100-199).
 //
-// Single font, two purposes:
+// Single font, one face:
 //   - Rajdhani SemiBold (600) by Indian Type Foundry — used UPRIGHT for
 //     EVERYTHING: labels, section titles, the "Render" / "App" labels,
-//     AND the value chiffres (FPS, frametimes, °C, %, ms). A narrow
+//     AND the value digits (FPS, frametimes, °C, %, ms). A narrow
 //     technical-feeling grotesque; the values are distinguished from the
-//     labels by SIZE, not a second typeface. (The glyph atlas still has a
-//     separate "Chiffres" GlyphFace, but it resolves to the same Rajdhani
-//     SemiBold — redundant; kept to avoid a value-run render refactor.)
+//     labels by SIZE and colour, not a second typeface. The glyph atlas
+//     bakes a single Rajdhani GlyphFace (RajdhaniUpright) for the whole
+//     HUD.
 //
 // SIL OFL licensed (see fonts/OFL.txt for the copyright notice).
 #define IDR_FONT_RAJDHANI_SEMIBOLD     200

@@ -50,19 +50,18 @@ namespace openxr_api_layer::utils::glyph_atlas {
     //     device and avoids leaking graphics-API choice into the API.
     //
     // Faces:
-    //   Only two cuts are baked. Match the format split in
-    //   CoreRenderer::init() (overlay_renderer.cpp): Rajdhani SemiBold
-    //   for the chiffres, Rajdhani SemiBold upright for labels / titles /
-    //   units. Adding a face means rasterizing a new working set at every
-    //   used size — keep this small.
+    //   One cut is baked: Rajdhani SemiBold, used UPRIGHT for everything
+    //   — labels, section titles, units, and the value digits. Hierarchy
+    //   in the HUD comes from size and colour, not a second typeface.
+    //   Adding a face means rasterizing a new working set at every used
+    //   size — keep this small.
     //
     // Working set:
-    //   * Chiffres: digits 0-9 plus '.' — see findValueRuns() in
-    //     overlay_renderer.cpp. The leading '-' stays upright Rajdhani.
     //   * RajdhaniUpright: ASCII 0x20..0x7E plus the small Unicode set
     //     used in unit suffixes (°, µ, ×). Conservatively wide — keeps
     //     us from re-baking every time a new string sneaks into the
-    //     overlay.
+    //     overlay. The printable range already covers the value digits
+    //     (0-9, '.', '-'), so numbers bake from the same set as labels.
     //
     // Sizes:
     //   The atlas bakes the union of font sizes used by the overlay
@@ -80,10 +79,10 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // -------- Face identification --------------------------------------
     //
     // 4 bits in the packed GlyphKey, so this enum can grow to 16 faces if
-    // we ever ship a third cut (heavier weight for an "alert" tier, e.g.).
+    // we ever ship a second cut (heavier weight for an "alert" tier, e.g.).
+    // Today the HUD renders entirely in one cut.
     enum class GlyphFace : uint8_t {
-        Chiffres        = 0,   // digits + '.' on the value chiffres
-        RajdhaniUpright = 1,   // everything else (labels, titles, units)
+        RajdhaniUpright = 0,   // everything: labels, titles, units, digits
     };
 
     // -------- Per-glyph table entry ------------------------------------
@@ -177,14 +176,13 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // them in — we don't want this module to own font loading or to
     // duplicate the in-memory loader plumbing.
     //
-    // `familyChiffres` / `familyLabels` decouple us from the actual
-    // family names: today both are L"Rajdhani" (one font for chiffres and
-    // labels); on fallback (bundled load failed) both flip to
-    // L"Bahnschrift" and the atlas still builds, upright.
+    // `familyLabels` decouples us from the actual family name: today it's
+    // L"Rajdhani" (one font for labels and the value digits alike); on
+    // fallback (bundled load failed) it flips to L"Bahnschrift" and the
+    // atlas still builds, upright.
     struct BuildSpec {
         Microsoft::WRL::ComPtr<IDWriteFactory>         dwriteFactory;
         Microsoft::WRL::ComPtr<IDWriteFontCollection>  fontCollection;   // may be null → use system
-        const wchar_t*                                  familyChiffres = L"Rajdhani";
         const wchar_t*                                  familyLabels   = L"Rajdhani";
 
         // Atlas dimensions. Square power-of-two. 1024 fits today's

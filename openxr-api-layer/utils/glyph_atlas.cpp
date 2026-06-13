@@ -129,10 +129,9 @@ namespace openxr_api_layer::utils::glyph_atlas {
         //
         // Picks the closest font in the family matching the (weight,
         // style) the format uses, then opens a font face and reads
-        // design metrics. Both faces resolve to Rajdhani SemiBold upright
-        // — the value chiffres and the labels share one font:
-        //   Chiffres        → weight SEMI_BOLD, style NORMAL
-        //   Rajdhani Upright → weight SEMI_BOLD, style NORMAL
+        // design metrics. The sole face resolves to Rajdhani SemiBold
+        // upright — labels and the value digits share one font:
+        //   RajdhaniUpright → weight SEMI_BOLD, style NORMAL
         bool resolveFace(
             IDWriteFactory*          factory,
             IDWriteFontCollection*   customCollection,
@@ -171,17 +170,15 @@ namespace openxr_api_layer::utils::glyph_atlas {
 
         // -------- Pick (weight, style) for a face ----------------------
         //
-        // Mirrors the format split in CoreRenderer::init() — keep these
-        // in lockstep with the kChiffresWeight / kLabelWeight constants
-        // over there.
+        // One face today: Rajdhani SemiBold, upright. Kept as a switch so
+        // adding a second cut (e.g. a heavier "alert" weight) is a one-
+        // line case rather than a signature change.
         struct FaceStyle {
             DWRITE_FONT_WEIGHT weight;
             DWRITE_FONT_STYLE  style;
         };
         FaceStyle styleFor(GlyphFace face) {
             switch (face) {
-            case GlyphFace::Chiffres:
-                return { DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL };
             case GlyphFace::RajdhaniUpright:
             default:
                 return { DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL };
@@ -191,7 +188,6 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // -------- Pick the right family for a face --------------------
         const wchar_t* familyFor(GlyphFace face, const BuildSpec& spec) {
             switch (face) {
-            case GlyphFace::Chiffres: return spec.familyChiffres;
             case GlyphFace::RajdhaniUpright:
             default:                          return spec.familyLabels;
             }
