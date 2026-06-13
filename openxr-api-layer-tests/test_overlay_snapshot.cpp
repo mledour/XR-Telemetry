@@ -42,9 +42,9 @@
 // binary covers BOTH the unit tests AND the snapshot generation. No
 // new vcxproj, no new solution entry, no order-of-build worries.
 //
-// The atlas builder's bundled-Barlow path uses FindResource against
+// The atlas builder's bundled-Orbitron path uses FindResource against
 // the running module's resource table. The test EXE has its OWN copy
-// of the Barlow resources via openxr-api-layer-tests.rc (see "Snapshot
+// of the Orbitron resources via openxr-api-layer-tests.rc (see "Snapshot
 // tests" in docs/DEVELOPMENT.md), so the test bakes the same atlas as
 // the in-headset HUD. It renders through the same GPU pipeline too
 // (WARP here vs the user's GPU in-headset), so the snapshot matches

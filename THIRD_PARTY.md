@@ -259,7 +259,7 @@ Bundled fonts (openxr-api-layer/fonts/*.ttf)
 ---------------------------------------------
 
     Copyright 2014 The Rajdhani Project Authors (https://github.com/itfoundry/rajdhani)
-    Copyright 2017 The Barlow Project Authors (https://github.com/jpt/barlow)
+    Copyright 2018 The Orbitron Project Authors (https://github.com/theleagueof/orbitron), with Reserved Font Name "Orbitron"
 
     SIL Open Font License, Version 1.1. The full license text covering both
     families is shipped at openxr-api-layer/fonts/OFL.txt.

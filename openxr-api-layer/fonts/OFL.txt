@@ -1,4 +1,4 @@
-Copyright 2017 The Barlow Project Authors (https://github.com/jpt/barlow)
+Copyright 2018 The Orbitron Project Authors (https://github.com/theleagueof/orbitron), with Reserved Font Name "Orbitron"
 Copyright 2014 The Rajdhani Project Authors (https://github.com/itfoundry/rajdhani)
 
 Both fonts are bundled under the SIL Open Font License, Version 1.1 (the

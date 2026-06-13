@@ -66,7 +66,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
     //     `baselineY` is the absolute pixel Y of the baseline. drawRun
     //     advances internally by each glyph's `advanceX` from the atlas
     //     table and returns the final pen position so the caller can
-    //     chain runs (e.g. mixed Rajdhani + Barlow Italic on one line).
+    //     chain runs (e.g. mixed Rajdhani + Orbitron on one line).
     //   * Alignment isn't done inside drawRun. The caller picks the
     //     anchor: LEADING is penX directly; TRAILING is penX = anchorX -
     //     measure(...); CENTER is penX = anchorX - 0.5 * measure(...).

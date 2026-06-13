@@ -21,10 +21,10 @@
 // SOFTWARE.
 
 // =============================================================================
-// openxr-api-layer-tests.rc — bundled Barlow fonts for the test binary.
+// openxr-api-layer-tests.rc — bundled Orbitron fonts for the test binary.
 //
 // The test EXE statically links overlay_renderer.cpp, which loads the
-// bundled Barlow font via:
+// bundled Orbitron font via:
 //
 //     GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 //                        &pickSwapchainFormat, &hMod);
@@ -37,7 +37,7 @@
 // into the EXE, FindResource returns null, loadBundledFontCollection
 // fails, and the renderer falls back to system Bahnschrift — which
 // is what made the first snapshot artifact look "wrong" (system
-// condensed sans instead of Barlow).
+// condensed sans instead of Orbitron).
 //
 // IDs / custom resource type match the layer's openxr-api-layer.rc.in
 // exactly (200 / 201, RT_BUNDLED_FONT == 256). loadBundledFontCollection

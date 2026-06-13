@@ -335,6 +335,6 @@ generator, `module.def`, the entry point, the logging helpers) is the
 work of Matthieu Bucchianeri (`mbucchia`), Copyright © 2022-2023, and
 ships under his MIT terms alongside ours.
 
-The two bundled fonts (`Rajdhani-SemiBold.ttf`, `Barlow-MediumItalic.ttf`)
+The two bundled fonts (`Rajdhani-SemiBold.ttf`, `Orbitron.ttf`)
 are licensed under the SIL Open Font License v1.1 — see
 [`openxr-api-layer/fonts/OFL.txt`](./openxr-api-layer/fonts/OFL.txt).

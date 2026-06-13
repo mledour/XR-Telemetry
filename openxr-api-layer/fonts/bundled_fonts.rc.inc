@@ -105,26 +105,25 @@
 //     all labels, section titles, and the "Render" / "App" labels of
 //     the CPU panel's compound string. Narrower, technical-feeling
 //     grotesque; reads as crisp small-cap labels at 14-22 px.
-//   - Barlow Medium Italic (500) by The Barlow Project Authors — used
-//     ITALIC for the chiffres (FPS, frametimes, °C, %, ms values).
-//     Wider geometric grotesque with a real italic cut (no synthetic
-//     oblique), gives the chiffres a "motion / dynamic readout" feel
-//     distinct from the static labels.
+//   - Orbitron (variable, Regular/400 baked) by The Orbitron Project
+//     Authors — used UPRIGHT for the chiffres (FPS, frametimes, °C, %,
+//     ms values). Wide geometric "sci-fi" face; gives the chiffres a
+//     distinct techno readout look against the narrower static labels.
+//     No italic cut (and none wanted) — no oblique synthesis.
 //
 // Both fonts are SIL OFL licensed (see fonts/OFL.txt for the dual
 // copyright notice).
 //
-// The renderer's `init()` builds two sets of IDWriteTextFormats: chiffres
-// formats anchor to "Barlow" with weight MEDIUM + style ITALIC; label /
-// title formats anchor to "Rajdhani" with weight SEMI_BOLD + style
-// NORMAL. The compound CPU-panel string (which mixes label + chiffres
-// in one rendered run) anchors to Rajdhani upright as its BASE and uses
-// IDWriteTextLayout::SetFontFamilyName + SetFontWeight + SetFontStyle
-// to override the chiffres ranges to Barlow Medium Italic at draw time.
+// The glyph atlas bakes two faces (see styleFor in glyph_atlas.cpp): the
+// chiffres face anchors to "Orbitron" with weight NORMAL + style NORMAL
+// (upright); the label / title face anchors to "Rajdhani" with weight
+// SEMI_BOLD + style NORMAL. Digit runs inside a value flip to the
+// Orbitron chiffres face at draw time (see findValueRuns in
+// overlay_renderer.cpp).
 #define IDR_FONT_RAJDHANI_SEMIBOLD     200
-#define IDR_FONT_BARLOW_MEDIUM_ITALIC  201
+#define IDR_FONT_ORBITRON              201
 
 // Bare basenames — rc.exe finds the actual TTFs via the /I include path
 // configured in each project's vcxproj ResourceCompile section.
 IDR_FONT_RAJDHANI_SEMIBOLD    RT_BUNDLED_FONT "Rajdhani-SemiBold.ttf"
-IDR_FONT_BARLOW_MEDIUM_ITALIC RT_BUNDLED_FONT "Barlow-MediumItalic.ttf"
+IDR_FONT_ORBITRON             RT_BUNDLED_FONT "Orbitron.ttf"

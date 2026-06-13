@@ -317,8 +317,8 @@ namespace openxr_api_layer::detail {
         // Mirror the m_fmt* IDWriteTextFormat lineup from
         // CoreRenderer::init. Kept at namespace scope (no member-class
         // qualification needed at the leaf call sites).
-        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::BarlowItalic,    52, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::BarlowItalic,    32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::Orbitron,    52, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::Orbitron,    32, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
@@ -384,59 +384,43 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Load the BUNDLED Barlow font (Medium + Medium Italic,
-                // subset to digits / ASCII letters / °/µ/× / punctuation).
-                // The TTF files live as RT_BUNDLED_FONT resources in the
-                // DLL (see fonts/bundled_fonts.rc.inc); we feed their
-                // bytes into an IDWriteInMemoryFontFileLoader and build
-                // a custom IDWriteFontCollection around them. The glyph
-                // atlas builder (buildGlyphAtlas below) resolves the
-                // faces through this collection by family name, never
-                // falling back to system fonts.
+                // Load the BUNDLED Orbitron font (variable font; the atlas
+                // bakes its Regular/400 upright instance, digits + '.').
+                // The TTF lives as an RT_BUNDLED_FONT resource in the DLL
+                // (see fonts/bundled_fonts.rc.inc); we feed its bytes into
+                // an IDWriteInMemoryFontFileLoader and build a custom
+                // IDWriteFontCollection around it. The glyph atlas builder
+                // (buildGlyphAtlas below) resolves the faces through this
+                // collection by family name, never falling back to system
+                // fonts.
                 //
-                // Why bundle two families: design lands on a true italic
-                // for the chiffres (Barlow Medium Italic) but keeps the
-                // labels and section titles in the original technical-
-                // grotesque feel (Rajdhani SemiBold upright). Synthesising
-                // italic via DWRITE_FONT_STYLE_OBLIQUE on a non-italic
-                // face produces a sheared geometric look that's
-                // noticeably uglier than a real italic cut, so we ship
-                // Barlow-MediumItalic.ttf for the italic chiffres.
-                // Rajdhani is brought back specifically because its
-                // narrower upright glyphs read crisper for short caps
-                // labels ("FPS", "GPU TEMP", "VRAM") than Barlow's
-                // wider Medium would.
+                // Why bundle two families: the chiffres (FPS, frametimes,
+                // °C, %, ms values) use Orbitron — a wide geometric
+                // "sci-fi" face, UPRIGHT — for a distinct readout look,
+                // while labels and section titles keep the narrower
+                // technical-grotesque feel (Rajdhani SemiBold upright),
+                // which reads crisper for short caps labels ("FPS",
+                // "GPU TEMP", "VRAM") than Orbitron's wide glyphs would.
+                // Orbitron ships no italic cut and we want it upright, so
+                // no oblique synthesis is ever involved.
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the
                 // custom collection and let the atlas builder resolve
-                // against the system default — Bahnschrift on Win10+.
-                // The fallback face is upright-only, so the chiffres
-                // render upright instead of italic. Graceful degrade —
-                // never crash the host process for a cosmetic font.
-                const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
+                // against the system default — Bahnschrift on Win10+, also
+                // upright. Graceful degrade — never crash the host process
+                // for a cosmetic font.
+                const wchar_t* kFamilyChiffres = L"Orbitron";  // upright chiffres
                 const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
                                                  m_customFontCollection)) {
-                    // Fallback: leave m_customFontCollection null and
-                    // let DirectWrite use system fonts. Bahnschrift
-                    // is the next-best match for both roles — italic
-                    // chiffres will be synthesised oblique on the
-                    // fallback face since system Bahnschrift has no
-                    // true italic face.
-                    //
-                    // KNOWN LIMITATION on this fallback: the atlas
-                    // resolves the chiffres face via IDWriteFontFamily::
-                    // GetFirstMatchingFont(... ITALIC ...), which does
-                    // NOT synthesise oblique — it returns the closest
-                    // existing face. Bahnschrift has no italic cut, so
-                    // the big FPS digits render upright (not sheared)
-                    // when the bundled fonts fail to load. Cosmetic,
-                    // narrow trigger; flagged so a future fix (shader-
-                    // side shear, or a 2D oblique transform on
-                    // CreateGlyphRunAnalysis in glyph_atlas.cpp) lands
-                    // with the context.
+                    // Fallback: leave m_customFontCollection null and let
+                    // DirectWrite resolve against system fonts — Bahnschrift
+                    // on Win10+ for both roles. The chiffres face requests
+                    // upright NORMAL, so the fallback is a clean upright
+                    // substitute (no oblique synthesis). Graceful degrade —
+                    // a cosmetic font miss never crashes the host.
                     kFamilyChiffres = L"Bahnschrift";
                     kFamilyLabels   = L"Bahnschrift";
                 } else {
@@ -639,7 +623,7 @@ namespace openxr_api_layer::detail {
 
             // -------- Glyph-atlas BuildSpec assembly + bake -----------------
             //
-            // Bakes Barlow Medium Italic + Rajdhani SemiBold (with system
+            // Bakes Orbitron + Rajdhani SemiBold (with system
             // Bahnschrift fallback) at every pixel size any IDWriteTextFormat
             // above uses. The charset is wide enough to cover everything the
             // overlay ever renders — see findValueRuns / drawChrome /
@@ -649,7 +633,7 @@ namespace openxr_api_layer::detail {
             //     97-char printable range, conservatively wide so we don't
             //     re-bake every time a label string changes) + ° (U+00B0)
             //     for the temperature unit suffix.
-            //   Barlow italic   (kFamilyChiffres): digits 0-9 plus '.' (the
+            //   Orbitron   (kFamilyChiffres): digits 0-9 plus '.' (the
             //     period appears between digits in "12.34" / "6.7 ms" and
             //     stays inside the italic range — see findValueRuns). Minus
             //     '-' is leading-only today and stays upright Rajdhani, but
@@ -676,13 +660,13 @@ namespace openxr_api_layer::detail {
                 for (wchar_t c = 0x20; c <= 0x7E; ++c) rajdhaniSet.push_back(c);
                 rajdhaniSet.push_back(static_cast<wchar_t>(0x00B0));  // °
 
-                std::vector<wchar_t> barlowItalicSet = {
+                std::vector<wchar_t> chiffresSet = {
                     // Space is included on purpose: fallbackAdvance()
                     // in glyph_atlas_renderer.cpp resolves the missing-
                     // glyph fallback by looking up ' ' at the same
                     // (face, sizePx). Without it any out-of-set glyph
                     // collapses to advance 0 instead of leaving a clean
-                    // gap. Today the BarlowItalic-base formats only
+                    // gap. Today the Orbitron-base formats only
                     // draw digits / '.' / '-', so out-of-set glyphs
                     // don't occur — defensive only.
                     L' ',
@@ -714,8 +698,8 @@ namespace openxr_api_layer::detail {
                 for (uint16_t sz : kSizes) {
                     spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
                                               sz, rajdhaniSet});
-                    spec.requests.push_back({glyph_atlas::GlyphFace::BarlowItalic,
-                                              sz, barlowItalicSet});
+                    spec.requests.push_back({glyph_atlas::GlyphFace::Orbitron,
+                                              sz, chiffresSet});
                 }
 
                 if (!glyph_atlas::build(spec, m_atlas)) return false;
@@ -736,7 +720,7 @@ namespace openxr_api_layer::detail {
             // in either binary) into a custom IDWriteFontCollection.
             // The collection holds two families:
             //   ID 200 → Rajdhani SemiBold (labels + section titles)
-            //   ID 201 → Barlow Medium Italic (chiffres)
+            //   ID 201 → Orbitron (chiffres)
             // DirectWrite reads the family + style from each TTF's
             // `name` table, so the loader code below is family-
             // agnostic and just adds the two files to the same set.
@@ -844,8 +828,8 @@ namespace openxr_api_layer::detail {
                     // AddFontFile internally handles all faces in
                     // the file (single face per file for our subsets
                     // — Rajdhani-SemiBold.ttf is one upright face in
-                    // the Rajdhani family, Barlow-MediumItalic.ttf is
-                    // one italic face in the Barlow family — but the
+                    // the Rajdhani family, Orbitron.ttf is
+                    // one italic face in the Orbitron family — but the
                     // API is robust either way; DirectWrite reads
                     // each file's `name` table to know which family /
                     // weight / style face it contains).
@@ -928,7 +912,7 @@ namespace openxr_api_layer::detail {
             // overrides.
             //
             // Three independently-applied sub-ranges:
-            //   italic[Start,Len]  digits-only sub-range; flips to Barlow
+            //   italic[Start,Len]  digits-only sub-range; flips to Orbitron
             //                      Medium Italic. Empty (italicLen == 0)
             //                      when the prefix is dash/dot-only —
             //                      e.g. the "--" / "--.-" placeholders.
@@ -1036,7 +1020,7 @@ namespace openxr_api_layer::detail {
 
             // Render a value string with mixed per-range styling.
             //
-            // Digit characters flip to Barlow Medium Italic; the rest
+            // Digit characters flip to Orbitron; the rest
             // (including unit suffixes like " ms" / " °C" / " %") stays
             // in `baseFmt`'s family + style — typically Rajdhani
             // SemiBold upright. Auto-detects digit and unit ranges from
@@ -1054,7 +1038,7 @@ namespace openxr_api_layer::detail {
             //
             // Mixed-style value rendering — thin forwarder onto the GPU
             // value emitter. Walks findValueRuns inside drawValueTextGpu
-            // to flip digit ranges to Barlow Italic, optionally shrink
+            // to flip digit ranges to Orbitron, optionally shrink
             // the unit suffix, and optionally recolour the value runs
             // (chiffresColor). `unitFontSize` stays float at the call
             // sites (it's a kFont* constant); the atlas is keyed on
@@ -1202,7 +1186,7 @@ namespace openxr_api_layer::detail {
                         if (chiffresColor) a.color = chiffresColor;
                         if (i >= run.italicStart &&
                             i <  run.italicStart + run.italicLen) {
-                            a.face = glyph_atlas::GlyphFace::BarlowItalic;
+                            a.face = glyph_atlas::GlyphFace::Orbitron;
                         }
                         if (unitSizePx &&
                             i >= run.unitStart &&
@@ -1278,14 +1262,13 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (kInnerR - kInnerL). Barlow Medium Italic kFontBigNumber=52 px
-            // on "142" measures ~95-100 px (Barlow is wider than the
-            // previous Rajdhani Bold ~78 px, italic slant adds a few
-            // px more). kFontTinyLabel=17 px upright Medium labels
-            // stay well under 50 px even for "P99.9". Comfortable
-            // margins. On systems without the bundled font we fall
-            // back to Bahnschrift — narrower but no true italic, so
-            // chiffres come out as synthetic-oblique upright Bahnschrift.
+            // (kInnerR - kInnerL). Orbitron is a WIDE geometric face:
+            // kFontBigNumber=52 px on "142" runs wider than the previous
+            // value font (~95-100 px) — watch the FPS cell for clipping and
+            // drop kFontBigNumber if "142" / "144" crowd the edges (the
+            // golden snapshot is the check). kFontTinyLabel=17 px upright
+            // labels stay well under 50 px even for "P99.9". On systems
+            // without the bundled font we fall back to upright Bahnschrift.
             void drawHeaderBar(float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -1374,7 +1357,7 @@ namespace openxr_api_layer::detail {
                 //       = OXRT "app CPU").
                 //
                 // Both go through drawValueAscii: every "X.X ms" run's
-                // digits flip to Barlow italic and pick up the cyan
+                // digits flip to Orbitron and pick up the cyan
                 // chiffres brush, while label copy ("Render", " / App",
                 // …) stays upright Rajdhani in white. The
                 // value rect shares the title rect's vertical bounds
@@ -1383,7 +1366,7 @@ namespace openxr_api_layer::detail {
                 if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
-                    // ms" value run; digit prefix italic Barlow, " ms"
+                    // ms" value run; digit prefix Orbitron, " ms"
                     // upright Rajdhani, both cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
@@ -1518,7 +1501,7 @@ namespace openxr_api_layer::detail {
                                             labelY + 22.0f),
                                kColorTextWhite);
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
-                    // prefix flips to Barlow Italic via drawValueWide /
+                    // prefix flips to Orbitron via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
                     // unit suffix (" °C" / " %" / " GB") keeps the base
                     // family/style AND shrinks to kFontTempUnit — a

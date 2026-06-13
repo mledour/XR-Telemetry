@@ -240,7 +240,7 @@ must be present at the SAME custom type + ID in BOTH binaries'
 resource tables. If the test EXE's table is missing an entry the
 DLL's table has, `FindResource` returns null in the test, the
 renderer silently falls back to its degraded path (e.g. system
-Bahnschrift instead of bundled Barlow for fonts), and the
+Bahnschrift instead of bundled Orbitron for fonts), and the
 snapshot test compares against a render that doesn't match
 production — defeating the visual-regression contract.
 
