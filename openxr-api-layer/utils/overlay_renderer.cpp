@@ -232,14 +232,15 @@ namespace openxr_api_layer::detail {
         constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
         // Left gutter inside the histogram strip, reserved for the ms-axis
-        // tick labels ("0", "5", "10", …). The bg / gridlines / bars all
-        // start at histoL + kAxisGutter; the labels are drawn LEFT-aligned
-        // at histoL (so they line up under the panel title). 34 px holds a
-        // 2-digit number at 13 px plus a gap before the first bar. The bars
-        // keep their fixed 4+1-px geometry, so the gutter costs the oldest
-        // ~7 of the 133 samples on the left via the strip's negative-slack
-        // clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
-        constexpr float kAxisGutter      = 34.0f;
+        // tick labels ("0 ms", "5 ms", "10 ms", …). The bg / gridlines /
+        // bars all start at histoL + kAxisGutter; the labels are RIGHT-
+        // aligned within it so the "ms" suffixes line up and the widest
+        // label's leading digit sits at histoL, under the panel title.
+        // 44 px holds "XX ms" at 13 px plus a gap before the first bar. The
+        // bars keep their fixed 4+1-px geometry, so the gutter costs the
+        // oldest ~9 of the 133 samples on the left via the strip's negative-
+        // slack clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
+        constexpr float kAxisGutter      = 44.0f;
         // 133 bars at the fixed 4-px-bar / 1-px-gap layout span
         // 133×4 + 132×1 = 664 px. Since the ms-axis gutter narrows the plot
         // to 664 − kAxisGutter = 630 px, the run no longer fits flush: the
@@ -346,11 +347,12 @@ namespace openxr_api_layer::detail {
         // two "X.X ms" terms fit the 360 px value rect (see
         // drawFrametimePanel's CPU branch).
         constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
-        // Histogram ms-axis tick labels — small, LEFT-aligned at the panel's
-        // inner-left so the numbers line up under the section title ("GPU
-        // FRAMETIME MS"), which anchors (Leading) at the same x. Drawn in the
-        // dynamic tier (they rescale with target_fps), not the static tier.
-        constexpr GpuTextFormat kFmtAxisLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 13, GpuTextFormat::Alignment::Leading  };
+        // Histogram ms-axis tick labels ("0 ms", "5 ms", "10 ms", …) —
+        // small, RIGHT-aligned so the "ms" suffixes line up and the widest
+        // label's leading digit lands at histoL, under the section title.
+        // Drawn in the dynamic tier (they rescale with target_fps), not the
+        // static tier.
+        constexpr GpuTextFormat kFmtAxisLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 13, GpuTextFormat::Alignment::Trailing };
 
         // -------- GPU text colours ----------------------------------------
         //
@@ -1415,17 +1417,21 @@ namespace openxr_api_layer::detail {
                 const float stripH = histoB - histoT;
                 const MsAxis axis = computeMsAxis(targetFps);
                 if (axis.valid && stripH > 0.0f) {
-                    // drawTextGpu centres the glyph on the rect's mid-Y and
-                    // never clips, so a label whose tick sits at the very TOP
-                    // of the strip — a top tick when topMs is an exact step
-                    // multiple (e.g. 10 ms @ 120 Hz) — would bleed up into the
-                    // title gap. Clamp the centre DOWN to >= histoT+halfH to
-                    // keep it inside the strip (halfH = half the ascent+descent
-                    // line box). The floor "0" is deliberately NOT clamped at
-                    // the bottom: a "0" resting on the strip baseline is the
-                    // conventional axis look (and it has no gridline to diverge
-                    // from). At real refresh rates only a top-edge tick is ever
-                    // nudged; 90 Hz (0/5/10) triggers no clamp at all.
+                    // Labels read "<n> ms" and RIGHT-align to a shared right
+                    // edge = histoL + the widest label's width. That puts the
+                    // widest label's leading digit at histoL (under the panel
+                    // title) and lines the "ms" suffixes up, with the narrower
+                    // labels right-aligned beneath the units column — the
+                    // reference look ("16 ms / 11 ms / 6 ms / 0 ms").
+                    //
+                    // Vertically drawTextGpu centres each glyph on the tick Y
+                    // and never clips, so clamp the centre DOWN to >=
+                    // histoT+halfH to keep a top-edge tick (a top tick at an
+                    // exact step multiple, e.g. 10 ms @ 120 Hz) out of the
+                    // title gap. The floor "0" is NOT clamped at the bottom: a
+                    // "0 ms" on the strip baseline is the conventional axis
+                    // look and has no gridline to diverge from. At 90 Hz
+                    // (0/5/10) no tick is near either edge, so nothing clamps.
                     const auto* lm = m_textRenderer
                         ? m_textRenderer->metrics(kFmtAxisLabelGpu.face,
                                                    kFmtAxisLabelGpu.sizePx)
@@ -1433,17 +1439,27 @@ namespace openxr_api_layer::detail {
                     const float halfH = lm
                         ? 0.5f * (lm->ascent + lm->descent)
                         : 0.5f * static_cast<float>(kFmtAxisLabelGpu.sizePx);
+
+                    float maxW = 0.0f;
+                    if (m_textRenderer) {
+                        for (int i = 0; i < axis.tickCount; ++i) {
+                            const std::string s =
+                                std::to_string(axis.ticks[i].ms) + " ms";
+                            const std::wstring w(s.begin(), s.end());
+                            maxW = std::max(maxW, m_textRenderer->measure(
+                                kFmtAxisLabelGpu.face,
+                                kFmtAxisLabelGpu.sizePx, w.c_str(), w.size()));
+                        }
+                    }
+                    const float labelRight = histoL + maxW;
                     for (int i = 0; i < axis.tickCount; ++i) {
                         const float yTick = histoT + stripH *
                             (1.0f - axis.ticks[i].heightFrac);
                         const float y = std::max(yTick, histoT + halfH);
-                        // Leading alignment anchors the pen at histoL
-                        // (rect.right is unused); the gutter is the label's
-                        // allotted span.
                         const D2D1_RECT_F labelRect = D2D1::RectF(
-                            histoL, y, histoL + kAxisGutter, y);
+                            histoL, y, labelRight, y);
                         drawAscii(kFmtAxisLabelGpu,
-                                   std::to_string(axis.ticks[i].ms),
+                                   std::to_string(axis.ticks[i].ms) + " ms",
                                    labelRect, kColorAxisLabel);
                     }
                 }
