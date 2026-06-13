@@ -40,7 +40,7 @@
 // condensed sans instead of Rajdhani).
 //
 // IDs / custom resource type match the layer's openxr-api-layer.rc.in
-// exactly (200 / 201, RT_BUNDLED_FONT == 256). loadBundledFontCollection
+// exactly (200, RT_BUNDLED_FONT == 256). loadBundledFontCollection
 // is therefore identical in both binaries — no test-specific code path.
 //
 // Why not VERSIONINFO too? The test EXE is never redistributed (it

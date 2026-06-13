@@ -105,9 +105,9 @@
 //     EVERYTHING: labels, section titles, the "Render" / "App" labels,
 //     AND the value chiffres (FPS, frametimes, °C, %, ms). A narrow
 //     technical-feeling grotesque; the values are distinguished from the
-//     labels by SIZE, not a second typeface. (The glyph atlas keeps a
-//     separate "Chiffres" face only so the digit runs can be sized /
-//     coloured independently — same Rajdhani SemiBold underneath.)
+//     labels by SIZE, not a second typeface. (The glyph atlas still has a
+//     separate "Chiffres" GlyphFace, but it resolves to the same Rajdhani
+//     SemiBold — redundant; kept to avoid a value-run render refactor.)
 //
 // SIL OFL licensed (see fonts/OFL.txt for the copyright notice).
 #define IDR_FONT_RAJDHANI_SEMIBOLD     200

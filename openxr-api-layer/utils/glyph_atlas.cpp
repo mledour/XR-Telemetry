@@ -191,7 +191,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // -------- Pick the right family for a face --------------------
         const wchar_t* familyFor(GlyphFace face, const BuildSpec& spec) {
             switch (face) {
-            case GlyphFace::Chiffres:    return spec.familyChiffres;
+            case GlyphFace::Chiffres: return spec.familyChiffres;
             case GlyphFace::RajdhaniUpright:
             default:                          return spec.familyLabels;
             }

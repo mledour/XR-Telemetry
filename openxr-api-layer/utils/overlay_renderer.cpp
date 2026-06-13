@@ -394,13 +394,20 @@ namespace openxr_api_layer::detail {
                 // through this collection by family name, never falling
                 // back to system fonts.
                 //
-                // One family, two atlas faces: the value chiffres (FPS,
+                // One typeface for everything: the value chiffres (FPS,
                 // frametimes, °C, %, ms) and the labels / section titles
-                // both render in Rajdhani SemiBold UPRIGHT. The two
-                // GlyphFace buckets are kept only so findValueRuns can size
-                // and colour the digit runs independently of the labels —
-                // the typeface is the same. Hierarchy comes from size
-                // (52 px big number vs 17 px labels), not a second font.
+                // all render in Rajdhani SemiBold UPRIGHT, with hierarchy
+                // from size (52 px big number vs 17 px labels), not a
+                // second font.
+                //
+                // NOTE: the atlas still keeps a separate "Chiffres"
+                // GlyphFace that now resolves to the same Rajdhani SemiBold
+                // as RajdhaniUpright — i.e. redundant. It's retained to
+                // avoid reworking the value-run path (findValueRuns /
+                // drawValue); the digit sub-range is tracked by
+                // chiffresStart/chiffresLen (for colour + size),
+                // independent of the face. Could be collapsed into
+                // RajdhaniUpright later.
                 //
                 // On failure (resource missing, factory QI fails,
                 // collection creation fails), we proceed without the custom
@@ -711,11 +718,11 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Loads the bundled font resources (RT_BUNDLED_FONT, IDs
-            // 200 + 201 in fonts/bundled_fonts.rc.inc — the shared
-            // include compiled into both the layer DLL and the test
-            // EXE so loadBundledFontCollection finds the same bytes
-            // in either binary) into a custom IDWriteFontCollection.
+            // Loads the bundled font resource (RT_BUNDLED_FONT, ID
+            // 200 in fonts/bundled_fonts.rc.inc — the shared include
+            // compiled into both the layer DLL and the test EXE so
+            // loadBundledFontCollection finds the same bytes in either
+            // binary) into a custom IDWriteFontCollection.
             // The collection holds one family:
             //   ID 200 → Rajdhani SemiBold (labels, titles, AND the value
             //            chiffres — one font for everything)
@@ -747,7 +754,7 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Find both font resources in the DLL. The trick
+                // Find the font resource in the DLL. The trick
                 // is using GetModuleHandleEx with the ADDRESS of a
                 // function INSIDE our own DLL — that resolves to
                 // our DLL's HMODULE (not the host EXE's). Without

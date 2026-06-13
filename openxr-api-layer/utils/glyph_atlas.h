@@ -82,7 +82,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
     // 4 bits in the packed GlyphKey, so this enum can grow to 16 faces if
     // we ever ship a third cut (heavier weight for an "alert" tier, e.g.).
     enum class GlyphFace : uint8_t {
-        Chiffres    = 0,   // digits + '.' on the value chiffres
+        Chiffres        = 0,   // digits + '.' on the value chiffres
         RajdhaniUpright = 1,   // everything else (labels, titles, units)
     };
 
