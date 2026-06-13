@@ -91,7 +91,12 @@ namespace {
         s.fps_p95     = 124.0f;
         s.fps_p99     = 108.0f;
         s.fps_p99_9   =  98.0f;
-        s.target_fps  = 144.0f;
+        s.target_fps  = 90.0f;   // 90 Hz — the most common VR refresh. Drives
+                                 // the budget (11.1 ms), the budget line, and
+                                 // the histograms' left-hand ms axis (→ 0/5/10).
+                                 // Matches the original 90 Hz design mockup; an
+                                 // fpsVR-style HUD shows render-rate FPS (142),
+                                 // which can sit above the display rate.
         s.gpu_frame_ms = 6.7f;
         s.cpu_frame_ms   = 7.4f;   // CPU FRAMETIME total (per-cycle)
         s.cpu_render_ms  = 2.7f;   // Render (Begin-exit → End)
