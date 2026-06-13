@@ -1416,16 +1416,16 @@ namespace openxr_api_layer::detail {
                 const MsAxis axis = computeMsAxis(targetFps);
                 if (axis.valid && stripH > 0.0f) {
                     // drawTextGpu centres the glyph on the rect's mid-Y and
-                    // never clips, so a label whose tick sits at the very top
-                    // or bottom of the strip would bleed ~half a glyph past
-                    // it (the floor "0" tick at histoB is the usual case).
-                    // Clamp the centre to [histoT+halfH, histoB-halfH] so the
-                    // number stays inside the strip; halfH is half the line
-                    // box (ascent+descent). Interior ticks at real refresh
-                    // rates are well inside this range, so only the extreme
-                    // ticks ("0", and a top tick when topMs is a step
-                    // multiple) are nudged — and the "0" has no gridline to
-                    // diverge from.
+                    // never clips, so a label whose tick sits at the very TOP
+                    // of the strip — a top tick when topMs is an exact step
+                    // multiple (e.g. 10 ms @ 120 Hz) — would bleed up into the
+                    // title gap. Clamp the centre DOWN to >= histoT+halfH to
+                    // keep it inside the strip (halfH = half the ascent+descent
+                    // line box). The floor "0" is deliberately NOT clamped at
+                    // the bottom: a "0" resting on the strip baseline is the
+                    // conventional axis look (and it has no gridline to diverge
+                    // from). At real refresh rates only a top-edge tick is ever
+                    // nudged; 90 Hz (0/5/10) triggers no clamp at all.
                     const auto* lm = m_textRenderer
                         ? m_textRenderer->metrics(kFmtAxisLabelGpu.face,
                                                    kFmtAxisLabelGpu.sizePx)
@@ -1436,8 +1436,7 @@ namespace openxr_api_layer::detail {
                     for (int i = 0; i < axis.tickCount; ++i) {
                         const float yTick = histoT + stripH *
                             (1.0f - axis.ticks[i].heightFrac);
-                        const float y = std::clamp(
-                            yTick, histoT + halfH, histoB - halfH);
+                        const float y = std::max(yTick, histoT + halfH);
                         // Leading alignment anchors the pen at histoL
                         // (rect.right is unused); the gutter is the label's
                         // allotted span.
