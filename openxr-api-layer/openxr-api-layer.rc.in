@@ -51,7 +51,7 @@ END
 // Subsetted to ASCII + °/µ/× glyphs (~11 KB each) so the DLL doesn't pay the
 // full multi-script weight (~400 KB original).
 //
-// IDs 200/201 are used at runtime via FindResource(...) +
+// ID 200 is used at runtime via FindResource(...) +
 // IDWriteFactory5::CreateInMemoryFontFileLoader — see overlay_renderer.cpp.
 //
 // Declarations live in the shared include below — the SAME file is included

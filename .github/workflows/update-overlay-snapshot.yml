@@ -213,7 +213,7 @@ jobs:
 
           # actions/upload-artifact@v4 rejects names containing any of
           # / \ : * ? " < > | (NTFS path-illegal chars). For
-          # workflow_dispatch on a branch like `feat/overlay-barlow-font`,
+          # workflow_dispatch on a branch like `feat/overlay-font`,
           # github.ref_name IS the branch name verbatim — so any slash
           # in the convention (feat/, ci-test/, fix/, …) breaks the
           # upload below. Same sanitisation as build-and-release.yml's

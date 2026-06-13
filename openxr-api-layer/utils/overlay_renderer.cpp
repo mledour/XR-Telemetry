@@ -317,16 +317,17 @@ namespace openxr_api_layer::detail {
         // Mirror the m_fmt* IDWriteTextFormat lineup from
         // CoreRenderer::init. Kept at namespace scope (no member-class
         // qualification needed at the leaf call sites).
-        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::BarlowItalic,    52, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::BarlowItalic,    32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::RajdhaniUpright, 52, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::RajdhaniUpright, 32, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
         // CPU frametime panel: Render + App (the per-cycle total) as one
         // right-aligned compound. 17 px — the smallest size baked in
-        // kSizes, and both faces ARE baked there. The two "X.X ms" terms
-        // fit the 360 px value rect (see drawFrametimePanel's CPU branch).
+        // kSizes, so the Rajdhani face IS baked there. The two "X.X ms"
+        // terms fit the 360 px value rect (see drawFrametimePanel's CPU
+        // branch).
         constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
 
         // -------- GPU text colours ----------------------------------------
@@ -384,61 +385,41 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Load the BUNDLED Barlow font (Medium + Medium Italic,
-                // subset to digits / ASCII letters / °/µ/× / punctuation).
-                // The TTF files live as RT_BUNDLED_FONT resources in the
-                // DLL (see fonts/bundled_fonts.rc.inc); we feed their
-                // bytes into an IDWriteInMemoryFontFileLoader and build
-                // a custom IDWriteFontCollection around them. The glyph
-                // atlas builder (buildGlyphAtlas below) resolves the
-                // faces through this collection by family name, never
-                // falling back to system fonts.
+                // Load the BUNDLED Rajdhani font (SemiBold upright; the
+                // atlas bakes the printable-ASCII set, which covers both
+                // the labels and the value digits). The TTF lives as an
+                // RT_BUNDLED_FONT resource in the DLL (see
+                // fonts/bundled_fonts.rc.inc); we feed its bytes into an
+                // IDWriteInMemoryFontFileLoader and build a custom
+                // IDWriteFontCollection around it. The glyph atlas builder
+                // (buildGlyphAtlas below) resolves the face through this
+                // collection by family name, never falling back to system
+                // fonts.
                 //
-                // Why bundle two families: design lands on a true italic
-                // for the chiffres (Barlow Medium Italic) but keeps the
-                // labels and section titles in the original technical-
-                // grotesque feel (Rajdhani SemiBold upright). Synthesising
-                // italic via DWRITE_FONT_STYLE_OBLIQUE on a non-italic
-                // face produces a sheared geometric look that's
-                // noticeably uglier than a real italic cut, so we ship
-                // Barlow-MediumItalic.ttf for the italic chiffres.
-                // Rajdhani is brought back specifically because its
-                // narrower upright glyphs read crisper for short caps
-                // labels ("FPS", "GPU TEMP", "VRAM") than Barlow's
-                // wider Medium would.
+                // One typeface for everything: the value digits (FPS,
+                // frametimes, °C, %, ms) and the labels / section titles
+                // all render in Rajdhani SemiBold UPRIGHT, with hierarchy
+                // from size (52 px big number vs 17 px labels) and colour,
+                // not a second font. The atlas bakes a single GlyphFace
+                // (RajdhaniUpright) — there is no separate digit face.
                 //
                 // On failure (resource missing, factory QI fails,
-                // collection creation fails), we proceed without the
-                // custom collection and let the atlas builder resolve
-                // against the system default — Bahnschrift on Win10+.
-                // The fallback face is upright-only, so the chiffres
-                // render upright instead of italic. Graceful degrade —
-                // never crash the host process for a cosmetic font.
-                const wchar_t* kFamilyChiffres = L"Barlow";   // italic chiffres
-                const wchar_t* kFamilyLabels   = L"Rajdhani"; // upright labels + titles
+                // collection creation fails), we proceed without the custom
+                // collection and let the atlas builder resolve against the
+                // system default — Bahnschrift on Win10+, also upright.
+                // Graceful degrade — never crash the host process for a
+                // cosmetic font.
+                const wchar_t* kFamilyLabels = L"Rajdhani";  // labels, titles, digits
                 IDWriteFontCollection* customCollection = nullptr;
                 if (!loadBundledFontCollection(m_dwriteFactory.Get(),
                                                  m_customFontCollection)) {
-                    // Fallback: leave m_customFontCollection null and
-                    // let DirectWrite use system fonts. Bahnschrift
-                    // is the next-best match for both roles — italic
-                    // chiffres will be synthesised oblique on the
-                    // fallback face since system Bahnschrift has no
-                    // true italic face.
-                    //
-                    // KNOWN LIMITATION on this fallback: the atlas
-                    // resolves the chiffres face via IDWriteFontFamily::
-                    // GetFirstMatchingFont(... ITALIC ...), which does
-                    // NOT synthesise oblique — it returns the closest
-                    // existing face. Bahnschrift has no italic cut, so
-                    // the big FPS digits render upright (not sheared)
-                    // when the bundled fonts fail to load. Cosmetic,
-                    // narrow trigger; flagged so a future fix (shader-
-                    // side shear, or a 2D oblique transform on
-                    // CreateGlyphRunAnalysis in glyph_atlas.cpp) lands
-                    // with the context.
-                    kFamilyChiffres = L"Bahnschrift";
-                    kFamilyLabels   = L"Bahnschrift";
+                    // Fallback: leave m_customFontCollection null and let
+                    // DirectWrite resolve against system fonts — Bahnschrift
+                    // on Win10+, upright like Rajdhani. The face requests
+                    // SEMI_BOLD upright, so the fallback is a clean upright
+                    // substitute. Graceful degrade — a cosmetic font miss
+                    // never crashes the host.
+                    kFamilyLabels = L"Bahnschrift";
                 } else {
                     customCollection = m_customFontCollection.Get();
                 }
@@ -448,8 +429,7 @@ namespace openxr_api_layer::detail {
                 // / D3D12 renderers, snapshot test) fail-close — the
                 // overlay is disabled rather than crashing the host.
                 // There is no D2D fallback anymore (Task 17 removed it).
-                if (!buildGlyphAtlas(kFamilyChiffres, kFamilyLabels,
-                                      customCollection)) {
+                if (!buildGlyphAtlas(kFamilyLabels, customCollection)) {
                     Log("xr_telemetry: glyph atlas build failed — "
                         "overlay will be disabled\n");
                     m_atlasReady = false;
@@ -639,7 +619,7 @@ namespace openxr_api_layer::detail {
 
             // -------- Glyph-atlas BuildSpec assembly + bake -----------------
             //
-            // Bakes Barlow Medium Italic + Rajdhani SemiBold (with system
+            // Bakes Rajdhani SemiBold + Rajdhani SemiBold (with system
             // Bahnschrift fallback) at every pixel size any IDWriteTextFormat
             // above uses. The charset is wide enough to cover everything the
             // overlay ever renders — see findValueRuns / drawChrome /
@@ -648,12 +628,11 @@ namespace openxr_api_layer::detail {
             //   Rajdhani upright (kFamilyLabels): ASCII 0x20..0x7E (the
             //     97-char printable range, conservatively wide so we don't
             //     re-bake every time a label string changes) + ° (U+00B0)
-            //     for the temperature unit suffix.
-            //   Barlow italic   (kFamilyChiffres): digits 0-9 plus '.' (the
-            //     period appears between digits in "12.34" / "6.7 ms" and
-            //     stays inside the italic range — see findValueRuns). Minus
-            //     '-' is leading-only today and stays upright Rajdhani, but
-            //     we still bake it as cheap insurance.
+            //     for the temperature unit suffix. The printable range
+            //     already covers the value digits (0-9), '.' (appears
+            //     between digits in "12.34" / "6.7 ms"), and the leading
+            //     '-', so the numbers bake from the same set as the labels
+            //     — no separate digit face.
             //
             // Sizes are the union of every kFont* constant used in
             // makeFormat() above: 17 (tiny label), 18 (ms / section title),
@@ -666,8 +645,7 @@ namespace openxr_api_layer::detail {
             // through a separate drawRun call. Baking the size adds
             // ~3 KB of atlas pixels and removes a layout-divergence
             // gotcha between paths.
-            bool buildGlyphAtlas(const wchar_t*         familyChiffres,
-                                  const wchar_t*         familyLabels,
+            bool buildGlyphAtlas(const wchar_t*         familyLabels,
                                   IDWriteFontCollection* collection) {
                 static constexpr uint16_t kSizes[] = {17, 18, 19, 32, 43, 52};
 
@@ -676,46 +654,30 @@ namespace openxr_api_layer::detail {
                 for (wchar_t c = 0x20; c <= 0x7E; ++c) rajdhaniSet.push_back(c);
                 rajdhaniSet.push_back(static_cast<wchar_t>(0x00B0));  // °
 
-                std::vector<wchar_t> barlowItalicSet = {
-                    // Space is included on purpose: fallbackAdvance()
-                    // in glyph_atlas_renderer.cpp resolves the missing-
-                    // glyph fallback by looking up ' ' at the same
-                    // (face, sizePx). Without it any out-of-set glyph
-                    // collapses to advance 0 instead of leaving a clean
-                    // gap. Today the BarlowItalic-base formats only
-                    // draw digits / '.' / '-', so out-of-set glyphs
-                    // don't occur — defensive only.
-                    L' ',
-                    L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
-                    L'8', L'9', L'.', L'-'
-                };
-
                 glyph_atlas::BuildSpec spec{};
                 spec.dwriteFactory  = m_dwriteFactory;
                 // Custom collection may be null on the system-fallback
                 // path; resolveFace inside glyph_atlas::build handles
                 // both cases.
                 spec.fontCollection = collection;
-                spec.familyChiffres = familyChiffres;
                 spec.familyLabels   = familyLabels;
-                // 1024×2048 R8 = 2 MB — fits all 6 sizes × 2 faces × full
+                // 1024×2048 R8 = 2 MB — fits all 6 sizes of the full
                 // ASCII set with comfortable slack after the kSizes
-                // expansion to {17, 18, 19, 32, 43, 52}. 1024×1024 was
-                // overflowing shelf-pack on a real HMD run; the 19-px
-                // shelf landed past the bottom edge and build returned
-                // false. Doubling the vertical extent costs 1 MB of
-                // bitmap memory at init (uploaded into the GPU texture
-                // and then dropped from RAM) and zero per-frame cost.
+                // expansion to {17, 18, 19, 32, 43, 52}. 1024×1024
+                // overflowed shelf-pack back when a second face was baked
+                // alongside this one; the 19-px shelf landed past the
+                // bottom edge and build returned false. One face leaves
+                // ample room now, but the spare 1 MB of init-time bitmap
+                // memory (uploaded into the GPU texture and then dropped
+                // from RAM) costs nothing per frame — keep the headroom.
                 spec.atlasWidthPx   = 1024;
                 spec.atlasHeightPx  = 2048;
                 spec.padding        = 1;
 
-                spec.requests.reserve(_countof(kSizes) * 2);
+                spec.requests.reserve(_countof(kSizes));
                 for (uint16_t sz : kSizes) {
                     spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
                                               sz, rajdhaniSet});
-                    spec.requests.push_back({glyph_atlas::GlyphFace::BarlowItalic,
-                                              sz, barlowItalicSet});
                 }
 
                 if (!glyph_atlas::build(spec, m_atlas)) return false;
@@ -729,14 +691,14 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Loads the bundled font resources (RT_BUNDLED_FONT, IDs
-            // 200 + 201 in fonts/bundled_fonts.rc.inc — the shared
-            // include compiled into both the layer DLL and the test
-            // EXE so loadBundledFontCollection finds the same bytes
-            // in either binary) into a custom IDWriteFontCollection.
-            // The collection holds two families:
-            //   ID 200 → Rajdhani SemiBold (labels + section titles)
-            //   ID 201 → Barlow Medium Italic (chiffres)
+            // Loads the bundled font resource (RT_BUNDLED_FONT, ID
+            // 200 in fonts/bundled_fonts.rc.inc — the shared include
+            // compiled into both the layer DLL and the test EXE so
+            // loadBundledFontCollection finds the same bytes in either
+            // binary) into a custom IDWriteFontCollection.
+            // The collection holds one family:
+            //   ID 200 → Rajdhani SemiBold (labels, titles, AND the value
+            //            chiffres — one font for everything)
             // DirectWrite reads the family + style from each TTF's
             // `name` table, so the loader code below is family-
             // agnostic and just adds the two files to the same set.
@@ -765,7 +727,7 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                // Find both font resources in the DLL. The trick
+                // Find the font resource in the DLL. The trick
                 // is using GetModuleHandleEx with the ADDRESS of a
                 // function INSIDE our own DLL — that resolves to
                 // our DLL's HMODULE (not the host EXE's). Without
@@ -820,10 +782,9 @@ namespace openxr_api_layer::detail {
                     return true;
                 };
 
-                // 200 = SemiBold, 201 = Bold (matches the IDs in the
-                // .rc.in template).
+                // 200 = Rajdhani SemiBold — the only bundled font now
+                // (serves both the labels and the value chiffres).
                 if (!addResourceFont(200)) return false;
-                if (!addResourceFont(201)) return false;
 
                 // Build the font set from the loaded files. We use
                 // IDWriteFontSetBuilder1 (the extended interface)
@@ -842,10 +803,9 @@ namespace openxr_api_layer::detail {
                     // Analyze validates the file is a recognised
                     // font format before we add it to the set;
                     // AddFontFile internally handles all faces in
-                    // the file (single face per file for our subsets
-                    // — Rajdhani-SemiBold.ttf is one upright face in
-                    // the Rajdhani family, Barlow-MediumItalic.ttf is
-                    // one italic face in the Barlow family — but the
+                    // the file (single face per file for our subset —
+                    // Rajdhani-SemiBold.ttf is one upright face in the
+                    // Rajdhani family — but the
                     // API is robust either way; DirectWrite reads
                     // each file's `name` table to know which family /
                     // weight / style face it contains).
@@ -927,17 +887,13 @@ namespace openxr_api_layer::detail {
             // drawValueAscii to apply per-range font / brush / size
             // overrides.
             //
-            // Three independently-applied sub-ranges:
-            //   italic[Start,Len]  digits-only sub-range; flips to Barlow
-            //                      Medium Italic. Empty (italicLen == 0)
-            //                      when the prefix is dash/dot-only —
-            //                      e.g. the "--" / "--.-" placeholders.
+            // Two independently-applied sub-ranges:
             //   unit[Start,Len]    leading-space + unit chars; receives
             //                      the optional `unitFontSize` override.
             //                      Empty when the prefix has no unit
             //                      suffix (pure-digit "142" FPS string).
             //   brush[Start,Len]   whole value (prefix + unit); receives
-            //                      the optional chiffres brush. This is
+            //                      the optional accent brush. This is
             //                      what lets the CPU compound paint "X.X
             //                      ms" entirely in cyan including the
             //                      upright " ms", while "Render" / " /
@@ -946,8 +902,6 @@ namespace openxr_api_layer::detail {
             struct ValueRun {
                 UINT32 brushStart;
                 UINT32 brushLen;
-                UINT32 italicStart;
-                UINT32 italicLen;
                 UINT32 unitStart;
                 UINT32 unitLen;
             };
@@ -964,9 +918,9 @@ namespace openxr_api_layer::detail {
             // pull into a value run. A unit-only span never happens
             // because we walk the prefix first.
             //
-            // The italic sub-range is the smallest range covering all
+            // The chiffres sub-range is the smallest range covering all
             // digits inside the prefix (digits + interior dots, but
-            // not surrounding dashes). For "-5.2" the italic range is
+            // not surrounding dashes). For "-5.2" the chiffres range is
             // "5.2" — the leading dash stays upright Rajdhani.
             template <typename CharT>
             static std::vector<ValueRun>
@@ -994,15 +948,9 @@ namespace openxr_api_layer::detail {
                     if (i >= n) break;
 
                     const UINT32 prefixStart = i;
-                    UINT32 firstDigit = 0;
-                    UINT32 lastDigit  = 0;
                     bool hasDigit = false;
                     while (i < n && isValuePrefix(s[i])) {
-                        if (isDigit(s[i])) {
-                            if (!hasDigit) firstDigit = i;
-                            lastDigit = i;
-                            hasDigit = true;
-                        }
+                        if (isDigit(s[i])) hasDigit = true;
                         ++i;
                     }
                     const UINT32 prefixEnd = i;
@@ -1024,8 +972,6 @@ namespace openxr_api_layer::detail {
                         ValueRun run{};
                         run.brushStart  = prefixStart;
                         run.brushLen    = (unitStart + unitLen) - prefixStart;
-                        run.italicStart = hasDigit ? firstDigit : prefixStart;
-                        run.italicLen   = hasDigit ? (lastDigit - firstDigit + 1) : 0;
                         run.unitStart   = unitStart;
                         run.unitLen     = unitLen;
                         runs.push_back(run);
@@ -1036,7 +982,7 @@ namespace openxr_api_layer::detail {
 
             // Render a value string with mixed per-range styling.
             //
-            // Digit characters flip to Barlow Medium Italic; the rest
+            // Digit characters flip to Rajdhani SemiBold; the rest
             // (including unit suffixes like " ms" / " °C" / " %") stays
             // in `baseFmt`'s family + style — typically Rajdhani
             // SemiBold upright. Auto-detects digit and unit ranges from
@@ -1054,7 +1000,7 @@ namespace openxr_api_layer::detail {
             //
             // Mixed-style value rendering — thin forwarder onto the GPU
             // value emitter. Walks findValueRuns inside drawValueTextGpu
-            // to flip digit ranges to Barlow Italic, optionally shrink
+            // to flip digit ranges to Rajdhani, optionally shrink
             // the unit suffix, and optionally recolour the value runs
             // (chiffresColor). `unitFontSize` stays float at the call
             // sites (it's a kFont* constant); the atlas is keyed on
@@ -1128,18 +1074,20 @@ namespace openxr_api_layer::detail {
             }
 
             // Mixed-style value rendering — the GPU equivalent of
-            // drawValueWide. Walks findValueRuns to identify italic
-            // (digit) and unit ranges per value run, then segments the
+            // drawValueWide. Walks findValueRuns to identify the unit
+            // range and the value extent per run, then segments the
             // string into maximal runs of constant (face, sizePx,
-            // color) attributes. One drawRun call per segment.
+            // color) attributes. One drawRun call per segment. (Face is
+            // uniform today — a single Rajdhani cut — so segments split
+            // only on size / colour.)
             //
             // `chiffresColor` (optional): when non-null, every value
-            // run's brush range (italic + unit) flips to this colour.
+            // run's brush range (digits + unit) flips to this colour.
             // Used by the CPU compound "Render {x} ms / App {y} ms"
             // so labels stay white, values cyan.
             //
             // `unitSizePx` (optional): when > 0, the unit range of
-            // every value run renders at this size; the italic and
+            // every value run renders at this size; the digits and
             // surrounding base text stay at baseFmt.sizePx. Used by
             // the bottom panel to render "67 °C" / "92 %" with a
             // smaller °C / % than the digit prefix.
@@ -1163,7 +1111,7 @@ namespace openxr_api_layer::detail {
                 // Sanity-check the caller's unitSizePx against the
                 // atlas — only sizes that were baked at init have
                 // glyphs to sample. Today the bottom-panel call sites
-                // pass 19 (which IS baked alongside the chiffres sizes),
+                // pass 19 (which IS baked at init like every value size),
                 // but if a future caller hands in an unbaked size every
                 // glyph in the unit range misses m_glyphs and silently
                 // collapses to fallbackAdvance(). Clamp to the base
@@ -1200,10 +1148,6 @@ namespace openxr_api_layer::detail {
                         if (i < run.brushStart) continue;
                         if (i >= run.brushStart + run.brushLen) continue;
                         if (chiffresColor) a.color = chiffresColor;
-                        if (i >= run.italicStart &&
-                            i <  run.italicStart + run.italicLen) {
-                            a.face = glyph_atlas::GlyphFace::BarlowItalic;
-                        }
                         if (unitSizePx &&
                             i >= run.unitStart &&
                             i <  run.unitStart + run.unitLen) {
@@ -1278,14 +1222,11 @@ namespace openxr_api_layer::detail {
             // use cyan.
             //
             // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (kInnerR - kInnerL). Barlow Medium Italic kFontBigNumber=52 px
-            // on "142" measures ~95-100 px (Barlow is wider than the
-            // previous Rajdhani Bold ~78 px, italic slant adds a few
-            // px more). kFontTinyLabel=17 px upright Medium labels
-            // stay well under 50 px even for "P99.9". Comfortable
-            // margins. On systems without the bundled font we fall
-            // back to Bahnschrift — narrower but no true italic, so
-            // chiffres come out as synthetic-oblique upright Bahnschrift.
+            // (kInnerR - kInnerL). Rajdhani SemiBold is a narrow grotesque,
+            // so kFontBigNumber=52 px on "142" sits comfortably inside the
+            // cell (~80-90 px). kFontTinyLabel=17 px labels stay under
+            // 50 px even for "P99.9". On systems without the bundled font
+            // we fall back to upright Bahnschrift.
             void drawHeaderBar(float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
@@ -1373,18 +1314,18 @@ namespace openxr_api_layer::detail {
                 //       the per-cycle total labelled "App" (currentValue,
                 //       = OXRT "app CPU").
                 //
-                // Both go through drawValueAscii: every "X.X ms" run's
-                // digits flip to Barlow italic and pick up the cyan
-                // chiffres brush, while label copy ("Render", " / App",
-                // …) stays upright Rajdhani in white. The
+                // Both go through drawValueAscii: every "X.X ms" run
+                // picks up the cyan accent brush, while label copy
+                // ("Render", " / App", …) stays white. All of it renders
+                // in one upright Rajdhani cut — digits and labels alike. The
                 // value rect shares the title rect's vertical bounds
                 // (titleT → titleB) so the baseline lands on the title
                 // line.
                 if (breakdown.empty()) {
                     // GPU panel: short "6.7 ms" primary frametime
                     // read-out. drawValueAscii auto-detects the "6.7
-                    // ms" value run; digit prefix italic Barlow, " ms"
-                    // upright Rajdhani, both cyan.
+                    // ms" value run; the whole thing renders upright
+                    // Rajdhani in cyan.
                     const std::string s = currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
                         r - kSectionInnerPad - 160.0f, titleT,
@@ -1518,7 +1459,7 @@ namespace openxr_api_layer::detail {
                                             labelY + 22.0f),
                                kColorTextWhite);
                     // m_fmtTemp's BASE is Rajdhani upright; the digit
-                    // prefix flips to Barlow Italic via drawValueWide /
+                    // prefix flips to Rajdhani via drawValueWide /
                     // drawValueAscii's auto-detected ranges, while the
                     // unit suffix (" °C" / " %" / " GB") keeps the base
                     // family/style AND shrinks to kFontTempUnit — a
