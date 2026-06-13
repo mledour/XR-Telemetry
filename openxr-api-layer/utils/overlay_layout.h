@@ -619,8 +619,15 @@ namespace openxr_api_layer::detail {
         int v = 0;
         while (axis.tickCount < kMaxMsAxisTicks &&
                static_cast<float>(v) <= axis.topMs + 1e-3f) {
-            axis.ticks[axis.tickCount] = {
-                v, static_cast<float>(v) / axis.topMs};
+            // Clamp the height fraction to [0,1]: the admission test above
+            // tolerates a tick a hair past topMs (the 1e-3 epsilon), which
+            // would otherwise give heightFrac marginally > 1 and nudge a
+            // gridline a sub-pixel past the strip top. (Only reachable when
+            // topMs lands within 1e-3 ms of a step multiple — never at real
+            // 60–240 Hz refresh rates, but keep the invariant exact.)
+            const float frac = std::clamp(
+                static_cast<float>(v) / axis.topMs, 0.0f, 1.0f);
+            axis.ticks[axis.tickCount] = {v, frac};
             ++axis.tickCount;
             v += axis.step;
         }

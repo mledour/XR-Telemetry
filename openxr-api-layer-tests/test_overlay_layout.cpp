@@ -761,7 +761,7 @@ TEST_CASE("computeMsAxis: never emits more than kMaxMsAxisTicks") {
         // Every tick sits within the strip and the top tick never exceeds it.
         for (int i = 0; i < a.tickCount; ++i) {
             CHECK(a.ticks[i].heightFrac >= 0.0f);
-            CHECK(a.ticks[i].heightFrac <= 1.0f + 1e-4f);
+            CHECK(a.ticks[i].heightFrac <= 1.0f);  // clamped in computeMsAxis
         }
     }
 }

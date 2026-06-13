@@ -233,20 +233,20 @@ namespace openxr_api_layer::detail {
         constexpr float kHistoBarGap     = 2.0f;
         // Left gutter inside the histogram strip, reserved for the ms-axis
         // tick labels ("0", "5", "10", …). The bg / gridlines / bars all
-        // start at histoL + kAxisGutter; the labels are drawn right-aligned
-        // within [histoL, histoL + kAxisGutter]. 34 px holds a 2-digit
-        // number at 13 px plus a small gap before the first bar. The bars
+        // start at histoL + kAxisGutter; the labels are drawn LEFT-aligned
+        // at histoL (so they line up under the panel title). 34 px holds a
+        // 2-digit number at 13 px plus a gap before the first bar. The bars
         // keep their fixed 4+1-px geometry, so the gutter costs the oldest
         // ~7 of the 133 samples on the left via the strip's negative-slack
         // clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
         constexpr float kAxisGutter      = 34.0f;
-        // 133 bars fill the GPU histogram strip exactly at the fixed
-        // 4-px-bar / 1-px-gap layout (133×4 + 132×1 = 664 px = strip
-        // inner width) — flush, zero margin, every bar pixel-aligned.
-        // Window covered ≈ 1.5 s @ 90 Hz / 0.9 s @ 144 Hz, still short
-        // enough that the histogram reacts within ~a second. The D2D
-        // fallback path (D3D12 + snapshot) recomputes its bar width from
-        // this count, so it stays consistent.
+        // 133 bars at the fixed 4-px-bar / 1-px-gap layout span
+        // 133×4 + 132×1 = 664 px. Since the ms-axis gutter narrows the plot
+        // to 664 − kAxisGutter = 630 px, the run no longer fits flush: the
+        // negative-slack path in drawPanel keeps the NEWEST bars against the
+        // right edge and the scissor clips the oldest ~7 (every bar still
+        // pixel-aligned at its 5-px step). Window covered ≈ 1.4 s @ 90 Hz /
+        // 0.9 s @ 144 Hz — still short enough to react within ~a second.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
         static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
@@ -1415,9 +1415,29 @@ namespace openxr_api_layer::detail {
                 const float stripH = histoB - histoT;
                 const MsAxis axis = computeMsAxis(targetFps);
                 if (axis.valid && stripH > 0.0f) {
+                    // drawTextGpu centres the glyph on the rect's mid-Y and
+                    // never clips, so a label whose tick sits at the very top
+                    // or bottom of the strip would bleed ~half a glyph past
+                    // it (the floor "0" tick at histoB is the usual case).
+                    // Clamp the centre to [histoT+halfH, histoB-halfH] so the
+                    // number stays inside the strip; halfH is half the line
+                    // box (ascent+descent). Interior ticks at real refresh
+                    // rates are well inside this range, so only the extreme
+                    // ticks ("0", and a top tick when topMs is a step
+                    // multiple) are nudged — and the "0" has no gridline to
+                    // diverge from.
+                    const auto* lm = m_textRenderer
+                        ? m_textRenderer->metrics(kFmtAxisLabelGpu.face,
+                                                   kFmtAxisLabelGpu.sizePx)
+                        : nullptr;
+                    const float halfH = lm
+                        ? 0.5f * (lm->ascent + lm->descent)
+                        : 0.5f * static_cast<float>(kFmtAxisLabelGpu.sizePx);
                     for (int i = 0; i < axis.tickCount; ++i) {
-                        const float y = histoT + stripH *
+                        const float yTick = histoT + stripH *
                             (1.0f - axis.ticks[i].heightFrac);
+                        const float y = std::clamp(
+                            yTick, histoT + halfH, histoB - halfH);
                         // Leading alignment anchors the pen at histoL
                         // (rect.right is unused); the gutter is the label's
                         // allotted span.
@@ -1943,13 +1963,14 @@ namespace openxr_api_layer::detail {
             // Paint one panel's histogram region (bg + grid + bars + budget)
             // into the target image. Rect is in target pixels; isGpu picks
             // the teal vs blue gradient. budgetNs <= 0 (no display-period
-            // info yet
-            // from the runtime — the first few frames before
-            // xrWaitFrame's predicted period lands) still paints the
-            // bg/grid/budget chrome; only the bars themselves are
-            // skipped (each one has no reference height, so
-            // barVisualForSample returns heightFraction 0 and the loop
-            // emits no instances). That keeps the histo region from
+            // info yet from the runtime — the first few frames before
+            // xrWaitFrame's predicted period lands) still paints the bg and
+            // the budget line, and skips the bars (each has no reference
+            // height, so barVisualForSample returns heightFraction 0 and the
+            // loop emits no instances). The ms-axis GRIDLINES are also absent
+            // during that window: computeMsAxis needs a valid target_fps, so
+            // with no fps there's no ms scale to mark and the grid slots
+            // collapse to zero-area quads. That keeps the histo region from
             // freezing on stale target content during the warm-up.
             void drawPanel(ID3D11RenderTargetView* rtv,
                             const HistogramRing<kRingSize>& ring,
