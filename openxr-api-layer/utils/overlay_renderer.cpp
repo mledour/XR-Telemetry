@@ -346,10 +346,11 @@ namespace openxr_api_layer::detail {
         // two "X.X ms" terms fit the 360 px value rect (see
         // drawFrametimePanel's CPU branch).
         constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
-        // Histogram ms-axis tick labels — small + right-aligned so the
-        // numbers hug the gridlines they annotate. Drawn in the dynamic
-        // tier (they rescale with target_fps), not the static tier.
-        constexpr GpuTextFormat kFmtAxisLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 13, GpuTextFormat::Alignment::Trailing };
+        // Histogram ms-axis tick labels — small, LEFT-aligned at the panel's
+        // inner-left so the numbers line up under the section title ("GPU
+        // FRAMETIME MS"), which anchors (Leading) at the same x. Drawn in the
+        // dynamic tier (they rescale with target_fps), not the static tier.
+        constexpr GpuTextFormat kFmtAxisLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 13, GpuTextFormat::Alignment::Leading  };
 
         // -------- GPU text colours ----------------------------------------
         //
@@ -1396,7 +1397,9 @@ namespace openxr_api_layer::detail {
                 // by HistogramBarRenderer::drawPanel from the SAME axis and
                 // the SAME strip geometry (recomputed identically below),
                 // so numbers and lines stay pixel-aligned. Each number is
-                // right-aligned in the gutter [histoL, histoL+kAxisGutter];
+                // LEFT-aligned at histoL — the same x as the section title —
+                // so the axis column lines up under the panel label; it lives
+                // in the gutter [histoL, plotL], clear of the first bar.
                 // drawAscii → drawTextGpu vertically-centres it on the tick
                 // Y. heightFrac is measured from the bottom, hence the
                 // (1 − heightFrac) for the top-down Y.
@@ -1412,14 +1415,14 @@ namespace openxr_api_layer::detail {
                 const float stripH = histoB - histoT;
                 const MsAxis axis = computeMsAxis(targetFps);
                 if (axis.valid && stripH > 0.0f) {
-                    constexpr float kAxisLabelPad = 5.0f;  // gap before the plot
-                    const float labelRight =
-                        histoL + kAxisGutter - kAxisLabelPad;
                     for (int i = 0; i < axis.tickCount; ++i) {
                         const float y = histoT + stripH *
                             (1.0f - axis.ticks[i].heightFrac);
-                        const D2D1_RECT_F labelRect =
-                            D2D1::RectF(histoL, y, labelRight, y);
+                        // Leading alignment anchors the pen at histoL
+                        // (rect.right is unused); the gutter is the label's
+                        // allotted span.
+                        const D2D1_RECT_F labelRect = D2D1::RectF(
+                            histoL, y, histoL + kAxisGutter, y);
                         drawAscii(kFmtAxisLabelGpu,
                                    std::to_string(axis.ticks[i].ms),
                                    labelRect, kColorAxisLabel);
