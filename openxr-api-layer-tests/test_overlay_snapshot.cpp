@@ -109,16 +109,21 @@ namespace {
         return s;
     }
 
-    // Bell-curve histogram with two stutter spikes. Empty slots at
-    // both ends so the renderer's dashed-placeholder path shows.
+    // Rising-ramp histogram with two stutter spikes. A few empty slots
+    // at the LEADING (oldest) end only — they render as the 2-px "no-data"
+    // dash, so the golden still covers that placeholder path. The trailing
+    // (newest) slots are always filled: in a live session the most recent
+    // frames are never missing, so the bars run flush to the right edge
+    // (only the oldest end empties, during ring warm-up).
     void fillSyntheticRing(openxr_api_layer::detail::HistogramRing<
                               openxr_api_layer::detail::kOverlayHistoRingSize>& ring,
                             float base_ms, float amp_ms, float stutter_ms,
                             int spike_a, int spike_b) {
         constexpr int N = static_cast<int>(
             openxr_api_layer::detail::kOverlayHistoRingSize);
-        constexpr int kEmptyHead = 15;
-        constexpr int kEmptyTail = 15;
+        constexpr int kEmptyHead = 15;  // oldest slots: warm-up / dash test
+        constexpr int kEmptyTail = 0;   // newest frames always present →
+                                        // bars reach the right edge
         for (int i = 0; i < N; ++i) {
             int64_t ns = 0;
             if (i < kEmptyHead || i >= N - kEmptyTail) {
@@ -129,7 +134,7 @@ namespace {
                 const float t = static_cast<float>(i - kEmptyHead) /
                                  static_cast<float>(N - kEmptyHead - kEmptyTail);
                 const float wave = 0.5f *
-                    (1.0f + std::sin((t - 0.5f) * 3.14159265f));  // 0..1 bell
+                    (1.0f + std::sin((t - 0.5f) * 3.14159265f));  // 0..1, monotonic
                 const float ms = base_ms + amp_ms * (wave - 0.5f) * 2.0f;
                 ns = static_cast<int64_t>(std::max(0.0f, ms) * 1.0e6f);
             }
