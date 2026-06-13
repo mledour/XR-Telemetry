@@ -91,7 +91,12 @@ namespace {
         s.fps_p95     = 124.0f;
         s.fps_p99     = 108.0f;
         s.fps_p99_9   =  98.0f;
-        s.target_fps  = 144.0f;
+        s.target_fps  = 90.0f;   // 90 Hz — the most common VR refresh. Drives
+                                 // the budget (11.1 ms), the budget line, and
+                                 // the histograms' left-hand ms axis (→ 0/5/10).
+                                 // Matches the original 90 Hz design mockup; an
+                                 // fpsVR-style HUD shows render-rate FPS (142),
+                                 // which can sit above the display rate.
         s.gpu_frame_ms = 6.7f;
         s.cpu_frame_ms   = 7.4f;   // CPU FRAMETIME total (per-cycle)
         s.cpu_render_ms  = 2.7f;   // Render (Begin-exit → End)
@@ -104,16 +109,21 @@ namespace {
         return s;
     }
 
-    // Bell-curve histogram with two stutter spikes. Empty slots at
-    // both ends so the renderer's dashed-placeholder path shows.
+    // Rising-ramp histogram with two stutter spikes. A few empty slots
+    // at the LEADING (oldest) end only — they render as the 2-px "no-data"
+    // dash, so the golden still covers that placeholder path. The trailing
+    // (newest) slots are always filled: in a live session the most recent
+    // frames are never missing, so the bars run flush to the right edge
+    // (only the oldest end empties, during ring warm-up).
     void fillSyntheticRing(openxr_api_layer::detail::HistogramRing<
                               openxr_api_layer::detail::kOverlayHistoRingSize>& ring,
                             float base_ms, float amp_ms, float stutter_ms,
                             int spike_a, int spike_b) {
         constexpr int N = static_cast<int>(
             openxr_api_layer::detail::kOverlayHistoRingSize);
-        constexpr int kEmptyHead = 15;
-        constexpr int kEmptyTail = 15;
+        constexpr int kEmptyHead = 15;  // oldest slots: warm-up / dash test
+        constexpr int kEmptyTail = 0;   // newest frames always present →
+                                        // bars reach the right edge
         for (int i = 0; i < N; ++i) {
             int64_t ns = 0;
             if (i < kEmptyHead || i >= N - kEmptyTail) {
@@ -124,7 +134,7 @@ namespace {
                 const float t = static_cast<float>(i - kEmptyHead) /
                                  static_cast<float>(N - kEmptyHead - kEmptyTail);
                 const float wave = 0.5f *
-                    (1.0f + std::sin((t - 0.5f) * 3.14159265f));  // 0..1 bell
+                    (1.0f + std::sin((t - 0.5f) * 3.14159265f));  // 0..1, monotonic
                 const float ms = base_ms + amp_ms * (wave - 0.5f) * 2.0f;
                 ns = static_cast<int64_t>(std::max(0.0f, ms) * 1.0e6f);
             }
@@ -239,7 +249,7 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
     // kTexH change, bump these in lockstep so the snapshot covers the
     // full painted area.
     constexpr UINT W = 720;
-    constexpr UINT H = 416;
+    constexpr UINT H = 436;
 
     // WARP D3D11 device. WARP (software rasteriser) is deterministic
     // run-to-run and available on GitHub's GPU-less CI runners, while

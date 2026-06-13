@@ -122,8 +122,8 @@ namespace openxr_api_layer::detail {
         // QUAD in 3D scales, not the resolution. kTexW × kTexH packs
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
-        //   - GPU FRAMETIME MS panel with histogram + current value
-        //   - CPU FRAMETIME MS panel with histogram + Render / App compound
+        //   - GPU FRAMETIME panel with histogram + current value
+        //   - CPU FRAMETIME panel with histogram + Render / App compound
         //   - bottom row split into two panels (60 / 40):
         //       GPU panel = TEMP / LOAD / VRAM (3 cells)
         //       CPU panel = TEMP / LOAD       (2 cells)
@@ -143,15 +143,15 @@ namespace openxr_api_layer::detail {
         //   inner padding        (4)   ← see kInnerT below
         //   kHeaderHeight       (90)
         //   kSectionGap          (8)
-        //   kFrametimeHeight    (90) — GPU panel
+        //   kFrametimeHeight   (100) — GPU panel
         //   kSectionGap          (8)
-        //   kFrametimeHeight    (90) — CPU panel
+        //   kFrametimeHeight   (100) — CPU panel
         //   kSectionGap          (8)
         //   kBottomHeight       (90)
         //   inner padding        (4)
         //   kFrameStroke         (2)
         //   kOuterPad           (10)
-        //   Total = 416 = kTexH, leaving zero slack between the last
+        //   Total = 436 = kTexH, leaving zero slack between the last
         //   panel and the inner bottom edge. Keeping the budget exact
         //   makes the top and bottom borders read at the same
         //   thickness in the HMD (4 px inner pad + 2 px stroke = 6 px
@@ -161,7 +161,13 @@ namespace openxr_api_layer::detail {
         //   any of the heights past this budget will visually clip the
         //   bottom panel.
         constexpr int32_t kTexW = 720;
-        constexpr int32_t kTexH = 416;
+        constexpr int32_t kTexH = 436;  // 416 + 2×10: the two frametime panels
+                                         // grew from 90 → 100 px to give the new
+                                         // left-hand ms axis room (kFrametimeHeight
+                                         // below). Keep this in lockstep with the
+                                         // vertical-budget ledger above AND with W/H
+                                         // in test_overlay_snapshot.cpp; the golden
+                                         // PNG must be regenerated when it changes.
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
@@ -189,12 +195,15 @@ namespace openxr_api_layer::detail {
         // plus paragraph-centring margins on both. Without the bump,
         // the FPS glyph's descender clipped at the panel bottom.
         constexpr float kHeaderHeight     = 90.0f;
-        constexpr float kFrametimeHeight  = 90.0f;   // strip height ≈ 54 px after the
-                                                      // title row. Sized so that a normal
-                                                      // frame at ~50 % budget fills most
-                                                      // of the strip — eliminates the
-                                                      // empty top-half users observed
-                                                      // in light-load scenarios.
+        constexpr float kFrametimeHeight  = 100.0f;  // strip height ≈ 52 px after the
+                                                      // title row (100 − 36 title − 12
+                                                      // bottom pad). Bumped 90 → 100 to
+                                                      // give the left-hand ms axis room:
+                                                      // up to 5 tick labels (e.g. 0/2/4/
+                                                      // 6/8 at 144 Hz) read cleanly at
+                                                      // ~10 px spacing. The +10 per panel
+                                                      // is matched by kTexH 416 → 436 so
+                                                      // the vertical budget stays exact.
         constexpr float kBottomHeight     = 90.0f;   // matches kHeaderHeight: the
                                                       // bottom TEMP/LOAD/VRAM row now
                                                       // reads at the same box height
@@ -222,13 +231,23 @@ namespace openxr_api_layer::detail {
         constexpr float kPanelTitleTopPad = 6.0f;
         constexpr float kHistoTitleGap    = 6.0f;
         constexpr float kHistoBarGap     = 2.0f;
-        // 133 bars fill the GPU histogram strip exactly at the fixed
-        // 4-px-bar / 1-px-gap layout (133×4 + 132×1 = 664 px = strip
-        // inner width) — flush, zero margin, every bar pixel-aligned.
-        // Window covered ≈ 1.5 s @ 90 Hz / 0.9 s @ 144 Hz, still short
-        // enough that the histogram reacts within ~a second. The D2D
-        // fallback path (D3D12 + snapshot) recomputes its bar width from
-        // this count, so it stays consistent.
+        // Left gutter inside the histogram strip, reserved for the ms-axis
+        // tick labels ("0 ms", "5 ms", "10 ms", …). The bg / gridlines /
+        // bars all start at histoL + kAxisGutter; the labels are RIGHT-
+        // aligned within it so the "ms" suffixes line up and the widest
+        // label's leading digit sits at histoL, under the panel title.
+        // 44 px holds "XX ms" at 13 px plus a gap before the first bar. The
+        // bars keep their fixed 4+1-px geometry, so the gutter costs the
+        // oldest ~9 of the 133 samples on the left via the strip's negative-
+        // slack clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
+        constexpr float kAxisGutter      = 44.0f;
+        // 133 bars at the fixed 4-px-bar / 1-px-gap layout span
+        // 133×4 + 132×1 = 664 px. Since the ms-axis gutter narrows the plot
+        // to 664 − kAxisGutter = 630 px, the run no longer fits flush: the
+        // negative-slack path in drawPanel keeps the NEWEST bars against the
+        // right edge and the scissor clips the oldest ~7 (every bar still
+        // pixel-aligned at its 5-px step). Window covered ≈ 1.4 s @ 90 Hz /
+        // 0.9 s @ 144 Hz — still short enough to react within ~a second.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
         static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
@@ -239,7 +258,7 @@ namespace openxr_api_layer::detail {
         // rendered to the head-locked quad they read at their natural
         // visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME"
         // Labels and section titles render in Rajdhani SemiBold.
         constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
@@ -324,11 +343,16 @@ namespace openxr_api_layer::detail {
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
         // CPU frametime panel: Render + App (the per-cycle total) as one
-        // right-aligned compound. 17 px — the smallest size baked in
-        // kSizes, so the Rajdhani face IS baked there. The two "X.X ms"
-        // terms fit the 360 px value rect (see drawFrametimePanel's CPU
-        // branch).
+        // right-aligned compound. 17 px — baked in kSizes (Rajdhani). The
+        // two "X.X ms" terms fit the 360 px value rect (see
+        // drawFrametimePanel's CPU branch).
         constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
+        // Histogram ms-axis tick labels ("0 ms", "5 ms", "10 ms", …) —
+        // small, RIGHT-aligned so the "ms" suffixes line up and the widest
+        // label's leading digit lands at histoL, under the section title.
+        // Drawn in the dynamic tier (they rescale with target_fps), not the
+        // static tier.
+        constexpr GpuTextFormat kFmtAxisLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 13, GpuTextFormat::Alignment::Trailing };
 
         // -------- GPU text colours ----------------------------------------
         //
@@ -341,6 +365,10 @@ namespace openxr_api_layer::detail {
         constexpr float kColorAccentCyan[4] = {0.098f, 0.820f, 0.851f, 1.00f};  // m_brushAccentCyan
         constexpr float kColorOrange[4]     = {1.000f, 0.553f, 0.000f, 1.00f};  // m_brushOrange
         constexpr float kColorTierRed[4]    = {1.000f, 0.196f, 0.235f, 1.00f};  // red warning tier
+        // Muted slate for the histogram ms-axis tick labels — readable but
+        // subdued so the numbers sit behind the bars in the visual
+        // hierarchy (a touch brighter than the kGridDash lines they label).
+        constexpr float kColorAxisLabel[4]  = {0.490f, 0.541f, 0.561f, 0.92f};
 
         // -------- GPU chrome-shape colours ---------------------------------
         //
@@ -572,9 +600,10 @@ namespace openxr_api_layer::detail {
                 // current value).
                 drawFrametimePanel(kInnerL, gpuPanelY, kInnerR,
                                     gpuPanelY + kFrametimeHeight,
-                                    L"GPU FRAMETIME MS",
+                                    L"GPU FRAMETIME",
                                     v.gpu_frametime_ms,
-                                    /*breakdown=*/std::string{});
+                                    /*breakdown=*/std::string{},
+                                    v.target_fps);
                 // CPU panel: build the Render term here; drawFrametimePanel
                 // appends the per-cycle total (labelled "App") and renders
                 // the pair as one right-aligned compound.
@@ -582,9 +611,10 @@ namespace openxr_api_layer::detail {
                     "Render " + v.cpu_render_ms + " ms";
                 drawFrametimePanel(kInnerL, cpuPanelY, kInnerR,
                                     cpuPanelY + kFrametimeHeight,
-                                    L"CPU FRAMETIME MS",
+                                    L"CPU FRAMETIME",
                                     v.cpu_frametime_ms,
-                                    cpuBreakdown);
+                                    cpuBreakdown,
+                                    v.target_fps);
 
                 // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
                 // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
@@ -647,7 +677,12 @@ namespace openxr_api_layer::detail {
             // gotcha between paths.
             bool buildGlyphAtlas(const wchar_t*         familyLabels,
                                   IDWriteFontCollection* collection) {
-                static constexpr uint16_t kSizes[] = {17, 18, 19, 32, 43, 52};
+                // 13 px is the histogram ms-axis tick labels (small, dim,
+                // right-aligned in the left gutter); the rest are the
+                // pre-existing HUD sizes. RajdhaniUpright 13 carries the
+                // digits the axis needs (and the full ASCII set, like the
+                // others — a few KB of extra atlas area).
+                static constexpr uint16_t kSizes[] = {13, 17, 18, 19, 32, 43, 52};
 
                 std::vector<wchar_t> rajdhaniSet;
                 rajdhaniSet.reserve(97 + 1);
@@ -661,15 +696,16 @@ namespace openxr_api_layer::detail {
                 // both cases.
                 spec.fontCollection = collection;
                 spec.familyLabels   = familyLabels;
-                // 1024×2048 R8 = 2 MB — fits all 6 sizes of the full
-                // ASCII set with comfortable slack after the kSizes
-                // expansion to {17, 18, 19, 32, 43, 52}. 1024×1024
-                // overflowed shelf-pack back when a second face was baked
-                // alongside this one; the 19-px shelf landed past the
-                // bottom edge and build returned false. One face leaves
-                // ample room now, but the spare 1 MB of init-time bitmap
-                // memory (uploaded into the GPU texture and then dropped
-                // from RAM) costs nothing per frame — keep the headroom.
+                // 1024×2048 R8 = 2 MB — fits all 7 sizes of the full ASCII
+                // set (one face, Rajdhani) with comfortable slack after the
+                // kSizes expansion to {13, 17, 18, 19, 32, 43, 52} (the 13-px
+                // axis labels are the smallest, so they add the least area).
+                // 1024×1024 overflowed shelf-pack back when a second face was
+                // baked alongside this one; the 19-px shelf landed past the
+                // bottom edge and build returned false. One face leaves ample
+                // room now, but the spare 1 MB of init-time bitmap memory
+                // (uploaded into the GPU texture and then dropped from RAM)
+                // costs nothing per frame — keep the headroom.
                 spec.atlasWidthPx   = 1024;
                 spec.atlasHeightPx  = 2048;
                 spec.padding        = 1;
@@ -1278,7 +1314,7 @@ namespace openxr_api_layer::detail {
             // -------- Frametime panel ---------------------------------------
             //
             // Layout:
-            //   - title "GPU FRAMETIME MS" (top-left, ~14 px line)
+            //   - title "GPU FRAMETIME" (top-left, ~14 px line)
             //   - current value "6.7" + cyan "ms" suffix (top-right)
             //   - 4 horizontal dashed grid lines
             //   - histogram bars filling the remaining vertical space
@@ -1292,7 +1328,8 @@ namespace openxr_api_layer::detail {
                                      float r, float b,
                                      const wchar_t* title,
                                      const std::string& currentValue,
-                                     const std::string& breakdown) const {
+                                     const std::string& breakdown,
+                                     float targetFps) const {
                 drawPanelBg(l, t, r, b);
 
                 // Title bar — top inner padding. Title row paddings
@@ -1354,10 +1391,78 @@ namespace openxr_api_layer::detail {
                                     kColorAccentCyan);   // the two value runs
                 }
 
-                // Histogram region is intentionally left untouched
-                // here — HistogramBarRenderer fills it every frame so
-                // the bars scroll at the host rate while the chrome
-                // above only repaints on snap.version ticks.
+                // --- left-hand ms axis ---------------------------------
+                // Tick LABELS for the histogram strip ("0", "5", "10", …),
+                // drawn in the DYNAMIC tier: they rescale with the refresh
+                // rate (computeMsAxis(targetFps)) so they can't be baked
+                // into the static cache. The matching gridlines are emitted
+                // by HistogramBarRenderer::drawPanel from the SAME axis and
+                // the SAME strip geometry (recomputed identically below),
+                // so numbers and lines stay pixel-aligned. Each number is
+                // LEFT-aligned at histoL — the same x as the section title —
+                // so the axis column lines up under the panel label; it lives
+                // in the gutter [histoL, plotL], clear of the first bar.
+                // drawAscii → drawTextGpu vertically-centres it on the tick
+                // Y. heightFrac is measured from the bottom, hence the
+                // (1 − heightFrac) for the top-down Y.
+                //
+                // The bar HISTOGRAM region itself is still owned by
+                // HistogramBarRenderer (bg + bars + gridlines + budget),
+                // refreshed every frame so the bars scroll at the host rate
+                // while this chrome only repaints on snap.version ticks.
+                const float histoL = l + kSectionInnerPad;
+                const float histoT =
+                    t + kPanelTitleTopPad + kHistoTitleH + kHistoTitleGap;
+                const float histoB = b - kSectionInnerPad;
+                const float stripH = histoB - histoT;
+                const MsAxis axis = computeMsAxis(targetFps);
+                if (axis.valid && stripH > 0.0f) {
+                    // Labels read "<n> ms" and RIGHT-align to a shared right
+                    // edge = histoL + the widest label's width. That puts the
+                    // widest label's leading digit at histoL (under the panel
+                    // title) and lines the "ms" suffixes up, with the narrower
+                    // labels right-aligned beneath the units column — the
+                    // reference look ("16 ms / 11 ms / 6 ms / 0 ms").
+                    //
+                    // Vertically drawTextGpu centres each glyph on the tick Y
+                    // and never clips, so clamp the centre DOWN to >=
+                    // histoT+halfH to keep a top-edge tick (a top tick at an
+                    // exact step multiple, e.g. 10 ms @ 120 Hz) out of the
+                    // title gap. The floor "0" is NOT clamped at the bottom: a
+                    // "0 ms" on the strip baseline is the conventional axis
+                    // look and has no gridline to diverge from. At 90 Hz
+                    // (0/5/10) no tick is near either edge, so nothing clamps.
+                    const auto* lm = m_textRenderer
+                        ? m_textRenderer->metrics(kFmtAxisLabelGpu.face,
+                                                   kFmtAxisLabelGpu.sizePx)
+                        : nullptr;
+                    const float halfH = lm
+                        ? 0.5f * (lm->ascent + lm->descent)
+                        : 0.5f * static_cast<float>(kFmtAxisLabelGpu.sizePx);
+
+                    float maxW = 0.0f;
+                    if (m_textRenderer) {
+                        for (int i = 0; i < axis.tickCount; ++i) {
+                            const std::string s =
+                                std::to_string(axis.ticks[i].ms) + " ms";
+                            const std::wstring w(s.begin(), s.end());
+                            maxW = std::max(maxW, m_textRenderer->measure(
+                                kFmtAxisLabelGpu.face,
+                                kFmtAxisLabelGpu.sizePx, w.c_str(), w.size()));
+                        }
+                    }
+                    const float labelRight = histoL + maxW;
+                    for (int i = 0; i < axis.tickCount; ++i) {
+                        const float yTick = histoT + stripH *
+                            (1.0f - axis.ticks[i].heightFrac);
+                        const float y = std::max(yTick, histoT + halfH);
+                        const D2D1_RECT_F labelRect = D2D1::RectF(
+                            histoL, y, labelRight, y);
+                        drawAscii(kFmtAxisLabelGpu,
+                                   std::to_string(axis.ticks[i].ms) + " ms",
+                                   labelRect, kColorAxisLabel);
+                    }
+                }
             }
 
             // -------- Bottom panel (TEMP / LOAD [/ VRAM], text-only) --------
@@ -1873,22 +1978,29 @@ namespace openxr_api_layer::detail {
             // Paint one panel's histogram region (bg + grid + bars + budget)
             // into the target image. Rect is in target pixels; isGpu picks
             // the teal vs blue gradient. budgetNs <= 0 (no display-period
-            // info yet
-            // from the runtime — the first few frames before
-            // xrWaitFrame's predicted period lands) still paints the
-            // bg/grid/budget chrome; only the bars themselves are
-            // skipped (each one has no reference height, so
-            // barVisualForSample returns heightFraction 0 and the loop
-            // emits no instances). That keeps the histo region from
+            // info yet from the runtime — the first few frames before
+            // xrWaitFrame's predicted period lands) still paints the bg and
+            // the budget line, and skips the bars (each has no reference
+            // height, so barVisualForSample returns heightFraction 0 and the
+            // loop emits no instances). The ms-axis GRIDLINES are also absent
+            // during that window: computeMsAxis needs a valid target_fps, so
+            // with no fps there's no ms scale to mark and the grid slots
+            // collapse to zero-area quads. That keeps the histo region from
             // freezing on stale target content during the warm-up.
             void drawPanel(ID3D11RenderTargetView* rtv,
                             const HistogramRing<kRingSize>& ring,
-                            int64_t budgetNs,
+                            int64_t budgetNs, float targetFps,
                             float histoL, float histoT,
                             float histoR, float histoB,
                             bool isGpu) {
                 if (!m_ready || !rtv) return;
-                const float fullW = histoR - histoL;
+                // The ms-axis tick labels occupy the left gutter; the plot
+                // (bg / gridlines / bars / budget line) starts after it.
+                // plotL is the single left edge every draw below uses, so
+                // the labels (drawn by drawFrametimePanel into [histoL,
+                // plotL]) never collide with a bar.
+                const float plotL  = histoL + kAxisGutter;
+                const float fullW  = histoR - plotL;
                 const float stripH = histoB - histoT;
                 if (fullW <= 0.0f || stripH <= 0.0f) return;
 
@@ -1912,7 +2024,7 @@ namespace openxr_api_layer::detail {
                 // with histoR. The scissor then clips the leftmost
                 // (oldest) bars rather than the rightmost (newest) —
                 // the newest sample carries the most signal.
-                const float startX = histoL + (slack >= 0.0f
+                const float startX = plotL + (slack >= 0.0f
                     ? std::floor(slack * 0.5f + 0.5f)
                     : slack);
 
@@ -1951,15 +2063,39 @@ namespace openxr_api_layer::detail {
                     if (SUCCEEDED(m_ctx->Map(m_quadInstances.Get(), 0,
                             D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                         auto* q = static_cast<QuadInstance*>(map.pData);
-                        q[0] = makeQuad(histoL, histoT, fullW, stripH, kPanelBg);
-                        for (int i = 1; i <= 4; ++i) {
-                            const float y = histoT + stripH *
-                                static_cast<float>(i) / 5.0f;
-                            q[i] = makeQuad(histoL, y, fullW, 1.0f, kGridDash);
+                        q[0] = makeQuad(plotL, histoT, fullW, stripH, kPanelBg);
+                        // Gridlines at the round-ms axis ticks (interior
+                        // ticks only — the 0 tick IS the strip bottom edge,
+                        // already bounded by the panel bg). The axis is
+                        // derived from the refresh rate (see computeMsAxis);
+                        // the matching LABELS are painted by
+                        // drawFrametimePanel at these same Ys. At most 4
+                        // interior lines occur (the 5-tick case has ticks
+                        // 0/2/4/6/8 → 4 interior), which fits the 4 grid
+                        // slots [1..4]; any unused slot collapses to a
+                        // zero-area quad so the fixed 5-instance bg+grid
+                        // draw paints nothing for it. heightFrac is measured
+                        // from the bottom, so the top-down Y is
+                        // histoT + stripH·(1 − heightFrac).
+                        const MsAxis axis = computeMsAxis(targetFps);
+                        int slot = 1;
+                        if (axis.valid) {
+                            for (int i = 0;
+                                 i < axis.tickCount && slot <= 4; ++i) {
+                                if (axis.ticks[i].ms == 0) continue;
+                                const float y = histoT + stripH *
+                                    (1.0f - axis.ticks[i].heightFrac);
+                                q[slot++] =
+                                    makeQuad(plotL, y, fullW, 1.0f, kGridDash);
+                            }
+                        }
+                        for (; slot <= 4; ++slot) {
+                            q[slot] =
+                                makeQuad(plotL, histoT, 0.0f, 0.0f, kGridDash);
                         }
                         const float by =
                             histoT + stripH * budgetLineFraction();
-                        q[5] = makeQuad(histoL, by, fullW, 1.0f, kBudgetLine);
+                        q[5] = makeQuad(plotL, by, fullW, 1.0f, kBudgetLine);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
                         quadOk = true;
                     }
@@ -1977,7 +2113,10 @@ namespace openxr_api_layer::detail {
                     BarConstants bc{};
                     bc.texSize[0] = static_cast<float>(kTexW);
                     bc.texSize[1] = static_cast<float>(kTexH);
-                    bc.histoTL[0] = histoL; bc.histoTL[1] = histoT;
+                    // .x is the PLOT left (after the ms-axis gutter) — the
+                    // bar VS only reads .y, but keep .x honest so the
+                    // cbuffer describes the actual plot rect.
+                    bc.histoTL[0] = plotL;  bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
                     bc.barWidth = kBarPx;   // fixed 4-px integer width
                     bc.dashHeight = kDashPlaceholderH;  // tier-3 "no data" dash
@@ -1995,8 +2134,14 @@ namespace openxr_api_layer::detail {
                 D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
                                   static_cast<float>(kTexH), 0.0f, 1.0f};
                 m_ctx->RSSetViewports(1, &vp);
+                // Clip to the PLOT rect (left = plotL, after the ms-axis
+                // gutter), not the full histo rect: under negative slack
+                // the oldest bars start left of plotL, and this scissor
+                // keeps them out of the gutter where the tick labels sit.
+                // (The glyph + chrome passes run earlier with ScissorEnable
+                // = FALSE, so the labels themselves are never clipped.)
                 const D3D11_RECT sc{
-                    static_cast<LONG>(std::floor(histoL)),
+                    static_cast<LONG>(std::floor(plotL)),
                     static_cast<LONG>(std::floor(histoT)),
                     static_cast<LONG>(std::ceil(histoR)),
                     static_cast<LONG>(std::ceil(histoB))};
@@ -2301,10 +2446,10 @@ namespace openxr_api_layer::detail {
                                     kHistoTitleH + kHistoTitleGap;
                 const float cpuB = cpuPanelY + kFrametimeHeight -
                                     kSectionInnerPad;
-                bars.drawPanel(rtv, gpuRing, budgetNs,
+                bars.drawPanel(rtv, gpuRing, budgetNs, snap.target_fps,
                                 histoL, gpuT, histoR, gpuB,
                                 /*isGpu=*/true);
-                bars.drawPanel(rtv, cpuRing, budgetNs,
+                bars.drawPanel(rtv, cpuRing, budgetNs, snap.target_fps,
                                 histoL, cpuT, histoR, cpuB,
                                 /*isGpu=*/false);
             }

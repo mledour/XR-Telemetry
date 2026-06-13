@@ -49,6 +49,11 @@ using openxr_api_layer::detail::normaliseBar;
 using openxr_api_layer::detail::BarTier;
 using openxr_api_layer::detail::barVisualForSample;
 using openxr_api_layer::detail::budgetLineFraction;
+using openxr_api_layer::detail::MsAxis;
+using openxr_api_layer::detail::MsAxisTick;
+using openxr_api_layer::detail::computeMsAxis;
+using openxr_api_layer::detail::niceMsStep;
+using openxr_api_layer::detail::kMaxMsAxisTicks;
 
 // =============================================================================
 // formatOverlayDisplayValues — snapshot → POD of per-cell formatted strings.
@@ -325,13 +330,14 @@ TEST_CASE("geometryForPosition: default head_top_right → +X, +Y, -Z") {
     // vertical budget changes (e.g. section-gap tweaks freeing
     // texture height).
     CHECK(g.width_m  == doctest::Approx(0.28f).epsilon(0.001));
-    CHECK(g.height_m == doctest::Approx(0.162f).epsilon(0.001));
+    CHECK(g.height_m == doctest::Approx(0.170f).epsilon(0.001));
 }
 
 TEST_CASE("geometryForPosition: aspect ratio matches the texture's native") {
     const auto g = geometryForPosition("head_top_right", 1.0f);
     const float aspect = g.width_m / g.height_m;
-    CHECK(aspect == doctest::Approx(720.0f / 416.0f).epsilon(0.01));
+    // 720×436 since the frametime panels grew to fit the ms axis (was 416).
+    CHECK(aspect == doctest::Approx(720.0f / 436.0f).epsilon(0.01));
 }
 
 TEST_CASE("geometryForPosition: head_top_left mirrors X") {
@@ -670,4 +676,139 @@ TEST_CASE("tierForUtilisation: ≥ 90 % → red (critical)") {
 TEST_CASE("tierForUtilisation: NaN defaults to green (safe default)") {
     const float kNan = std::numeric_limits<float>::quiet_NaN();
     CHECK(tierForUtilisation(kNan) == BarTier::Green);
+}
+
+// =============================================================================
+// computeMsAxis — refresh-rate-derived ms ticks for the frametime histograms.
+// The vertical span is 0..1.2×budget (budget = 1000/targetFps), and ticks land
+// on round 1/2/5/10-ms values. The budget reference line is always at 5/6 of
+// the strip (= 1 − budgetLineFraction); only the ms labels rescale per rate.
+// =============================================================================
+
+// Helper: collect the integer tick values for terser assertions.
+static std::vector<int> tickValues(const MsAxis& a) {
+    std::vector<int> v;
+    for (int i = 0; i < a.tickCount; ++i) v.push_back(a.ticks[i].ms);
+    return v;
+}
+
+TEST_CASE("computeMsAxis: 90 Hz → budget 11.1 ms, top 13.3 ms, ticks 0/5/10") {
+    const MsAxis a = computeMsAxis(90.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(11.111f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(13.333f).epsilon(0.01));
+    CHECK(a.step == 5);
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10});
+}
+
+TEST_CASE("computeMsAxis: 72 Hz → ticks 0/5/10/15") {
+    const MsAxis a = computeMsAxis(72.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(13.889f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(16.667f).epsilon(0.01));
+    CHECK(a.step == 5);
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15});
+}
+
+TEST_CASE("computeMsAxis: 75 Hz → ticks 0/5/10/15") {
+    const MsAxis a = computeMsAxis(75.0f);
+    REQUIRE(a.valid);
+    CHECK(a.topMs == doctest::Approx(16.0f).epsilon(0.01));
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15});
+}
+
+TEST_CASE("computeMsAxis: 80 Hz → ticks 0/5/10/15, budget 12.5 ms") {
+    const MsAxis a = computeMsAxis(80.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(12.5f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(15.0f).epsilon(0.01));
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15});
+}
+
+TEST_CASE("computeMsAxis: 120 Hz → ticks 0/5/10 (top is exactly 10 ms)") {
+    const MsAxis a = computeMsAxis(120.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(8.333f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(10.0f).epsilon(0.01));
+    CHECK(a.step == 5);
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10});
+}
+
+TEST_CASE("computeMsAxis: 144 Hz → finer 2-ms step, ticks 0/2/4/6/8") {
+    const MsAxis a = computeMsAxis(144.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(6.944f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(8.333f).epsilon(0.01));
+    CHECK(a.step == 2);
+    CHECK(tickValues(a) == std::vector<int>{0, 2, 4, 6, 8});
+    CHECK(a.tickCount == kMaxMsAxisTicks);
+}
+
+TEST_CASE("computeMsAxis: 60 Hz → step 5 fills exactly 5 ticks 0..20") {
+    const MsAxis a = computeMsAxis(60.0f);
+    REQUIRE(a.valid);
+    CHECK(a.topMs == doctest::Approx(20.0f).epsilon(0.01));
+    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15, 20});
+}
+
+TEST_CASE("computeMsAxis: never emits more than kMaxMsAxisTicks") {
+    for (float hz : {30.0f, 45.0f, 60.0f, 72.0f, 90.0f, 120.0f, 144.0f,
+                     165.0f, 240.0f}) {
+        const MsAxis a = computeMsAxis(hz);
+        REQUIRE(a.valid);
+        CHECK(a.tickCount >= 2);
+        CHECK(a.tickCount <= kMaxMsAxisTicks);
+        // Every tick sits within the strip and the top tick never exceeds it.
+        for (int i = 0; i < a.tickCount; ++i) {
+            CHECK(a.ticks[i].heightFrac >= 0.0f);
+            CHECK(a.ticks[i].heightFrac <= 1.0f);  // clamped in computeMsAxis
+        }
+    }
+}
+
+TEST_CASE("computeMsAxis: heightFrac == ms / topMs for every tick") {
+    const MsAxis a = computeMsAxis(90.0f);
+    REQUIRE(a.valid);
+    for (int i = 0; i < a.tickCount; ++i) {
+        CHECK(a.ticks[i].heightFrac ==
+              doctest::Approx(a.ticks[i].ms / a.topMs).epsilon(1e-4));
+    }
+    // First tick is always 0 ms, pinned to the strip bottom.
+    CHECK(a.ticks[0].ms == 0);
+    CHECK(a.ticks[0].heightFrac == doctest::Approx(0.0f));
+}
+
+TEST_CASE("computeMsAxis: budget always lands at 1 − budgetLineFraction") {
+    // The top is 1.2×budget by construction, so a hypothetical tick AT the
+    // budget would sit at budgetMs/topMs = 1/1.2 ≈ 0.8333 up from the bottom,
+    // i.e. exactly 1 − budgetLineFraction() (= 1 − 1/6). This is the invariant
+    // that keeps the axis labels and the existing budget line in lockstep,
+    // independent of refresh rate.
+    for (float hz : {72.0f, 90.0f, 120.0f, 144.0f}) {
+        const MsAxis a = computeMsAxis(hz);
+        REQUIRE(a.valid);
+        const float budgetFracFromBottom = a.budgetMs / a.topMs;
+        CHECK(budgetFracFromBottom ==
+              doctest::Approx(1.0f - budgetLineFraction()).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("computeMsAxis: non-finite / non-positive targetFps → invalid") {
+    CHECK_FALSE(computeMsAxis(0.0f).valid);
+    CHECK_FALSE(computeMsAxis(-90.0f).valid);
+    CHECK_FALSE(computeMsAxis(
+        std::numeric_limits<float>::quiet_NaN()).valid);
+    CHECK_FALSE(computeMsAxis(
+        std::numeric_limits<float>::infinity()).valid);
+    // An invalid axis carries no ticks — the renderer skips the axis pass.
+    CHECK(computeMsAxis(0.0f).tickCount == 0);
+}
+
+TEST_CASE("niceMsStep: walks the 1-2-5 ladder to cap tick count") {
+    CHECK(niceMsStep(8.33f)  == 2);   // 144 Hz top
+    CHECK(niceMsStep(10.0f)  == 5);   // 120 Hz top
+    CHECK(niceMsStep(13.33f) == 5);   // 90 Hz top
+    CHECK(niceMsStep(20.0f)  == 5);   // 60 Hz top
+    CHECK(niceMsStep(30.0f)  == 10);  // very low rate → coarse 10-ms step
+    CHECK(niceMsStep(0.0f)   == 1);   // degenerate guard
 }

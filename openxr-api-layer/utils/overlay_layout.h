@@ -65,12 +65,12 @@ namespace openxr_api_layer::detail {
     //   fps_instant fps_avg   fps_p95  fps_p99  fps_p99_9
     //
     //   ── GPU frametime panel ───────────────────────────────────────
-    //   GPU FRAMETIME MS                          6.7 ms
+    //   GPU FRAMETIME                          6.7 ms
     //                                     gpu_frametime_ms
     //   <histogram >
     //
     //   ── CPU frametime panel ───────────────────────────────────────
-    //   CPU FRAMETIME MS              Render 2.7 ms / App 4.1 ms
+    //   CPU FRAMETIME              Render 2.7 ms / App 4.1 ms
     //                                 cpu_render_ms   cpu_frametime_ms
     //   <histogram>
     //
@@ -152,6 +152,14 @@ namespace openxr_api_layer::detail {
         // is also a utilisation percentage. 0 when the source is absent.
         float       cpus_max_fraction = 0.0f;
 
+        // Predicted display rate (Hz), copied straight from the snapshot.
+        // Drives the frametime histograms' left-hand ms axis: the renderer
+        // feeds it to computeMsAxis() in the dynamic text pass so the tick
+        // LABELS rescale with the runtime's refresh rate, in lockstep with
+        // the gridlines the bar pipeline draws from the same value. 0 until
+        // the first valid snapshot (axis then skipped, like the bars).
+        float       target_fps        = 0.0f;
+
         // True when at least the FPS field carries a real value. The
         // renderer can skip the text pass (but still paint the
         // frame/background) on the very first ~100 ms of a session
@@ -163,6 +171,7 @@ namespace openxr_api_layer::detail {
         OverlayDisplayValues v;
         if (!snap.valid) return v;
         v.valid = true;
+        v.target_fps = snap.target_fps;  // drives the histogram ms axis
 
         // The aggregator guards against div-by-zero already, but a
         // momentarily-negative `frame_total - wait_block` can
@@ -303,9 +312,13 @@ namespace openxr_api_layer::detail {
         // to the edge of a comfortable reading zone — they're a starting
         // point the user can fine-tune via offset_x / offset_y.
         constexpr float kBaseWidth  = 0.28f;
-        constexpr float kBaseHeight = 0.162f;  // tracks kTexH/kTexW (see above) so
+        constexpr float kBaseHeight = 0.170f;  // tracks kTexH/kTexW (see above) so
                                                // HMD pixels stay square; recompute
                                                // whenever the texture height changes.
+                                               // 0.28 × 436/720 ≈ 0.1696 → 0.170 for
+                                               // the 720×436 texture (was 0.162 at
+                                               // 720×416, before the frametime panels
+                                               // grew to fit the ms axis).
         constexpr float kZ          = -1.0f;          // 1 m forward
         // Pushed further toward the corner than the original 0.22 / 0.14 so
         // the HUD hugs the edge of the FOV out of the box and gets less in
@@ -527,6 +540,98 @@ namespace openxr_api_layer::detail {
     // bottom = 1/6 from the top).
     inline constexpr float budgetLineFraction() noexcept {
         return 1.0f / 6.0f;
+    }
+
+    // --- ms-axis ticks for the frametime histograms ----------------------
+    //
+    // The histogram strip maps frametime 0..(1.2 × budget) onto its full
+    // height — a sample at 1.2×budget fills the strip (see
+    // barVisualForSample). To label that vertical span in absolute
+    // milliseconds, we drop a handful of "nice" round-number ticks
+    // (multiples of 1 / 2 / 5 / 10 ms) along it.
+    //
+    // The scale is therefore DERIVED FROM THE REFRESH RATE — nothing is
+    // hard-coded:
+    //   * 72 Hz  → budget 13.9 ms, top 16.7 ms → ticks 0 / 5 / 10 / 15
+    //   * 90 Hz  → budget 11.1 ms, top 13.3 ms → ticks 0 / 5 / 10
+    //   * 120 Hz → budget  8.3 ms, top 10.0 ms → ticks 0 / 5 / 10
+    //   * 144 Hz → budget  6.9 ms, top  8.3 ms → ticks 0 / 2 / 4 / 6 / 8
+    //
+    // The budget reference line (budgetLineFraction) always sits at the
+    // SAME height (5/6 up the strip) whatever the rate — only its ms VALUE
+    // changes — because the top is defined as 1.2×budget. A tick whose
+    // value equals the budget reproduces budgetLineFraction() exactly
+    // (1 − budget/(1.2·budget) = 1/6), which keeps the labels and the
+    // existing budget line in lockstep.
+    //
+    // heightFrac is measured FROM THE BOTTOM (0 = strip bottom, 1 = strip
+    // top); the renderer turns it into a top-down Y as
+    // histoT + stripH·(1 − heightFrac).
+    inline constexpr int kMaxMsAxisTicks = 5;
+
+    struct MsAxisTick {
+        int   ms;          // round tick value in milliseconds (0, 5, 10, …)
+        float heightFrac;  // 0..1 up from the strip bottom (= ms / topMs)
+    };
+
+    struct MsAxis {
+        float budgetMs  = 0.0f;  // 1000 / targetFps
+        float topMs     = 0.0f;  // 1.2 × budgetMs (the strip top)
+        int   step      = 0;     // chosen tick step in ms
+        int   tickCount = 0;     // number of valid entries in `ticks`
+        std::array<MsAxisTick, kMaxMsAxisTicks> ticks{};
+        bool  valid     = false; // false when targetFps is non-finite / <= 0
+    };
+
+    // Smallest "nice" step (1, 2, 5, 10, 20, 50, …) such that the strip
+    // top carries at most kMaxMsAxisTicks ticks (the 0 tick included).
+    // Walks the 1-2-5 decade ladder; the outer loop is bounded defensively
+    // (a frametime top is a few tens of ms at most).
+    inline int niceMsStep(float topMs) noexcept {
+        if (!(topMs > 0.0f)) return 1;
+        static constexpr int kLadder[] = {1, 2, 5};
+        for (int decade = 1; decade <= 1000; decade *= 10) {
+            for (int m : kLadder) {
+                const int step = m * decade;
+                // ticks at 0, step, 2·step, … ≤ topMs → floor(topMs/step)+1
+                const int count =
+                    static_cast<int>(topMs / static_cast<float>(step)) + 1;
+                if (count <= kMaxMsAxisTicks) return step;
+            }
+        }
+        return 1000;
+    }
+
+    // Build the ms-axis tick set for a given predicted display rate.
+    // Returns valid == false (and an all-zero axis) when targetFps is
+    // non-finite or non-positive — the renderer then skips the axis
+    // entirely, same degrade-don't-crash contract as the rest of the HUD.
+    inline MsAxis computeMsAxis(float targetFps) noexcept {
+        MsAxis axis;
+        if (!std::isfinite(targetFps) || targetFps <= 0.0f) return axis;
+        axis.budgetMs = 1000.0f / targetFps;
+        axis.topMs    = 1.2f * axis.budgetMs;
+        // Guard a degenerate / overflowed top (absurdly low targetFps).
+        if (!std::isfinite(axis.topMs) || axis.topMs <= 0.0f) return axis;
+        axis.step  = niceMsStep(axis.topMs);
+        axis.valid = true;
+
+        int v = 0;
+        while (axis.tickCount < kMaxMsAxisTicks &&
+               static_cast<float>(v) <= axis.topMs + 1e-3f) {
+            // Clamp the height fraction to [0,1]: the admission test above
+            // tolerates a tick a hair past topMs (the 1e-3 epsilon), which
+            // would otherwise give heightFrac marginally > 1 and nudge a
+            // gridline a sub-pixel past the strip top. (Only reachable when
+            // topMs lands within 1e-3 ms of a step multiple — never at real
+            // 60–240 Hz refresh rates, but keep the invariant exact.)
+            const float frac = std::clamp(
+                static_cast<float>(v) / axis.topMs, 0.0f, 1.0f);
+            axis.ticks[axis.tickCount] = {v, frac};
+            ++axis.tickCount;
+            v += axis.step;
+        }
+        return axis;
     }
 
     // Height, in overlay-texture pixels, of the placeholder dash drawn at
