@@ -122,8 +122,8 @@ namespace openxr_api_layer::detail {
         // QUAD in 3D scales, not the resolution. kTexW × kTexH packs
         // the four sections of the redesigned HUD:
         //   - header bar (FPS / FPS AVG / P95 / P99 / P99.9, 5 cells)
-        //   - GPU FRAMETIME MS panel with histogram + current value
-        //   - CPU FRAMETIME MS panel with histogram + Render / App compound
+        //   - GPU FRAMETIME panel with histogram + current value
+        //   - CPU FRAMETIME panel with histogram + Render / App compound
         //   - bottom row split into two panels (60 / 40):
         //       GPU panel = TEMP / LOAD / VRAM (3 cells)
         //       CPU panel = TEMP / LOAD       (2 cells)
@@ -258,7 +258,7 @@ namespace openxr_api_layer::detail {
         // rendered to the head-locked quad they read at their natural
         // visual weight in the HMD.
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
-        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME MS"
+        constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME"
         // Labels and section titles render in Rajdhani SemiBold.
         constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
@@ -600,7 +600,7 @@ namespace openxr_api_layer::detail {
                 // current value).
                 drawFrametimePanel(kInnerL, gpuPanelY, kInnerR,
                                     gpuPanelY + kFrametimeHeight,
-                                    L"GPU FRAMETIME MS",
+                                    L"GPU FRAMETIME",
                                     v.gpu_frametime_ms,
                                     /*breakdown=*/std::string{},
                                     v.target_fps);
@@ -611,7 +611,7 @@ namespace openxr_api_layer::detail {
                     "Render " + v.cpu_render_ms + " ms";
                 drawFrametimePanel(kInnerL, cpuPanelY, kInnerR,
                                     cpuPanelY + kFrametimeHeight,
-                                    L"CPU FRAMETIME MS",
+                                    L"CPU FRAMETIME",
                                     v.cpu_frametime_ms,
                                     cpuBreakdown,
                                     v.target_fps);
@@ -1314,7 +1314,7 @@ namespace openxr_api_layer::detail {
             // -------- Frametime panel ---------------------------------------
             //
             // Layout:
-            //   - title "GPU FRAMETIME MS" (top-left, ~14 px line)
+            //   - title "GPU FRAMETIME" (top-left, ~14 px line)
             //   - current value "6.7" + cyan "ms" suffix (top-right)
             //   - 4 horizontal dashed grid lines
             //   - histogram bars filling the remaining vertical space

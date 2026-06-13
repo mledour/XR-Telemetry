@@ -65,12 +65,12 @@ namespace openxr_api_layer::detail {
     //   fps_instant fps_avg   fps_p95  fps_p99  fps_p99_9
     //
     //   ── GPU frametime panel ───────────────────────────────────────
-    //   GPU FRAMETIME MS                          6.7 ms
+    //   GPU FRAMETIME                          6.7 ms
     //                                     gpu_frametime_ms
     //   <histogram >
     //
     //   ── CPU frametime panel ───────────────────────────────────────
-    //   CPU FRAMETIME MS              Render 2.7 ms / App 4.1 ms
+    //   CPU FRAMETIME              Render 2.7 ms / App 4.1 ms
     //                                 cpu_render_ms   cpu_frametime_ms
     //   <histogram>
     //
