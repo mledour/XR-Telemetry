@@ -46,6 +46,11 @@ cbuffer TextConstants : register(b0)
 {
     float2 texSize;     // (kTexW, kTexH) for pixel → NDC on the destination
     float2 atlasSize;   // (atlasW, atlasH) for atlas-pixel → atlas-UV
+    // Overlay supersample factor (= renderer m_ss). The VS ignores it; the PS
+    // gates its edge-contrast + gamma corrections on supersample > 1 so the
+    // 1x (snapshot/golden) path stays byte-identical to the legacy shader.
+    float  supersample; // reg1.x
+    float3 _pad;        // reg1.yzw
 };
 
 Texture2D<float> atlasTexture : register(t0);   // R8_UNORM glyph atlas
