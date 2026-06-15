@@ -245,11 +245,14 @@ TEST_CASE("overlay snapshot — render mock to PNG (visual-regression artifact)"
         CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(wic.GetAddressOf()))));
 
-    // Native overlay texture dimensions. If the renderer's kTexW /
-    // kTexH change, bump these in lockstep so the snapshot covers the
-    // full painted area.
-    constexpr UINT W = 720;
-    constexpr UINT H = 436;
+    // Physical (supersampled) overlay dimensions — the exact size
+    // renderOverlayToTextureD3D11 renders at. Queried from the renderer so the
+    // snapshot tracks kOverlaySupersample automatically: no manual lockstep
+    // with kTexW / kTexH or the supersample factor (bump the factor and the
+    // target + golden size follow). The golden PNG must be regenerated when
+    // these change — that's the deliberate, reviewed visual baseline.
+    UINT W = 0, H = 0;
+    openxr_api_layer::detail::overlaySnapshotTargetSize(W, H);
 
     // WARP D3D11 device. WARP (software rasteriser) is deterministic
     // run-to-run and available on GitHub's GPU-less CI runners, while
