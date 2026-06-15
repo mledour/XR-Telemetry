@@ -49,9 +49,13 @@ QuadVSOutput VSMain(QuadVSInput v)
     // Rounded-rect SDF inputs (texture pixels). `local` is this vertex's
     // offset from the rect centre and interpolates per-pixel; halfsz and
     // rb (corner radius, border width) are per-instance constants the PS
-    // reads to evaluate the signed distance and the border ring.
+    // reads to evaluate the signed distance and the border ring. `dash`
+    // (period, on-length px) is the per-instance dash pattern the PS uses to
+    // break the grid + left-axis lines into dashes; 0 = solid (every other
+    // quad).
     o.halfsz = v.rect.zw * 0.5f;
     o.local  = float2(px, py) - (v.rect.xy + o.halfsz);
     o.rb     = v.params.xy;
+    o.dash   = v.params.zw;
     return o;
 }

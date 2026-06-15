@@ -73,6 +73,38 @@ float4 PSMain(QuadVSOutput i) : SV_TARGET
         const float fillCov = saturate(0.5f - (d + borderWidth) / aa);
         c = lerp(i.borderColor, i.color, fillCov);
     }
-    c.a *= outerCov;
+
+    // Procedural dashing (the histogram grid lines + the left ms-axis).
+    // dash.x = period px (0 = solid, every other quad), dash.y = lit "on"
+    // length px. The pattern runs along the rect's LONG axis, so ONE quad
+    // serves both the horizontal gridlines (dash along X) and the vertical
+    // axis (dash along Y) with no orientation flag. It's measured from the
+    // line's start edge in LOGICAL px (local + halfsz), and every gridline
+    // shares the same start (plotL) + length, so their dashes line up into a
+    // clean grid. A ~1-physical-px fwidth band softens each dash edge, the
+    // same analytic AA the box edge gets, so the dashes survive the lens
+    // resample without shimmering. The budget line and the panel bg pass
+    // dash.x == 0 and stay solid.
+    // Position along the line's long axis (X for the horizontal gridlines,
+    // Y for the vertical axis), in LOGICAL px from the start edge. The aa
+    // band is fwidth() of that coordinate — computed UNCONDITIONALLY so the
+    // gradient op never sits inside flow control (fxc rejects that, X4014).
+    const bool  horiz = i.halfsz.x >= i.halfsz.y;
+    const float ext   = horiz ? i.halfsz.x : i.halfsz.y;
+    const float along = horiz ? i.local.x  : i.local.y;
+    const float s     = along + ext;               // 0 .. line length
+    const float aaT   = max(fwidth(s), 1e-5f);      // ~1-px dash-edge band
+
+    float dashCov = 1.0f;
+    if (i.dash.x > 0.0f)
+    {
+        const float phase  = frac(s / i.dash.x) * i.dash.x;  // 0 .. period
+        const float halfOn = i.dash.y * 0.5f;
+        // Lit where |phase - halfOn| < halfOn, i.e. phase in (0, on), with a
+        // half-aa-wide soft edge at each end (0.5 coverage on the boundary).
+        dashCov = saturate((halfOn - abs(phase - halfOn)) / aaT + 0.5f);
+    }
+
+    c.a *= outerCov * dashCov;
     return c;
 }

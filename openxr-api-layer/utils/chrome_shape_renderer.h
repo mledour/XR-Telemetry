@@ -75,15 +75,17 @@ namespace openxr_api_layer::utils::chrome_shapes {
     // so the two pipelines that feed the same overlay_quad shader can't
     // drift. Mirrors overlay_quad.hlsli's QuadVSInput byte-for-byte:
     //   rect(16) + color(16) + borderColor(16) + radius(4) + borderWidth(4)
-    //   + pad(8) = 64 B. QUAD_PARAMS (offset 48) packs {radius, borderWidth}
-    //   into its .xy; .zw (pad) is unread.
+    //   + dash(8) = 64 B. QUAD_PARAMS (offset 48) packs {radius, borderWidth}
+    //   into its .xy and the dash pattern {period px, on-length px} into its
+    //   .zw — 0/0 (the struct default) renders a solid quad, so every chrome
+    //   shape stays solid; only the histogram grid + left axis set it.
     struct QuadInstance {
         float rect[4];         // x, y, w, h (px, top-left origin)
         float color[4];        // fill colour, straight-alpha
         float borderColor[4];  // border-ring colour (used when borderWidth > 0)
         float radius;          // corner radius px; 0 = sharp
         float borderWidth;     // border ring px; 0 = no border
-        float pad[2];          // → the QUAD_PARAMS float4 slot at offset 48
+        float dash[2];         // QUAD_PARAMS.zw: dash {period px (0 = solid), on-length px}
     };
     static_assert(sizeof(QuadInstance) == 64,
                    "QuadInstance must match overlay_quad.hlsli's QuadVSInput "

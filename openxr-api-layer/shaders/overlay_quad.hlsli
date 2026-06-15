@@ -26,8 +26,9 @@
 //
 // Generic instanced axis-aligned rectangles in straight-alpha colour, used
 // to paint the parts of the histogram region that AREN'T the bars: the
-// opaque panel-background fill, the 4 dashed-style grid lines (drawn as thin
-// translucent rects), and the budget reference line — one DrawInstanced per
+// opaque panel-background fill, the dashed horizontal grid lines + the dashed
+// left (ms) axis (thin translucent rects the PS breaks into dashes via
+// QUAD_PARAMS.zw), and the solid budget reference line — one DrawInstanced per
 // group. Colours carry their own alpha; the blend state is straight alpha-
 // over, and every rect lands on the already-opaque panel background so the
 // composited result stays opaque (premultiplied == straight on the BGRA8
@@ -48,7 +49,7 @@ struct QuadVSInput
     float4 rect        : QUAD_RECT;         // (x, y, width, height) px (top-left origin)
     float4 color       : QUAD_COLOR;        // fill colour, straight-alpha RGBA
     float4 borderColor : QUAD_BORDER_COLOR; // border-ring colour (used when borderWidth > 0)
-    float4 params      : QUAD_PARAMS;       // x = corner radius px (0 = sharp), y = border width px (0 = none)
+    float4 params      : QUAD_PARAMS;       // xy = {corner radius px (0 = sharp), border width px (0 = none)}; zw = dash {period px (0 = solid), "on" length px}
 };
 
 struct QuadVSOutput
@@ -60,4 +61,5 @@ struct QuadVSOutput
     float2 local                  : TEXCOORD0;  // pixel offset from the rect centre
     nointerpolation float2 halfsz : TEXCOORD1;  // rect half-size in pixels
     nointerpolation float2 rb     : TEXCOORD2;  // x = corner radius, y = border width (px)
+    nointerpolation float2 dash   : TEXCOORD3;  // x = dash period px (0 = solid), y = dash "on" length px
 };

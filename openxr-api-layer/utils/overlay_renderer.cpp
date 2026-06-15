@@ -1428,11 +1428,11 @@ namespace openxr_api_layer::detail {
             // Layout:
             //   - title "GPU FRAMETIME" (top-left, ~14 px line)
             //   - current value "6.7" + cyan "ms" suffix (top-right)
-            //   - 4 horizontal dashed grid lines
+            //   - 4 horizontal dashed grid lines + a dashed left ms-axis
             //   - histogram bars filling the remaining vertical space
             // Draws only the "chrome" of a frametime panel: panel
             // background, title, and the top-right current value. The
-            // histogram region itself (background fill, dashed grid,
+            // histogram region itself (background fill, dashed grid + axis,
             // bars, budget line) is owned by drawHistoRegion() and is
             // refreshed every frame so the ring buffer's scroll stays
             // smooth — see paint()'s static/dynamic dispatch.
@@ -1909,9 +1909,9 @@ namespace openxr_api_layer::detail {
 
         // -------- HistogramBarRenderer: D3D11 instanced histogram region -----
         //
-        // Paints the histogram region (background + grid + bars + budget line)
-        // with a handful of instanced GPU draws. Owns two pipelines —
-        // solid-colour quads for the background / grid / budget line, and
+        // Paints the histogram region (background + grid + left axis + bars +
+        // budget line) with a handful of instanced GPU draws. Owns two
+        // pipelines — solid-colour quads for the bg / grid / axis / budget, and
         // gradient bars for the samples — plus the dynamic instance + constant
         // buffers refilled per panel per frame. The render target is passed
         // per drawPanel(rtv, …) call — the acquired swapchain image (the
@@ -2101,18 +2101,20 @@ namespace openxr_api_layer::detail {
                 return true;
             }
 
-            // Paint one panel's histogram region (bg + grid + bars + budget)
-            // into the target image. Rect is in target pixels; isGpu picks
-            // the teal vs blue gradient. budgetNs <= 0 (no display-period
-            // info yet from the runtime — the first few frames before
-            // xrWaitFrame's predicted period lands) still paints the bg and
-            // the budget line, and skips the bars (each has no reference
-            // height, so barVisualForSample returns heightFraction 0 and the
-            // loop emits no instances). The ms-axis GRIDLINES are also absent
-            // during that window: computeMsAxis needs a valid target_fps, so
-            // with no fps there's no ms scale to mark and the grid slots
-            // collapse to zero-area quads. That keeps the histo region from
-            // freezing on stale target content during the warm-up.
+            // Paint one panel's histogram region (bg + grid + left axis +
+            // bars + budget) into the target image. Rect is in target pixels;
+            // isGpu picks the teal vs blue gradient. budgetNs <= 0 (no
+            // display-period info yet from the runtime — the first few frames
+            // before xrWaitFrame's predicted period lands) still paints the bg,
+            // the left axis, and the budget line, and skips the bars (each has
+            // no reference height, so barVisualForSample returns heightFraction
+            // 0 and the loop emits no instances). The horizontal ms-axis
+            // GRIDLINES are the only part absent during that window:
+            // computeMsAxis needs a valid target_fps, so with no fps there's no
+            // ms scale to mark and the grid slots collapse to zero-area quads
+            // (the vertical axis spans the strip height and needs no fps). That
+            // keeps the histo region from freezing on stale target content
+            // during the warm-up.
             void drawPanel(ID3D11RenderTargetView* rtv,
                             const HistogramRing<kRingSize>& ring,
                             int64_t budgetNs, float targetFps,
@@ -2182,7 +2184,7 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // --- refill quad instances: [0]=bg, [1..4]=grid, [5]=budget ---
+                // --- refill quads: [0]=bg, [1..4]=grid, [5]=axis, [6]=budget -
                 bool quadOk = false;
                 {
                     D3D11_MAPPED_SUBRESOURCE map{};
@@ -2190,10 +2192,10 @@ namespace openxr_api_layer::detail {
                             D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                         auto* q = static_cast<QuadInstance*>(map.pData);
                         // overlay_quad_ps anti-aliases every quad (box SDF +
-                        // fwidth), so the thin grid + budget lines below need
-                        // no explicit corner radius to get clean edges.
+                        // fwidth), so the thin grid / axis / budget lines below
+                        // need no explicit corner radius to get clean edges.
                         q[0] = makeQuad(plotL, histoT, fullW, stripH, kPanelBg);
-                        // Gridlines at the round-ms axis ticks (interior
+                        // Dashed gridlines at the round-ms axis ticks (interior
                         // ticks only — the 0 tick IS the strip bottom edge,
                         // already bounded by the panel bg). The axis is
                         // derived from the refresh rate (see computeMsAxis);
@@ -2202,10 +2204,12 @@ namespace openxr_api_layer::detail {
                         // interior lines occur (the 5-tick case has ticks
                         // 0/2/4/6/8 → 4 interior), which fits the 4 grid
                         // slots [1..4]; any unused slot collapses to a
-                        // zero-area quad so the fixed 5-instance bg+grid
+                        // zero-area quad so the fixed 6-instance bg+grid+axis
                         // draw paints nothing for it. heightFrac is measured
                         // from the bottom, so the top-down Y is
-                        // histoT + stripH·(1 − heightFrac).
+                        // histoT + stripH·(1 − heightFrac). The dash pattern
+                        // (kGridDashPeriod/On) runs along X; every line shares
+                        // plotL + fullW so the dashes line up column-to-column.
                         const MsAxis axis = computeMsAxis(targetFps);
                         int slot = 1;
                         if (axis.valid) {
@@ -2216,13 +2220,22 @@ namespace openxr_api_layer::detail {
                                     (1.0f - axis.ticks[i].heightFrac);
                                 q[slot++] =
                                     makeQuad(plotL, y, fullW, kChromeLineW,
-                                              kGridDash);
+                                              kGridDash,
+                                              kGridDashPeriod, kGridDashOn);
                             }
                         }
                         for (; slot <= 4; ++slot) {
                             q[slot] =
                                 makeQuad(plotL, histoT, 0.0f, 0.0f, kGridDash);
                         }
+                        // Vertical ms-axis down the left edge of the plot
+                        // (x = plotL), dashed to match the horizontal grid.
+                        // The PS auto-orients the dash along the long axis, so
+                        // this one runs along Y. Painted in the bg+grid pass so
+                        // the bars composite over it, same as the gridlines.
+                        q[5] = makeQuad(plotL, histoT, kChromeLineW, stripH,
+                                         kGridDash,
+                                         kGridDashPeriod, kGridDashOn);
                         const float by =
                             histoT + stripH * budgetLineFraction();
                         // Same kChromeLineW as the panel borders / separators /
@@ -2231,7 +2244,9 @@ namespace openxr_api_layer::detail {
                         // physical texels = better off-axis warp survival. The
                         // dim kBudgetLine colour keeps it from CA-fringing (a
                         // brighter line shows the off-axis warp aliasing more).
-                        q[5] = makeQuad(plotL, by, fullW, kChromeLineW,
+                        // SOLID (no dash args) — the one reference line that
+                        // stays unbroken so it reads apart from the grid.
+                        q[6] = makeQuad(plotL, by, fullW, kChromeLineW,
                                          kBudgetLine);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
                         quadOk = true;
@@ -2300,9 +2315,9 @@ namespace openxr_api_layer::detail {
 
                 // Three draw passes per panel. Layering relies on D3D11's
                 // documented in-order primitive submission: bg + 4 grid
-                // lines (alpha-over) → opaque bars → budget line (alpha-
-                // over). Without that guarantee the alpha-blended grid and
-                // budget could land on the wrong side of the bars.
+                // lines + left axis (alpha-over) → opaque bars → budget line
+                // (alpha-over). Without that guarantee the alpha-blended grid
+                // and budget could land on the wrong side of the bars.
                 //
                 // Both quad passes are skipped if the quad buffer didn't map
                 // this frame (quadOk == false) — never draw over its stale /
@@ -2314,10 +2329,11 @@ namespace openxr_api_layer::detail {
                 // removed), so dropping the panel for that frame is the right
                 // trade.
                 //
-                // quad pass 1 — bg (instance 0) + 4 grid lines (1..4).
+                // quad pass 1 — bg (instance 0) + 4 grid lines (1..4) + the
+                // left ms-axis (instance 5).
                 if (quadOk) {
                     bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, 5, 0, 0);
+                    m_ctx->DrawInstanced(4, 6, 0, 0);
                 }
 
                 // bar pass — samples on top of bg/grid (instances 0..barCount).
@@ -2326,10 +2342,10 @@ namespace openxr_api_layer::detail {
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
                 }
 
-                // quad pass 2 — budget line on top of the bars (instance 5).
+                // quad pass 2 — budget line on top of the bars (instance 6).
                 if (quadOk) {
                     bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, 1, 0, 5);
+                    m_ctx->DrawInstanced(4, 1, 0, 6);
                 }
             }
 
@@ -2345,7 +2361,7 @@ namespace openxr_api_layer::detail {
             // The quad instance layout is shared with ChromeShapeRenderer —
             // see overlay_quad_layout (QuadInstance + kQuadInputLayout) in
             // chrome_shape_renderer.h — so the two overlay_quad pipelines
-            // (chrome shapes + this bg/grid/budget pass) can't drift.
+            // (chrome shapes + this bg/grid/axis/budget pass) can't drift.
             using QuadInstance = chrome_shapes::QuadInstance;
             struct BarConstants {
                 float texSize[2]; float histoTL[2]; float histoBR[2];
@@ -2369,7 +2385,15 @@ namespace openxr_api_layer::detail {
             // QuadInstance's size assert lives with the shared definition
             // in chrome_shape_renderer.h (overlay_quad_layout).
 
-            static constexpr UINT kQuadSlots = 6;  // bg + 4 grid + budget
+            static constexpr UINT kQuadSlots = 7;  // bg + 4 grid + left axis + budget
+
+            // Dash pattern for the grid lines + the left ms-axis, in LOGICAL
+            // px (constant angular size across supersample factors, like
+            // kChromeLineW). ~4 px lit + ~4 px gap reads as a clean dotted grid
+            // at the 1.5-px line weight without shimmering through the lens
+            // resample. The budget line is drawn WITHOUT these (solid).
+            static constexpr float kGridDashOn     = 4.0f;
+            static constexpr float kGridDashPeriod = 8.0f;  // on + gap
 
             // Colours (linear RGBA), copied from initBrushes().
             static constexpr float kPanelBg[4]    = {0.035f, 0.039f, 0.039f, 1.00f};
@@ -2403,13 +2427,20 @@ namespace openxr_api_layer::detail {
                 dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
             }
             static QuadInstance makeQuad(float x, float y, float w, float h,
-                                          const float c[4]) noexcept {
+                                          const float c[4],
+                                          float dashPeriod = 0.0f,
+                                          float dashOn     = 0.0f) noexcept {
                 QuadInstance q{};
                 q.rect[0] = x; q.rect[1] = y; q.rect[2] = w; q.rect[3] = h;
                 copyColor(q.color, c);
                 // radius / borderWidth stay zero-initialised: overlay_quad_ps
                 // anti-aliases every quad via the box SDF, so no per-quad
                 // radius is needed to soften the thin lines.
+                // dash → QUAD_PARAMS.zw: the grid + left-axis lines pass a
+                // non-zero period so the PS breaks them into dashes; everything
+                // else (bg, budget line) keeps the 0/0 default and stays solid.
+                q.dash[0] = dashPeriod;
+                q.dash[1] = dashOn;
                 return q;
             }
 
