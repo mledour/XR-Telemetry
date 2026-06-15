@@ -1957,6 +1957,13 @@ namespace openxr_api_layer::detail {
                 m_device = device;
                 m_ctx = ctx;
                 m_ss  = ss;
+                // Reset the per-panel cbuffer cache: the bar cbuffers are
+                // filled-once-and-cached (and now carry m_ss + the tier
+                // colours), so a re-init at a different factor must refill them
+                // rather than bind the stale cache. No in-place re-init exists
+                // today (each renderer is constructed fresh), but this keeps
+                // init() correct if one is ever added (device-loss, pooling).
+                m_barCBFilled[0] = m_barCBFilled[1] = false;
 
                 // Per-step failure logging. Without it, an HRESULT lost
                 // somewhere in this chain just disabled the GPU path with
@@ -2628,6 +2635,53 @@ namespace openxr_api_layer::detail {
             return ok;
         }
 
+        // Bring up the three GPU render pipelines (bars + glyph atlas + chrome
+        // shapes) against a device/context at the production supersample, then
+        // free the CPU atlas bitmap. Shared by BOTH backends' init() so the
+        // dst/physical dimensions and the bring-up order can't drift between
+        // D3D11 and D3D12 (the swapchain + RTV plumbing around it genuinely
+        // differs and stays per-class). Fail-closed: logs + returns false on
+        // any failure so the caller disables the overlay.
+        inline bool initOverlayRenderers(ID3D11Device*            dev,
+                                          ID3D11DeviceContext*     ctx,
+                                          CoreRenderer&            core,
+                                          HistogramBarRenderer&    bars,
+                                          glyph_atlas::Renderer&   gpuText,
+                                          chrome_shapes::Renderer& gpuShapes) {
+            if (!bars.init(dev, ctx, kEffectiveSupersample)) {
+                Log("xr_telemetry: overlay disabled — bars init failed\n");
+                return false;
+            }
+            if (!core.atlasReady()) {
+                Log("xr_telemetry: overlay disabled — glyph atlas not built "
+                    "(DirectWrite face resolution failed)\n");
+                return false;
+            }
+            // dst = LOGICAL design space (cbuffer texSize); render = PHYSICAL
+            // swapchain-image extent (viewport). They differ only when
+            // supersampled — the renderer maps between them.
+            if (!gpuText.init(dev, ctx, static_cast<UINT>(kTexW),
+                               static_cast<UINT>(kTexH), core.atlas(),
+                               static_cast<UINT>(kTexWPhys),
+                               static_cast<UINT>(kTexHPhys))) {
+                Log("xr_telemetry: overlay disabled — glyph renderer init "
+                    "failed\n");
+                return false;
+            }
+            if (!gpuShapes.init(dev, ctx, static_cast<UINT>(kTexW),
+                                 static_cast<UINT>(kTexH),
+                                 static_cast<UINT>(kTexWPhys),
+                                 static_cast<UINT>(kTexHPhys))) {
+                Log("xr_telemetry: overlay disabled — chrome shapes renderer "
+                    "init failed\n");
+                return false;
+            }
+            // Glyph texture uploaded — free the CPU atlas bitmap (8 MB at 2.0×)
+            // so it isn't resident for the host process's lifetime.
+            core.releaseAtlasBitmap();
+            return true;
+        }
+
         // -------- D3D11 native renderer --------------------------------------
         //
         // App uses D3D11 directly. Each swapchain image is an ID3D11Texture2D
@@ -2950,46 +3004,14 @@ namespace openxr_api_layer::detail {
                         return false;
                     }
                 }
-                // GPU pipelines. All three run on the APP's device +
-                // context, isolated per-frame via SwapDeviceContextState.
-                // Fail-closed: if any one fails to init, the overlay is
-                // disabled (no D2D fallback) — the layer logs and
-                // makeD3D11OverlayRenderer returns nullptr.
-                if (!m_bars.init(m_device.Get(), m_context.Get(),
-                                  kEffectiveSupersample)) {
-                    Log("xr_telemetry: overlay disabled — bars init failed\n");
+                // GPU pipelines (bars + glyph atlas + chrome shapes). All run
+                // on the APP's device + context, isolated per-frame via
+                // SwapDeviceContextState. Fail-closed (no D2D fallback). Shared
+                // with the D3D12 backend so the two bring-ups can't drift.
+                if (!initOverlayRenderers(m_device.Get(), m_context.Get(),
+                                           m_core, m_bars, m_glyphRenderer,
+                                           m_chromeShapeRenderer))
                     return false;
-                }
-                if (!m_core.atlasReady()) {
-                    Log("xr_telemetry: overlay disabled — glyph atlas not "
-                        "built (DirectWrite face resolution failed)\n");
-                    return false;
-                }
-                // dst = LOGICAL design space (cbuffer texSize); render =
-                // PHYSICAL swapchain-image extent (viewport). They differ
-                // only when supersampled — the renderer maps between them.
-                if (!m_glyphRenderer.init(m_device, m_context,
-                                           static_cast<UINT>(kTexW),
-                                           static_cast<UINT>(kTexH),
-                                           m_core.atlas(),
-                                           static_cast<UINT>(kTexWPhys),
-                                           static_cast<UINT>(kTexHPhys))) {
-                    Log("xr_telemetry: overlay disabled — glyph renderer "
-                        "init failed\n");
-                    return false;
-                }
-                if (!m_chromeShapeRenderer.init(m_device, m_context,
-                                                 static_cast<UINT>(kTexW),
-                                                 static_cast<UINT>(kTexH),
-                                                 static_cast<UINT>(kTexWPhys),
-                                                 static_cast<UINT>(kTexHPhys))) {
-                    Log("xr_telemetry: overlay disabled — chrome shapes "
-                        "renderer init failed\n");
-                    return false;
-                }
-                // Glyph texture uploaded — free the CPU atlas bitmap (8 MB at
-                // 2.0×) so it isn't resident for the host process's lifetime.
-                m_core.releaseAtlasBitmap();
 
                 // Fill the immutable XrCompositionLayerQuad fields
                 // now that m_swapchain is alive. SOURCE_ALPHA blending
@@ -3402,47 +3424,14 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // GPU pipelines on the D3D11On12 bridge. Same classes
-                // as the D3D11 path; each fails closed — if any init
-                // returns false the overlay is disabled (no D2D
-                // fallback). RTV is passed per draw call.
-                if (!m_bars.init(m_d3d11Device.Get(), m_d3d11Context.Get(),
-                                  kEffectiveSupersample)) {
-                    Log("xr_telemetry: overlay disabled — D3D12 bars "
-                        "init failed\n");
+                // GPU pipelines on the D3D11On12 bridge — same renderers as the
+                // D3D11 path; shared init so the two bring-ups can't drift. RTV
+                // is passed per draw call.
+                if (!initOverlayRenderers(m_d3d11Device.Get(),
+                                           m_d3d11Context.Get(),
+                                           m_core, m_bars, m_glyphRenderer,
+                                           m_chromeShapeRenderer))
                     return false;
-                }
-                if (!m_core.atlasReady()) {
-                    Log("xr_telemetry: overlay disabled — D3D12 glyph atlas "
-                        "not built\n");
-                    return false;
-                }
-                // dst = LOGICAL design space (cbuffer texSize); render =
-                // PHYSICAL wrapped-image extent (viewport). See the D3D11
-                // path for the supersample contract.
-                if (!m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
-                                           static_cast<UINT>(kTexW),
-                                           static_cast<UINT>(kTexH),
-                                           m_core.atlas(),
-                                           static_cast<UINT>(kTexWPhys),
-                                           static_cast<UINT>(kTexHPhys))) {
-                    Log("xr_telemetry: overlay disabled — D3D12 glyph "
-                        "renderer init failed\n");
-                    return false;
-                }
-                if (!m_chromeShapeRenderer.init(
-                        m_d3d11Device, m_d3d11Context,
-                        static_cast<UINT>(kTexW),
-                        static_cast<UINT>(kTexH),
-                        static_cast<UINT>(kTexWPhys),
-                        static_cast<UINT>(kTexHPhys))) {
-                    Log("xr_telemetry: overlay disabled — D3D12 chrome "
-                        "shapes renderer init failed\n");
-                    return false;
-                }
-                // Glyph texture uploaded — free the CPU atlas bitmap (8 MB at
-                // 2.0×) so it isn't resident for the host process's lifetime.
-                m_core.releaseAtlasBitmap();
 
                 // One-time fill of the immutable quad-layer fields.
                 // Byte-identical to the D3D11 path's helper — a shared base
