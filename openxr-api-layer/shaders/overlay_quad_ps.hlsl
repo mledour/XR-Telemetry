@@ -44,15 +44,17 @@ float4 PSMain(QuadVSOutput i) : SV_TARGET
     const float radius      = i.rb.x;
     const float borderWidth = i.rb.y;
 
-    // No rounding AND no border → plain rectangle, byte-for-byte the old
-    // passthrough. Every sharp quad (bars, grid, separators, budget line)
-    // takes this branch unchanged; only rounded / stroked panels and the
-    // outer frame fall through to the SDF path below.
-    if (radius <= 0.0f && borderWidth <= 0.0f)
-        return i.color;
-
-    // Clamp the radius to half the shorter side so an over-large value
-    // degrades to a stadium/pill instead of an inverted SDF.
+    // Analytic edge AA for EVERY quad — sharp or rounded — via the box /
+    // rounded-box SDF + a ~1-physical-px fwidth band. Sharp rects (radius 0)
+    // formerly took a passthrough `return i.color` with no AA: fine on a 1:1
+    // target, but the runtime resamples the quad layer through the lens
+    // distortion, which turns hard thin-rect edges (the frame outline, the
+    // column separators) into shimmering "crénelage" once the HUD sits
+    // off-axis. Running them through the SDF gives the same clean edges the
+    // rounded panels already get, for a few ALU/pixel — far cheaper than an
+    // MSAA target + resolve, and unlike MSAA it's resolution-independent
+    // (fwidth is screen-space) and needs no intermediate. For a sharp rect
+    // `r` clamps to 0 below, so the SDF is a plain box.
     const float r  = min(radius, min(i.halfsz.x, i.halfsz.y));
     const float d  = sdRoundBox(i.local, i.halfsz, r);
     const float aa = max(fwidth(d), 1e-5f);        // ~1-px anti-alias band
