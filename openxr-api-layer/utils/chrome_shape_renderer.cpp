@@ -46,13 +46,18 @@ namespace openxr_api_layer::utils::chrome_shapes {
     bool Renderer::init(ComPtr<ID3D11Device>        device,
                         ComPtr<ID3D11DeviceContext> ctx,
                         UINT                        dstWidth,
-                        UINT                        dstHeight) {
+                        UINT                        dstHeight,
+                        UINT                        renderWidth,
+                        UINT                        renderHeight) {
         if (!device || !ctx || dstWidth == 0 || dstHeight == 0) return false;
 
         m_device = std::move(device);
         m_ctx    = std::move(ctx);
         m_dstW   = dstWidth;
         m_dstH   = dstHeight;
+        // 0 → "= dst" (supersample 1.0, legacy + golden path).
+        m_renderW = renderWidth  ? renderWidth  : dstWidth;
+        m_renderH = renderHeight ? renderHeight : dstHeight;
 
         auto fail = [](const char* step) {
             Log(fmt::format(
@@ -199,13 +204,14 @@ namespace openxr_api_layer::utils::chrome_shapes {
         if (!m_batch.upload({ { m_scratch.data(), count } })) return false;
 
         // Full pipeline state — caller is assumed to have left the
-        // device in an unknown configuration. Viewport uses the same
-        // (dstW, dstH) the cbuffer was built with, so pixel-space NDC
-        // math in the VS stays consistent across paints.
+        // device in an unknown configuration. Viewport spans the PHYSICAL
+        // render target (m_renderW/H); the cbuffer's texSize stays logical
+        // (m_dstW/H), so the solid rects stretch losslessly onto a
+        // supersampled image. At factor 1.0, m_renderW == m_dstW (legacy).
         m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
         D3D11_VIEWPORT vp{
             0.0f, 0.0f,
-            static_cast<float>(m_dstW), static_cast<float>(m_dstH),
+            static_cast<float>(m_renderW), static_cast<float>(m_renderH),
             0.0f, 1.0f};
         m_ctx->RSSetViewports(1, &vp);
         m_ctx->RSSetState(m_raster.Get());

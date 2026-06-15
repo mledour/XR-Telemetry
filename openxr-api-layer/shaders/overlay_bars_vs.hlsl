@@ -60,8 +60,11 @@ VSOutput VSMain(VSInput v)
     // gradient per-pixel — matching D2D's strip-spanning linear brush.
     o.stripY = saturate((py - histoT) / max(stripH, 1.0f));
     o.tier = v.tier;
-    // Pixel-space rect (left, top, right, bottom) for the PS's analytic
-    // edge anti-aliasing. top = bar tip (smaller Y), bottom = strip floor.
-    o.rectPx = float4(left, top, right, bottom);
+    // Pixel-space rect (left, top, right, bottom) for the PS's analytic edge
+    // anti-aliasing, scaled to PHYSICAL render-target pixels (× supersample)
+    // so it lines up with SV_Position in the PS — which is physical under the
+    // supersampled viewport (viewport = texSize × ss, while texSize stays
+    // logical for the NDC math above). At ss == 1 this is the logical rect.
+    o.rectPx = float4(left, top, right, bottom) * supersample;
     return o;
 }

@@ -110,10 +110,18 @@ namespace openxr_api_layer::utils::chrome_shapes {
         // texture). dstWidth/dstHeight are the fixed pixel dimensions of
         // those targets; they pre-populate the cbuffer's texSize and
         // stay constant for the renderer's lifetime (always kTexW × kTexH).
+        // renderWidth/renderHeight: PHYSICAL render-target (viewport) dims,
+        // distinct from the LOGICAL dstWidth/dstHeight (cbuffer texSize) only
+        // when the overlay is supersampled. Default 0 → "= dst" (factor 1.0,
+        // legacy + golden-test path). Chrome rects are solid quads, so the
+        // viewport stretch from logical→physical is lossless (no atlas, no
+        // resampling) — only the viewport changes here.
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>        device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx,
                   UINT                                        dstWidth,
-                  UINT                                        dstHeight);
+                  UINT                                        dstHeight,
+                  UINT                                        renderWidth  = 0,
+                  UINT                                        renderHeight = 0);
 
         bool isReady() const noexcept { return m_ready; }
 
@@ -172,9 +180,13 @@ namespace openxr_api_layer::utils::chrome_shapes {
 
         Microsoft::WRL::ComPtr<ID3D11Device>           m_device;
         Microsoft::WRL::ComPtr<ID3D11DeviceContext>    m_ctx;
-        // Target dimensions snapshotted at init for the cbuffer.
+        // LOGICAL target dimensions snapshotted at init for the cbuffer's
+        // texSize; PHYSICAL render dims drive the flush-time viewport. Equal
+        // unless supersampled.
         UINT                                            m_dstW = 0;
         UINT                                            m_dstH = 0;
+        UINT                                            m_renderW = 0;
+        UINT                                            m_renderH = 0;
 
         Microsoft::WRL::ComPtr<ID3D11VertexShader>     m_vs;
         Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;

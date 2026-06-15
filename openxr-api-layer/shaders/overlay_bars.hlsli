@@ -61,6 +61,13 @@ cbuffer BarConstants : register(b0)
     float4 orangeColor;    // BarTier::Orange           reg4
     float4 redColor;       // BarTier::Red              reg5
     float4 dashColor;      // empty-slot placeholder    reg6
+    // Overlay supersample factor (= renderer m_ss). The VS scales rectPx by
+    // it so the PS's analytic edge coverage — measured against SV_Position,
+    // which is in PHYSICAL render-target pixels under the supersampled
+    // viewport — compares like-for-like. Appended at reg7 so the colour
+    // registers above keep their natural 16-byte boundaries. ss==1 → no-op.
+    float  supersample;    // overlay supersample factor reg7.x
+    float3 _pad;           //                            reg7.yzw
 };
 
 // Per-vertex: the four corners of a unit quad (0,0)-(1,1), fed as a

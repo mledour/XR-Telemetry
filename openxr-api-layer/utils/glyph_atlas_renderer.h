@@ -100,13 +100,26 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // device and the D3D11-on-12 shim device, tomorrow potentially
         // additional debug viewers.
         //
+        // `renderWidth` / `renderHeight` are the PHYSICAL render-target
+        // (swapchain image / viewport) dimensions. They differ from
+        // dstWidth/dstHeight — the LOGICAL design space the cbuffer's
+        // texSize uses — only when the overlay is supersampled. Default 0
+        // means "= dst" (supersample factor 1.0): the legacy path, and what
+        // the snapshot/golden test uses, so its goldens stay byte-stable.
+        // When they differ, the atlas passed in MUST have been baked at the
+        // physical glyph sizes (CoreRenderer::init does this with the same
+        // factor) — the renderer looks glyphs up at the physical size and
+        // folds the factor back out into logical dest rects + metrics.
+        //
         // Returns false on any pipeline-creation failure. Caller logs +
         // degrades to bypass — never crashes the host.
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>          device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext>   ctx,
                   UINT                                          dstWidth,
                   UINT                                          dstHeight,
-                  const BuildResult&                            atlas);
+                  const BuildResult&                            atlas,
+                  UINT                                          renderWidth  = 0,
+                  UINT                                          renderHeight = 0);
 
         bool isReady() const noexcept { return m_ready; }
 
@@ -183,11 +196,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
             float color[4];    // straight-alpha RGBA
         };
 
-        // Cbuffer mirror — 16-byte register, 2× float2.
+        // Cbuffer mirror — two 16-byte registers. reg0 = texSize + atlasSize
+        // (2× float2); reg1 = supersample + pad. Must match overlay_text.hlsli.
         struct TextConstants {
             float texSize[2];     // dest tex (kTexW, kTexH)
             float atlasSize[2];   // atlas (atlasWidth, atlasHeight)
+            float supersample;    // = m_ss; PS gates its corrections on > 1
+            float pad[3];
         };
+        static_assert(sizeof(TextConstants) == 32,
+                      "TextConstants must mirror overlay_text.hlsli's cbuffer "
+                      "(2 x float4 = 32 B); the immutable cbuffer relies on it");
 
         // Instance-buffer sizing, handed to m_batch (InstancedBatchBuffer),
         // which owns the power-of-two growth + DISCARD-map upload. Initial
@@ -210,9 +229,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
 
         Microsoft::WRL::ComPtr<ID3D11Device>           m_device;
         Microsoft::WRL::ComPtr<ID3D11DeviceContext>    m_ctx;
-        // Target dimensions snapshotted at init for the cbuffer.
+        // LOGICAL target dimensions snapshotted at init for the cbuffer's
+        // texSize (the design space layout code positions text in).
         UINT                                            m_dstW = 0;
         UINT                                            m_dstH = 0;
+        // PHYSICAL render dimensions (viewport) and the derived supersample
+        // factor m_ss = renderW / dstW. At m_ss == 1 the renderer is the
+        // legacy path: glyphs looked up + emitted at the logical size, no
+        // metric folding, viewport == texSize.
+        UINT                                            m_renderW = 0;
+        UINT                                            m_renderH = 0;
+        float                                           m_ss      = 1.0f;
 
         Microsoft::WRL::ComPtr<ID3D11VertexShader>     m_vs;
         Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;

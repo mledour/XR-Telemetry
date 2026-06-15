@@ -173,7 +173,10 @@ namespace openxr_api_layer::detail {
     // Renders the overlay HUD through the SAME GPU pipeline the in-headset
     // D3D11 path uses (chrome shapes + glyph atlas + instanced bars,
     // shaders sampled / blended on the GPU) into `target` — a caller-owned
-    // BGRA8_UNORM texture sized kTexW × kTexH with D3D11_BIND_RENDER_TARGET.
+    // BGRA8_UNORM texture sized via overlaySnapshotTargetSize() (the PHYSICAL
+    // supersampled dimensions) with D3D11_BIND_RENDER_TARGET. It renders at the
+    // production supersample factor, so the golden captures the shipped 2.0x
+    // output — gamma, edge-contrast, supersampled glyphs, physical bar/line AA.
     // The caller reads `target` back via a staging copy to obtain pixels
     // for the golden comparison. This is the snapshot coverage of the
     // actual shipping render path (the legacy D2D snapshot entry was
@@ -190,5 +193,11 @@ namespace openxr_api_layer::detail {
         const HistogramRing<kOverlayHistoRingSize>& cpuRing,
         const HistogramRing<kOverlayHistoRingSize>& gpuRing,
         std::string* errOut = nullptr);
+
+    // Pixel dimensions renderOverlayToTextureD3D11 renders at — the PRODUCTION
+    // (supersampled) physical size. The snapshot test sizes its target +
+    // readback buffers from these, so it tracks kOverlaySupersample with no
+    // hardcoded dimensions to drift if the factor changes. Fills width/height.
+    void overlaySnapshotTargetSize(UINT& width, UINT& height);
 
 } // namespace openxr_api_layer::detail

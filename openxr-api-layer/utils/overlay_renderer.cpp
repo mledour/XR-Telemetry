@@ -169,10 +169,88 @@ namespace openxr_api_layer::detail {
                                          // in test_overlay_snapshot.cpp; the golden
                                          // PNG must be regenerated when it changes.
 
+        // -------- Overlay supersampling -------------------------------------
+        //
+        // The HUD is AUTHORED entirely in the logical (kTexW × kTexH) "design
+        // pixel" space — every layout constant, font size, inline offset and
+        // the histogram bar geometry below stays in that space and is NEVER
+        // scaled. We raise only the RENDER resolution: the swapchain image,
+        // each renderer's viewport, and the glyph-atlas bake are multiplied
+        // by kOverlaySupersample so the runtime composites from a sharper
+        // source. The quad's WORLD size (overlay_layout.h) is unchanged, so
+        // the HUD subtends the same angle in the HMD — it does NOT get bigger
+        // on screen, only crisper.
+        //
+        // Why this helps: a Quad composition layer is resampled by the
+        // runtime with a single bilinear tap through the lens-distortion /
+        // reprojection mesh, and the quad's texel grid never aligns to the
+        // HMD pixel grid — that softens crisp text by ~1 px no matter what.
+        // Feeding the compositor ~kOverlaySupersample² the texels is what
+        // recovers the sharpness that single tap eats. The glyph atlas is
+        // baked at the matching physical sizes so the extra texels carry real
+        // glyph detail (not an upscale of the logical-size raster).
+        //
+        // 1.0 == legacy 720×436. Production passes 2.0×. Earlier HMD tuning
+        // pushed this to 3.0× chasing off-axis thin-line aliasing — but that
+        // turned out to be carried by the line thickening (kChromeLineW), the
+        // unconditional quad AA, and the dim budget colour, all of which are
+        // resolution-independent. So the factor is really just the FONT
+        // sharpness / cost dial: glyphs are textured, only more source texels
+        // sharpen them (AA + thickening don't touch them).
+        //
+        // 2.0× (1440×872, ≈ 5 MB per swapchain image) is the balance —
+        // noticeably sharper text than 1.5×, and the 2048×4096 atlas packs
+        // comfortably, whereas 3.0× pushed a 3072×6144 atlas (3× glyphs) with a
+        // real shelf-pack-overflow risk (overflow fails closed = HUD disabled).
+        // Render cost is sub-ms (cadenced paint) at any of these. Change ONLY
+        // this constant — physical extents, atlas, bar/line scaling and the
+        // snapshot all derive from it: drop to 1.5× if a GPU is bound, raise
+        // for crisper text.
+        constexpr float   kOverlaySupersample = 2.0f;   // requested factor
+        // Physical pixel extents, rounded through the SAME helper the atlas
+        // bake and glyph lookup use (glyph_atlas::supersampledSizePx) — one
+        // rounding rule, no open-coded (int)(x*ss+0.5f) drift.
+        constexpr int32_t kTexWPhys = glyph_atlas::supersampledSizePx(
+            static_cast<uint16_t>(kTexW), kOverlaySupersample);
+        constexpr int32_t kTexHPhys = glyph_atlas::supersampledSizePx(
+            static_cast<uint16_t>(kTexH), kOverlaySupersample);
+        // EFFECTIVE factor after pixel rounding = exactly the ratio each
+        // renderer derives as renderW/dstW (kTexWPhys/kTexW). The atlas bake
+        // and the histogram bars take THIS value (not the requested factor) so
+        // the bake size, the glyph-lookup size and the bar viewport agree. At
+        // the shipped 2.0x it equals kOverlaySupersample.
+        //
+        // This single scalar is WIDTH-derived, and the bars + glyph passes also
+        // scale Y by it — correct only when width and height round to the SAME
+        // ratio. The assert below enforces that at compile time, so a future
+        // tweak to kOverlaySupersample can't pick a factor (e.g. 1.3x:
+        // 936/720 != 567/436) that would misalign the bars + glyph vertical
+        // metrics by a fraction of a pixel. 1.5x and 2.0x both pass.
+        constexpr float kEffectiveSupersample =
+            static_cast<float>(kTexWPhys) / static_cast<float>(kTexW);
+        static_assert(static_cast<int64_t>(kTexWPhys) * kTexH ==
+                          static_cast<int64_t>(kTexHPhys) * kTexW,
+                      "kOverlaySupersample must scale width and height by the "
+                      "same ratio (kTexWPhys/kTexW == kTexHPhys/kTexH) — use a "
+                      "factor like 1.5 or 2.0; one like 1.3 rounds W and H "
+                      "differently and would misalign the bars + glyph metrics");
+
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
         constexpr float kSectionGap     =  8.0f;
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
+
+        // Thin structural line width — panel borders, column separators, AND
+        // the histogram grid + budget lines — in LOGICAL px. Bumped 1.0 -> 1.5
+        // after HMD testing: a 1-px line is too thin to survive the runtime's
+        // quad-layer resample once the HUD sits off-axis, where it hatches at
+        // the lens periphery. 1.5px (~3 physical at 2.0x) holds as a
+        // continuous line there; marginally heavier when centred, where 1px
+        // already looked clean. (The histogram lines were missed in the first
+        // pass and so alone still hatched until matched up here.) The outer
+        // frame keeps kFrameStroke (load-bearing — kInner* derive from it — and
+        // already 2px). Tune here.
+        constexpr float kChromeLineW    = 1.5f;
 
         // Inner content rectangle — single source of truth for the
         // layout inset. Both paint() and drawHistoRegion() derive
@@ -405,7 +483,13 @@ namespace openxr_api_layer::detail {
                 }
             }
 
-            bool init() {
+            // `ss` is the overlay supersample factor (see kOverlaySupersample).
+            // It only affects the glyph-atlas bake size — the atlas is
+            // rasterized at the PHYSICAL (ss-scaled) sizes so the GPU text
+            // renderer can sample it 1:1 at the higher render resolution.
+            // Defaults to 1.0 so the snapshot/golden path (which calls init()
+            // with no argument) bakes the legacy sizes and stays byte-stable.
+            bool init(float ss = 1.0f) {
                 if (FAILED(::DWriteCreateFactory(
                         DWRITE_FACTORY_TYPE_SHARED,
                         __uuidof(IDWriteFactory),
@@ -457,7 +541,7 @@ namespace openxr_api_layer::detail {
                 // / D3D12 renderers, snapshot test) fail-close — the
                 // overlay is disabled rather than crashing the host.
                 // There is no D2D fallback anymore (Task 17 removed it).
-                if (!buildGlyphAtlas(kFamilyLabels, customCollection)) {
+                if (!buildGlyphAtlas(kFamilyLabels, customCollection, ss)) {
                     Log("xr_telemetry: glyph atlas build failed — "
                         "overlay will be disabled\n");
                     m_atlasReady = false;
@@ -477,6 +561,17 @@ namespace openxr_api_layer::detail {
             // atlas texture via glyph_atlas::Renderer::init.
             const glyph_atlas::BuildResult& atlas() const noexcept { return m_atlas; }
             bool atlasReady() const noexcept { return m_atlasReady; }
+
+            // Free the CPU-side atlas bitmap once a renderer has uploaded it to
+            // its GPU texture (CreateTexture2D copies the bytes). Only the glyph
+            // renderer consumes the bitmap; the glyph + metrics tables it also
+            // needs are copied separately and stay intact. At 2.0× the bitmap
+            // is an 8 MB R8 buffer that would otherwise sit resident in every
+            // host game process for its lifetime — drop it. Idempotent.
+            void releaseAtlasBitmap() noexcept {
+                m_atlas.bitmap.clear();
+                m_atlas.bitmap.shrink_to_fit();
+            }
 
             // Rebuild the chrome instance batches from the current
             // snapshot. Pure CPU work (NO GPU submission): populates the
@@ -676,12 +771,18 @@ namespace openxr_api_layer::detail {
             // ~3 KB of atlas pixels and removes a layout-divergence
             // gotcha between paths.
             bool buildGlyphAtlas(const wchar_t*         familyLabels,
-                                  IDWriteFontCollection* collection) {
-                // 13 px is the histogram ms-axis tick labels (small, dim,
-                // right-aligned in the left gutter); the rest are the
-                // pre-existing HUD sizes. RajdhaniUpright 13 carries the
+                                  IDWriteFontCollection* collection,
+                                  float                  ss) {
+                // LOGICAL design-pixel sizes. 13 px is the histogram ms-axis
+                // tick labels (small, dim, right-aligned in the left gutter);
+                // the rest are the pre-existing HUD sizes (the union of every
+                // kFont* / kFmt*Gpu constant). RajdhaniUpright 13 carries the
                 // digits the axis needs (and the full ASCII set, like the
-                // others — a few KB of extra atlas area).
+                // others). Each size is baked at its PHYSICAL size (logical ×
+                // ss, see supersampledSizePx) so the GPU text renderer — which
+                // maps the same logical size to the same physical size at
+                // lookup — samples each glyph 1:1 at the render resolution. At
+                // ss == 1 these bake unchanged.
                 static constexpr uint16_t kSizes[] = {13, 17, 18, 19, 32, 43, 52};
 
                 std::vector<wchar_t> rajdhaniSet;
@@ -696,24 +797,35 @@ namespace openxr_api_layer::detail {
                 // both cases.
                 spec.fontCollection = collection;
                 spec.familyLabels   = familyLabels;
-                // 1024×2048 R8 = 2 MB — fits all 7 sizes of the full ASCII
-                // set (one face, Rajdhani) with comfortable slack after the
-                // kSizes expansion to {13, 17, 18, 19, 32, 43, 52} (the 13-px
-                // axis labels are the smallest, so they add the least area).
-                // 1024×1024 overflowed shelf-pack back when a second face was
-                // baked alongside this one; the 19-px shelf landed past the
-                // bottom edge and build returned false. One face leaves ample
-                // room now, but the spare 1 MB of init-time bitmap memory
-                // (uploaded into the GPU texture and then dropped from RAM)
-                // costs nothing per frame — keep the headroom.
-                spec.atlasWidthPx   = 1024;
-                spec.atlasHeightPx  = 2048;
+                // 1024×2048 R8 = 2 MB at ss == 1 — fits all 7 sizes of the
+                // full ASCII set (one face, Rajdhani) with comfortable slack
+                // (1024×1024 overflowed shelf-pack back when a second face was
+                // baked alongside this one; one face leaves ample room now).
+                // Scale BOTH dims by the factor so the budget tracks glyph
+                // area (which grows ~ss²) and the shelf-pack keeps the same
+                // slack ratio: 1.5x → 1536×3072, 2.0x → 2048×4096 (~4× area),
+                // through the same rounding helper as everything else. The
+                // bitmap lives only until the GPU texture is created from it —
+                // CoreRenderer::releaseAtlasBitmap() frees it once the glyph
+                // renderer has uploaded it, so the R8 buffer (8 MB at 2.0×)
+                // isn't resident for the host process's lifetime; zero
+                // per-frame cost. ss == 1 keeps the legacy 1024×2048
+                // (golden-stable).
+                //
+                // NOTE: shelf-pack success at the shipped factor still needs a
+                // Windows build to confirm (build() returns false on overflow
+                // → m_atlasReady=false → HUD disabled); the proportional
+                // budget makes overflow unlikely but isn't a static proof.
+                spec.atlasWidthPx   = glyph_atlas::supersampledSizePx(1024, ss);
+                spec.atlasHeightPx  = glyph_atlas::supersampledSizePx(2048, ss);
                 spec.padding        = 1;
 
                 spec.requests.reserve(_countof(kSizes));
                 for (uint16_t sz : kSizes) {
+                    const uint16_t physSz =
+                        glyph_atlas::supersampledSizePx(sz, ss);
                     spec.requests.push_back({glyph_atlas::GlyphFace::RajdhaniUpright,
-                                              sz, rajdhaniSet});
+                                              physSz, rajdhaniSet});
                 }
 
                 if (!glyph_atlas::build(spec, m_atlas)) return false;
@@ -1680,7 +1792,7 @@ namespace openxr_api_layer::detail {
                 m_chromeShapes->addRoundedRect(l, t, r - l, b - t,
                                                 /*fill=*/kColorPanelBg,
                                                 /*border=*/kColorSeparator,
-                                                /*borderWidth=*/1.0f,
+                                                /*borderWidth=*/kChromeLineW,
                                                 /*radius=*/kPanelCornerRadius);
             }
 
@@ -1705,9 +1817,9 @@ namespace openxr_api_layer::detail {
                                                 /*radius=*/kFrameCornerRadius);
             }
 
-            // Static-tier column separators: `count` thin 1-px vertical
-            // rules at l + colWidth*i (i = 1..count), inset by insetY top
-            // and bottom. One home for the "thin separators across N
+            // Static-tier column separators: `count` thin vertical rules
+            // (kChromeLineW wide) at l + colWidth*i (i = 1..count), inset by
+            // insetY top and bottom. One home for the "thin separators across N
             // columns" geometry shared by the header (4 fixed rules) and
             // the bottom panels (numCols-1 rules) — and one consistent
             // tier gate (inside the helper, matching drawPanelBg /
@@ -1719,7 +1831,7 @@ namespace openxr_api_layer::detail {
                 for (int i = 1; i <= count; ++i) {
                     const float x = l + colWidth * static_cast<float>(i);
                     m_chromeShapes->addRect(
-                        x, t + insetY, 1.0f, (b - insetY) - (t + insetY),
+                        x, t + insetY, kChromeLineW, (b - insetY) - (t + insetY),
                         kColorSeparator);
                 }
             }
@@ -1834,10 +1946,17 @@ namespace openxr_api_layer::detail {
             // target rotates each frame). Target dimensions (kTexW,
             // kTexH) are constant for the renderer's lifetime so we
             // bake them into the immutable cbuffer at init.
-            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx) {
+            // `ss` is the overlay supersample factor (kOverlaySupersample).
+            // The cbuffers keep LOGICAL texSize (kTexW × kTexH); only the
+            // flush-time viewport + scissor scale by ss to cover the physical
+            // render target. Defaults to 1.0 so the snapshot/golden path
+            // (which calls init with two args) renders at the legacy size.
+            bool init(ID3D11Device* device, ID3D11DeviceContext* ctx,
+                       float ss = 1.0f) {
                 if (!device || !ctx) return false;
                 m_device = device;
                 m_ctx = ctx;
+                m_ss  = ss;
 
                 // Per-step failure logging. Without it, an HRESULT lost
                 // somewhere in this chain just disabled the GPU path with
@@ -2063,6 +2182,9 @@ namespace openxr_api_layer::detail {
                     if (SUCCEEDED(m_ctx->Map(m_quadInstances.Get(), 0,
                             D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                         auto* q = static_cast<QuadInstance*>(map.pData);
+                        // overlay_quad_ps anti-aliases every quad (box SDF +
+                        // fwidth), so the thin grid + budget lines below need
+                        // no explicit corner radius to get clean edges.
                         q[0] = makeQuad(plotL, histoT, fullW, stripH, kPanelBg);
                         // Gridlines at the round-ms axis ticks (interior
                         // ticks only — the 0 tick IS the strip bottom edge,
@@ -2086,7 +2208,8 @@ namespace openxr_api_layer::detail {
                                 const float y = histoT + stripH *
                                     (1.0f - axis.ticks[i].heightFrac);
                                 q[slot++] =
-                                    makeQuad(plotL, y, fullW, 1.0f, kGridDash);
+                                    makeQuad(plotL, y, fullW, kChromeLineW,
+                                              kGridDash);
                             }
                         }
                         for (; slot <= 4; ++slot) {
@@ -2095,7 +2218,14 @@ namespace openxr_api_layer::detail {
                         }
                         const float by =
                             histoT + stripH * budgetLineFraction();
-                        q[5] = makeQuad(plotL, by, fullW, 1.0f, kBudgetLine);
+                        // Same kChromeLineW as the panel borders / separators /
+                        // grid: LOGICAL px → constant angular thickness across
+                        // supersample factors, while a higher factor gives more
+                        // physical texels = better off-axis warp survival. The
+                        // dim kBudgetLine colour keeps it from CA-fringing (a
+                        // brighter line shows the off-axis warp aliasing more).
+                        q[5] = makeQuad(plotL, by, fullW, kChromeLineW,
+                                         kBudgetLine);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
                         quadOk = true;
                     }
@@ -2120,6 +2250,7 @@ namespace openxr_api_layer::detail {
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
                     bc.barWidth = kBarPx;   // fixed 4-px integer width
                     bc.dashHeight = kDashPlaceholderH;  // tier-3 "no data" dash
+                    bc.supersample = m_ss;  // logical→physical for the PS edge AA
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
                     copyColor(bc.gradBottom, isGpu ? kGpuGradBot : kCpuGradBot);
                     copyColor(bc.orange, kOrange);
@@ -2131,8 +2262,13 @@ namespace openxr_api_layer::detail {
 
                 // --- pipeline state (prior passes clobbered it; set all) ---
                 m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-                D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kTexW),
-                                  static_cast<float>(kTexH), 0.0f, 1.0f};
+                // Viewport spans the PHYSICAL render target (logical × ss).
+                // texSize in the cbuffers stays logical, so the bars' float
+                // rects stretch losslessly onto the supersampled image.
+                D3D11_VIEWPORT vp{0.0f, 0.0f,
+                                  static_cast<float>(kTexW) * m_ss,
+                                  static_cast<float>(kTexH) * m_ss,
+                                  0.0f, 1.0f};
                 m_ctx->RSSetViewports(1, &vp);
                 // Clip to the PLOT rect (left = plotL, after the ms-axis
                 // gutter), not the full histo rect: under negative slack
@@ -2140,11 +2276,14 @@ namespace openxr_api_layer::detail {
                 // keeps them out of the gutter where the tick labels sit.
                 // (The glyph + chrome passes run earlier with ScissorEnable
                 // = FALSE, so the labels themselves are never clipped.)
+                // The scissor is in PHYSICAL render-target pixels, so the
+                // logical bounds scale by m_ss too (else the clip would land
+                // at 2/3 of the strip on a supersampled target).
                 const D3D11_RECT sc{
-                    static_cast<LONG>(std::floor(plotL)),
-                    static_cast<LONG>(std::floor(histoT)),
-                    static_cast<LONG>(std::ceil(histoR)),
-                    static_cast<LONG>(std::ceil(histoB))};
+                    static_cast<LONG>(std::floor(plotL  * m_ss)),
+                    static_cast<LONG>(std::floor(histoT * m_ss)),
+                    static_cast<LONG>(std::ceil(histoR * m_ss)),
+                    static_cast<LONG>(std::ceil(histoB * m_ss))};
                 m_ctx->RSSetScissorRects(1, &sc);
                 m_ctx->RSSetState(m_raster.Get());
                 const float bf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -2193,7 +2332,7 @@ namespace openxr_api_layer::detail {
             // static_asserts below freeze the C++ side's sizeof so a future
             // member insertion (e.g. a stray float between dashHeight and
             // gradTop) can't silently shift every colour off by 8 bytes.
-            // Mirror cbuffer layout: 7×float4 registers (112 B) for bars,
+            // Mirror cbuffer layout: 8×float4 registers (128 B) for bars,
             // 1×float4 register (16 B) for quads.
             struct BarInstance  { float xLeft; float height; uint32_t tier; };
             // The quad instance layout is shared with ChromeShapeRenderer —
@@ -2206,11 +2345,17 @@ namespace openxr_api_layer::detail {
                 float barWidth; float dashHeight;
                 float gradTop[4]; float gradBottom[4];
                 float orange[4]; float red[4]; float dash[4];
+                // reg7: supersample factor (= renderer m_ss). The bars VS
+                // scales rectPx by it so the PS's analytic edge coverage —
+                // computed against SV_Position, which is in PHYSICAL pixels
+                // under the supersampled viewport — compares like-for-like.
+                // pad keeps the register 16-byte aligned. ss==1 → no-op.
+                float supersample; float pad[3];
             };
             struct QuadConstants { float texSize[2]; float pad[2]; };
-            static_assert(sizeof(BarConstants)  == 112,
+            static_assert(sizeof(BarConstants)  == 128,
                           "BarConstants must mirror HLSL cbuffer packing "
-                          "(7 × float4 = 112 B) — see overlay_bars.hlsli");
+                          "(8 × float4 = 128 B) — see overlay_bars.hlsli");
             static_assert(sizeof(QuadConstants) == 16,
                           "QuadConstants must mirror HLSL cbuffer packing "
                           "(1 × float4 = 16 B) — see overlay_quad.hlsli");
@@ -2222,7 +2367,24 @@ namespace openxr_api_layer::detail {
             // Colours (linear RGBA), copied from initBrushes().
             static constexpr float kPanelBg[4]    = {0.035f, 0.039f, 0.039f, 1.00f};
             static constexpr float kGridDash[4]   = {0.353f, 0.431f, 0.451f, 0.30f};
-            static constexpr float kBudgetLine[4] = {0.949f, 0.957f, 0.961f, 0.45f};
+            // Budget reference line. Key HMD finding: the 5/10ms grid ticks
+            // (kGridDash, dim blue-grey at 0.30) render CLEAN at the same
+            // thickness + position, while a bright near-white budget line
+            // CA-fringed (violet/pink magenta fringe) and showed aliasing — so
+            // the cause is BRIGHTNESS, not geometry. A bright near-white thin
+            // line on dark is the worst case for the HMD lens to split and
+            // makes any residual aliasing visible; a dim line hides both.
+            //
+            // So drop into the grid's clean low-contrast regime. Once the grid
+            // and budget lines were the same thickness, ~2.5x the grid's
+            // brightness still read "too contrasted" off-axis — the brighter
+            // line just makes its (identical) off-axis aliasing more visible,
+            // while the dim grid hides it. Dim further to ~1.5x the grid: dark
+            // enough to share the grid's clean off-axis behaviour, a touch
+            // brighter + neutral (vs the grid's cool tint) to stay readable as
+            // the budget. Tune here: brighter = more prominent but more visible
+            // aliasing; dimmer = cleaner but closer to the ticks.
+            static constexpr float kBudgetLine[4] = {0.50f, 0.52f, 0.55f, 0.35f};
             static constexpr float kGpuGradTop[4] = {0.157f, 0.878f, 0.898f, 1.00f};
             static constexpr float kGpuGradBot[4] = {0.075f, 0.682f, 0.710f, 1.00f};
             static constexpr float kCpuGradTop[4] = {0.157f, 0.686f, 1.000f, 1.00f};
@@ -2238,6 +2400,9 @@ namespace openxr_api_layer::detail {
                 QuadInstance q{};
                 q.rect[0] = x; q.rect[1] = y; q.rect[2] = w; q.rect[3] = h;
                 copyColor(q.color, c);
+                // radius / borderWidth stay zero-initialised: overlay_quad_ps
+                // anti-aliases every quad via the box SDF, so no per-quad
+                // radius is needed to soften the thin lines.
                 return q;
             }
 
@@ -2300,6 +2465,11 @@ namespace openxr_api_layer::detail {
             }
 
             bool m_ready = false;
+            // Overlay supersample factor. Scales ONLY the flush-time
+            // viewport + scissor (physical render target); the cbuffers'
+            // texSize stays logical so the bar/grid float rects stretch
+            // losslessly. 1.0 == legacy.
+            float m_ss = 1.0f;
             ComPtr<ID3D11Device>           m_device;
             ComPtr<ID3D11DeviceContext>    m_ctx;
             // RTV is supplied per drawPanel call (Task 15) so the
@@ -2625,7 +2795,7 @@ namespace openxr_api_layer::detail {
           private:
             bool init() {
                 if (!m_device || !m_api || m_session == XR_NULL_HANDLE) return false;
-                if (!m_core.init()) {
+                if (!m_core.init(kEffectiveSupersample)) {
                     Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
@@ -2641,8 +2811,8 @@ namespace openxr_api_layer::detail {
                                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
                 sci.format = format;
                 sci.sampleCount = 1;
-                sci.width = static_cast<uint32_t>(kTexW);
-                sci.height = static_cast<uint32_t>(kTexH);
+                sci.width = static_cast<uint32_t>(kTexWPhys);
+                sci.height = static_cast<uint32_t>(kTexHPhys);
                 sci.faceCount = 1;
                 sci.arraySize = 1;
                 sci.mipCount = 1;
@@ -2785,7 +2955,8 @@ namespace openxr_api_layer::detail {
                 // Fail-closed: if any one fails to init, the overlay is
                 // disabled (no D2D fallback) — the layer logs and
                 // makeD3D11OverlayRenderer returns nullptr.
-                if (!m_bars.init(m_device.Get(), m_context.Get())) {
+                if (!m_bars.init(m_device.Get(), m_context.Get(),
+                                  kEffectiveSupersample)) {
                     Log("xr_telemetry: overlay disabled — bars init failed\n");
                     return false;
                 }
@@ -2794,21 +2965,31 @@ namespace openxr_api_layer::detail {
                         "built (DirectWrite face resolution failed)\n");
                     return false;
                 }
+                // dst = LOGICAL design space (cbuffer texSize); render =
+                // PHYSICAL swapchain-image extent (viewport). They differ
+                // only when supersampled — the renderer maps between them.
                 if (!m_glyphRenderer.init(m_device, m_context,
                                            static_cast<UINT>(kTexW),
                                            static_cast<UINT>(kTexH),
-                                           m_core.atlas())) {
+                                           m_core.atlas(),
+                                           static_cast<UINT>(kTexWPhys),
+                                           static_cast<UINT>(kTexHPhys))) {
                     Log("xr_telemetry: overlay disabled — glyph renderer "
                         "init failed\n");
                     return false;
                 }
                 if (!m_chromeShapeRenderer.init(m_device, m_context,
                                                  static_cast<UINT>(kTexW),
-                                                 static_cast<UINT>(kTexH))) {
+                                                 static_cast<UINT>(kTexH),
+                                                 static_cast<UINT>(kTexWPhys),
+                                                 static_cast<UINT>(kTexHPhys))) {
                     Log("xr_telemetry: overlay disabled — chrome shapes "
                         "renderer init failed\n");
                     return false;
                 }
+                // Glyph texture uploaded — free the CPU atlas bitmap (8 MB at
+                // 2.0×) so it isn't resident for the host process's lifetime.
+                m_core.releaseAtlasBitmap();
 
                 // Fill the immutable XrCompositionLayerQuad fields
                 // now that m_swapchain is alive. SOURCE_ALPHA blending
@@ -2845,7 +3026,7 @@ namespace openxr_api_layer::detail {
                 m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 m_quadLayer.subImage.swapchain = m_swapchain;
                 m_quadLayer.subImage.imageRect.offset = {0, 0};
-                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
+                m_quadLayer.subImage.imageRect.extent = {kTexWPhys, kTexHPhys};
                 m_quadLayer.subImage.imageArrayIndex = 0;
                 m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
             }
@@ -3107,7 +3288,7 @@ namespace openxr_api_layer::detail {
                     return false;
                 }
 
-                if (!m_core.init()) {
+                if (!m_core.init(kEffectiveSupersample)) {
                     Log("xr_telemetry: overlay DirectWrite / glyph-atlas init failed; HUD disabled\n");
                     return false;
                 }
@@ -3123,8 +3304,8 @@ namespace openxr_api_layer::detail {
                                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
                 sci.format = format;
                 sci.sampleCount = 1;
-                sci.width = static_cast<uint32_t>(kTexW);
-                sci.height = static_cast<uint32_t>(kTexH);
+                sci.width = static_cast<uint32_t>(kTexWPhys);
+                sci.height = static_cast<uint32_t>(kTexHPhys);
                 sci.faceCount = 1;
                 sci.arraySize = 1;
                 sci.mipCount = 1;
@@ -3225,7 +3406,8 @@ namespace openxr_api_layer::detail {
                 // as the D3D11 path; each fails closed — if any init
                 // returns false the overlay is disabled (no D2D
                 // fallback). RTV is passed per draw call.
-                if (!m_bars.init(m_d3d11Device.Get(), m_d3d11Context.Get())) {
+                if (!m_bars.init(m_d3d11Device.Get(), m_d3d11Context.Get(),
+                                  kEffectiveSupersample)) {
                     Log("xr_telemetry: overlay disabled — D3D12 bars "
                         "init failed\n");
                     return false;
@@ -3235,10 +3417,15 @@ namespace openxr_api_layer::detail {
                         "not built\n");
                     return false;
                 }
+                // dst = LOGICAL design space (cbuffer texSize); render =
+                // PHYSICAL wrapped-image extent (viewport). See the D3D11
+                // path for the supersample contract.
                 if (!m_glyphRenderer.init(m_d3d11Device, m_d3d11Context,
                                            static_cast<UINT>(kTexW),
                                            static_cast<UINT>(kTexH),
-                                           m_core.atlas())) {
+                                           m_core.atlas(),
+                                           static_cast<UINT>(kTexWPhys),
+                                           static_cast<UINT>(kTexHPhys))) {
                     Log("xr_telemetry: overlay disabled — D3D12 glyph "
                         "renderer init failed\n");
                     return false;
@@ -3246,11 +3433,16 @@ namespace openxr_api_layer::detail {
                 if (!m_chromeShapeRenderer.init(
                         m_d3d11Device, m_d3d11Context,
                         static_cast<UINT>(kTexW),
-                        static_cast<UINT>(kTexH))) {
+                        static_cast<UINT>(kTexH),
+                        static_cast<UINT>(kTexWPhys),
+                        static_cast<UINT>(kTexHPhys))) {
                     Log("xr_telemetry: overlay disabled — D3D12 chrome "
                         "shapes renderer init failed\n");
                     return false;
                 }
+                // Glyph texture uploaded — free the CPU atlas bitmap (8 MB at
+                // 2.0×) so it isn't resident for the host process's lifetime.
+                m_core.releaseAtlasBitmap();
 
                 // One-time fill of the immutable quad-layer fields.
                 // Byte-identical to the D3D11 path's helper — a shared base
@@ -3278,7 +3470,7 @@ namespace openxr_api_layer::detail {
                 m_quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 m_quadLayer.subImage.swapchain = m_swapchain;
                 m_quadLayer.subImage.imageRect.offset = {0, 0};
-                m_quadLayer.subImage.imageRect.extent = {kTexW, kTexH};
+                m_quadLayer.subImage.imageRect.extent = {kTexWPhys, kTexHPhys};
                 m_quadLayer.subImage.imageArrayIndex = 0;
                 m_quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
             }
@@ -3361,19 +3553,30 @@ namespace openxr_api_layer::detail {
         };
         if (!device || !ctx || !target) return fail("null device/ctx/target");
 
+        // Render at the PRODUCTION supersample factor so the snapshot mirrors
+        // what ships: the atlas bakes at the physical glyph sizes, the text PS
+        // applies its gamma + edge-contrast, the bars use physical edge
+        // coverage, and the grid/budget lines take the AA path — none of which
+        // are exercised at 1x (they're all gated on supersample > 1). The
+        // caller MUST size `target` via overlaySnapshotTargetSize() (= kTexWPhys
+        // x kTexHPhys) to match the physical viewport these renderers use.
         CoreRenderer core;
-        if (!core.init()) return fail("core.init() failed (DWrite / atlas)");
+        if (!core.init(kEffectiveSupersample)) return fail("core.init() failed (DWrite / atlas)");
         if (!core.atlasReady()) return fail("glyph atlas not built");
 
         HistogramBarRenderer    bars;
         glyph_atlas::Renderer   text;
         chrome_shapes::Renderer shapes;
-        if (!bars.init(device, ctx)) return fail("bars init failed");
+        if (!bars.init(device, ctx, kEffectiveSupersample)) return fail("bars init failed");
         if (!text.init(device, ctx, static_cast<UINT>(kTexW),
-                        static_cast<UINT>(kTexH), core.atlas()))
+                        static_cast<UINT>(kTexH), core.atlas(),
+                        static_cast<UINT>(kTexWPhys),
+                        static_cast<UINT>(kTexHPhys)))
             return fail("glyph renderer init failed");
         if (!shapes.init(device, ctx, static_cast<UINT>(kTexW),
-                          static_cast<UINT>(kTexH)))
+                          static_cast<UINT>(kTexH),
+                          static_cast<UINT>(kTexWPhys),
+                          static_cast<UINT>(kTexHPhys)))
             return fail("chrome shapes init failed");
 
         ComPtr<ID3D11RenderTargetView> rtv;
@@ -3389,6 +3592,15 @@ namespace openxr_api_layer::detail {
             return fail("paintOverlay failed");
         ctx->Flush();
         return true;
+    }
+
+    void overlaySnapshotTargetSize(UINT& width, UINT& height) {
+        // Physical (supersampled) pixel size renderOverlayToTextureD3D11
+        // renders at — the production dimensions. Exposed so the snapshot
+        // test sizes its target from here and tracks kOverlaySupersample
+        // automatically (no hardcoded dims to drift if the factor changes).
+        width  = static_cast<UINT>(kTexWPhys);
+        height = static_cast<UINT>(kTexHPhys);
     }
 
 } // namespace openxr_api_layer::detail

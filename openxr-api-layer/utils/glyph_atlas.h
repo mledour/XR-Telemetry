@@ -153,6 +153,22 @@ namespace openxr_api_layer::utils::glyph_atlas {
              |  static_cast<FaceMetricsKey>(sizePx);
     }
 
+    // -------- Supersampled pixel size ----------------------------------
+    //
+    // Maps a LOGICAL "design pixel" font size to the PHYSICAL atlas-bake /
+    // glyph-lookup size at a given supersample factor. Two call sites MUST
+    // agree on this mapping: the atlas builder (which rasterizes each glyph
+    // at the physical size) and glyph_atlas::Renderer (which looks the same
+    // glyph up by the physical size at draw time). Sharing one rounding
+    // rule guarantees the bake key and the draw key are byte-identical, so
+    // the lookup can never miss. `ss == 1.0f` is the identity (legacy
+    // behaviour: physical == logical), which keeps the snapshot/golden
+    // tests — that build the atlas without a factor — byte-stable.
+    constexpr uint16_t supersampledSizePx(uint16_t logicalPx, float ss) {
+        return static_cast<uint16_t>(
+            static_cast<float>(logicalPx) * ss + 0.5f);
+    }
+
     // -------- Build request --------------------------------------------
     //
     // One entry per (face, sizePx, charset) tuple to bake. The builder

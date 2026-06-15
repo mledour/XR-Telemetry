@@ -50,7 +50,9 @@ namespace openxr_api_layer::utils::glyph_atlas {
                         ComPtr<ID3D11DeviceContext> ctx,
                         UINT                        dstWidth,
                         UINT                        dstHeight,
-                        const BuildResult&          atlas) {
+                        const BuildResult&          atlas,
+                        UINT                        renderWidth,
+                        UINT                        renderHeight) {
         if (!device || !ctx || dstWidth == 0 || dstHeight == 0) return false;
         if (atlas.atlasWidth == 0 || atlas.atlasHeight == 0) return false;
         if (atlas.bitmap.empty()) return false;
@@ -59,6 +61,12 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_ctx    = std::move(ctx);
         m_dstW   = dstWidth;
         m_dstH   = dstHeight;
+        // renderWidth/renderHeight default to 0 → "= dst" → supersample 1.0
+        // (legacy path; what the snapshot/golden test gets). When they're
+        // the physical swapchain extent, m_ss is the supersample factor.
+        m_renderW = renderWidth  ? renderWidth  : dstWidth;
+        m_renderH = renderHeight ? renderHeight : dstHeight;
+        m_ss      = static_cast<float>(m_renderW) / static_cast<float>(m_dstW);
         // Snapshot the atlas dimensions before createBuffers — it bakes
         // them (with texSize) into an IMMUTABLE constant buffer, so they
         // must be set first.
@@ -88,6 +96,21 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // BuildResult holder owns.
         m_glyphs       = atlas.glyphs;
         m_faceMetrics  = atlas.faceMetrics;
+
+        // The atlas was baked at the PHYSICAL (supersampled) sizes, so its
+        // cached metrics are in physical pixels. Layout code works in logical
+        // design pixels, so fold the supersample factor out of the metrics
+        // once here — drawRun divides each glyph's rect/advance by m_ss at
+        // emit time the same way. At m_ss == 1 this loop is a no-op.
+        if (m_ss != 1.0f) {
+            const float inv = 1.0f / m_ss;
+            for (auto& kv : m_faceMetrics) {
+                kv.second.ascent    *= inv;
+                kv.second.descent   *= inv;
+                kv.second.lineGap   *= inv;
+                kv.second.capHeight *= inv;
+            }
+        }
 
         m_dynamicScratch.reserve(kInitialInstances);
         m_staticScratch.reserve(kInitialStaticInstances);
@@ -209,7 +232,9 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // which does the same for its texSize cbuffer).
         const TextConstants tc{
             { static_cast<float>(m_dstW),   static_cast<float>(m_dstH) },
-            { static_cast<float>(m_atlasW), static_cast<float>(m_atlasH) }
+            { static_cast<float>(m_atlasW), static_cast<float>(m_atlasH) },
+            m_ss,
+            { 0.0f, 0.0f, 0.0f }
         };
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth      = sizeof(TextConstants);
@@ -280,10 +305,20 @@ namespace openxr_api_layer::utils::glyph_atlas {
         std::vector<TextInstance>& scratch =
             m_activeStatic ? m_staticScratch : m_dynamicScratch;
 
+        // The glyph was baked at the PHYSICAL size; look it up there. Its
+        // metrics (bearings, w/h, advance) are therefore physical too, so
+        // emit the dest rect in LOGICAL units (× inv) — the cbuffer texSize
+        // is logical and the viewport stretches it back to physical, so the
+        // atlas region samples 1:1 at the render resolution (sharp). The UV
+        // rect stays in physical atlas pixels. At m_ss == 1: physSize ==
+        // sizePx, inv == 1 → byte-identical to the legacy path.
+        const uint16_t physSize = supersampledSizePx(sizePx, m_ss);
+        const float    inv      = 1.0f / m_ss;
+
         float x = penX;
         for (std::size_t i = 0; i < n; ++i) {
             const wchar_t cp = s[i];
-            const GlyphKey key = makeGlyphKey(face, sizePx, static_cast<uint16_t>(cp));
+            const GlyphKey key = makeGlyphKey(face, physSize, static_cast<uint16_t>(cp));
             auto it = m_glyphs.find(key);
             if (it == m_glyphs.end()) {
                 // Missing glyph: advance by the face's space width so
@@ -298,15 +333,17 @@ namespace openxr_api_layer::utils::glyph_atlas {
             // Whitespace glyph (w == 0 || h == 0): no instance, just
             // advance the pen.
             if (gi.w > 0 && gi.h > 0) {
-                // Quad destination = pen-space + glyph bearings.
-                //   left   = x + bearingX
-                //   top    = baselineY - bearingY  (bearingY is from
-                //                                    baseline up, positive)
+                // Quad destination = pen-space + glyph bearings, in LOGICAL
+                // units (physical metrics × inv):
+                //   left   = x + bearingX·inv
+                //   top    = baselineY - bearingY·inv  (bearingY is from
+                //                                        baseline up, positive)
+                // UV rect stays in PHYSICAL atlas pixels (the baked glyph).
                 TextInstance ti{};
-                ti.rect[0] = x + static_cast<float>(gi.bearingX);
-                ti.rect[1] = baselineY - static_cast<float>(gi.bearingY);
-                ti.rect[2] = static_cast<float>(gi.w);
-                ti.rect[3] = static_cast<float>(gi.h);
+                ti.rect[0] = x + static_cast<float>(gi.bearingX) * inv;
+                ti.rect[1] = baselineY - static_cast<float>(gi.bearingY) * inv;
+                ti.rect[2] = static_cast<float>(gi.w) * inv;
+                ti.rect[3] = static_cast<float>(gi.h) * inv;
                 ti.uvRect[0] = static_cast<float>(gi.u);
                 ti.uvRect[1] = static_cast<float>(gi.v);
                 ti.uvRect[2] = static_cast<float>(gi.w);
@@ -317,7 +354,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
                 ti.color[3] = color[3];
                 scratch.push_back(ti);
             }
-            x += gi.advanceX;
+            x += gi.advanceX * inv;   // physical advance → logical pen
         }
         return x;
     }
@@ -327,13 +364,18 @@ namespace openxr_api_layer::utils::glyph_atlas {
                             const wchar_t* s,
                             std::size_t    n) const {
         if (!s || n == 0) return 0.0f;
+        // Look up at the physical size; return the advance in LOGICAL units
+        // so callers (which anchor TRAILING / CENTER in logical space) stay
+        // consistent. At m_ss == 1 this is the legacy measure.
+        const uint16_t physSize = supersampledSizePx(sizePx, m_ss);
+        const float    inv      = 1.0f / m_ss;
         float w = 0.0f;
         for (std::size_t i = 0; i < n; ++i) {
             const GlyphKey key =
-                makeGlyphKey(face, sizePx, static_cast<uint16_t>(s[i]));
+                makeGlyphKey(face, physSize, static_cast<uint16_t>(s[i]));
             auto it = m_glyphs.find(key);
             if (it != m_glyphs.end()) {
-                w += it->second.advanceX;
+                w += it->second.advanceX * inv;
             } else {
                 w += fallbackAdvance(face, sizePx);
             }
@@ -342,17 +384,23 @@ namespace openxr_api_layer::utils::glyph_atlas {
     }
 
     const FaceMetrics* Renderer::metrics(GlyphFace face, uint16_t sizePx) const {
-        const auto it = m_faceMetrics.find(makeFaceMetricsKey(face, sizePx));
+        // Keyed at the physical bake size; the cached values were folded back
+        // to LOGICAL units in init(), so callers get logical ascent/descent.
+        // At m_ss == 1 the key is just sizePx and the values are untouched.
+        const auto it = m_faceMetrics.find(
+            makeFaceMetricsKey(face, supersampledSizePx(sizePx, m_ss)));
         return it == m_faceMetrics.end() ? nullptr : &it->second;
     }
 
     float Renderer::fallbackAdvance(GlyphFace face, uint16_t sizePx) const {
-        // Try the space glyph at the same face+size — should always be
+        // `sizePx` is LOGICAL; the space glyph is baked at the physical size.
+        // Return its advance in logical units (÷ m_ss). Should always be
         // baked because ' ' is in the standard ASCII charset.
         const GlyphKey spaceKey =
-            makeGlyphKey(face, sizePx, static_cast<uint16_t>(L' '));
+            makeGlyphKey(face, supersampledSizePx(sizePx, m_ss),
+                          static_cast<uint16_t>(L' '));
         auto it = m_glyphs.find(spaceKey);
-        if (it != m_glyphs.end()) return it->second.advanceX;
+        if (it != m_glyphs.end()) return it->second.advanceX / m_ss;
 
         // No space glyph baked for this face (e.g. a digits-only face like
         // Rajdhani) — fall back to a half-em advance so a stray codepoint
@@ -400,9 +448,13 @@ namespace openxr_api_layer::utils::glyph_atlas {
         // state in an unknown configuration (chrome shapes, bars, app).
         m_ctx->OMSetRenderTargets(1, &rtv, nullptr);
 
+        // Viewport spans the PHYSICAL render target; the cbuffer's texSize
+        // stays logical (m_dstW/H), so glyph quads — emitted in logical units
+        // — stretch to physical and sample the physical-baked atlas 1:1. At
+        // m_ss == 1, m_renderW == m_dstW so this is the legacy viewport.
         D3D11_VIEWPORT vp{
             0.0f, 0.0f,
-            static_cast<float>(m_dstW), static_cast<float>(m_dstH),
+            static_cast<float>(m_renderW), static_cast<float>(m_renderH),
             0.0f, 1.0f};
         m_ctx->RSSetViewports(1, &vp);
         m_ctx->RSSetState(m_raster.Get());
@@ -421,10 +473,11 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_ctx->VSSetShader(m_vs.Get(), nullptr, 0);
         m_ctx->PSSetShader(m_ps.Get(), nullptr, 0);
 
-        // The VS reads texSize (b0), the PS reads nothing from b0 — but
-        // binding to both stages is harmless and makes the binding
-        // pattern symmetric with HistogramBarRenderer's bindBarPipeline().
+        // b0 carries texSize / atlasSize / supersample. The VS reads texSize;
+        // the PS now reads supersample to gate its edge-contrast + gamma
+        // corrections — so bind b0 to BOTH stages (previously VS-only).
         m_ctx->VSSetConstantBuffers(0, 1, m_cb.GetAddressOf());
+        m_ctx->PSSetConstantBuffers(0, 1, m_cb.GetAddressOf());
 
         m_ctx->PSSetShaderResources(0, 1, m_atlasSRV.GetAddressOf());
         m_ctx->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
