@@ -49,7 +49,6 @@
 #include <cmath>
 #include <cstring>     // std::memcpy for constant-buffer uploads
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
-#include <initializer_list>  // drawBottomPanel takes a cell descriptor list
 #include <string>
 #include <vector>
 
@@ -289,7 +288,7 @@ namespace openxr_api_layer::detail {
                                                       // (22), then metric(43) centred
                                                       // in the region BELOW the label
                                                       // (the value rect is anchored at
-                                                      // labelY+22 in drawBottomPanel,
+                                                      // labelY+22 in drawBottomCell,
                                                       // not the full cell) so the
                                                       // 43-px digit stays clear of the
                                                       // caption at this reduced height.
@@ -353,13 +352,12 @@ namespace openxr_api_layer::detail {
                                                      // as part of the value rather
                                                      // than fading into the caption.
 
-        // Vertical insets for the 1-px column separator lines.
-        // Header bar uses a tighter inset (the cells are 90 px tall);
-        // bottom panel inset is larger because the panel is 130 px
-        // and the design's airier separator visual asks for more
-        // breathing room above and below.
+        // Vertical inset for the 1-px column separator lines inside the
+        // header's percentile box (the 3 dividers between AVG/P95/P99/
+        // P99.9). The footer no longer carries internal separators — each
+        // metric is its own framed box now — so only the header inset
+        // remains.
         constexpr float kHeaderSepInsetY      =  8.0f;
-        constexpr float kBottomSepInsetY      = 14.0f;
 
         // Target DXGI format for the swapchain image — also the format
         // the D2D RenderTarget paints into.
@@ -711,31 +709,40 @@ namespace openxr_api_layer::detail {
                                     cpuBreakdown,
                                     v.target_fps);
 
-                // Bottom row: 5 equal cells (GPU TEMP/LOAD/VRAM +
-                // CPU LOAD/CPUs LOAD), 60/40 split. Tier colours follow
-                // tierForUtilisation. The GPU panel leads with a TEMP
-                // cell; the CPU panel is two utilisation percentages —
-                // "CPU LOAD" (per-cycle CPU vs budget) next to "CPUs LOAD"
-                // (busiest single core). Each panel is described by its
-                // cells (see BottomCell / drawBottomPanel).
-                const float bottomCellW =
-                    (kInnerR - kInnerL - kSectionGap) / 5.0f;
-                const float gpuPanelL = kInnerL;
-                const float gpuPanelR = gpuPanelL + 3.0f * bottomCellW;
-                const float cpuPanelL = gpuPanelR + kSectionGap;
-                const float cpuPanelR = kInnerR;
+                // Bottom row: 5 individually-framed cells (was two
+                // multi-cell panels split 60/40, GPU-side + CPU-side). Each
+                // metric now gets its own framed box, all five divided by
+                // kSectionGap — the same gap the frametime panels use
+                // vertically. Order stays GPU-side first (TEMP / LOAD /
+                // VRAM) then CPU-side (CPU LOAD / CPUs LOAD). Tier colours
+                // follow tierForUtilisation; the TEMP cell stays white (no
+                // thermal tier). See BottomCell / drawBottomCell.
                 using Cell = BottomCell;
-                drawBottomPanel(gpuPanelL, bottomY,
-                                 gpuPanelR, bottomY + kBottomHeight, {
-                    Cell{L"GPU TEMP", v.gpu_temp_c,  BottomCellKind::Temp,    0.0f},
-                    Cell{L"GPU LOAD", v.gpu_util_pct, BottomCellKind::Percent, v.gpu_util_fraction},
-                    Cell{L"VRAM",     v.vram_pct,     BottomCellKind::Percent, v.vram_fraction},
-                });
-                drawBottomPanel(cpuPanelL, bottomY,
-                                 cpuPanelR, bottomY + kBottomHeight, {
+                constexpr int kBottomCellCount = 5;
+                const Cell bottomCells[kBottomCellCount] = {
+                    Cell{L"GPU TEMP",  v.gpu_temp_c,   BottomCellKind::Temp,    0.0f},
+                    Cell{L"GPU LOAD",  v.gpu_util_pct, BottomCellKind::Percent, v.gpu_util_fraction},
+                    Cell{L"VRAM",      v.vram_pct,     BottomCellKind::Percent, v.vram_fraction},
                     Cell{L"CPU LOAD",  v.cpu_util_pct, BottomCellKind::Percent, v.cpu_util_fraction},
                     Cell{L"CPUs LOAD", v.cpus_max_pct, BottomCellKind::Percent, v.cpus_max_fraction},
-                });
+                };
+                // 5 boxes + 4 inter-box gaps span the inner width.
+                const float bottomGapTotal =
+                    kSectionGap * static_cast<float>(kBottomCellCount - 1);
+                const float bottomCellW =
+                    (kInnerR - kInnerL - bottomGapTotal) /
+                    static_cast<float>(kBottomCellCount);
+                for (int i = 0; i < kBottomCellCount; ++i) {
+                    const float cellL = kInnerL +
+                        static_cast<float>(i) * (bottomCellW + kSectionGap);
+                    // Last box clamps to the inner-right edge so FP rounding
+                    // of bottomCellW can't leave a seam at the frame border.
+                    const float cellR = (i + 1 == kBottomCellCount)
+                        ? kInnerR
+                        : cellL + bottomCellW;
+                    drawBottomCell(cellL, bottomY, cellR,
+                                    bottomY + kBottomHeight, bottomCells[i]);
+                }
             }
 
             // -------- end static-tier helpers --------
@@ -748,7 +755,7 @@ namespace openxr_api_layer::detail {
             // Bahnschrift fallback) at every pixel size any IDWriteTextFormat
             // above uses. The charset is wide enough to cover everything the
             // overlay ever renders — see findValueRuns / drawChrome /
-            // drawBottomPanel for the actual call sites:
+            // drawBottomCell for the actual call sites:
             //
             //   Rajdhani upright (kFamilyLabels): ASCII 0x20..0x7E (the
             //     97-char printable range, conservatively wide so we don't
@@ -1363,48 +1370,68 @@ namespace openxr_api_layer::detail {
 
             // -------- Header bar --------------------------------------------
             //
-            // Layout: 5 cells of equal width separated by 1-px vertical
-            // bars. Each cell has a small uppercase label at the top
-            // and a big number below. The FPS cell uses the white
-            // brush; the four accent cells (AVG / P95 / P99 / P99.9)
-            // use cyan.
+            // Layout: TWO separately-framed boxes, divided by kSectionGap
+            // (the same gap the panels below use):
             //
-            // Cell width = ~688 / 5 ≈ 137 px on the 720-wide texture
-            // (kInnerR - kInnerL). Rajdhani SemiBold is a narrow grotesque,
-            // so kFontBigNumber=52 px on "142" sits comfortably inside the
-            // cell (~80-90 px). kFontTinyLabel=17 px labels stay under
-            // 50 px even for "P99.9". On systems without the bundled font
-            // we fall back to upright Bahnschrift.
+            //   ┌─────────┐   ┌──────────────────────────────────────┐
+            //   │  FPS    │   │ FPS AVG │  P95  │  P99  │   P99.9     │
+            //   │  142    │   │  138    │  124  │  108  │    98       │
+            //   └─────────┘   └──────────────────────────────────────┘
+            //    FPS box        percentile box (4 cells, 3 separators)
+            //
+            //   * FPS box   — its own panel, single cell, big white hero
+            //                 number (kFontBigNumber=52 px on "142").
+            //   * stats box — its own panel; the four percentile cells
+            //                 (AVG / P95 / P99 / P99.9) in cyan, divided
+            //                 by 3 thin vertical separators.
+            //
+            // Width split, after carving out the one inter-box gap: the
+            // FPS box is kHeaderFpsCellUnits (1.25) percentile-cells wide
+            // — a touch wider than one stat cell since it carries the hero
+            // number — and the four stat cells share the rest equally.
+            // Each cell is ~130 px on the 720-wide texture (kInnerR -
+            // kInnerL ≈ 688). Rajdhani SemiBold is a narrow grotesque, so
+            // 52 px on "142" sits comfortably inside the FPS box; the
+            // kFontTinyLabel=17 px caption stays under 50 px even for
+            // "P99.9". On systems without the bundled font we fall back to
+            // upright Bahnschrift.
             void drawHeaderBar(float l, float t,
                                 float r, float b,
                                 const OverlayDisplayValues& v) const {
-                drawPanelBg(l, t, r, b);
-
-                const float w = r - l;
-                const float cellW = w / 5.0f;
-
-                // Vertical separators between cells (4 of them), each a
-                // 1-px-wide thin rect on the chrome-shapes batch.
-                drawColumnSeparators(l, t, b, cellW, /*count=*/4,
-                                      kHeaderSepInsetY);
+                // FPS box is 1.25 stat-cells wide; the 4 stat cells take
+                // 1 unit each. Carve out the single inter-box gap first,
+                // then split the remainder into (1.25 + 4) units.
+                constexpr float kHeaderFpsCellUnits = 1.25f;
+                const float availW    = (r - l) - kSectionGap;
+                const float statCellW = availW / (kHeaderFpsCellUnits + 4.0f);
+                const float fpsR      = l + statCellW * kHeaderFpsCellUnits;
+                const float statsL    = fpsR + kSectionGap;
 
                 const float labelH = 22.0f;
                 const float labelY = t + 4.0f;
                 const float valueY = labelY + labelH;
 
-                drawHeaderCell(l + cellW * 0.0f, labelY, l + cellW * 1.0f, valueY,
+                // --- FPS box: its own framed panel, single cell ----------
+                drawPanelBg(l, t, fpsR, b);
+                drawHeaderCell(l, labelY, fpsR, valueY,
                                 L"FPS", v.fps_instant,
                                 kFmtBigNumberGpu, kColorTextWhite);
-                drawHeaderCell(l + cellW * 1.0f, labelY, l + cellW * 2.0f, valueY,
+
+                // --- Percentile box: own framed panel, 4 cells -----------
+                drawPanelBg(statsL, t, r, b);
+                // 3 vertical separators between the 4 percentile cells.
+                drawColumnSeparators(statsL, t, b, statCellW, /*count=*/3,
+                                      kHeaderSepInsetY);
+                drawHeaderCell(statsL + statCellW * 0.0f, labelY, statsL + statCellW * 1.0f, valueY,
                                 L"FPS AVG", v.fps_avg,
                                 kFmtAccentNumberGpu, kColorAccentCyan);
-                drawHeaderCell(l + cellW * 2.0f, labelY, l + cellW * 3.0f, valueY,
+                drawHeaderCell(statsL + statCellW * 1.0f, labelY, statsL + statCellW * 2.0f, valueY,
                                 L"P95", v.fps_p95,
                                 kFmtAccentNumberGpu, kColorAccentCyan);
-                drawHeaderCell(l + cellW * 3.0f, labelY, l + cellW * 4.0f, valueY,
+                drawHeaderCell(statsL + statCellW * 2.0f, labelY, statsL + statCellW * 3.0f, valueY,
                                 L"P99", v.fps_p99,
                                 kFmtAccentNumberGpu, kColorAccentCyan);
-                drawHeaderCell(l + cellW * 4.0f, labelY, l + cellW * 5.0f, valueY,
+                drawHeaderCell(statsL + statCellW * 3.0f, labelY, r, valueY,
                                 L"P99.9", v.fps_p99_9,
                                 kFmtAccentNumberGpu, kColorAccentCyan);
             }
@@ -1632,13 +1659,13 @@ namespace openxr_api_layer::detail {
                 float          fraction;  // tier input; ignored when kind == Temp
             };
 
-            // Draw equally-sized cells across [l,r] x [t,b], one per
-            // descriptor (2 for the CPU panel, 3 for the GPU panel). The
-            // panel sizes the columns, paints the separators, and styles each
-            // cell from its kind. Both callers stay declarative and a future
-            // panel can add/reorder cells without churning this signature.
-            void drawBottomPanel(float l, float t, float r, float b,
-                                  std::initializer_list<BottomCell> cells) const {
+            // Draw a single framed footer cell across [l,r] x [t,b]: its own
+            // panel background, the caption, and the kind-styled value.
+            // drawChrome sizes the box and the inter-box gaps; this helper
+            // owns everything inside one box. (Was drawBottomPanel, which
+            // grouped 2-3 cells with internal separators into one panel.)
+            void drawBottomCell(float l, float t, float r, float b,
+                                 const BottomCell& cell) const {
                 drawPanelBg(l, t, r, b);
 
                 // Tier-colour helper: same logic for LOAD, VRAM and both
@@ -1654,14 +1681,9 @@ namespace openxr_api_layer::detail {
                     return kColorAccentCyan;
                 };
 
-                const int numCols = static_cast<int>(cells.size());
-                if (numCols == 0) return;
-                const float colW = (r - l) / static_cast<float>(numCols);
-
-                // Vertical separators between cells, each a 1-px-wide
-                // thin rect on the chrome-shapes batch.
-                drawColumnSeparators(l, t, b, colW, /*count=*/numCols - 1,
-                                      kBottomSepInsetY);
+                // No internal separators: each metric is its own framed box
+                // now (drawChrome lays the five out with kSectionGap between
+                // them), so there are no columns to rule off here.
 
                 // Cell labels arrive as wide string literals in each
                 // descriptor (see the call site in paint()). VRAM is a
@@ -1763,29 +1785,23 @@ namespace openxr_api_layer::detail {
                 // question — the wide literal is exactly L"°"
                 // regardless of how MSVC parses the surrounding
                 // bytes.
-                // Lay the cells out left-to-right. The last column uses the
-                // panel's own right edge `r` (not l + colW*numCols) so FP
-                // rounding of colW never leaves a seam at the border.
-                int colIdx = 0;
-                for (const BottomCell& cell : cells) {
-                    const float cellL = l + colW * static_cast<float>(colIdx);
-                    const float cellR = (colIdx + 1 == numCols)
-                                            ? r
-                                            : l + colW * static_cast<float>(colIdx + 1);
-                    if (cell.kind == BottomCellKind::Temp) {
-                        // Wide-glyph path, white. The L" \u00B0C" escape (not a
-                        // literal degree byte) sidesteps MSVC's CP1252 source
-                        // reading \u2014 see the encoding note above.
-                        drawCell(cellL, cellR, cell.label, cell.value,
-                                  L" \u00B0C", kColorTextWhite,
-                                  /*useWideValue=*/true);
-                    } else {
-                        // Percent: ASCII " %" suffix, tier-coloured.
-                        drawCell(cellL, cellR, cell.label, cell.value,
-                                  L" %", tierColor(cell.fraction),
-                                  /*useWideValue=*/false);
-                    }
-                    ++colIdx;
+                // Single framed cell: the box spans the full [l, r]. (Was a
+                // left-to-right loop over 2-3 columns; drawChrome now owns the
+                // multi-box layout.)
+                const float cellL = l;
+                const float cellR = r;
+                if (cell.kind == BottomCellKind::Temp) {
+                    // Wide-glyph path, white. The L" \u00B0C" escape (not a
+                    // literal degree byte) sidesteps MSVC's CP1252 source
+                    // reading \u2014 see the encoding note above.
+                    drawCell(cellL, cellR, cell.label, cell.value,
+                              L" \u00B0C", kColorTextWhite,
+                              /*useWideValue=*/true);
+                } else {
+                    // Percent: ASCII " %" suffix, tier-coloured.
+                    drawCell(cellL, cellR, cell.label, cell.value,
+                              L" %", tierColor(cell.fraction),
+                              /*useWideValue=*/false);
                 }
             }
 
@@ -1837,11 +1853,12 @@ namespace openxr_api_layer::detail {
 
             // Static-tier column separators: `count` thin vertical rules
             // (kChromeLineW wide) at l + colWidth*i (i = 1..count), inset by
-            // insetY top and bottom. One home for the "thin separators across N
-            // columns" geometry shared by the header (4 fixed rules) and
-            // the bottom panels (numCols-1 rules) — and one consistent
-            // tier gate (inside the helper, matching drawPanelBg /
-            // drawChamferedRect) instead of an inline if at each call site.
+            // insetY top and bottom. Now used only by the header's percentile
+            // box (3 rules between AVG/P95/P99/P99.9); the footer cells are
+            // individually framed, so they no longer rule columns. Kept as a
+            // shared helper with one consistent tier gate (inside the helper,
+            // matching drawPanelBg / drawChamferedRect) instead of an inline
+            // if at the call site.
             void drawColumnSeparators(float l, float t, float b,
                                        float colWidth, int count,
                                        float insetY) const {
@@ -1889,7 +1906,7 @@ namespace openxr_api_layer::detail {
 
             // GPU chrome-shape renderer, stashed the same way. drawPanelBg /
             // drawChamferedRect / the column-separator loops in
-            // drawHeaderBar / drawBottomPanel append rects to its batch.
+            // drawHeaderBar / drawBottomCell append rects to its batch.
             chrome_shapes::Renderer* m_chromeShapes = nullptr;
 
             // -------- Two-tier static/dynamic paint state -----------------
@@ -1906,7 +1923,7 @@ namespace openxr_api_layer::detail {
             // Single source of truth for the STATIC structural signature:
             // any input that changes the chrome's fixed geometry or label
             // set. Today that's only whether the GPU bottom panel carries a
-            // VRAM column (drawBottomPanel shows it iff its vram value is
+            // VRAM column (drawBottomCell shows it iff its vram value is
             // non-empty; drawChrome feeds it v.vram_pct). A new optional
             // column / panel / second GPU must be folded in HERE (widen the
             // return to a bitmask if more than one independent input ever
