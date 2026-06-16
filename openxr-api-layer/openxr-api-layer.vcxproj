@@ -97,6 +97,24 @@
     <IntDir>$(SolutionDir)\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>$(SolutionName)-32</TargetName>
   </PropertyGroup>
+  <!-- Defaults inherited by every conditional ItemDefinitionGroup below.
+       Defining ResourceCompile/AdditionalIncludeDirectories here once
+       avoids the 4× / 2× duplication that was reviewed away from the
+       initial commit on this PR. Configurations that need to override
+       (rare) can still add their own <ResourceCompile> inside their
+       conditional group. -->
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <!-- rc.exe's /I search path for the bare-basename TTF references
+           inside fonts/bundled_fonts.rc.inc (the shared font include
+           that both the layer DLL and the test EXE pull in). Without
+           this, rc.exe fails with RC2135 file-not-found on every
+           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
+           bundled resource" for why the include uses bare basenames
+           and not a path prefix. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -105,14 +123,14 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(IntDir);$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
@@ -123,7 +141,7 @@
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -159,14 +177,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(IntDir);$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
@@ -177,7 +195,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
@@ -215,7 +233,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(IntDir);$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -224,7 +242,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
@@ -235,7 +253,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
@@ -273,7 +291,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)\framework;$(IntDir);$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -282,7 +300,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
       <ModuleDefinitionFile>module.def</ModuleDefinitionFile>
@@ -293,7 +311,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
            to render an auxiliary swapchain. A pure pass-through or
            metadata-only layer never touches D3D11 at all and the
            DLLs stay unloaded for the host process's lifetime. -->
-      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
@@ -328,8 +346,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="framework\util.h" />
     <ClInclude Include="layer.h" />
     <ClInclude Include="pch.h" />
-    <!-- Place your layer-specific headers under utils\ and register them
-         here, e.g. <ClInclude Include="utils\my_logic.h" /> -->
+    <ClInclude Include="telemetry_internals.h" />
+    <ClInclude Include="utils\chrome_shape_renderer.h" />
+    <ClInclude Include="utils\cpu_usage.h" />
+    <ClInclude Include="utils\default_settings_template.h" />
+    <ClInclude Include="utils\glyph_atlas.h" />
+    <ClInclude Include="utils\glyph_atlas_renderer.h" />
+    <ClInclude Include="utils\gpu_telemetry.h" />
+    <ClInclude Include="utils\histogram_ring.h" />
+    <ClInclude Include="utils\hotkey.h" />
+    <ClInclude Include="utils\instanced_batch.h" />
+    <ClInclude Include="utils\name_utils.h" />
+    <ClInclude Include="utils\overlay_aggregator.h" />
+    <ClInclude Include="utils\overlay_cadence.h" />
+    <ClInclude Include="utils\overlay_layout.h" />
+    <ClInclude Include="utils\overlay_renderer.h" />
+    <ClInclude Include="utils\settings.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="framework\dispatch.cpp" />
@@ -337,6 +369,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClCompile Include="framework\entry.cpp" />
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="layer.cpp" />
+    <ClCompile Include="utils\chrome_shape_renderer.cpp" />
+    <ClCompile Include="utils\cpu_usage.cpp" />
+    <ClCompile Include="utils\glyph_atlas.cpp" />
+    <ClCompile Include="utils\glyph_atlas_renderer.cpp" />
+    <ClCompile Include="utils\gpu_telemetry.cpp" />
+    <ClCompile Include="utils\overlay_renderer.cpp" />
     <!-- Place your layer-specific .cpp files under utils\ and register them
          here, e.g. <ClCompile Include="utils\my_logic.cpp" /> -->
     <ClCompile Include="pch.cpp">
@@ -357,15 +395,85 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <None Include="framework\layer_apis.py" />
     <None Include="module.def" />
     <None Include="packages.config" />
-    <None Include="XR_APILAYER_NOVENDOR_template-32.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry-32.json" />
     <None Include="openxr-api-layer.rc.in" />
     <None Include="version.h.in" />
-    <None Include="XR_APILAYER_NOVENDOR_template.json">
+    <None Include="fonts\Rajdhani-SemiBold.ttf" />
+    <None Include="fonts\OFL.txt" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</DeploymentContent>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Histogram-bar shaders. Compiled offline by FxCompile (no runtime
+         D3DCompile / d3dcompiler dependency) into embedded bytecode headers
+         under $(IntDir): overlay_bars_vs.h / overlay_bars_ps.h, each exposing
+         a `const BYTE g_<filename>[]` array (VariableName below). The C++
+         HistogramBarRenderer includes those headers to create the shaders;
+         $(IntDir) is added to the C++ include path once the renderer lands.
+         Shader Model 4.0 = feature level 10_0, the broadest target that still
+         supports the input-layout instancing we use (no 5.0 features needed)
+         — keeps the layer loadable on the widest range of OpenXR hosts. -->
+    <FxCompile Include="shaders\overlay_bars_vs.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>VSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_bars_ps.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>PSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_vs.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>VSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_ps.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>PSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_vs.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>VSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_ps.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>4.0</ShaderModel>
+      <EntryPointName>PSMain</EntryPointName>
+      <HeaderFileOutput>$(IntDir)%(Filename).h</HeaderFileOutput>
+      <VariableName>g_%(Filename)</VariableName>
+      <ObjectFileOutput>
+      </ObjectFileOutput>
+    </FxCompile>
+    <None Include="shaders\overlay_bars.hlsli" />
+    <None Include="shaders\overlay_quad.hlsli" />
+    <None Include="shaders\overlay_text.hlsli" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

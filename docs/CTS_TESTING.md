@@ -177,7 +177,7 @@ OpenXR loader honours the `disable_environment` field of the JSON
 manifest. For this layer the variable is:
 
 ```
-DISABLE_XR_APILAYER_NOVENDOR_template=1
+DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry=1
 ```
 
 Install the layer **once** in an elevated PowerShell:
@@ -190,11 +190,11 @@ Then toggle with the env var per-shell:
 
 ```powershell
 # Baseline: pretend the layer isn't there.
-$env:DISABLE_XR_APILAYER_NOVENDOR_template = "1"
+$env:DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry = "1"
 # ... run CTS, capture baseline.xml ...
 
 # With the layer:
-Remove-Item Env:\DISABLE_XR_APILAYER_NOVENDOR_template
+Remove-Item Env:\DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry
 # ... run CTS, capture with_layer.xml ...
 ```
 
@@ -255,12 +255,12 @@ session.
 
 ```powershell
 # Baseline
-$env:DISABLE_XR_APILAYER_NOVENDOR_template = "1"
+$env:DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry = "1"
 .\conformance_cli.exe -G D3D11 `
     --reporter "junit::out=baseline.xml" "~[interactive]"
 
 # With layer
-Remove-Item Env:\DISABLE_XR_APILAYER_NOVENDOR_template
+Remove-Item Env:\DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry
 .\conformance_cli.exe -G D3D11 `
     --reporter "junit::out=with_layer.xml" "~[interactive]"
 

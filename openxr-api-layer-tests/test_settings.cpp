@@ -1,0 +1,440 @@
+// MIT License
+//
+// Copyright (c) 2026 Michael Ledour
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// test_settings.cpp — unit tests on parseSettings. Covers the happy path,
+// the "missing fields → defaults" robustness contract, and the malformed-
+// input failure modes. Since parseSettings is the only path between JSON
+// text and the layer's runtime decision tree, every branch in here directly
+// maps to "what happens if a user's settings.json looks like X".
+// =============================================================================
+
+#include <doctest/doctest.h>
+
+#include "utils/settings.h"
+#include "utils/default_settings_template.h"
+
+using openxr_api_layer::detail::parseSettings;
+using openxr_api_layer::detail::ParsedSettings;
+using openxr_api_layer::detail::LogMode;
+using openxr_api_layer::detail::OverlayMode;
+using openxr_api_layer::detail::OverlayAnchor;
+using openxr_api_layer::detail::defaultHotkey;
+using openxr_api_layer::detail::defaultOverlayHotkey;
+using openxr_api_layer::detail::formatHotkey;
+
+namespace {
+    // The parser's missing-field FALLBACK (safety) defaults — what an empty
+    // or partial config resolves to: log.enabled=false, log.mode=auto,
+    // log.hotkey=Ctrl+Shift+T, overlay.enabled=false, overlay.mode=auto,
+    // overlay.hotkey=Ctrl+Shift+O, overlay.refresh_hz=10,
+    // overlay.position=head_top_right. NOTE: the SHIPPED template
+    // (installer/default_settings.json) intentionally differs — it ships log
+    // and overlay enabled in hotkey mode; the fallback stays disabled so a
+    // partial/malformed config never silently arms a feature.
+    void checkFallbackDefaults(const ParsedSettings& p) {
+        CHECK(p.error.empty());
+        CHECK_FALSE(p.settings.log.enabled);
+        CHECK(p.settings.log.mode == LogMode::Auto);
+        CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
+        CHECK_FALSE(p.settings.overlay.enabled);
+        CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+        CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+        CHECK(p.settings.overlay.refresh_hz == 10);
+        CHECK(p.settings.overlay.position == "head_top_right");
+        CHECK(p.settings.overlay.scale == 1.0f);
+        CHECK(p.settings.overlay.anchor == OverlayAnchor::Head);
+        CHECK(p.settings.overlay.offset_x == 0.0f);
+        CHECK(p.settings.overlay.offset_y == 0.0f);
+    }
+}
+
+// =============================================================================
+// Defaults — everything missing must produce the "current behaviour" path.
+// =============================================================================
+
+TEST_CASE("parseSettings: empty input → documented defaults, no error") {
+    checkFallbackDefaults(parseSettings(""));
+}
+
+TEST_CASE("parseSettings: empty object → documented defaults, no error") {
+    checkFallbackDefaults(parseSettings("{}"));
+}
+
+TEST_CASE("parseSettings: comment-only object → documented defaults") {
+    checkFallbackDefaults(parseSettings(R"({ "_comment": "hi" })"));
+}
+
+// =============================================================================
+// Shipped template — the headline default (distinct from the fallback above).
+// =============================================================================
+
+TEST_CASE("parseSettings: the shipped template arms log + overlay in hotkey mode") {
+    // The fallback tests above lock what an ABSENT block resolves to
+    // (disabled). This locks the opposite end: the in-binary template
+    // kBuiltInDefaultSettings — and, via the no-schema-drift test in
+    // test_telemetry.cpp, installer/default_settings.json — ships BOTH
+    // features enabled in HOTKEY mode. Without this, a revert to
+    // enabled=false/auto passes the whole suite green (the drift test only
+    // checks the two templates agree; the fallback tests only check the
+    // parser's missing-field defaults).
+    const auto p = parseSettings(openxr_api_layer::detail::kBuiltInDefaultSettings);
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Hotkey);
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
+}
+
+// =============================================================================
+// log block — happy paths.
+// =============================================================================
+
+TEST_CASE("parseSettings: full log block parses every field") {
+    const auto p = parseSettings(R"({
+        "log": {
+            "enabled": true,
+            "mode": "hotkey",
+            "hotkey": { "key": "F11", "modifiers": ["ctrl", "alt"] }
+        }
+    })");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Hotkey);
+    CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Alt+F11");
+}
+
+TEST_CASE("parseSettings: log.enabled false propagates") {
+    const auto p = parseSettings(R"({ "log": { "enabled": false } })");
+    REQUIRE(p.error.empty());
+    CHECK_FALSE(p.settings.log.enabled);
+    // Other fields still defaulted.
+    CHECK(p.settings.log.mode == LogMode::Auto);
+}
+
+TEST_CASE("parseSettings: mode strings are case-insensitive") {
+    CHECK(parseSettings(R"({"log":{"mode":"HOTKEY"}})").settings.log.mode ==
+          LogMode::Hotkey);
+    CHECK(parseSettings(R"({"log":{"mode":"Auto"}})").settings.log.mode ==
+          LogMode::Auto);
+}
+
+TEST_CASE("parseSettings: unknown mode falls back to auto (no error surfaced)") {
+    const auto p = parseSettings(R"({ "log": { "mode": "nonsense" } })");
+    CHECK(p.error.empty());
+    CHECK(p.settings.log.mode == LogMode::Auto);
+}
+
+// =============================================================================
+// hotkey sub-block defaults.
+// =============================================================================
+
+TEST_CASE("parseSettings: log present but hotkey omitted → default hotkey") {
+    const auto p = parseSettings(R"({ "log": { "mode": "hotkey" } })");
+    CHECK(p.error.empty());
+    CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
+}
+
+TEST_CASE("parseSettings: hotkey with unknown key name falls back to default") {
+    const auto p = parseSettings(R"({
+        "log": { "hotkey": { "key": "NotAKey", "modifiers": ["ctrl"] } }
+    })");
+    CHECK(p.error.empty());
+    // Default hotkey kicks in, not a partial parse of the user's modifiers.
+    CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
+}
+
+TEST_CASE("parseSettings: bare key with no modifiers parses cleanly") {
+    const auto p = parseSettings(R"({
+        "log": { "hotkey": { "key": "F11", "modifiers": [] } }
+    })");
+    CHECK(p.error.empty());
+    CHECK(formatHotkey(p.settings.log.hotkey) == "F11");
+}
+
+// =============================================================================
+// Wrong types — fields that don't match their expected JSON type fall back
+// to defaults silently. The robustness contract: a user who pasted a
+// settings.json from a different layer doesn't crash xr_telemetry.
+// =============================================================================
+
+TEST_CASE("parseSettings: log.enabled with non-bool falls back to default") {
+    const auto p = parseSettings(R"({ "log": { "enabled": "yes please" } })");
+    CHECK(p.error.empty());
+    CHECK_FALSE(p.settings.log.enabled);  // fallback is false (safety default)
+}
+
+TEST_CASE("parseSettings: log.mode with non-string falls back to default") {
+    const auto p = parseSettings(R"({ "log": { "mode": 42 } })");
+    CHECK(p.error.empty());
+    CHECK(p.settings.log.mode == LogMode::Auto);
+}
+
+TEST_CASE("parseSettings: hotkey block not an object → default hotkey, no error") {
+    const auto p = parseSettings(R"({ "log": { "hotkey": "F11" } })");
+    CHECK(p.error.empty());
+    CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+Shift+T");
+}
+
+TEST_CASE("parseSettings: modifiers array with non-strings filters silently") {
+    const auto p = parseSettings(R"({
+        "log": { "hotkey": { "key": "T", "modifiers": [42, "ctrl", null] } }
+    })");
+    CHECK(p.error.empty());
+    // Only "ctrl" survives the filter.
+    CHECK(formatHotkey(p.settings.log.hotkey) == "Ctrl+T");
+}
+
+// =============================================================================
+// JSON-level failures — actual parse errors DO surface in `error`, but the
+// returned settings struct is still the safe defaults so the caller can use
+// it unconditionally.
+// =============================================================================
+
+TEST_CASE("parseSettings: malformed JSON surfaces error, settings = defaults") {
+    const auto p = parseSettings(R"({"log": )");
+    CHECK_FALSE(p.error.empty());
+    CHECK_FALSE(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Auto);
+}
+
+TEST_CASE("parseSettings: root is a JSON array, not an object") {
+    const auto p = parseSettings(R"([1, 2, 3])");
+    CHECK_FALSE(p.error.empty());
+    CHECK_FALSE(p.settings.log.enabled);
+}
+
+// =============================================================================
+// overlay block — happy paths.
+// =============================================================================
+
+TEST_CASE("parseSettings: full overlay block parses every field") {
+    const auto p = parseSettings(R"({
+        "overlay": {
+            "enabled": true,
+            "mode": "hotkey",
+            "hotkey": { "key": "F12", "modifiers": ["alt"] },
+            "refresh_hz": 20,
+            "position": "head_top_left"
+        }
+    })");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Alt+F12");
+    CHECK(p.settings.overlay.refresh_hz == 20);
+    CHECK(p.settings.overlay.position == "head_top_left");
+}
+
+TEST_CASE("parseSettings: overlay.anchor=world switches to the world frame") {
+    const auto p = parseSettings(R"({"overlay":{"anchor":"world"}})");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.anchor == OverlayAnchor::World);
+}
+
+TEST_CASE("parseSettings: overlay.anchor is case-insensitive") {
+    // iequalsAscii match — a user writing "World" must still get world.
+    CHECK(parseSettings(R"({"overlay":{"anchor":"World"}})")
+              .settings.overlay.anchor == OverlayAnchor::World);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"WORLD"}})")
+              .settings.overlay.anchor == OverlayAnchor::World);
+}
+
+TEST_CASE("parseSettings: overlay.anchor missing/typo/wrong-type falls back to head") {
+    // Anything that isn't "world" keeps the stock head-locked behaviour,
+    // so a config written before `anchor` existed never changes meaning.
+    CHECK(parseSettings(R"({"overlay":{}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"head"}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":"squiggle"}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+    CHECK(parseSettings(R"({"overlay":{"anchor":42}})")
+              .settings.overlay.anchor == OverlayAnchor::Head);
+}
+
+TEST_CASE("parseSettings: overlay.offset_x / offset_y read and default to 0") {
+    const auto p = parseSettings(R"({"overlay":{"offset_x":0.15,"offset_y":-0.2}})");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.offset_x == doctest::Approx(0.15f));
+    CHECK(p.settings.overlay.offset_y == doctest::Approx(-0.2f));
+    // Missing → 0 (no nudge).
+    const auto d = parseSettings(R"({"overlay":{}})");
+    CHECK(d.settings.overlay.offset_x == 0.0f);
+    CHECK(d.settings.overlay.offset_y == 0.0f);
+}
+
+TEST_CASE("parseSettings: overlay offsets clamp to [-1.0, 1.0] metres") {
+    CHECK(parseSettings(R"({"overlay":{"offset_x":5.0}})").settings.overlay.offset_x == 1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_x":-5.0}})").settings.overlay.offset_x == -1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":99}})").settings.overlay.offset_y == 1.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":-99}})").settings.overlay.offset_y == -1.0f);
+    // In-range and integer-typed JSON pass through.
+    CHECK(parseSettings(R"({"overlay":{"offset_x":0.5}})").settings.overlay.offset_x
+              == doctest::Approx(0.5f));
+    CHECK(parseSettings(R"({"overlay":{"offset_y":0}})").settings.overlay.offset_y == 0.0f);
+}
+
+TEST_CASE("parseSettings: overlay offset wrong-type falls back to 0") {
+    CHECK(parseSettings(R"({"overlay":{"offset_x":"nope"}})").settings.overlay.offset_x == 0.0f);
+    CHECK(parseSettings(R"({"overlay":{"offset_y":true}})").settings.overlay.offset_y == 0.0f);
+}
+
+TEST_CASE("parseSettings: empty overlay block resolves to the safe disabled fallback") {
+    // Locks the parser FALLBACK for an absent overlay block (safety default:
+    // disabled/auto). Distinct from the SHIPPED template, which arms the
+    // overlay in hotkey mode — see default_settings_template.h.
+    const auto p = parseSettings("{}");
+    REQUIRE(p.error.empty());
+    CHECK_FALSE(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+    CHECK(p.settings.overlay.refresh_hz == 10);
+    CHECK(p.settings.overlay.position == "head_top_right");
+}
+
+TEST_CASE("parseSettings: overlay refresh_hz clamped to [1, 60]") {
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":0}})").settings.overlay.refresh_hz == 1);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":-5}})").settings.overlay.refresh_hz == 1);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":300}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":30}})").settings.overlay.refresh_hz == 30);
+    // Exact boundary checks — 60 passes through, 61 clamps to 60, 1
+    // is the lowest valid value. Locks the std::clamp(rawHz, 1, 60)
+    // contract in case a future refactor changes the range.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":60}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":61}})").settings.overlay.refresh_hz == 60);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1}})").settings.overlay.refresh_hz == 1);
+}
+
+TEST_CASE("parseSettings: oversized overlay.position string clamps to default") {
+    // A corrupted or malicious settings.json could put an arbitrarily-
+    // long string in the position field. The recognised values are all
+    // <= 16 chars; anything past 64 is junk. Parser substitutes the
+    // documented default so the layer doesn't end up holding a multi-
+    // megabyte string verbatim for the whole session.
+    std::string huge(2048, 'x');
+    const std::string json = R"({"overlay":{"position":")" + huge + R"("}})";
+    const auto p = parseSettings(json);
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.overlay.position == "head_top_right");
+    // Boundary: 64 chars exactly is still stored verbatim (then the
+    // renderer's unknown-string fallback handles it). Lock the
+    // > 64 cutoff so a future refactor doesn't drift it.
+    std::string sixtyFour(64, 'y');
+    const std::string okJson = R"({"overlay":{"position":")" + sixtyFour + R"("}})";
+    CHECK(parseSettings(okJson).settings.overlay.position == sixtyFour);
+}
+
+TEST_CASE("parseSettings: overlay scale clamped to [0.5, 2.0]") {
+    CHECK(parseSettings(R"({"overlay":{"scale":0.0}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":-3.0}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":5.0}})").settings.overlay.scale == 2.0f);
+    CHECK(parseSettings(R"({"overlay":{"scale":1.5}})").settings.overlay.scale == 1.5f);
+    // Boundaries pass through unchanged.
+    CHECK(parseSettings(R"({"overlay":{"scale":0.5}})").settings.overlay.scale == 0.5f);
+    CHECK(parseSettings(R"({"overlay":{"scale":2.0}})").settings.overlay.scale == 2.0f);
+    // Integer JSON also accepted (a user writing 1 instead of 1.0).
+    CHECK(parseSettings(R"({"overlay":{"scale":1}})").settings.overlay.scale == 1.0f);
+}
+
+TEST_CASE("parseSettings: overlay refresh_hz accepts JSON floats too") {
+    // A user pasting from another tool's config might write 10.0 instead
+    // of 10 — the parser should still accept it.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":12.0}})").settings.overlay.refresh_hz == 12);
+}
+
+TEST_CASE("parseSettings: out-of-range refresh_hz float degrades safely (no UB)") {
+    // static_cast<int> of a double outside int range is UB; the parser must
+    // range-check before the cast. Out-of-range / huge values fall back to
+    // the default (10) instead of invoking UB, then clamp as usual.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1e18}})").settings.overlay.refresh_hz == 10);
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":-1e18}})").settings.overlay.refresh_hz == 10);
+    // In-range-but-large float still casts, then clamps to the [1,60] ceiling.
+    CHECK(parseSettings(R"({"overlay":{"refresh_hz":1000000.0}})").settings.overlay.refresh_hz == 60);
+}
+
+TEST_CASE("parseSettings: overlay mode strings are case-insensitive") {
+    CHECK(parseSettings(R"({"overlay":{"mode":"HOTKEY"}})").settings.overlay.mode ==
+          OverlayMode::Hotkey);
+    CHECK(parseSettings(R"({"overlay":{"mode":"Auto"}})").settings.overlay.mode ==
+          OverlayMode::Auto);
+}
+
+TEST_CASE("parseSettings: overlay position is normalised to lowercase") {
+    // geometryForPosition compares case-sensitively against lowercase
+    // snake_case, so the parser lowercases — a user writing mixed case
+    // still gets the placement they asked for instead of the fallback.
+    CHECK(parseSettings(R"({"overlay":{"position":"Head_Top_Left"}})")
+              .settings.overlay.position == "head_top_left");
+    CHECK(parseSettings(R"({"overlay":{"position":"HEAD_CENTER"}})")
+              .settings.overlay.position == "head_center");
+}
+
+TEST_CASE("parseSettings: unknown overlay mode falls back to auto (no error surfaced)") {
+    const auto p = parseSettings(R"({"overlay":{"mode":"whatever"}})");
+    CHECK(p.error.empty());
+    CHECK(p.settings.overlay.mode == OverlayMode::Auto);
+}
+
+TEST_CASE("parseSettings: overlay hotkey defaults to Ctrl+Shift+O when block missing") {
+    const auto p = parseSettings(R"({"overlay":{"mode":"hotkey"}})");
+    REQUIRE(p.error.empty());
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+}
+
+TEST_CASE("parseSettings: overlay hotkey unknown key falls back to default") {
+    const auto p = parseSettings(R"({
+        "overlay": { "hotkey": { "key": "Squiggle", "modifiers": ["alt"] } }
+    })");
+    REQUIRE(p.error.empty());
+    CHECK(formatHotkey(p.settings.overlay.hotkey) == "Ctrl+Shift+O");
+}
+
+TEST_CASE("parseSettings: overlay enabled with non-bool falls back to false default") {
+    const auto p = parseSettings(R"({"overlay":{"enabled":"yes"}})");
+    CHECK(p.error.empty());
+    CHECK_FALSE(p.settings.overlay.enabled);
+}
+
+TEST_CASE("parseSettings: log and overlay blocks parsed independently") {
+    // Common config: log on, overlay also on with custom hotkey. Both
+    // blocks must read out cleanly without cross-contamination.
+    const auto p = parseSettings(R"({
+        "log":     { "enabled": true,  "mode": "auto",   "hotkey": {"key":"T","modifiers":["ctrl","shift"]} },
+        "overlay": { "enabled": true,  "mode": "hotkey", "hotkey": {"key":"O","modifiers":["ctrl","shift"]}, "refresh_hz": 5 }
+    })");
+    REQUIRE(p.error.empty());
+    CHECK(p.settings.log.enabled);
+    CHECK(p.settings.log.mode == LogMode::Auto);
+    CHECK(p.settings.overlay.enabled);
+    CHECK(p.settings.overlay.mode == OverlayMode::Hotkey);
+    CHECK(p.settings.overlay.refresh_hz == 5);
+}
+
+TEST_CASE("parseSettings: unknown top-level keys are tolerated") {
+    // A user who tries random extensions should not get a parse error.
+    const auto p = parseSettings(R"({
+        "log": {}, "future_feature": true, "x": [1, 2]
+    })");
+    CHECK(p.error.empty());
+    CHECK_FALSE(p.settings.log.enabled);  // empty log{} → disabled (fallback)
+}

@@ -42,6 +42,56 @@ namespace openxr_api_layer::log {
 #define TLXArg TLPArg
 #endif
 
+    // RAII scoped timer for trace-gated ETW duration spans. Captures the start
+    // tick on construction (only when the provider is enabled) and reports the
+    // elapsed time in nanoseconds off a process-cached QPC frequency. The event
+    // NAME must stay a string literal in the TraceLoggingWrite macro, so the
+    // write itself remains at the call site; this factors out the
+    // IsTraceEnabled() gate and the QueryPerformanceCounter / frequency
+    // bookkeeping the per-frame instrumentation spans would otherwise repeat:
+    //
+    //     log::ScopedQpcSpan span;
+    //     /* ...timed work... */
+    //     if (span.enabled())
+    //         TraceLoggingWrite(g_traceProvider, "my_event",
+    //                           TLArg(span.elapsedNs(), "duration_ns"), ...);
+    class ScopedQpcSpan {
+      public:
+        ScopedQpcSpan() noexcept : m_enabled(IsTraceEnabled()) {
+            if (m_enabled) {
+                LARGE_INTEGER c;
+                QueryPerformanceCounter(&c);
+                m_startTicks = c.QuadPart;
+            }
+        }
+        bool enabled() const noexcept { return m_enabled; }
+        // Nanoseconds since construction. Splits whole/fractional so the
+        // ticks * 1e9 intermediate can't overflow int64 for any realistic
+        // span (same strategy as detail::qpcToNs).
+        int64_t elapsedNs() const noexcept {
+            LARGE_INTEGER c;
+            QueryPerformanceCounter(&c);
+            const int64_t freq = frequency();
+            if (freq <= 0) return 0;
+            const int64_t ticks = c.QuadPart - m_startTicks;
+            return (ticks / freq) * 1'000'000'000LL
+                 + ((ticks % freq) * 1'000'000'000LL) / freq;
+        }
+
+      private:
+        // QPC frequency is fixed for the process lifetime — query once.
+        static int64_t frequency() noexcept {
+            static const int64_t f = [] {
+                LARGE_INTEGER q;
+                QueryPerformanceFrequency(&q);
+                return q.QuadPart;
+            }();
+            return f;
+        }
+        bool    m_enabled;
+        int64_t m_startTicks = 0;
+    };
+
     // Closes the current file logger and reopens it at `path` in append
     // mode. Used by the layer to switch from the bootstrap log (written
     // during xrNegotiateLoaderApiLayerInterface, before the application

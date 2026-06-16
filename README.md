@@ -1,201 +1,340 @@
-# OpenXR-Layer-Template
+# XR Telemetry
 
-A starting point for building an OpenXR API layer on Windows, with
-everything-but-the-kitchen-sink scaffolding so you can focus on the
-layer's own logic instead of plumbing.
+An OpenXR API layer for Windows that gives you two ways to see what
+your VR game is actually doing each frame: an **in-headset HUD** with
+live FPS / frametimes / GPU+CPU load (head-locked or world-locked), and
+a **per-frame CSV log**
+covering every CPU and GPU segment of the OpenXR frame cycle. Both
+features are independent — you can run either, both, or neither.
 
-Based on [`mbucchia/OpenXR-Layer-Template`](https://github.com/mbucchia/OpenXR-Layer-Template)
-— huge thanks to Matthieu Bucchianeri for the original framework. This
-template **adds** the following on top of his work:
+The layer sits between the game and the OpenXR runtime, so it works
+across SteamVR / WMR / Oculus / Pimax / Varjo without per-runtime
+patches. It never modifies the frame content the game submits; it only
+observes timings and (optionally) composites its own quad on top.
 
-- **GitHub Actions CI** that builds Debug + Release x64, runs unit
-  tests, builds an Inno Setup installer, signs everything, and creates
-  a GitHub Release on every `v*.*.*` tag push
-- **Code signing pipeline** (Certum Open Source Code Signing Cloud)
-  driven headlessly via the undocumented `SimplySignDesktop /autologin`
-  flag — the only known public recipe for headless Certum signing on
-  a GitHub-hosted Windows runner. Skip-on-fork built in
-- **Inno Setup installer** that installs to `C:\Program Files\` (correct
-  ACLs for sandboxed identities), registers under HKLM, and creates an
-  Add/Remove Programs entry
-- **VERSIONINFO from git tag** baked into the DLL via a pre-build script
-- **doctest unit test target** with an in-process mock OpenXR runtime,
-  so you can drive your layer through `xrCreateInstance` ↔ `xrEndFrame`
-  without a loader, GPU, or HMD
-- **D3D11 + D3D12 (via D3D11On12) support in `pch.h`**, all delay-loaded
-  so your layer DLL doesn't load `d3d11.dll` / `d3d12.dll` into game
-  processes that never exercise your graphics path
-- **HKLM install / uninstall PowerShell scripts** + signed installer
-- **`docs/DEVELOPMENT.md`** with the signing pipeline written up in
-  enough detail that you (or your future self) can debug it
-- **`docs/CTS_TESTING.md`** for how to run the OpenXR CTS against your
-  layer on a real machine — useful long before you ship
+## Install
 
-## Quick start
+Download the latest `Setup.exe` from
+[Releases](https://github.com/mledour/XR-Telemetry/releases)
+and run it. The installer registers the layer under `HKLM` so every
+OpenXR runtime on the machine picks it up, and creates an Add/Remove
+Programs entry for clean uninstall.
 
-```powershell
-# 1. Click "Use this template" on GitHub to get your own copy, then
-#    clone it locally.
-git clone https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
+The overlay (HUD) and the CSV log both ship **enabled in hotkey mode** —
+armed but dormant. Nothing is drawn and no CSV is written until
+you press the toggle in-game (`Ctrl+Shift+O` for the overlay,
+`Ctrl+Shift+T` for the log). See Settings below to make a feature
+always-on (`auto`) or turn it off entirely.
 
-# 2. Pull the OpenXR submodules.
-git submodule update --init --recursive
+## Quickstart
 
-# 3. Run the post-clone init script. It asks for your vendor tag,
-#    layer name, your real name, year, etc., and substitutes them
-#    across the tree (filenames AND file contents).
-#    Windows:
-powershell -ExecutionPolicy Bypass -File .\scripts\Init-Template.ps1
-#    macOS / Linux / WSL:
-#    bash scripts/init-template.sh
+1. Install via `Setup.exe`. It drops a default `settings.json` into
+   `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`.
+2. Launch your OpenXR game. Both features ship enabled in hotkey mode, so
+   nothing shows yet — press `Ctrl+Shift+O` to toggle the overlay (it
+   appears in the top-right of your FOV) and `Ctrl+Shift+T` to start/stop a
+   CSV recording (files land in `…\sessions\`).
+3. Want a feature always-on instead of hotkey-toggled? Edit `settings.json`
+   and set its `mode` to `"auto"`. To turn a feature off entirely, set its
+   `enabled` to `false`.
 
-# 4. Open the renamed .sln in Visual Studio 2019+ and build Release|x64.
-#    The pre-build event runs framework\dispatch_generator.py to produce
-#    dispatch.gen.{h,cpp} from layer_apis.py, then bakes the version into
-#    VERSIONINFO. You should get a DLL + test binary at the first build.
+Until you toggle something on, the layer just polls for the hotkeys a few
+times a second — no CSV, no HUD, negligible overhead.
+
+## Disabling the layer
+
+Because the loader injects this DLL into **every** OpenXR app on the
+machine, there are two ways to make it stand down without uninstalling:
+
+- **Fully inert (loader level).** Set the environment variable
+  `DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry=1` (the manifest's
+  `disable_environment`). The OpenXR loader then never loads the layer into
+  the process at all — the safest option if a game or its anti-cheat
+  misbehaves with any third-party layer present.
+- **Pure pass-through (settings level).** Set both `log.enabled` and
+  `overlay.enabled` to `false` in `settings.json`. The DLL still loads but
+  every call forwards straight through — no hotkeys polled, no
+  instrumentation.
+
+## Settings
+
+The layer reads its configuration from
+`%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`:
+
+- **`settings.json`** — the global template. Edit this to change the
+  defaults for future games.
+- **`<app>_settings.json`** — auto-created the first time you run a
+  given game, copied from the template. Lets you keep different
+  settings per game (DCS, MSFS, iRacing, …) without them clashing.
+
+Slug rules: spaces and special characters become `_`, uppercase is
+lowered. `DiRT Rally 2.0` → `dirt_rally_2_0_settings.json`.
+
+Full schema:
+
+```json
+{
+  "log": {
+    "enabled": true,
+    "mode": "hotkey",
+    "hotkey": { "key": "T", "modifiers": ["ctrl", "shift"] }
+  },
+  "overlay": {
+    "enabled": true,
+    "mode": "hotkey",
+    "hotkey": { "key": "O", "modifiers": ["ctrl", "shift"] },
+    "refresh_hz": 10,
+    "position": "head_top_right",
+    "scale": 1.0,
+    "anchor": "head",
+    "offset_x": 0.0,
+    "offset_y": 0.0
+  }
+}
 ```
 
-The shipped skeleton overrides exactly one OpenXR function
-(`xrCreateInstance`) and just logs the application name and runtime
-identity. That's a sanity check the layer is loading. From there:
+The parser is permissive — missing keys, wrong types, unknown enum
+values all fall back to the documented defaults silently rather than
+disabling the feature, so a typo never kills your session.
 
-- Add functions to `override_functions` in
-  [`openxr-api-layer/framework/layer_apis.py`](./openxr-api-layer/framework/layer_apis.py)
-- Override the matching method on `OpenXrLayer` in
-  [`openxr-api-layer/layer.cpp`](./openxr-api-layer/layer.cpp)
-- Anything you don't override is forwarded to the next layer / runtime
-  automatically by the framework
+---
 
-The `layer.cpp` in the template has commented examples for a typical
-`xrLocateViews` override.
+## Overlay
 
-## What's in the box
+The overlay is a HUD in a corner of your FOV, two-column fpsVR-style
+layout. By default it's **head-locked** — it follows your view and
+stays in the same spot. You can also pin it **world-locked** so it
+freezes in the room in front of you (see `anchor` below).
+
+![Overlay snapshot](screenshots/overlay_snapshot.png)
+
+### What's displayed
+
+| Row | Field | Meaning |
+|---|---|---|
+| Header | **FPS** | Instant frame rate from the last frame's duration (`1e9 / frame_total_ns`). White, the eye-catcher. |
+| Header | **FPS AVG** | Mean FPS over the refresh window (10 Hz by default). |
+| Header | **P95** | 95 % of frames hit at least this FPS — the slow 5 % drop below. Sliding 30 s window. |
+| Header | **P99** | 99 % of frames hit at least this FPS. The worst 1 % drop below. |
+| Header | **P99.9** | The single worst ~0.1 % — typically a handful of specific spike frames in the window. Matches fpsVR / SteamVR "Frame Timing" convention. |
+| GPU Frametime ms | **`6.7 ms`** + bars | Mean GPU time spent on the app's `xrBeginFrame → xrEndFrame` draws over the refresh window. Bars: 120-sample rolling histogram, one bar per frame. Y axis spans `0..2× period`; the white midline marks the budget. |
+| CPU Frametime ms | **`Render X.X ms / App X.X ms`** + bars | **App** = the per-cycle total (`frame_total - wait_block`) — the same number OpenXR Toolkit / fpsVR / PresentMon call *app CPU* (hence the label), and what drives CPU LOAD. **Render** = the app's render-recording window (`render_ns` — `xrBeginFrame` returning to the app → `xrEndFrame`), matching OXRT's *render CPU*. Render is a sub-part of App; the rest (the app's pre-render / between-frames work + the runtime's begin/end calls) isn't broken out. |
+| Bottom | **GPU TEMP** | Temperature in °C from the active GPU sensor. |
+| Bottom | **GPU LOAD** | Utilisation % derived from `gpu_headroom_pct`. Cyan < 80 %, orange 80–89 %, red ≥ 90 %. |
+| Bottom | **VRAM** | `vram_used / vram_budget` as a %. Same tier colours as GPU LOAD. |
+| Bottom | **CPU LOAD** | Per-cycle CPU utilisation % derived from `headroom_pct` (the app's CPU work vs. the frame budget — distinct from the system-wide **CPUs LOAD** reading). Same tier colours as GPU LOAD. |
+| Bottom | **CPUs LOAD** | Utilisation % of the **busiest logical processor** (fpsVR's "CPUs"). Sampled system-wide via a documented user-mode NT call (`NtQuerySystemInformation`) — no driver, no elevation. A high **CPUs LOAD** next to a tame **CPU LOAD** is the classic single-thread-bound signature most VR titles hit. `--` only when the sampler couldn't initialise. Same tier colours as GPU LOAD. |
+
+**CPU breakdown — comparing to OpenXR Toolkit.** Both terms map 1:1 to
+OXRT's two CPU read-outs: **App** = OXRT *app CPU* (the full per-cycle
+time), and **Render** = OXRT *render CPU* (the app's own render-recording
+between `xrBeginFrame` and `xrEndFrame`). Render is measured from *after*
+the downstream `xrBeginFrame` returns, so — exactly like OXRT — it
+excludes the runtime's begin call (which can be ~0.5 ms on a young
+runtime). Render is always ≤ App; the difference is the app's pre-render
+/ between-frames work plus the runtime's begin/end calls, which aren't
+broken out. Caveat: a passive layer only sees the OpenXR-calling thread,
+so neither number includes simulation the engine runs on other threads.
+
+**Bar colour code** (per-sample, not overall):
+
+| Colour | When |
+|---|---|
+| Cyan / blue gradient | Frametime ≤ 80 % of the runtime's predicted display period |
+| Orange | 80 – 100 % of budget — close to missing the deadline |
+| Red | ≥ 100 % — frame busted the budget. Reprojected / stuttered frames cross the white midline. |
+
+The budget is anchored, not auto-normalised — a single spike won't
+squash the rest of the bars, and a stretch where every bar is red
+honestly means "you're busting every frame here" (e.g. a 60 Hz menu
+cap on a 90 Hz HMD).
+
+### Settings — `overlay.*`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Master switch. Ships **on** in hotkey mode, so the HUD never paints uninvited — it stays hidden until you press the combo. Set `false` to disable the overlay entirely. |
+| `mode` | string | `"hotkey"` | `hotkey` (the default) = HUD hidden until you press the combo, toggles on/off on each subsequent press. `auto` = HUD visible the whole session when `enabled=true`. |
+| `hotkey.key` | string | `"O"` | Main key. Recognised: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Space`, `Tab`, `Enter`, `Escape`, `Backspace`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`. Punctuation is intentionally unsupported (locale-dependent). |
+| `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers required IN ADDITION to the main key. Recognised: `ctrl`, `shift`, `alt`, `win`. Must match exactly — `Ctrl+Alt+Shift+O` does NOT trigger a `Ctrl+Shift+O` binding. |
+| `refresh_hz` | int | `10` | How often the displayed numbers update. Clamped to `[1, 60]`. 10 Hz matches fpsVR — fast enough that the numbers track reality, slow enough to be readable in motion. |
+| `position` | string | `"head_top_right"` | Corner of the FOV. Recognised: `head_top_right`, `head_top_left`, `head_top_center`, `head_center`. Anything else falls back to `head_top_right`. With `anchor: "world"` this picks where the panel lands at the moment it's summoned. |
+| `scale` | float | `1.0` | Multiplier on the default quad size. Clamped to `[0.5, 2.0]`. |
+| `offset_x` | float | `0.0` | Fine-tune the HUD's horizontal placement, in metres at the 1 m quad distance, on top of `position`. `+` = right, `−` = left. The stock corner already hugs the edge; use this to push it further out (or back toward centre) without a rebuild. Clamped to `[-1.0, 1.0]`. |
+| `offset_y` | float | `0.0` | Same as `offset_x` but vertical: `+` = up, `−` = down. Clamped to `[-1.0, 1.0]`. |
+| `anchor` | string | `"head"` | Reference frame. `head` = the HUD is attached to the headset and follows your gaze (the stock behaviour). `world` = the HUD freezes in the play space in front of you the moment it turns on and stays there as you move and look around. It always hangs **upright** — a tilted head when it's summoned won't leave it pitched or rolled — but you aim its **height with your gaze**: look up as you summon it and it anchors higher, look down and it anchors lower. To re-centre a world-locked HUD, toggle it off and on again (auto mode: it re-anchors at the start of each session; hotkey mode: each time you press the combo to summon it). If the headset isn't tracking when it's summoned the panel waits for tracking, and falls back to head-locked after a couple of seconds rather than never appearing. Anything other than `world` falls back to `head`. |
+
+**Graphics-API support.** D3D11 hosts paint the HUD with GPU shaders (a
+prebuilt glyph atlas + instanced quads) straight into a BGRA8 swapchain.
+D3D12 hosts go through D3D11On12 so those same D3D11 shaders can render
+directly into the D3D12 swapchain image.
+**Vulkan and OpenGL hosts are not supported** — the layer logs
+`overlay disabled — Vulkan/OpenGL hosts not supported by the renderer`
+and the CSV-logging path keeps running.
+
+**Hotkey caveats.** Hotkeys are polled inside `xrEndFrame` (game must
+have focus + be rendering). On European AZERTY / QWERTZ keyboards
+AltGr reports as `Ctrl + Alt`, so a `Ctrl + letter` binding will also
+fire on `AltGr + letter` — prefer `Shift + F-key` if you hit this.
+The layer does NOT consume key presses (no `RegisterHotKey`), so a
+game binding on the same combo will fire alongside the layer toggle;
+pick a combo your game doesn't claim, or add `alt` to push into the
+under-used `Ctrl+Alt+Shift+letter` range.
+
+---
+
+## Logs
+
+The layer writes one CSV row per frame, capturing every CPU + GPU
+segment of the OpenXR frame cycle. Files live at:
 
 ```
-.
-├── .github/workflows/build-and-release.yml   # CI: build, test, sign, release
-├── installer/installer.iss                   # Inno Setup script (auto-built)
-├── openxr-api-layer/
-│   ├── framework/                            # dispatch generator, entry, log
-│   ├── layer.cpp / layer.h                   # ← your layer code goes here
-│   ├── pch.h                                 # D3D11 + D3D12 includes (delay-loaded)
-│   └── XR_APILAYER_<vendor>_<name>.json      # loader manifest
-├── openxr-api-layer-tests/
-│   ├── main.cpp                              # doctest entry point
-│   ├── mock_runtime.{h,cpp}                  # in-process OpenXR mock
-│   ├── test_example.cpp                      # ← your tests go here
-│   └── test_stubs.cpp                        # symbols entry.cpp normally provides
-├── scripts/
-│   ├── Init-Template.ps1                     # post-clone placeholder substitution
-│   ├── Generate-VersionRc.ps1                # bakes git tag into VERSIONINFO
-│   ├── Get-CertumTotp.ps1                    # RFC 6238 TOTP (Certum auth)
-│   ├── Sign-Artifact.ps1                     # headless Certum signing flow
-│   ├── Test-CertumTotp.ps1                   # offline TOTP self-test
-│   ├── Install-Layer.ps1                     # HKLM register (manual install)
-│   └── Uninstall-Layer.ps1                   # HKLM unregister
-├── docs/
-│   ├── DEVELOPMENT.md                        # CI + signing + framework internals
-│   └── CTS_TESTING.md                        # how to run OpenXR CTS locally
-├── external/                                 # OpenXR SDK + MixedReality (submodules)
-├── LICENSE                                   # MIT (yours + mbucchia attribution)
-└── README.md                                 # ← rewrite this for your layer
+%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\sessions\
+    YYYY-MM-DD_HH-MM-SS.mmmZ_<AppName>.csv
 ```
 
-## CI / signing setup
+One file per session in `auto` mode, one file per recording window in
+`hotkey` mode. Openable directly in Excel / Pandas / LibreOffice.
+Pandas reads the footer transparently with `pd.read_csv(path,
+comment='#')`.
 
-Skip this section if you don't care about signed releases — the CI
-will build and produce unsigned artifacts just fine without any
-secrets. The signing steps fall through cleanly on PR builds, forks,
-and any tag push made without the secrets configured.
+### Sample
 
-If you DO want signed releases:
-
-1. Get a code signing certificate. The cheapest legitimate option for
-   open-source projects is [Certum Open Source Code Signing Cloud](https://shop.certum.eu/en/open-source-code-signing-in-the-cloud-1-year.html)
-   (~25 €/yr at time of writing).
-2. Enroll the 2FA in the SimplySign portal. During the QR-code step,
-   save the Base32 **seed** (the otpauth URI's `secret=` parameter) —
-   not the current 6-digit code. You need the seed for CI.
-3. Add three GitHub repo Secrets (Settings → Secrets and variables →
-   Actions):
-   - `CERTUM_USERNAME` — your SimplySign portal email
-   - `CERTUM_TOTP_SEED` — the Base32 seed from step 2
-   - `CERTUM_CERT_THUMBPRINT` — 40-hex-char SHA-1 of the issued cert
-4. Tag a release (`git tag v0.0.1 && git push origin v0.0.1`). The
-   workflow signs the DLL + Setup.exe and attaches everything to a
-   GitHub Release automatically.
-
-[`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) has the full write-up
-on how the signing pipeline works — including why we use
-`SimplySignDesktop /autologin` and what to do when Certum updates the
-desktop client.
-
-## Test loop
-
-`openxr-api-layer-tests` builds alongside the DLL and runs after every
-build (the workflow fails on a non-zero test exit). Add your own tests
-under `openxr-api-layer-tests/test_*.cpp` and list them in the test
-project's `<ClCompile>` items.
-
-Two patterns to know:
-
-- **Unit tests on pure helpers** — just `#include` the header and
-  `CHECK(...)`. No OpenXR types involved. Fast.
-- **Integration tests via `mock_runtime`** — drives `OpenXrLayer`
-  through `xrCreateInstance` ↔ `xrEndFrame` with a fake runtime that
-  produces deterministic FOV / pose data. No GPU, no HMD, no loader.
-
-`test_example.cpp` shows the minimal doctest pattern and has a
-commented-out integration example.
-
-## Releasing
-
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
+```csv
+frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,headroom_pct,gpu_headroom_pct,should_render,gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct,render_ns
+0,18452119837601,0,153244,6041122,287413,0,0,11111111,100.00,100.00,1,67.5,6079217664,8589934592,nan,5797878
+1,18452121034711,3128905,148902,6112874,294118,11969012,5183047,11111111,20.31,53.35,1,67.5,6079217664,8589934592,96.2,5873972
+2,18452122156388,3204711,151088,6088423,289776,11217677,5198114,11111111,27.84,53.21,1,67.6,6079217664,8589934592,95.8,5847335
+3,18452123277014,3198044,149837,6094811,291204,11206264,5179420,11111111,27.94,53.38,1,67.6,6079217664,8589934592,97.1,5854974
+4,18452124398211,3187621,150412,6097104,290847,11212197,5191388,11111111,27.89,53.27,1,67.6,6086217728,8589934592,96.5,5856692
+5,18452125519988,3175102,152017,6105844,293012,11221777,5208112,11111111,27.80,53.12,1,67.7,6086217728,8589934592,95.9,5863827
+…
+# session_end written=8124 dropped_try_lock=0 dropped_queue_full=0 dropped_disk_write=0
 ```
 
-The workflow handles the rest:
+The trailing `# session_end` footer records the total rows written and
+per-cause drop counters (a frame may be skipped if the writer thread
+falls behind, but in practice drops are zero on healthy hardware).
 
-1. Builds Debug + Release x64 in parallel
-2. Runs the test binary; non-zero exit fails the job
-3. (Release only) Builds the Inno Setup installer
-4. (Tag push only) Signs the DLL + installer if the Certum secrets
-   are set
-5. (Tag push only) Creates a GitHub Release with both ZIPs + the
-   Setup.exe attached
+### Fields
 
-Builds on non-tag pushes (main, PRs, manual `workflow_dispatch`)
-produce unsigned verification artifacts and don't create a release.
+| Column | Definition | What it captures |
+|---|---|---|
+| `frame` | Sequential 0-based counter | Frame index since the session start. |
+| `timestamp_qpc` | `QueryPerformanceCounter` ticks at `xrEndFrame` entry | Frame-end wall clock. Convert to seconds by dividing by `QueryPerformanceFrequency` (typically ~10 MHz on modern Windows hosts). |
+| `wait_block_ns` | `tWaitOut − tWaitIn` | **Compositor throttle.** Time the runtime made the app wait inside `xrWaitFrame`. Big = compositor has headroom and is rate-limiting the app (good). Small = app is the bottleneck. |
+| `pre_begin_ns` | `tBegin − tWaitOut` | **Housekeeping.** Time between `xrWaitFrame` returning and `xrBeginFrame` being called — input poll, state update. Usually ~50–300 µs. |
+| `app_cpu_ns` | `tEnd − tWaitOut` | **Wait→End window** = `pre_begin_ns` + render submission. CPU time the app spent between `xrWaitFrame` returning and `xrEndFrame` being called — render-thread heaviness. |
+| `end_frame_ns` | Duration of the downstream `xrEndFrame` call | **Runtime/compositor ingest overhead.** Layer composition, projection correction, compositor handoff. On mature runtimes (SteamVR / Oculus) typically a few hundred µs; on young runtimes can reach 1–2 ms. |
+| `frame_total_ns` | `tEnd_now − tEnd_prev` | **Full cycle duration.** End-to-end wall clock of the previous frame. Includes the post-`xrEndFrame` work (sim, physics, AI, input polling) that `app_cpu_ns` can't see because it happens AFTER the app returns and BEFORE the next `xrWaitFrame`. `0` on the first frame. |
+| `gpu_time_ns` | GPU timestamp delta from `xrBeginFrame` to `xrEndFrame` | **App GPU work for this frame.** D3D11: `D3D11_QUERY_TIMESTAMP` bracketed by a `D3D11_QUERY_TIMESTAMP_DISJOINT` for frequency validation. D3D12: native `D3D12_QUERY_TYPE_TIMESTAMP` on the layer's own short command lists (no D3D11On12 wrapping). `0` for Vulkan / OpenGL hosts (not instrumented) and for the first ~4 frames (async-query warmup). |
+| `period_ns` | `XrFrameState.predictedDisplayPeriod` | Target frame budget reported by the runtime. ~11.11 ms @ 90 Hz, ~8.33 ms @ 120 Hz, ~13.89 ms @ 72 Hz. Constant for a given session. |
+| `headroom_pct` | `(1 − (frame_total_ns − wait_block_ns) / period_ns) × 100` | **CPU % of the frame budget NOT spent on app CPU work this cycle.** Matches fpsVR / OpenXR Toolkit semantics. Negative ⇒ CPU-bound. Falls back to `(1 − app_cpu_ns / period_ns) × 100` on the first frame. Reads `100.00` when `period_ns == 0` (transient at session start) — filter on `period_ns > 0` to exclude. |
+| `gpu_headroom_pct` | `(1 − gpu_time_ns / period_ns) × 100` | **GPU % of the frame budget NOT spent on app GPU work this cycle.** Negative ⇒ GPU-bound. `100.00` when `gpu_time_ns == 0` (no D3D binding, disjoint range invalid, query not yet ready) — filter on `gpu_time_ns > 0` to exclude unmeasured rows. |
+| `should_render` | `XrFrameState.shouldRender` as 0/1 | Whether the runtime asked the app to render this frame. `0` = skipped (focus loss, scene transition). Typically filtered out for steady-state analysis. |
+| `gpu_temp_c` | GPU temperature in °C, 1 decimal | Latched at the snapshot's refresh cadence. `nan` (pandas reads as `np.nan`) if the GPU vendor's sensor path is unavailable. |
+| `vram_used_bytes` | GPU dedicated memory currently allocated, bytes | From DXGI's local-memory budget query. `0` if the query failed. |
+| `vram_budget_bytes` | OS-suggested VRAM budget for the process, bytes | From the same DXGI query. The renderer uses this for the bottom-row VRAM percentage (`used / budget`). |
+| `cpus_max_pct` | Busiest logical processor's utilisation %, 1 decimal | The overlay's **CPUs LOAD**. Latched at the sampler's ~1 Hz poll cadence (system-wide, via `NtQuerySystemInformation`). `nan` until the first reading and on hosts where the sampler couldn't initialise. A high `cpus_max_pct` with a tame `headroom_pct` is the single-thread-bound signature. |
+| `render_ns` | `tEnd − tBeginExit` | **App render-recording.** `xrBeginFrame` returning to the app → `xrEndFrame` entry — the app's own draw submission, EXCLUDING the runtime's `xrBeginFrame` call. Matches OpenXR Toolkit's *render CPU* and is surfaced in the overlay as **Render**. Tighter than the derived `app_cpu_ns − pre_begin_ns`, which also counts the runtime begin call. Appended last (after `cpus_max_pct`) to keep the column order stable. |
 
-## Conventions inherited from this template
+### Anatomy of a frame cycle
 
-These are decisions baked into the framework — feel free to override
-them if your layer has different needs, but they're the defaults:
+Stitched chronologically, the CPU columns cover 100 % of the cycle.
+The GPU column runs in parallel — the GPU processes the app's draws
+while the CPU has already moved on to the next frame's sim work:
 
-- **HKLM registration**, not HKCU (anti-cheat and OpenXR Tools for WMR
-  expect this — see the upstream `docs/openxr_api_layers_best_practices.md`
-  rule 2)
-- **Settings file per OpenXR application** at
-  `%LOCALAPPDATA%\<your-layer-name>\<app>_settings.json`, plus a
-  global `settings.json` template
-- **Log file per application** at
-  `%LOCALAPPDATA%\<your-layer-name>\<app>.log`
-- **Graceful degradation, never crash** — every overridden method
-  should check `m_bypassApiLayer` and forward to the runtime if your
-  feature can't run safely for this context
-- **Delay-loaded D3D DLLs** so the layer doesn't bloat the process
-  load image of Vulkan-only or D3D12-only games that don't trigger
-  your graphics path
+```
+CPU timeline:
+
+xrEndFrame_prev ↓
+                ├──────── post_end ────────────┐
+                                               ↓
+                                          xrWaitFrame ↓
+                                          ├ wait_block ┤
+                                                       ↓
+                                              ├ pre_begin ┤
+                                                          ↓ xrBeginFrame
+                                              ├ render_submission ┤
+                                                                  ↓ xrEndFrame ↓
+                                                                  ├ end_frame ┤
+                                                                              ↓
+                ←──────────────────── frame_total ────────────────────────────→
+
+
+GPU timeline (parallel, may overlap with the next CPU frame):
+
+                                              xrBeginFrame ↓
+                                                        ├──── gpu_time ───┤
+                                                                          ↓ xrEndFrame
+```
+
+The app's draw-submission window is stored directly as `render_ns`
+(`xrBeginFrame` returning → `xrEndFrame`, excluding the runtime's begin
+call — the overlay's **Render**, = OXRT *render CPU*). The looser
+`app_cpu_ns − pre_begin_ns` measures the same window but also counts the
+runtime's `xrBeginFrame` call.
+
+One segment isn't stored — compute it in analysis when you need it:
+
+- `post_end_ns = frame_total_ns − wait_block_ns − pre_begin_ns − app_cpu_ns − end_frame_ns`
+  — time spent OUTSIDE OpenXR calls (game simulation, physics, AI,
+  scripting, event polling). `app_cpu_ns` alone can't see this — it
+  only covers the wait→end window.
+
+### Diagnostic patterns
+
+| Symptom | Where to look | Reading |
+|---|---|---|
+| App feels stuttery | `frame_total_ns > period_ns × 1.5` rows | Missed deadlines. Drill into which segment dominates. |
+| **CPU-bound vs GPU-bound** | Average `headroom_pct` vs `gpu_headroom_pct` | Whichever is **lower** is your bottleneck. Both low + similar = balanced at the limit, optimise both. Only CPU low = simplify sim / submission. Only GPU low = drop shader complexity / resolution. |
+| Render-thread heavy | `render_ns` close to `period_ns` | Too many draw calls / state changes / GPU-queue stalls. Profile with PIX / RenderDoc. |
+| Sim heavy | `frame_total_ns − wait_block_ns − app_cpu_ns − end_frame_ns` dominates | Physics / AI / scripting between frames is the bottleneck — game-logic thread, not the renderer. |
+| Runtime overhead | `end_frame_ns > ~1 ms` consistently | The runtime itself is slow ingesting frames. Switching runtimes (SteamVR ↔ Oculus ↔ vendor) usually moves this number. |
+| Healthy session | `wait_block_ns ≈ period_ns × 0.3`, `frame_total_ns ≈ period_ns` | App finishes early, runtime throttles, equilibrium. |
+
+GPU timestamps are asynchronous — a query issued at `xrBeginFrame_N`
+returns 1–3 frames later, so the layer **defers each row by ~3–4
+frames** to keep `gpu_time_ns` aligned with its own `frame_index`. The
+last ~4 rows of a session flush with `gpu_time_ns = 0` because the GPU
+result wasn't ready at shutdown — filter on `gpu_time_ns > 0` before
+computing GPU averages.
+
+### Settings — `log.*`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Master switch for the CSV. Ships **on** in hotkey mode (no file is written until you press the combo). Set `false` to skip logging entirely; with both `log.enabled` and `overlay.enabled` set to `false` the layer is a pure pass-through. |
+| `mode` | string | `"hotkey"` | `hotkey` (the default) = no CSV until you press the combo; each press starts/stops a recording window (one fresh file per window — short sessions don't merge into one giant log). `auto` = one CSV per session, opened at session start and closed at session end. |
+| `hotkey.key` | string | `"T"` | Main key. Same set of recognised names as the overlay hotkey. |
+| `hotkey.modifiers` | string[] | `["ctrl", "shift"]` | Modifiers. Same set as the overlay hotkey. |
+
+The two hotkeys default to **different combos** (`Ctrl+Shift+O` for
+the overlay, `Ctrl+Shift+T` for the log) so users running both in
+hotkey mode can drive them independently without a chord collision.
+Every transition is logged (`xr_telemetry: hotkey pressed — log
+RECORDING/STOPPED`) so support sessions can see when the user thought
+they started or stopped something.
+
+### Settings are read once
+
+The settings file is parsed at `xrCreateInstance` and stays cached for
+the rest of the session — no filewatch reload. A filewatch adds steady
+jitter to the frame loop (we observed this on the sibling `fov_crop`
+layer's `live_edit` flag), and the whole point of `xr_telemetry` is to
+measure frame timings — polluting the measurement with its own
+bookkeeping defeats the purpose. **Restart the game** to apply a new
+settings file.
 
 ## License
 
-MIT License — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE).
 
-The framework code (`openxr-api-layer/framework/`, dispatch generator,
-`module.def`, entry point, logging helpers) is the work of Matthieu
-Bucchianeri (`mbucchia`), Copyright © 2022-2023. Everything else is
-new in this template. If you fork this template, your own work goes
-under your name in the LICENSE; please keep mbucchia's attribution
-intact.
+The framework code (`openxr-api-layer/framework/`, the dispatch
+generator, `module.def`, the entry point, the logging helpers) is the
+work of Matthieu Bucchianeri (`mbucchia`), Copyright © 2022-2023, and
+ships under his MIT terms alongside ours.
+
+The bundled font (`Rajdhani-SemiBold.ttf`) is licensed under the SIL Open
+Font License v1.1 — see
+[`openxr-api-layer/fonts/OFL.txt`](./openxr-api-layer/fonts/OFL.txt).

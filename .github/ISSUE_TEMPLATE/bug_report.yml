@@ -7,8 +7,8 @@ body:
       value: |
         Thanks for taking the time to report. The more of this form you
         fill in, the faster the root cause can be found — most of these
-        fields narrow things down to a specific runtime, game, or crop
-        configuration in a few seconds.
+        fields narrow things down to a specific runtime, game, or
+        graphics API in a few seconds.
 
         If you're not sure about a field, leave a short note ("I don't
         know") rather than leaving it blank.
@@ -19,7 +19,7 @@ body:
       label: Layer version
       description: |
         Shown in the filename of the installer or ZIP you downloaded
-        (e.g. `XR_APILAYER_NOVENDOR_template-0.0.6-x64-Setup.exe`), or
+        (e.g. `XR_APILAYER_MLEDOUR_xr_telemetry-0.0.6-x64-Setup.exe`), or
         in Windows Explorer → right-click the DLL → Properties → Details
         → Product version.
       placeholder: "0.0.6"
@@ -54,7 +54,7 @@ body:
       description: |
         Visible in [OpenXR Explorer](https://github.com/maluoi/openxr-explorer)
         (open the app, look for "Runtime name"). Or in the layer's own log
-        file at `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        file at `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>.log`
         (sanitized game name, e.g. `le_mans_ultimate.log`) — search for
         "Using OpenXR runtime:".
       options:
@@ -83,9 +83,9 @@ body:
     attributes:
       label: What did you expect?
       placeholder: |
-        After setting `"enabled": true` and relaunching the game, I
-        expected the FOV to be narrowed and the black bars to appear on
-        the edges of my view.
+        I pressed `Ctrl+Shift+O` while the game was running and
+        expected the telemetry HUD to appear in the top-right of my
+        view, showing live FPS and frametime numbers.
     validations:
       required: true
 
@@ -94,8 +94,9 @@ body:
     attributes:
       label: What actually happened?
       placeholder: |
-        The game launched but the FOV looks unchanged. No black bars.
-        It's as if the layer wasn't loaded at all.
+        Nothing appeared. I pressed `Ctrl+Shift+O` several times with
+        the game focused and actively rendering, but no HUD was ever
+        drawn — it's as if the layer wasn't loaded at all.
     validations:
       required: true
 
@@ -105,12 +106,13 @@ body:
       label: Steps to reproduce
       description: Numbered list. Include anything unusual about your setup.
       placeholder: |
-        1. Install the layer with `...-Setup.exe`.
-        2. Edit `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\settings.json`
-           and set `"enabled": true`.
-        3. Launch Le Mans Ultimate via Steam.
-        4. Enter a car, start a session.
-        5. Expected: cropped view. Actual: full FOV.
+        1. Install the layer with `...-Setup.exe` (leaves the default
+           `settings.json` — overlay enabled in hotkey mode).
+        2. Launch Le Mans Ultimate via Steam and put on the headset.
+        3. Enter a car so the game is focused and actively rendering.
+        4. Press `Ctrl+Shift+O` to summon the overlay.
+        5. Expected: the HUD appears in the top-right of my FOV.
+           Actual: nothing is drawn.
     validations:
       required: true
 
@@ -120,7 +122,7 @@ body:
       label: Active settings file (content)
       description: |
         Paste the content of the per-app file that was in effect —
-        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>_settings.json`
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>_settings.json`
         (or the global `settings.json` if the per-app file doesn't exist
         yet). Redact anything sensitive, which shouldn't be anything in
         practice.
@@ -134,7 +136,7 @@ body:
       label: Log excerpt
       description: |
         The relevant part of
-        `%LOCALAPPDATA%\XR_APILAYER_NOVENDOR_template\<game>.log`
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\<game>.log`
         (the file named after the sanitized game name, e.g.
         `le_mans_ultimate.log`).
         Usually the first 30-50 lines show the instance creation and the

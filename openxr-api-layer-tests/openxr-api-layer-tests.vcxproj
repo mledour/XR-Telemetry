@@ -50,20 +50,38 @@
     <IntDir>$(SolutionDir)\obj\$(Platform)\$(Configuration)\tests\</IntDir>
     <TargetName>openxr-api-layer-tests</TargetName>
   </PropertyGroup>
+  <!-- Defaults inherited by every conditional ItemDefinitionGroup below.
+       Defining ResourceCompile/AdditionalIncludeDirectories here once
+       avoids the 4× / 2× duplication that was reviewed away from the
+       initial commit on this PR. Configurations that need to override
+       (rare) can still add their own <ResourceCompile> inside their
+       conditional group. -->
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <!-- rc.exe's /I search path for the bare-basename TTF references
+           inside fonts/bundled_fonts.rc.inc (the shared font include
+           that both the layer DLL and the test EXE pull in). Without
+           this, rc.exe fails with RC2135 file-not-found on every
+           Rajdhani-*.ttf. See docs/DEVELOPMENT.md "Adding a new
+           bundled resource" for why the include uses bare basenames
+           and not a path prefix. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)openxr-api-layer\fonts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <!-- LAYER_NAME matches the layer DLL's define so layer.cpp / dispatch.cpp
            compile the same way they do in the DLL project. -->
-      <PreprocessorDefinitions>LAYER_NAME="XR_APILAYER_NOVENDOR_template";_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>LAYER_NAME="XR_APILAYER_MLEDOUR_xr_telemetry";_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <!-- PCH is disabled for the test target: layer.cpp and friends have
            `#include "pch.h"` at the top, so MSVC treats it as a normal include
            without needing the separate Create/Use pch.cpp dance. Slower to
            compile than the layer project, but simpler and self-contained. -->
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\obj\$(Platform)\$(Configuration)\;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -78,8 +96,8 @@
            gets mapped into the test binary the first time you
            actually call D3D11On12CreateDevice / a D3D11 free
            function. delayimp.lib pairs with DelayLoadDLLs. -->
-      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>d3d11.dll</DelayLoadDLLs>
+      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -88,10 +106,10 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>LAYER_NAME="XR_APILAYER_NOVENDOR_template";NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>LAYER_NAME="XR_APILAYER_MLEDOUR_xr_telemetry";NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)\external;$(SolutionDir)\openxr-api-layer;$(SolutionDir)\openxr-api-layer\framework;$(SolutionDir)\obj\$(Platform)\$(Configuration)\;$(SolutionDir)\external\OpenXR-SDK\include;$(SolutionDir)\external\OpenXR-SDK\src\common;$(SolutionDir)\external\OpenXR-MixedReality\Shared\XrUtility;$(SolutionDir)\external\OpenXR-MixedReality\shared\ext</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -108,8 +126,8 @@
            gets mapped into the test binary the first time you
            actually call D3D11On12CreateDevice / a D3D11 free
            function. delayimp.lib pairs with DelayLoadDLLs. -->
-      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>d3d11.dll</DelayLoadDLLs>
+      <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ole32.lib;oleaut32.lib;uuid.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;windowscodecs.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;dxgi.dll;d2d1.dll;dwrite.dll;windowscodecs.dll</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <!-- Order-only dependency on the layer project. We compile layer.cpp /
@@ -131,7 +149,19 @@
     <!-- doctest driver + tests in this project. Add your own test_*.cpp
          files here — see test_example.cpp for the doctest pattern. -->
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="test_cpu_usage.cpp" />
     <ClCompile Include="test_example.cpp" />
+    <ClCompile Include="test_gpu_telemetry.cpp" />
+    <ClCompile Include="test_histogram_ring.cpp" />
+    <ClCompile Include="test_hotkey.cpp" />
+    <ClCompile Include="test_name_utils.cpp" />
+    <ClCompile Include="test_overlay_aggregator.cpp" />
+    <ClCompile Include="test_overlay_cadence.cpp" />
+    <ClCompile Include="test_overlay_layout.cpp" />
+    <ClCompile Include="test_overlay_snapshot.cpp" />
+    <ClCompile Include="test_settings.cpp" />
+    <ClCompile Include="test_telemetry.cpp" />
+    <ClCompile Include="test_telemetry_math.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
     <ClCompile Include="test_stubs.cpp" />
     <!-- Layer sources we link into the test binary. These define the
@@ -145,6 +175,12 @@
          Add ..\openxr-api-layer\utils\*.cpp entries below as you grow
          your layer with more .cpp files. -->
     <ClCompile Include="..\openxr-api-layer\layer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\chrome_shape_renderer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\cpu_usage.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\glyph_atlas_renderer.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\gpu_telemetry.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\overlay_renderer.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\dispatch.gen.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\log.cpp" />
   </ItemGroup>
@@ -154,6 +190,16 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+    <!-- Font TTFs are referenced from the .rc below; listing them here too
+         makes them visible in Solution Explorer and triggers a rebuild when
+         the subset is regenerated. They are NOT copied to the output dir
+         — rc.exe bakes their bytes directly into the EXE's resource table. -->
+    <None Include="..\openxr-api-layer\fonts\Rajdhani-SemiBold.ttf" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- RT_BUNDLED_FONT resource (ID 200). See header comment in
+         the .rc for why the test EXE needs its own copy of these. -->
+    <ResourceCompile Include="openxr-api-layer-tests.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <!-- NuGet: fmt (pch.h), wil (pch.h). Paths match the layer project so a

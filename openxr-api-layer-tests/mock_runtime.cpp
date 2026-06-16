@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) 2026 <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -22,8 +22,10 @@
 
 #include "mock_runtime.h"
 
+#include <chrono>
 #include <cstring>
 #include <string_view>
+#include <thread>
 
 namespace mock {
 
@@ -154,13 +156,13 @@ namespace mock {
             return XR_SUCCESS;
         }
 
-        // Helmet-overlay companion stubs. The integration tests never
-        // enable the overlay, so none of these is actually exercised
-        // end-to-end — they only need to resolve at layer init time.
-        // Returning XR_ERROR_FUNCTION_UNSUPPORTED when the overlay path
-        // does call them surfaces as a graceful degrade in the layer
-        // (isArmed() stays false) rather than a silent null-pointer
-        // call, matching how the layer treats hostile runtimes.
+        // Helmet-overlay companion stubs. The CSV-only integration tests
+        // don't build a real D3D overlay (no GPU in the headless runtime),
+        // but the overlay-integration tests inject a mock renderer via
+        // ForceOverlayActiveForTest and drive the quad injection + the
+        // teardown's xrDestroySpace through these stubs (which record what
+        // they receive — see State). The swapchain stubs only need to
+        // resolve at layer-init time for the non-overlay tests.
 
         XrResult XRAPI_CALL m_xrCreateReferenceSpace(XrSession /*session*/,
                                                     const XrReferenceSpaceCreateInfo* /*info*/,
@@ -170,7 +172,21 @@ namespace mock {
             return XR_SUCCESS;
         }
 
-        XrResult XRAPI_CALL m_xrDestroySpace(XrSpace /*space*/) {
+        XrResult XRAPI_CALL m_xrDestroySpace(XrSpace space) {
+            g_state.destroySpaceCallCount++;
+            g_state.lastDestroyedSpace = space;
+            return XR_SUCCESS;
+        }
+
+        XrResult XRAPI_CALL m_xrLocateSpace(XrSpace space, XrSpace baseSpace,
+                                            XrTime /*time*/,
+                                            XrSpaceLocation* location) {
+            if (!location) return XR_ERROR_VALIDATION_FAILURE;
+            g_state.locateSpaceCallCount++;
+            g_state.lastLocateSpace = space;
+            g_state.lastLocateBaseSpace = baseSpace;
+            location->locationFlags = g_state.locateSpaceFlags;
+            location->pose = g_state.locateSpacePose;
             return XR_SUCCESS;
         }
 
@@ -216,10 +232,41 @@ namespace mock {
             return XR_SUCCESS;
         }
 
+        // Frame-loop mocks for the telemetry layer's wait/begin/end overrides.
+        // xrWaitFrame optionally sleeps (waitFrameSleepMicros) to give the
+        // layer a non-zero wait_block_ns to measure. xrBeginFrame is a pure
+        // counter — the layer only times around it.
+        XrResult XRAPI_CALL m_xrWaitFrame(XrSession /*session*/,
+                                         const XrFrameWaitInfo* /*frameWaitInfo*/,
+                                         XrFrameState* frameState) {
+            if (!frameState) return XR_ERROR_VALIDATION_FAILURE;
+            g_state.waitFrameCallCount++;
+            if (g_state.waitFrameSleepMicros > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(g_state.waitFrameSleepMicros));
+            }
+            // Advance predictedDisplayTime by one period each call, so the
+            // layer sees a plausible monotonic XrTime stream.
+            frameState->predictedDisplayTime = g_state.predictedDisplayTime;
+            frameState->predictedDisplayPeriod = g_state.predictedDisplayPeriod;
+            frameState->shouldRender = g_state.shouldRender;
+            g_state.predictedDisplayTime += g_state.predictedDisplayPeriod;
+            return XR_SUCCESS;
+        }
+
+        XrResult XRAPI_CALL m_xrBeginFrame(XrSession /*session*/,
+                                          const XrFrameBeginInfo* /*frameBeginInfo*/) {
+            g_state.beginFrameCallCount++;
+            return XR_SUCCESS;
+        }
+
         XrResult XRAPI_CALL m_xrEndFrame(XrSession /*session*/, const XrFrameEndInfo* info) {
             g_state.endFrameCallCount++;
             g_state.lastEndFrameProjLayers.clear();
+            g_state.lastEndFrameLayerCount = 0;
+            g_state.lastEndFrameQuadCount = 0;
             if (!info) return XR_SUCCESS;
+            g_state.lastEndFrameLayerCount = info->layerCount;
             for (uint32_t i = 0; i < info->layerCount; ++i) {
                 const auto* base = info->layers[i];
                 if (!base) continue;
@@ -228,6 +275,8 @@ namespace mock {
                     State::RecordedProjLayer rec;
                     rec.views.assign(proj->views, proj->views + proj->viewCount);
                     g_state.lastEndFrameProjLayers.push_back(std::move(rec));
+                } else if (base->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    g_state.lastEndFrameQuadCount++;
                 }
             }
             return XR_SUCCESS;
@@ -278,6 +327,8 @@ namespace mock {
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrCreateReferenceSpace);
         else if (n == "xrDestroySpace")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrDestroySpace);
+        else if (n == "xrLocateSpace")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrLocateSpace);
         else if (n == "xrEnumerateSwapchainFormats")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrEnumerateSwapchainFormats);
         else if (n == "xrEnumerateSwapchainImages")
@@ -288,6 +339,10 @@ namespace mock {
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrWaitSwapchainImage);
         else if (n == "xrReleaseSwapchainImage")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrReleaseSwapchainImage);
+        else if (n == "xrWaitFrame")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrWaitFrame);
+        else if (n == "xrBeginFrame")
+            *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrBeginFrame);
         else if (n == "xrEndFrame")
             *function = reinterpret_cast<PFN_xrVoidFunction>(m_xrEndFrame);
         else {

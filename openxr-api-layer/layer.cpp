@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) <<YEAR>> <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Based on https://github.com/mbucchia/OpenXR-Layer-Template.
 // Copyright (c) 2022-2023 Matthieu Bucchianeri
@@ -49,12 +49,31 @@
 #include "pch.h"
 
 #include "layer.h"
+#include "telemetry_internals.h"
+#include "utils/cpu_usage.h"
+#include "utils/default_settings_template.h"
+#include "utils/gpu_telemetry.h"
+#include "utils/name_utils.h"
+#include "utils/overlay_aggregator.h"
+#include "utils/overlay_layout.h"
+#include "utils/overlay_renderer.h"
+#include "utils/settings.h"
+
+#include <dxgi1_4.h>  // IDXGIFactory4::EnumAdapterByLuid for the D3D12 path
 #include <log.h>
 #include <util.h>
 
 namespace openxr_api_layer {
 
     using namespace log;
+    // FrameRecord, qpcToNs, gpuTimestampDeltaToNs, gpuTimestampPairToNs,
+    // computeCpuHeadroomPct, computeGpuHeadroomPct, patchAndDrainPending,
+    // flushPendingFramesUnresolved, findInTypedChain all live in
+    // openxr_api_layer::detail (telemetry_internals.h) so the
+    // test binary can exercise the math + bookkeeping bits without faking
+    // an OpenXR session. Bring the type alias in here so the rest of this
+    // file doesn't have to spell out detail:: every time.
+    using detail::FrameRecord;
 
     // Extensions the layer cares about. Empty = pass-through, the
     // layer never appears in xrEnumerateApiLayerProperties' extension
@@ -71,10 +90,1481 @@ namespace openxr_api_layer {
     // is a do/while statement macro). The .wprp profile in scripts\
     // captures the matching GUID for Windows Performance Recorder.
 
+    namespace {
+
+        // Async CSV writer: the frame thread does an O(1) push under a
+        // try_lock; a dedicated background thread (BELOW_NORMAL priority)
+        // batches records and writes them to disk. Disk I/O never lands on
+        // the frame thread.
+        //
+        // Backpressure policy: when the queue hits kMaxQueueSize, the
+        // producer drops the OLDEST record (pop_front before push_back). A
+        // counter is reported at session end. The producer never blocks the
+        // frame thread; if it can't even grab the mutex (consumer mid-batch
+        // copy) it drops the new record and increments the counter — rare
+        // but accepted as the cost of "frame thread is sacred".
+        class CsvWriter {
+          public:
+            ~CsvWriter() {
+                stop();
+            }
+
+            // Returns false on file-open failure; the rest of push() then
+            // becomes a no-op. Telemetry is best-effort; we never fail the
+            // host's OpenXR call because we couldn't write our CSV.
+            //
+            // IDEMPOTENT & THREAD-SAFE — defence-in-depth, not the steady
+            // state. With the singleton wired to the framework's
+            // g_instance, each XrInstance gets a fresh OpenXrLayer (and a
+            // fresh CsvWriter) — start() is called exactly once per
+            // CsvWriter. This guard catches the static-singleton
+            // anti-pattern (where the same writer would see two start()
+            // calls and the second `m_thread = std::thread(...)` would
+            // call std::terminate via [thread.thread.assign]) in case a
+            // future refactor reintroduces it. It also serialises
+            // concurrent start()/stop() against any caller that doesn't
+            // honour the loader's serialisation guarantee.
+            bool start(const std::filesystem::path& path) {
+                std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
+                if (m_started.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                m_file.open(path, std::ios::out | std::ios::trunc);
+                if (!m_file.is_open()) {
+                    return false;
+                }
+                // Column order is APPEND-ONLY for backward compat — analysis
+                // notebooks reference columns by name, so adding gpu_temp_c
+                // / vram_used_bytes / vram_budget_bytes / cpus_max_pct at the
+                // END never breaks existing scripts. NaN gpu_temp_c /
+                // cpus_max_pct render as "nan" in the CSV; pandas reads them
+                // as NaN floats natively.
+                m_file << "frame,timestamp_qpc,wait_block_ns,pre_begin_ns,app_cpu_ns,"
+                          "end_frame_ns,frame_total_ns,gpu_time_ns,period_ns,"
+                          "headroom_pct,gpu_headroom_pct,should_render,"
+                          "gpu_temp_c,vram_used_bytes,vram_budget_bytes,cpus_max_pct,"
+                          "render_ns\n";
+                m_file.flush();
+                m_path = path;
+                m_stopping = false;  // defensive: clear from any prior stop()
+                // Reset per-file stat counters so the footer reflects only
+                // THIS recording window. Matters in mode=hotkey where the
+                // same CsvWriter is started/stopped multiple times per
+                // session — otherwise drop counts would accumulate across
+                // windows and the footer of the Nth file would show the
+                // sum of all preceding ones.
+                m_written = 0;
+                m_droppedTryLock.store(0, std::memory_order_relaxed);
+                m_droppedQueueFull.store(0, std::memory_order_relaxed);
+                m_droppedDiskWrite = 0;
+                m_diskWriteFailedLogged.store(false, std::memory_order_relaxed);
+                m_started.store(true, std::memory_order_release);
+                m_thread = std::thread(&CsvWriter::writerLoop, this);
+                return true;
+            }
+
+            // stop() is robust against ExitProcess() shutdown. On Windows,
+            // ExitProcess terminates every thread except the caller BEFORE
+            // running DLL_PROCESS_DETACH (which is where this destructor
+            // chain lives). If the writer thread was killed while holding
+            // m_mtx, naively taking it would deadlock. We:
+            //   1. try to acquire m_mtx with a 100 ms deadline,
+            //   2. wait for the writer thread with a 100 ms deadline,
+            //   3. detach + skip the footer if either step times out.
+            // Normal session shutdown (cooperative, writer alive and free)
+            // completes in well under 10 ms and writes the footer; the
+            // bounded wait only kicks in for hard-shutdown paths.
+            // `deleteIfEmpty=true` (the default) deletes the file if zero
+            // frames were written — used to suppress empty CSVs from
+            // OpenComposite / OXRT probe XrInstances that never reach
+            // the frame loop. `deleteIfEmpty=false` ALWAYS keeps the
+            // file — used by the hotkey toggle path, where an empty
+            // recording is an intentional user action ("did my hotkey
+            // even fire?") and the trace is the binding-validation
+            // signal we want to surface.
+            void stop(bool deleteIfEmpty = true) {
+                std::lock_guard<std::mutex> lifeLock(m_lifetimeMtx);
+                if (!m_started.exchange(false)) {
+                    return;
+                }
+
+                using namespace std::chrono_literals;
+
+                // Phase 1: signal m_stopping under m_mtx, with a deadline
+                // so an orphaned mutex (writer killed mid-batch) doesn't
+                // hang us.
+                bool signalled = false;
+                {
+                    std::unique_lock<std::timed_mutex> lock(m_mtx, 100ms);
+                    if (lock.owns_lock()) {
+                        m_stopping = true;
+                        signalled = true;
+                    }
+                }
+                if (!signalled) {
+                    // Mutex unreachable — writer thread is probably dead.
+                    // Detach so ~std::thread doesn't call std::terminate.
+                    if (m_thread.joinable()) {
+                        m_thread.detach();
+                    }
+                    return;
+                }
+                m_cv.notify_one();
+
+                // Phase 2: wait for the writer to exit. WaitForSingleObject
+                // is the Win32 way to do "join with timeout"; std::thread
+                // doesn't expose one.
+                if (m_thread.joinable()) {
+                    const HANDLE h = m_thread.native_handle();
+                    const DWORD rc = ::WaitForSingleObject(h, 100);
+                    if (rc == WAIT_OBJECT_0) {
+                        m_thread.join();  // now non-blocking, just bookkeeping
+                    } else {
+                        // Writer didn't exit in 100 ms (or its handle is
+                        // gone). Detach and skip the footer.
+                        m_thread.detach();
+                        return;
+                    }
+                }
+
+                if (m_file.is_open()) {
+                    if (m_written == 0 && deleteIfEmpty) {
+                        // No frames were written — this is almost certainly
+                        // the OpenComposite / OXR Toolkit probe XrInstance
+                        // (capability-check; never reaches the frame loop)
+                        // OR an instance that was created+destroyed before
+                        // any rendering started. Don't litter the sessions/
+                        // folder with empty CSVs; close and delete.
+                        m_file.close();
+                        std::error_code ec;
+                        std::filesystem::remove(m_path, ec);  // best-effort
+                    } else if (m_written == 0) {
+                        // Hotkey toggle with zero frames between press →
+                        // stop. Keep the empty file (just the header +
+                        // footer) so users can confirm their binding
+                        // fired even when they tap-tap by mistake.
+                        m_file << "# session_end written=0 (hotkey toggle, "
+                                  "no frames captured)\n";
+                        m_file.flush();
+                        m_file.close();
+                    } else {
+                        // Real session — write the footer with split drop
+                        // counters so a slow writer (try_lock) is
+                        // distinguishable from a stuffed queue (queue_full)
+                        // and from disk failures (disk_write). Comment-style
+                        // line: Pandas reads it with pd.read_csv(p,
+                        // comment='#'); Excel ignores the unparseable row.
+                        m_file << "# session_end"
+                               << " written=" << m_written
+                               << " dropped_try_lock=" << m_droppedTryLock.load(std::memory_order_relaxed)
+                               << " dropped_queue_full=" << m_droppedQueueFull.load(std::memory_order_relaxed)
+                               << " dropped_disk_write=" << m_droppedDiskWrite
+                               << "\n";
+                        m_file.flush();
+                        m_file.close();
+                    }
+                }
+            }
+
+            void push(const FrameRecord& rec) {
+                if (!m_started.load(std::memory_order_acquire)) {
+                    return;
+                }
+                // try_lock so the frame thread never blocks on the consumer's
+                // batch copy. Cheap (~25 ns on Windows when uncontended) and
+                // we accept the rare drop on contention.
+                std::unique_lock<std::timed_mutex> lock(m_mtx, std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    m_droppedTryLock.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                if (m_queue.size() >= kMaxQueueSize) {
+                    m_queue.pop_front();  // drop oldest (per design choice)
+                    m_droppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+                }
+                m_queue.push_back(rec);
+                lock.unlock();
+                m_cv.notify_one();
+            }
+
+            uint64_t droppedTryLock() const { return m_droppedTryLock.load(std::memory_order_relaxed); }
+            uint64_t droppedQueueFull() const { return m_droppedQueueFull.load(std::memory_order_relaxed); }
+            uint64_t droppedTotal() const { return droppedTryLock() + droppedQueueFull() + m_droppedDiskWrite; }
+            uint64_t written() const { return m_written; }
+            const std::filesystem::path& path() const { return m_path; }
+
+          private:
+            static constexpr size_t kMaxQueueSize = 4096;        // ~45 s @ 90 Hz
+            static constexpr size_t kFlushEveryRecords = 256;     // ~3 s @ 90 Hz
+
+            void writerLoop() {
+                // Don't preempt the frame thread — disk hiccups stay on us.
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+                std::vector<FrameRecord> batch;
+                batch.reserve(kMaxQueueSize);
+                size_t recordsSinceFlush = 0;
+
+                while (true) {
+                    {
+                        std::unique_lock<std::timed_mutex> lock(m_mtx);
+                        m_cv.wait(lock, [this] { return m_stopping || !m_queue.empty(); });
+                        batch.assign(m_queue.begin(), m_queue.end());
+                        m_queue.clear();
+                        if (m_stopping && batch.empty()) {
+                            break;
+                        }
+                    }
+                    for (const auto& rec : batch) {
+                        // fmt::format here is fine — we're on the writer
+                        // thread, not the frame thread. Output a single
+                        // line per frame; bool as 0/1 for Pandas friendliness.
+                        // gpu_temp_c / cpus_max_pct use %.1f; NaN renders as
+                        // the platform's canonical "nan" token (libfmt mirrors
+                        // snprintf), which pandas reads as np.nan via read_csv.
+                        m_file << fmt::format(
+                            "{},{},{},{},{},{},{},{},{},{:.2f},{:.2f},{},"
+                            "{:.1f},{},{},{:.1f},{}\n",
+                            rec.frame_index,
+                            rec.timestamp_qpc,
+                            rec.wait_block_ns,
+                            rec.pre_begin_ns,
+                            rec.app_cpu_ns,
+                            rec.end_frame_ns,
+                            rec.frame_total_ns,
+                            rec.gpu_time_ns,
+                            rec.period_ns,
+                            rec.headroom_pct,
+                            rec.gpu_headroom_pct,
+                            rec.should_render ? 1 : 0,
+                            rec.gpu_temp_c,
+                            rec.vram_used_bytes,
+                            rec.vram_budget_bytes,
+                            rec.cpus_max_pct,
+                            rec.render_ns);
+                    }
+
+                    // Disk-error detection: if the stream went bad mid-batch
+                    // (disk full, ACL revoked, file handle invalidated) we
+                    // count the batch as dropped, log once, and stop trying.
+                    // Clearing the bits keeps the stream usable for a future
+                    // attempt (the file system may recover) but we conserve
+                    // CPU by skipping further formatting if the failure is
+                    // sticky — we just keep counting drops.
+                    if (!m_file.good()) {
+                        m_droppedDiskWrite += batch.size();
+                        if (!m_diskWriteFailedLogged.exchange(true)) {
+                            ErrorLog("xr_telemetry: CSV write failed mid-session; "
+                                     "subsequent records will be reported in the "
+                                     "dropped_disk_write footer count.\n");
+                        }
+                        m_file.clear();  // reset failbit/badbit so we can retry next batch
+                    } else {
+                        m_written += batch.size();
+                    }
+
+                    recordsSinceFlush += batch.size();
+                    // Periodic flush — a crash should not lose more than
+                    // kFlushEveryRecords frames of telemetry.
+                    if (recordsSinceFlush >= kFlushEveryRecords) {
+                        m_file.flush();
+                        recordsSinceFlush = 0;
+                    }
+                }
+            }
+
+            std::ofstream m_file;
+            std::filesystem::path m_path;
+            std::thread m_thread;
+            // timed_mutex so stop() can bound its wait via try_lock_for. push()
+            // still uses try_to_lock; writerLoop() uses the standard blocking
+            // acquire (it's the consumer — blocking is the whole point).
+            std::timed_mutex m_mtx;
+            std::condition_variable_any m_cv;     // _any because m_mtx is timed_mutex
+            std::deque<FrameRecord> m_queue;
+            std::atomic<bool> m_started{false};
+
+            // Three causes of dropped records, surfaced separately in the
+            // footer so a slow writer is distinguishable from a stuffed
+            // queue and from real disk failures.
+            std::atomic<uint64_t> m_droppedTryLock{0};   // producer try_lock failed
+            std::atomic<uint64_t> m_droppedQueueFull{0}; // queue saturated, oldest popped
+            uint64_t m_droppedDiskWrite = 0;             // writer-thread only
+
+            uint64_t m_written = 0;             // writer-thread only, no atomic
+            bool m_stopping = false;             // guarded by m_mtx
+
+            // One-shot guard so a disk-failure storm only logs once.
+            std::atomic<bool> m_diskWriteFailedLogged{false};
+
+            // Serialises start()/stop() with each other against any future
+            // concurrent caller. The OpenXR loader serialises today; this
+            // doesn't depend on that staying true.
+            std::mutex m_lifetimeMtx;
+        };
+
+        // Build %LOCALAPPDATA%\<layer>\sessions\YYYY-MM-DD_HH-MM-SS.mmmZ_<appName>.csv.
+        // UTC (Z suffix) rather than local time: trace files are comparable
+        // across machines and immune to DST transitions mid-session.
+        //
+        // Millisecond resolution matters in mode=hotkey: a user double-tap
+        // (press → stop → press) lands two paths within the same second,
+        // and CsvWriter::start opens with std::ios::trunc — without the
+        // .mmm component the second press would overwrite the first
+        // recording. The .003-ish resolution we get from system_clock on
+        // Windows is plenty to disambiguate human inputs.
+        //
+        // As an extra safety net, if a path STILL collides (system clock
+        // not monotonic across reboots, simulator firing back-to-back
+        // calls within the same millisecond, NTP resync rewinding the
+        // wallclock mid-bench, …) we suffix _2 / _3 / … until we find
+        // a free slot. Caps at 999 attempts.
+        //
+        // Beyond 999 we hand back the suffixed-but-still-colliding
+        // path and let CsvWriter::start truncate it (it opens with
+        // std::ios::trunc, no failure on existing files). That would
+        // overwrite another instance's _999 file — vanishingly
+        // unlikely to ever happen (would require 999 concurrent
+        // captures of the same app slug in the same millisecond),
+        // and the bench-script panic of 999 attempts giving up is a
+        // clearer signal than infinite-loop-checking-disk.
+        //
+        // Strict TOCTOU note: the exists() check and the subsequent
+        // CsvWriter::start aren't atomic. A different process could
+        // win the slot between the check and the open. In practice
+        // this requires two OpenXR sessions of the same app slug
+        // starting within the same millisecond — vanishingly
+        // unlikely. If it ever shows up in support reports, switch
+        // CsvWriter::start to O_EXCL-style open + retry.
+        //
+        // appName is sanitised to keep only [A-Za-z0-9._-]; any other char →
+        // '_'. Empty appName falls back to "unknown".
+        std::filesystem::path buildSessionCsvPath(const std::string& appName) {
+            const auto now = std::chrono::system_clock::now();
+            const auto tt = std::chrono::system_clock::to_time_t(now);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now.time_since_epoch()).count() % 1000;
+            std::tm tm{};
+            char timestamp[40];
+            if (::gmtime_s(&tm, &tt) == 0) {
+                const size_t n = std::strftime(timestamp, sizeof(timestamp),
+                                                "%Y-%m-%d_%H-%M-%S", &tm);
+                std::snprintf(timestamp + n, sizeof(timestamp) - n,
+                               ".%03lldZ", static_cast<long long>(ms));
+            } else {
+                // gmtime_s failed (returns errno_t, non-zero on failure).
+                // Fall back to a tick-based stamp so the filename is still
+                // unique across consecutive sessions even without wallclock.
+                std::snprintf(timestamp, sizeof(timestamp), "unknown-time-%lld",
+                              static_cast<long long>(tt));
+            }
+
+            std::string safeName;
+            safeName.reserve(appName.size());
+            for (char c : appName) {
+                const auto uc = static_cast<unsigned char>(c);
+                if (std::isalnum(uc) || c == '-' || c == '_' || c == '.') {
+                    safeName.push_back(c);
+                } else {
+                    safeName.push_back('_');
+                }
+            }
+            if (safeName.empty()) {
+                safeName = "unknown";
+            }
+
+            const auto dir = openxr_api_layer::localAppData / "sessions";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);  // best-effort
+
+            const auto baseStem = fmt::format("{}_{}", timestamp, safeName);
+            auto candidate = dir / (baseStem + ".csv");
+            // Caps at counter<1000 — see the comment block above the
+            // function for what happens at exhaustion (in short: we
+            // return the suffixed-but-colliding path and let trunc
+            // win the race).
+            for (int counter = 2; counter < 1000; ++counter) {
+                if (!std::filesystem::exists(candidate, ec)) break;
+                candidate = dir / fmt::format("{}_{}.csv", baseStem, counter);
+            }
+            return candidate;
+        }
+
+        // -------------------------------------------------------------------
+        // Settings bootstrap + load. Mirrors the fov_crop sibling layer's
+        // contract: an installer drops `settings.json` into the user's
+        // %LOCALAPPDATA%\<layer>\ as a TEMPLATE, and on first run for each
+        // OpenXR application we copy that template to <app>_settings.json
+        // (the per-app file). Subsequent runs read the per-app file
+        // directly; the template is never re-touched.
+        //
+        // Three failure paths, all non-fatal — telemetry must keep
+        // working even if the filesystem misbehaves:
+        //   - template missing (ZIP install, never ran installer) →
+        //     writeDefaultTemplate() drops a copy of the schema below.
+        //   - per-app file missing → bootstrap from template, or from
+        //     built-in defaults if the template is also absent.
+        //   - parse error → parseSettings() returns documented defaults
+        //     and a non-empty error string we log once.
+        // -------------------------------------------------------------------
+
+        // kBuiltInDefaultSettings lives in utils/default_settings_
+        // template.h so layer.cpp and test_telemetry.cpp share the same
+        // byte sequence. test_telemetry.cpp's "default template
+        // matches installer/default_settings.json" case parses both
+        // this constexpr and the on-disk installer file at every CI
+        // build and fails on semantic drift — no more "update both
+        // copies in the same commit" rule to remember.
+
+        // Writes the built-in default JSON to `outputPath` via a
+        // write-then-rename pattern: open .tmp sibling, write,
+        // best-effort flush of the user-space buffer, rename over the
+        // target. A mid-write disk-full / read-only failure leaves
+        // the .tmp behind (best-effort cleanup) and returns false —
+        // the on-disk `outputPath` either doesn't exist (fresh
+        // install) or stays intact (we never overwrite a non-existing
+        // target with a partial file). Without this, a torn first-run
+        // write would leave a zero-byte settings.json that the next
+        // run sees as "exists" and never re-tries.
+        //
+        // We do NOT call FlushFileBuffers / fsync — the std::ofstream
+        // flush only drains user-space buffers, and adding a true
+        // disk-level fsync would block bootstrap on the disk's commit
+        // (10s of ms on spinning rust). A hardware crash after rename
+        // but before kernel commit can still lose the file; in that
+        // case the NEXT layer run regenerates it from the constexpr,
+        // so we trade durability for a faster first frame.
+        //
+        // Caller-side contract: only called when outputPath does NOT
+        // already exist (the bootstrap branch above checks). Rename-
+        // to-existing fails on Windows; we don't bother with replace_
+        // file_t semantics because we never have a target to replace.
+        bool writeBuiltInSettings(const std::filesystem::path& outputPath) {
+            const auto tmpPath =
+                std::filesystem::path(outputPath.string() + ".tmp");
+            {
+                std::ofstream out(tmpPath, std::ios::out | std::ios::trunc);
+                if (!out.is_open()) return false;
+                out << detail::kBuiltInDefaultSettings;
+                out.flush();
+                if (!out.good()) {
+                    // Disk full / read-only mid-write. Drop the partial
+                    // file so the next run can retry from scratch.
+                    out.close();
+                    std::error_code ec;
+                    std::filesystem::remove(tmpPath, ec);
+                    return false;
+                }
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmpPath, outputPath, ec);
+            if (ec) {
+                std::error_code ec2;
+                std::filesystem::remove(tmpPath, ec2);  // best-effort
+                return false;
+            }
+            return true;
+        }
+
+        // Reads `path` into a string. Returns std::nullopt if the file is
+        // absent or unreadable (the caller treats both as "use defaults").
+        std::optional<std::string> readWholeFile(const std::filesystem::path& path) {
+            std::ifstream in(path, std::ios::in | std::ios::binary);
+            if (!in.is_open()) return std::nullopt;
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            if (!in.good() && !in.eof()) return std::nullopt;
+            return ss.str();
+        }
+
+        // The full bootstrap-and-parse flow. Called once at xrCreateInstance
+        // when we know the app name. Returns a parsed ParsedSettings that
+        // the caller stores on OpenXrLayer.
+        detail::ParsedSettings bootstrapAndLoadSettings(
+            const std::filesystem::path& configDir,
+            const std::string& appName) {
+
+            std::error_code ec;
+            std::filesystem::create_directories(configDir, ec);  // best-effort
+
+            const std::filesystem::path templatePath = configDir / "settings.json";
+            const std::filesystem::path perAppPath =
+                openxr_api_layer::resolvePerAppConfigPath(configDir, appName);
+
+            // 1. Ensure the global template exists. ZIP / dev installs
+            //    bypass the Inno Setup script that drops it; rebuild it
+            //    from the built-in default so the user has something to
+            //    edit. Never overwrites an existing template — preserves
+            //    any user edits to global defaults.
+            if (!std::filesystem::exists(templatePath)) {
+                if (writeBuiltInSettings(templatePath)) {
+                    Log(fmt::format("xr_telemetry: created template at {}\n",
+                                     templatePath.string()));
+                }
+            }
+
+            // 2. Bootstrap the per-app file if missing. Prefer copying the
+            //    template (so user edits to global defaults are inherited
+            //    by every NEW app), fall back to the built-in if no
+            //    template materialised.
+            //
+            //    The exists() check is racy w.r.t. another XR instance
+            //    being launched in parallel for the same app (double-
+            //    click, OpenXR Tools probe firing alongside the game,
+            //    …). copy_options::skip_existing makes the copy_file
+            //    call itself the arbiter: if the perAppPath already
+            //    exists by the time the kernel processes our request,
+            //    it returns without clobbering. The bootstrapped
+            //    bool still flips true (skip_existing is not an
+            //    error), and the subsequent read picks up whichever
+            //    process won the race — same template content either
+            //    way, so the user sees no difference.
+            if (!std::filesystem::exists(perAppPath)) {
+                bool bootstrapped = false;
+                if (std::filesystem::exists(templatePath)) {
+                    std::filesystem::copy_file(
+                        templatePath, perAppPath,
+                        std::filesystem::copy_options::skip_existing, ec);
+                    if (!ec) {
+                        bootstrapped = true;
+                        Log(fmt::format("xr_telemetry: bootstrapped {} from template\n",
+                                         perAppPath.string()));
+                    }
+                }
+                if (!bootstrapped && writeBuiltInSettings(perAppPath)) {
+                    Log(fmt::format("xr_telemetry: bootstrapped {} with built-in defaults\n",
+                                     perAppPath.string()));
+                }
+            }
+
+            // 3. Read + parse. Missing file (everything above failed) =
+            //    parser returns documented defaults; we log it once.
+            const auto fileContent = readWholeFile(perAppPath);
+            if (!fileContent) {
+                Log(fmt::format("xr_telemetry: settings file unreadable at {}, "
+                                 "using built-in defaults\n", perAppPath.string()));
+                return detail::parseSettings("");
+            }
+            auto parsed = detail::parseSettings(*fileContent);
+            if (!parsed.error.empty()) {
+                ErrorLog(fmt::format("xr_telemetry: settings parse error at {}: {} — "
+                                      "using built-in defaults\n",
+                                      perAppPath.string(), parsed.error));
+            }
+            return parsed;
+        }
+
+        // Polls the OS for the exact combo described by `spec`. Returns
+        // true only when the main key is held AND the modifier state
+        // matches bit-for-bit — pressing Ctrl+Alt+Shift+T must NOT fire a
+        // Ctrl+Shift+T binding (or every accidental Alt-graveyard would
+        // toggle the recorder). See the README's AltGr caveat: on
+        // European layouts, AltGr is reported as Ctrl+Alt, so a hotkey
+        // bound with `ctrl` is matched by AltGr-augmented presses too.
+        //
+        // GetAsyncKeyState is a process-global, foreground-independent
+        // poll of the keyboard state. The DESIRED foreground-scoping
+        // comes from WHERE we call it: only inside xrEndFrame, which
+        // only fires while this game's render loop is active. A user
+        // running an OpenXR mirror in the background while typing in
+        // Notepad would still see the combo register; we accept that
+        // edge case rather than wire up a Win32 focus check (which
+        // would mis-classify HMD-focused sessions).
+        bool pollHotkeyPressed(const detail::HotkeySpec& spec) {
+            if (!spec.valid()) return false;
+            auto down = [](int vk) {
+                return (::GetAsyncKeyState(vk) & 0x8000) != 0;
+            };
+            if (!down(spec.vk)) return false;
+            if (spec.ctrl != down(VK_CONTROL)) return false;
+            if (spec.shift != down(VK_SHIFT)) return false;
+            if (spec.alt != down(VK_MENU)) return false;  // VK_MENU = Alt
+            const bool winDown = down(VK_LWIN) || down(VK_RWIN);
+            if (spec.win != winDown) return false;
+            return true;
+        }
+
+        // -------------------------------------------------------------------
+        // GPU-side timing for app frames.
+        //
+        // GPU timestamps are inherently asynchronous: a timestamp issued in
+        // the command stream at xrBeginFrame_N's exit reflects the GPU's
+        // wall clock at the moment that command actually runs on the GPU,
+        // which is usually 1-3 frames after the CPU submitted it. So the
+        // CPU thread can only READ a frame's GPU timings once the GPU is
+        // done with that frame.
+        //
+        // We support two paths, picked at xrCreateSession based on which
+        // graphics binding the app provided:
+        //
+        //   D3D11GpuTimer — issues D3D11 timestamp queries (a disjoint pair
+        //                   bracketing two D3D11_QUERY_TIMESTAMPs) on the
+        //                   app's immediate context.
+        //
+        //   D3D12GpuTimer — records D3D12_QUERY_TYPE_TIMESTAMP queries on
+        //                   our own short command lists, submitted to the
+        //                   app's command queue alongside the app's draws.
+        //                   No D3D11On12 wrapper — we go straight to D3D12
+        //                   so there's no translation layer between us and
+        //                   the queue, and no risk of the wrapper inserting
+        //                   barriers in our measured range. Matches the
+        //                   pattern used by OpenXR Toolkit / fpsVR.
+        //
+        // Both expose the same IGpuTimer interface so OpenXrLayer holds a
+        // single unique_ptr<IGpuTimer> and routes Begin/End/Resolve
+        // through it without caring about the underlying API.
+        //
+        // Each timer uses a small ring of slots (kGpuRingSize) to keep
+        // multiple frames in flight. endFrameAndResolveOldest():
+        //
+        //   1. Closes the in-flight slot opened by beginFrame()
+        //   2. Advances the ring head
+        //   3. Drains every slot whose GPU work has completed since the
+        //      last poll, returning the MOST RECENTLY resolved result.
+        //      Older slots are still drained and their state reset, but
+        //      only the latest is returned — brief stutters produce a few
+        //      CSV rows with gpu_time_ns=0 instead of being held back
+        //      further.
+        //
+        // The caller (OpenXrLayer::xrEndFrame) matches the resolved
+        // frame_index back to the FrameRecord queued at that frame's
+        // xrEndFrame_N — see the m_pendingFrames deque on OpenXrLayer.
+        //
+        // If no compatible graphics binding is found (Vulkan / OpenGL /
+        // null), m_gpuTimer stays null and beginFrame/queueAndResolve are
+        // simply not called — gpu_time_ns reads as 0 in the CSV.
+        struct GpuFrameResult {
+            uint64_t frame_index;
+            int64_t gpu_time_ns;
+        };
+
+        // Common shape both backends implement so OpenXrLayer doesn't need
+        // to branch on the graphics API at the frame-loop call sites.
+        class IGpuTimer {
+          public:
+            virtual ~IGpuTimer() = default;
+            virtual void beginFrame(uint64_t frame_index) = 0;
+            virtual std::optional<GpuFrameResult> endFrameAndResolveOldest() = 0;
+        };
+
+        // Shared ring constants. kGpuRingSize=4 → ~44 ms in flight at 90 Hz,
+        // comfortably above any realistic GPU→CPU latency. Keep small to
+        // limit pending CSV records the layer holds back at session end.
+        constexpr size_t kGpuRingSize = 4;
+        enum class GpuSlotState { Idle, Started, Pending };
+
+        // ---- D3D11 path -----------------------------------------------------
+
+        class D3D11GpuTimer : public IGpuTimer {
+          public:
+            ~D3D11GpuTimer() override {
+                shutdown();
+            }
+
+            // device comes from XrGraphicsBindingD3D11KHR. We pull the
+            // immediate context from it via GetImmediateContext — same
+            // single-threaded context the app submits draws on, so D3D11
+            // timestamp queries land in command-stream order vs the draws
+            // without any explicit Flush.
+            bool init(ID3D11Device* device) {
+                if (!device) return false;
+                // init() is called once per session from
+                // std::make_unique<D3D11GpuTimer> in xrCreateSession.
+                // Catch double-init in debug rather than papering over
+                // it with a silent no-op that would mask the bug in
+                // release.
+                assert(!m_active &&
+                       "D3D11GpuTimer::init called twice — call site should "
+                       "use std::make_unique to ensure a fresh timer.");
+
+                m_device = device;
+                m_device->GetImmediateContext(m_context.ReleaseAndGetAddressOf());
+                if (!m_context) {
+                    m_device.Reset();
+                    return false;
+                }
+
+                D3D11_QUERY_DESC disjointDesc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+                D3D11_QUERY_DESC tsDesc{D3D11_QUERY_TIMESTAMP, 0};
+                for (auto& slot : m_ring) {
+                    if (FAILED(m_device->CreateQuery(&disjointDesc, slot.disjoint.GetAddressOf())) ||
+                        FAILED(m_device->CreateQuery(&tsDesc, slot.start.GetAddressOf())) ||
+                        FAILED(m_device->CreateQuery(&tsDesc, slot.end.GetAddressOf()))) {
+                        for (auto& s : m_ring) {
+                            s.disjoint.Reset();
+                            s.start.Reset();
+                            s.end.Reset();
+                        }
+                        return false;
+                    }
+                    slot.state = GpuSlotState::Idle;
+                }
+                m_writeIdx = 0;
+                m_readIdx = 0;
+                m_active = true;
+                return true;
+            }
+
+            void beginFrame(uint64_t frame_index) override {
+                if (!m_active) return;
+                auto& slot = m_ring[m_writeIdx];
+                m_context->Begin(slot.disjoint.Get());
+                m_context->End(slot.start.Get());
+                slot.frame_index = frame_index;
+                slot.state = GpuSlotState::Started;
+            }
+
+            std::optional<GpuFrameResult> endFrameAndResolveOldest() override {
+                if (!m_active) return std::nullopt;
+
+                // Close the trio that beginFrame() opened. If the slot is
+                // NOT Started (xrEndFrame fired without a matching
+                // xrBeginFrame this cycle — spec violation, but we
+                // tolerate it), we skip the End() calls but still advance
+                // m_writeIdx. Self-healing: after kGpuRingSize dangling
+                // cycles every slot is Idle again.
+                auto& closing = m_ring[m_writeIdx];
+                if (closing.state == GpuSlotState::Started) {
+                    m_context->End(closing.end.Get());
+                    m_context->End(closing.disjoint.Get());
+                    closing.state = GpuSlotState::Pending;
+                }
+                m_writeIdx = (m_writeIdx + 1) % kGpuRingSize;
+
+                std::optional<GpuFrameResult> latest;
+                while (true) {
+                    auto& slot = m_ring[m_readIdx];
+                    if (slot.state != GpuSlotState::Pending) break;
+
+                    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+                    const HRESULT hr = m_context->GetData(slot.disjoint.Get(),
+                                                          &disjointData,
+                                                          sizeof(disjointData),
+                                                          D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                    if (hr != S_OK) break;
+
+                    UINT64 tStart = 0, tEnd = 0;
+                    if (m_context->GetData(slot.start.Get(), &tStart, sizeof(tStart),
+                                           D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                        m_context->GetData(slot.end.Get(), &tEnd, sizeof(tEnd),
+                                           D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                        slot.state = GpuSlotState::Idle;
+                        m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                        continue;
+                    }
+
+                    // The Disjoint flag lives on the disjoint query, not
+                    // on the timestamp pair, so it stays at the call site.
+                    // freq==0 and tEnd<=tStart are handled by the helper
+                    // (shared with the D3D12 path).
+                    const int64_t gpuNs = disjointData.Disjoint
+                        ? 0
+                        : detail::gpuTimestampPairToNs(tStart, tEnd,
+                                                       disjointData.Frequency);
+                    latest = GpuFrameResult{slot.frame_index, gpuNs};
+                    slot.state = GpuSlotState::Idle;
+                    m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                }
+                return latest;
+            }
+
+          private:
+            void shutdown() {
+                if (!m_active) return;
+                for (auto& slot : m_ring) {
+                    slot.disjoint.Reset();
+                    slot.start.Reset();
+                    slot.end.Reset();
+                    slot.state = GpuSlotState::Idle;
+                    slot.frame_index = 0;
+                }
+                m_context.Reset();
+                m_device.Reset();
+                m_active = false;
+            }
+
+            struct Slot {
+                ComPtr<ID3D11Query> disjoint;
+                ComPtr<ID3D11Query> start;
+                ComPtr<ID3D11Query> end;
+                uint64_t frame_index = 0;
+                GpuSlotState state = GpuSlotState::Idle;
+            };
+
+            ComPtr<ID3D11Device> m_device;
+            ComPtr<ID3D11DeviceContext> m_context;
+            std::array<Slot, kGpuRingSize> m_ring;
+            size_t m_writeIdx = 0;
+            size_t m_readIdx = 0;
+            bool m_active = false;
+        };
+
+        // ---- D3D12 path -----------------------------------------------------
+
+        // D3D12 native timing. Records two D3D12_QUERY_TYPE_TIMESTAMP queries
+        // per frame on our own command lists, submitted to the app's command
+        // queue. ResolveQueryData copies the timestamps into a readback
+        // buffer; we Map() that buffer when the per-slot fence has signaled
+        // past the relevant ExecuteCommandLists.
+        //
+        // Why two separate command lists per slot (one for the start
+        // timestamp, one for the end + resolve) rather than a single one?
+        // Because the app submits its draws DIRECTLY to the queue between
+        // our two timestamps — we have to submit the start half BEFORE the
+        // app's draws (at xrBeginFrame) and the end half AFTER (at
+        // xrEndFrame). One ExecuteCommandLists each, so 2 extra submissions
+        // per frame on the app's queue. Same cost class as the explicit
+        // Flushes a D3D11On12 wrapper would force; no translation layer.
+        //
+        // D3D12 has no disjoint query. We get the GPU clock frequency once
+        // at init via ID3D12CommandQueue::GetTimestampFrequency() and trust
+        // it for the session — same convention as OpenXR Toolkit /
+        // xrframetools.
+        class D3D12GpuTimer : public IGpuTimer {
+          public:
+            ~D3D12GpuTimer() override {
+                shutdown();
+            }
+
+            bool init(ID3D12Device* device, ID3D12CommandQueue* queue) {
+                if (!device || !queue) return false;
+                // The init function is only called once per session via
+                // std::make_unique<D3D12GpuTimer> in xrCreateSession. Catch
+                // any future double-init in debug rather than papering
+                // over it with a silent no-op (which would mask the bug
+                // in release).
+                assert(!m_active &&
+                       "D3D12GpuTimer::init called twice — call site should "
+                       "use std::make_unique to ensure a fresh timer.");
+
+                // Validate the queue is one we can ExecuteCommandLists
+                // direct command lists onto. The OpenXR spec requires this
+                // (XR_KHR_D3D12_enable: "queue must be a direct queue"),
+                // but a buggy app could pass a compute / copy queue, in
+                // which case the rest of our init would succeed and
+                // ExecuteCommandLists would fail silently every frame.
+                const D3D12_COMMAND_QUEUE_DESC queueDesc = queue->GetDesc();
+                if (queueDesc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    return false;
+                }
+                // Propagate the queue's NodeMask to every D3D12 object we
+                // create. Hardcoding 0 (node 0) breaks silently on multi-
+                // adapter rigs where the app put its queue on node 1+ —
+                // ExecuteCommandLists would fail at runtime. 99% of VR rigs
+                // are single-GPU so NodeMask is 1<<0 = 1 → we route to
+                // node 0 anyway; the propagation is the defensive move.
+                const UINT nodeMask = queueDesc.NodeMask;
+
+                m_device = device;
+                m_queue = queue;
+                m_frequency = 0;
+                if (FAILED(m_queue->GetTimestampFrequency(&m_frequency)) || m_frequency == 0) {
+                    // The queue type doesn't support timestamps (copy
+                    // queues historically didn't on some HW). Degrade.
+                    m_queue.Reset();
+                    m_device.Reset();
+                    return false;
+                }
+
+                // Query heap: 2 timestamp slots per ring entry (start, end).
+                D3D12_QUERY_HEAP_DESC qhDesc{};
+                qhDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+                qhDesc.Count = static_cast<UINT>(kGpuRingSize * 2);
+                qhDesc.NodeMask = nodeMask;
+                if (FAILED(m_device->CreateQueryHeap(&qhDesc, IID_PPV_ARGS(m_queryHeap.GetAddressOf())))) {
+                    m_queue.Reset();
+                    m_device.Reset();
+                    return false;
+                }
+
+                // Readback buffer: UINT64 × 2 per slot.
+                D3D12_HEAP_PROPERTIES heapProps{};
+                heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+                heapProps.CreationNodeMask = nodeMask;
+                heapProps.VisibleNodeMask = nodeMask;
+                D3D12_RESOURCE_DESC bufDesc{};
+                bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bufDesc.Width = sizeof(UINT64) * 2 * kGpuRingSize;
+                bufDesc.Height = 1;
+                bufDesc.DepthOrArraySize = 1;
+                bufDesc.MipLevels = 1;
+                bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+                bufDesc.SampleDesc.Count = 1;
+                bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(m_device->CreateCommittedResource(
+                        &heapProps, D3D12_HEAP_FLAG_NONE,
+                        &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(m_readback.GetAddressOf())))) {
+                    shutdownInternal();
+                    return false;
+                }
+
+                // Per-slot (allocator, command list) pairs — one for the
+                // begin submission, one for the end+resolve submission.
+                // Created closed so the first Reset() in beginFrame /
+                // endFrame works. Both use the same NodeMask as the queue.
+                for (auto& slot : m_ring) {
+                    for (auto* pair : { &slot.beginPair, &slot.endPair }) {
+                        if (FAILED(m_device->CreateCommandAllocator(
+                                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                IID_PPV_ARGS(pair->allocator.GetAddressOf()))) ||
+                            FAILED(m_device->CreateCommandList(
+                                nodeMask, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                pair->allocator.Get(), nullptr,
+                                IID_PPV_ARGS(pair->cmdList.GetAddressOf())))) {
+                            shutdownInternal();
+                            return false;
+                        }
+                        pair->cmdList->Close();
+                    }
+                    slot.state = GpuSlotState::Idle;
+                }
+
+                if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                                 IID_PPV_ARGS(m_fence.GetAddressOf())))) {
+                    shutdownInternal();
+                    return false;
+                }
+                m_fenceValue = 0;
+                m_writeIdx = 0;
+                m_readIdx = 0;
+                m_active = true;
+                return true;
+            }
+
+            void beginFrame(uint64_t frame_index) override {
+                if (!m_active) return;
+                auto& slot = m_ring[m_writeIdx];
+                auto& pair = slot.beginPair;
+
+                // Allocator reset requires the previous submission using
+                // it to have completed on the GPU. In steady state at
+                // kGpuRingSize frames behind this is always true, but be
+                // explicit — the D3D12 debug layer flags violations
+                // viciously and a single missed reset corrupts later
+                // recordings.
+                if (slot.fenceValueAtBegin > 0 &&
+                    !waitForFenceBounded(slot.fenceValueAtBegin, /*timeoutMs=*/100)) {
+                    // GPU is >100 ms behind on this slot — drop the begin
+                    // for this frame, the slot stays whatever it was. The
+                    // matching end will see state != Started and skip too.
+                    //
+                    // Contract with OpenXrLayer::m_pendingFrames: xrEndFrame
+                    // unconditionally pushes a FrameRecord for `frame_index`,
+                    // so the orphan stays in the pending deque until either
+                    // a later frame's GpuFrameResult arrives (patchAndDrain
+                    // Pending flushes everything older than the resolved
+                    // index with gpu_time_ns=0) or xrDestroySession runs
+                    // flushPendingFramesUnresolved. No leak, no stuck row.
+                    return;
+                }
+
+                if (FAILED(pair.allocator->Reset()) ||
+                    FAILED(pair.cmdList->Reset(pair.allocator.Get(), nullptr))) {
+                    return;
+                }
+                const UINT startIdx = static_cast<UINT>(m_writeIdx * 2);
+                pair.cmdList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, startIdx);
+                if (FAILED(pair.cmdList->Close())) {
+                    return;
+                }
+                ID3D12CommandList* lists[] = { pair.cmdList.Get() };
+                m_queue->ExecuteCommandLists(1, lists);
+                slot.fenceValueAtBegin = ++m_fenceValue;
+                m_queue->Signal(m_fence.Get(), slot.fenceValueAtBegin);
+
+                slot.frame_index = frame_index;
+                slot.state = GpuSlotState::Started;
+            }
+
+            std::optional<GpuFrameResult> endFrameAndResolveOldest() override {
+                if (!m_active) return std::nullopt;
+
+                auto& closing = m_ring[m_writeIdx];
+                if (closing.state == GpuSlotState::Started) {
+                    auto& pair = closing.endPair;
+                    if (closing.fenceValueAtEnd > 0 &&
+                        !waitForFenceBounded(closing.fenceValueAtEnd, /*timeoutMs=*/100)) {
+                        // Same degrade as beginFrame: skip the close, the
+                        // slot becomes orphan — its data will never be
+                        // resolved but the ring keeps cycling.
+                        closing.state = GpuSlotState::Idle;
+                    } else if (SUCCEEDED(pair.allocator->Reset()) &&
+                               SUCCEEDED(pair.cmdList->Reset(pair.allocator.Get(), nullptr))) {
+                        const UINT startIdx = static_cast<UINT>(m_writeIdx * 2);
+                        const UINT endIdx = startIdx + 1;
+                        pair.cmdList->EndQuery(m_queryHeap.Get(),
+                                               D3D12_QUERY_TYPE_TIMESTAMP, endIdx);
+                        // Copy this slot's two timestamps from the query
+                        // heap into the readback buffer at our per-slot
+                        // offset. ResolveQueryData is a GPU operation —
+                        // we Map() the buffer once the fence below
+                        // signals.
+                        pair.cmdList->ResolveQueryData(
+                            m_queryHeap.Get(),
+                            D3D12_QUERY_TYPE_TIMESTAMP,
+                            startIdx, /*NumQueries=*/2,
+                            m_readback.Get(),
+                            /*AlignedDestinationBufferOffset=*/sizeof(UINT64) * startIdx);
+                        if (SUCCEEDED(pair.cmdList->Close())) {
+                            ID3D12CommandList* lists[] = { pair.cmdList.Get() };
+                            m_queue->ExecuteCommandLists(1, lists);
+                            closing.fenceValueAtEnd = ++m_fenceValue;
+                            m_queue->Signal(m_fence.Get(), closing.fenceValueAtEnd);
+                            closing.state = GpuSlotState::Pending;
+                        } else {
+                            closing.state = GpuSlotState::Idle;
+                        }
+                    } else {
+                        closing.state = GpuSlotState::Idle;
+                    }
+                }
+                m_writeIdx = (m_writeIdx + 1) % kGpuRingSize;
+
+                std::optional<GpuFrameResult> latest;
+                while (true) {
+                    auto& slot = m_ring[m_readIdx];
+                    if (slot.state != GpuSlotState::Pending) break;
+                    if (m_fence->GetCompletedValue() < slot.fenceValueAtEnd) break;
+
+                    // Read the two timestamps from the readback buffer.
+                    // D3D12_RANGE narrows the Map to only the bytes we
+                    // actually need.
+                    const SIZE_T begin = sizeof(UINT64) * m_readIdx * 2;
+                    const D3D12_RANGE readRange{begin, begin + sizeof(UINT64) * 2};
+                    void* mapped = nullptr;
+                    UINT64 tStart = 0, tEnd = 0;
+                    if (SUCCEEDED(m_readback->Map(0, &readRange, &mapped)) && mapped) {
+                        const auto* ts = reinterpret_cast<const UINT64*>(
+                            reinterpret_cast<const std::byte*>(mapped) + begin);
+                        tStart = ts[0];
+                        tEnd = ts[1];
+                        const D3D12_RANGE noWrite{0, 0};
+                        m_readback->Unmap(0, &noWrite);
+                    }
+
+                    // freq==0 and tEnd<=tStart (the WMR-driver out-of-order
+                    // bug) are handled by the helper, shared with D3D11.
+                    const int64_t gpuNs =
+                        detail::gpuTimestampPairToNs(tStart, tEnd, m_frequency);
+                    latest = GpuFrameResult{slot.frame_index, gpuNs};
+                    slot.state = GpuSlotState::Idle;
+                    m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                }
+                return latest;
+            }
+
+          private:
+            void shutdown() {
+                // Drain any in-flight GPU work before releasing query heap
+                // and command objects — D3D12 spec is strict that
+                // resources referenced by submitted command lists must
+                // outlive their execution.
+                if (m_active && m_fence && m_queue) {
+                    const UINT64 v = ++m_fenceValue;
+                    m_queue->Signal(m_fence.Get(), v);
+                    waitForFenceBounded(v, /*timeoutMs=*/1000);
+                }
+                shutdownInternal();
+            }
+
+            void shutdownInternal() {
+                for (auto& slot : m_ring) {
+                    slot.beginPair.allocator.Reset();
+                    slot.beginPair.cmdList.Reset();
+                    slot.endPair.allocator.Reset();
+                    slot.endPair.cmdList.Reset();
+                    slot.state = GpuSlotState::Idle;
+                    slot.frame_index = 0;
+                    slot.fenceValueAtBegin = 0;
+                    slot.fenceValueAtEnd = 0;
+                }
+                m_readback.Reset();
+                m_queryHeap.Reset();
+                m_fence.Reset();
+                m_queue.Reset();
+                m_device.Reset();
+                m_active = false;
+            }
+
+            // Returns true if the fence reached `value` within timeoutMs,
+            // false on timeout. Used both to ensure allocator reuse is
+            // safe and to wait for resolve readback to be ready.
+            bool waitForFenceBounded(UINT64 value, DWORD timeoutMs) {
+                if (m_fence->GetCompletedValue() >= value) return true;
+                wil::unique_event_nothrow ev;
+                if (FAILED(ev.create())) return false;
+                if (FAILED(m_fence->SetEventOnCompletion(value, ev.get()))) return false;
+                return WaitForSingleObject(ev.get(), timeoutMs) == WAIT_OBJECT_0;
+            }
+
+            struct AllocatorListPair {
+                ComPtr<ID3D12CommandAllocator> allocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+            };
+            struct Slot {
+                AllocatorListPair beginPair;
+                AllocatorListPair endPair;
+                UINT64 fenceValueAtBegin = 0;
+                UINT64 fenceValueAtEnd = 0;
+                uint64_t frame_index = 0;
+                GpuSlotState state = GpuSlotState::Idle;
+            };
+
+            ComPtr<ID3D12Device> m_device;
+            ComPtr<ID3D12CommandQueue> m_queue;
+            ComPtr<ID3D12QueryHeap> m_queryHeap;
+            ComPtr<ID3D12Resource> m_readback;
+            ComPtr<ID3D12Fence> m_fence;
+            UINT64 m_fenceValue = 0;
+            UINT64 m_frequency = 0;
+            std::array<Slot, kGpuRingSize> m_ring;
+            size_t m_writeIdx = 0;
+            size_t m_readIdx = 0;
+            bool m_active = false;
+        };
+
+        // Walks the XrBaseInStructure-style `next` chain looking for the
+        // first XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses
+        // a different graphics API (Vulkan, OpenGL, D3D12).
+        //
+        // The actual walk lives in detail::findInTypedChain (header-only,
+        // pure pointer arithmetic) so a unit test can exercise it without
+        // pulling in the OpenXR/D3D headers — see test_telemetry_math.cpp.
+        const XrGraphicsBindingD3D11KHR* findD3D11Binding(const void* nextChain) {
+            return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(
+                detail::findInTypedChain(nextChain, XR_TYPE_GRAPHICS_BINDING_D3D11_KHR));
+        }
+
+        // Same walk for XrGraphicsBindingD3D12KHR. The struct carries an
+        // ID3D12Device* AND an ID3D12CommandQueue* (unlike the D3D11
+        // binding which is just the device) because D3D12 has no
+        // immediate context — the app submits commands to a queue it
+        // owns. We need that queue handle so D3D12GpuTimer can
+        // ExecuteCommandLists onto the same stream the app draws on.
+        const XrGraphicsBindingD3D12KHR* findD3D12Binding(const void* nextChain) {
+            return reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(
+                detail::findInTypedChain(nextChain, XR_TYPE_GRAPHICS_BINDING_D3D12_KHR));
+        }
+
+    }  // anonymous namespace
+
+
     class OpenXrLayer : public OpenXrApi {
     public:
-        OpenXrLayer() = default;
-        ~OpenXrLayer() override = default;
+        OpenXrLayer() {
+            // Cache QPC frequency once. Used by every frame-thread timestamp
+            // conversion below; constant for the process lifetime.
+            //
+            // Fallback to 10 MHz (the typical Windows QPC frequency on
+            // modern hardware) rather than 1 if QueryPerformanceFrequency
+            // ever returns 0. qpcToNs interprets `ticks / freq` as
+            // seconds, so freq=1 would make every QPC delta blow up to
+            // ~1e9× the intended nanosecond value — corrupting the CSV,
+            // the headroom math, AND the overlay aggregator's refresh
+            // deadline. 10 MHz is a sane, realistic guess that keeps the
+            // numbers in the right ballpark even on a broken HAL clock.
+            // The aggregator has its own < 1000 clamp as defense in
+            // depth, and it falls back to the SAME 10 MHz — so the
+            // CSV side and the overlay side stay numerically coherent
+            // even in the broken-clock case (no 100× drift between
+            // CSV.period_ns and overlay.fps_target).
+            LARGE_INTEGER freq{};
+            QueryPerformanceFrequency(&freq);
+            m_qpcFrequency = freq.QuadPart > 0 ? freq.QuadPart : 10'000'000LL;
+        }
+
+        // Test seam (see ForceOverlayActiveForTest in layer.h): drop the
+        // singleton straight into "overlay active" with a (mock) renderer +
+        // a view-space handle, as if xrCreateSession had built a D3D-backed
+        // overlay. Lets headless integration tests drive the xrEndFrame
+        // overlay fanout / layer-injection and the teardown paths without a
+        // real GPU device or OpenXR swapchain. Not used in production.
+        void forceOverlayActiveForTest(
+                std::unique_ptr<detail::OverlayRenderer> renderer,
+                XrSpace viewSpace, XrSpace localSpace) {
+            m_overlayRenderer = std::move(renderer);
+            m_viewSpace = viewSpace;
+            m_overlayActive = true;
+            // A non-null LOCAL space is exactly what production uses to mean
+            // "world mode" (xrCreateSession only creates one when anchor==
+            // World), so the seam just sets it — no settings mutation. NULL
+            // leaves the layer head-locked, unchanged.
+            m_localSpace = localSpace;
+            requestReanchor();
+        }
+
+        // Test-only: current value of the monotonic frame counter. Lets a test
+        // assert the suspend gate actually skipped collection — a suspended
+        // frame early-returns before the fetch_add in xrEndFrame, so the
+        // counter stays put. See FrameIndexForTest in layer.h.
+        uint64_t frameIndexForTest() const {
+            return m_frameIndex.load(std::memory_order_relaxed);
+        }
+
+        // Build the overlay renderer + its reference spaces from the graphics
+        // binding stashed at xrCreateSession. Idempotent: returns immediately
+        // if the renderer is already up, or if a build attempt already ran this
+        // session (so a failure neither retries nor re-logs every frame —
+        // m_overlayInitAttempted is cleared per session in
+        // releaseSessionScopedResources). Called eagerly at xrCreateSession for
+        // overlay.mode == Auto, and lazily from xrEndFrame the first time the
+        // HUD is summoned for overlay.mode == Hotkey, so an un-activated hotkey
+        // session never spins up the renderer's private D3D device. Contains
+        // every throw/failure inside the C-ABI frame it's called from
+        // (xrCreateSession / xrEndFrame are extern-"C" boundaries) and degrades
+        // to "no overlay this session" rather than unwinding across the ABI.
+        void ensureOverlayResources(XrSession session) {
+            if (m_overlayRenderer) {
+                return;  // already built this session — nothing to do
+            }
+            if (m_overlayInitAttempted) {
+                // A prior build attempt this session already failed (renderer is
+                // null). Don't retry — and keep m_overlayActive cleared so a
+                // REPEAT hotkey press can't re-pin collecting=true for a HUD that
+                // can never draw (each press flips m_overlayActive true again).
+                m_overlayActive = false;
+                return;
+            }
+            m_overlayInitAttempted = true;
+            try {
+                // Binding kind is implied by which pointer is non-null
+                // (xrCreateSession stashes exactly one; mutually exclusive).
+                if (m_d3d11Device) {
+                    m_overlayRenderer = detail::makeD3D11OverlayRenderer(
+                        this, session, m_d3d11Device.Get());
+                } else if (m_d3d12Device && m_d3d12Queue) {
+                    m_overlayRenderer = detail::makeD3D12OverlayRenderer(
+                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get());
+                }
+            } catch (...) {
+                m_overlayRenderer.reset();
+                Log("xr_telemetry: overlay disabled — renderer init threw "
+                    "(out of memory?)\n");
+            }
+            if (!m_overlayRenderer) {
+                Log("xr_telemetry: overlay unavailable this session — no usable "
+                    "D3D11/D3D12 binding or renderer init failed\n");
+                // Drop the active flag so a HUD that can't be built doesn't pin
+                // collecting = (m_recording || m_overlayActive) true for the
+                // whole session — that would run the full per-frame pipeline at
+                // 90-144 Hz for a HUD that can never draw, defeating the idle
+                // optimisation. The draw path is already null-guarded; this just
+                // lets the collecting gate fall back to suspend.
+                m_overlayActive = false;
+                return;
+            }
+
+            // View space for the head-locked overlay quad (was inline in
+            // xrCreateSession). xrDestroySession releases it. If the base call
+            // fails, drop the renderer and stay inactive for this session.
+            XrReferenceSpaceCreateInfo viewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+            viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+            viewSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            viewSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+            if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                    session, &viewSpaceInfo, &m_viewSpace))) {
+                Log("xr_telemetry: overlay disabled — xrCreateReferenceSpace(VIEW) "
+                    "failed for this session\n");
+                m_overlayRenderer.reset();
+                m_viewSpace = XR_NULL_HANDLE;
+                m_overlayActive = false;  // don't pin collecting=true (see above)
+                return;
+            }
+
+            // World-locked anchor: also create a LOCAL space to freeze the quad
+            // into. Only when the user asked for it — a head-locked session has
+            // no use for it. If LOCAL creation fails we fall back to head-locked
+            // (m_localSpace stays NULL; the xrEndFrame anchor path checks for
+            // it) rather than dropping the overlay.
+            if (m_settings.overlay.anchor == detail::OverlayAnchor::World) {
+                XrReferenceSpaceCreateInfo localSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+                localSpaceInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                localSpaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+                if (XR_FAILED(OpenXrApi::xrCreateReferenceSpace(
+                        session, &localSpaceInfo, &m_localSpace))) {
+                    Log("xr_telemetry: overlay anchor=world unavailable — "
+                        "xrCreateReferenceSpace(LOCAL) failed; falling back to "
+                        "head-locked for this session\n");
+                    m_localSpace = XR_NULL_HANDLE;
+                }
+            }
+            // No requestReanchor() here: m_needsReanchor is already true at
+            // every session start (member default + the reset in
+            // releaseSessionScopedResources), and the hotkey toggle re-centres
+            // on each activation. Reanchoring here too double-fired on the first
+            // hotkey activation (toggle + build, same frame).
+        }
+
+        // Poll the log + overlay hotkey combos and apply their edges. Called
+        // from xrEndFrame behind the ~kHotkeyPollIntervalNs throttle (so the
+        // GetAsyncKeyState calls inside pollHotkeyPressed don't run every
+        // frame). The edge detectors fire exactly once per press regardless of
+        // sample rate. Runs even while collection is suspended — this is how an
+        // un-activated hotkey session detects its activation press.
+        void pollAndApplyHotkeys() {
+            // Log hotkey: toggle the recorder. Edge cases handled by callees:
+            //   - m_csv.start() returning false (read-only LOCALAPPDATA, disk
+            //     full) leaves m_recording = false and the next press retries.
+            //     We log once per failure so a broken setup is visible.
+            //   - m_csv.stop() during a pending GPU result: the resolved
+            //     FrameRecord drains into a now-closed CsvWriter and push()
+            //     silently no-ops. No leak.
+            if (m_settings.log.enabled &&
+                m_settings.log.mode == detail::LogMode::Hotkey) {
+                if (m_hotkeyDetector.tick(pollHotkeyPressed(m_settings.log.hotkey))) {
+                    if (!m_recording) {
+                        m_csvPath = buildSessionCsvPath(m_appName);
+                        if (m_csv.start(m_csvPath)) {
+                            m_recording = true;
+                            Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                             "recording started, writing to {}\n",
+                                             m_csvPath.string()));
+                        } else {
+                            ErrorLog(fmt::format("xr_telemetry: hotkey pressed but "
+                                                  "could not open {} — recording NOT started\n",
+                                                  m_csvPath.string()));
+                        }
+                    } else {
+                        // deleteIfEmpty=false: in hotkey mode, an empty
+                        // recording is the user's explicit signal "did my
+                        // binding fire?" — keep the header+footer file so
+                        // they can confirm in the sessions/ folder.
+                        m_csv.stop(/*deleteIfEmpty=*/false);
+                        // Read the count AFTER stop() joins the writer —
+                        // m_written is non-atomic and the writer may still be
+                        // draining when we enter stop().
+                        const uint64_t written = m_csv.written();
+                        m_recording = false;
+                        Log(fmt::format("xr_telemetry: hotkey pressed — "
+                                         "recording stopped ({} frames written to {})\n",
+                                         written, m_csvPath.string()));
+                    }
+                }
+            }
+
+            // Same rising-edge pattern for the overlay hotkey. Independent
+            // from the log hotkey: a user can have both running in mode=
+            // hotkey with separate combos. m_overlayHotkeyDetector keeps
+            // its own latch so a press for one doesn't fire the other.
+            //
+            // No file I/O on this toggle — it just flips m_overlayActive; the
+            // renderer is built lazily (ensureOverlayResources) on the same
+            // frame back in xrEndFrame once m_overlayActive goes true.
+            if (m_settings.overlay.enabled &&
+                m_settings.overlay.mode == detail::OverlayMode::Hotkey) {
+                if (m_overlayHotkeyDetector.tick(
+                        pollHotkeyPressed(m_settings.overlay.hotkey))) {
+                    m_overlayActive = !m_overlayActive;
+                    // Rising edge → re-centre a world-locked panel in front
+                    // of the user. This is the (intentional) re-center
+                    // gesture: toggle the HUD off then on to reposition it.
+                    // No-op for head-locked (the draw path ignores the
+                    // request when m_localSpace is NULL).
+                    if (m_overlayActive) {
+                        requestReanchor();
+                    }
+                    Log(fmt::format("xr_telemetry: hotkey pressed — overlay {}\n",
+                                     m_overlayActive ? "ENABLED" : "DISABLED"));
+                }
+            }
+        }
+
+        // SINGLETON LIFETIME — this destructor runs from
+        // ResetInstance() (auto-generated xrDestroyInstance), so the
+        // application's threads are still alive and the writer thread can
+        // drain cooperatively in <10 ms. The bounded-time guards in
+        // CsvWriter::stop() (timed_mutex + WaitForSingleObject) are
+        // therefore defence-in-depth for crash / hard-shutdown paths,
+        // not the steady-state contract.
+        //
+        // Probe XrInstances (OpenComposite, OXR Toolkit, capability
+        // checks) never reach xrEndFrame, so CsvWriter::stop() deletes
+        // their empty CSVs rather than leaving header-only litter in the
+        // sessions/ folder.
+        ~OpenXrLayer() override {
+            // If xrDestroySession was never called (e.g. host process is
+            // tearing down without a graceful OpenXR shutdown), release the
+            // session-scoped handles ourselves: this flushes GPU-pending
+            // records to the CSV (gpu_time_ns=0) and — the bug this fixes —
+            // resets the overlay renderer and destroys the view XrSpace.
+            // xrDestroySession does this too, but this path used to skip it,
+            // leaking the XrSpace and tearing the swapchain down against a
+            // session the runtime may already be destroying.
+            releaseSessionScopedResources();
+
+            // Auto mode: keep the existing probe-instance protection
+            // (delete an empty CSV from OpenComposite / OXRT capability
+            // probes). Hotkey mode: any open CSV at this point came
+            // from an explicit user press, so KEEP it on disk regardless
+            // of frame count — it's the user-visible signal that their
+            // binding worked.
+            const bool deleteIfEmpty =
+                m_settings.log.mode == detail::LogMode::Auto;
+            m_csv.stop(deleteIfEmpty);
+            // Read the frame count AFTER stop() joins the writer thread —
+            // reading m_csv.written() while the writer is still draining
+            // races on the non-atomic counter.
+            const uint64_t written = m_csv.written();
+            if (m_csvPath.has_filename()) {
+                if (written == 0 && deleteIfEmpty) {
+                    Log(fmt::format("xr_telemetry: probe XrInstance — no frames; csv deleted: {}\n",
+                                    m_csvPath.string()));
+                } else {
+                    Log(fmt::format("xr_telemetry: session csv closed "
+                                    "(written={}, dropped_try_lock={}, dropped_queue_full={}) "
+                                    "at {}\n",
+                                    written,
+                                    m_csv.droppedTryLock(),
+                                    m_csv.droppedQueueFull(),
+                                    m_csvPath.string()));
+                }
+            }
+
+            // Log the aggregator's final snapshot once per xrInstance
+            // lifetime. Moved here from xrDestroySession
+            // because OpenComposite's probe pattern fires xrDestroy
+            // Session BEFORE the real gameplay session has accumulated
+            // any frames — logging there produced a "session too short"
+            // message even when the real session ran for minutes. The
+            // destructor sees the cumulative aggregator state across
+            // every session of this instance, which is what we want.
+            //
+            // Logging is gated on the snapshot's own `valid` flag (NOT
+            // on m_overlayActive). The user might toggle the overlay
+            // off via hotkey late in the session — losing the summary
+            // for the 30 minutes that ALREADY accumulated would be a
+            // regression. As long as the aggregator finalised at
+            // least one snapshot during the run, the user gets it.
+            //
+            // The Log() uses the same "%s" + fmt::format(...).c_str()
+            // dance as the CSV log above to dodge vsnprintf's printf-
+            // style re-interpretation of "% util" inside the formatted
+            // string (verified bug from an earlier build that read
+            // "cpu=… (832588922944til)" instead of "(47% util)").
+            const auto& snap = m_overlay.snapshot();
+            if (snap.valid) {
+                const std::string msg = fmt::format(
+                    "xr_telemetry: overlay final snapshot — "
+                    "fps={:.1f} (avg {:.1f}, target {:.1f}), "
+                    "cpu={:.2f} ms ({:.0f}% util), "
+                    "gpu={:.2f} ms ({:.0f}% util)\n",
+                    snap.fps_instant, snap.fps_avg, snap.target_fps,
+                    snap.cpu_frame_ms, snap.cpu_utilisation_pct,
+                    snap.gpu_frame_ms, snap.gpu_utilisation_pct);
+                Log("%s", msg.c_str());
+            } else if (m_overlayActive) {
+                // Overlay was on at session end but never reached a
+                // refresh tick — e.g. the user pressed the hotkey
+                // within the last 100 ms of play. Distinct from
+                // "overlay was off" (no log at all): the user
+                // explicitly enabled it but didn't give it enough
+                // time to finalise.
+                Log("xr_telemetry: overlay was active but session too short for a "
+                    "snapshot to finalise (need at least one refresh interval of frames)\n");
+            }
+        }
 
         // ---- xrCreateInstance ---------------------------------------------
         // First call the loader hands to a freshly-loaded layer. The
@@ -107,13 +1597,32 @@ namespace openxr_api_layer {
             // XrApplicationInfo, plus the runtime that materialised
             // beneath us once the baseclass returns.
             const std::string appName = createInfo->applicationInfo.applicationName;
-            Log(fmt::format("<<LAYER_NAME>> {} starting for application '{}'\n",
+            Log(fmt::format("xr_telemetry {} starting for application '{}'\n",
                              VersionString, appName));
 
             const XrResult result = OpenXrApi::xrCreateInstance(createInfo);
             if (XR_FAILED(result)) {
                 return result;
             }
+
+            // Idempotency guard. A second xrCreateInstance on the same
+            // singleton (OpenComposite probe-then-real, or any host that
+            // re-initialises without an intervening xrDestroyInstance)
+            // must NOT re-run our bootstrap: re-reading settings keyed
+            // on a possibly different applicationName would re-key
+            // m_appName / m_settings onto the second app and rebuild the
+            // overlay aggregator from scratch (discarding the session's
+            // accumulated history), and could flip m_bypassApiLayer /
+            // recording state mid-session. The base-class
+            // forward above has already given the loader a result; we
+            // just preserve layer state and exit.
+            if (m_layerInitialized) {
+                Log(fmt::format("xr_telemetry: ignoring second xrCreateInstance for '{}' "
+                                "(already initialised as '{}') — keeping existing layer state\n",
+                                appName, m_appName));
+                return result;
+            }
+            m_layerInitialized = true;
 
             // Runtime identity. Useful in logs when supporting multiple
             // runtimes — anti-cheat reports often reference the runtime
@@ -129,12 +1638,879 @@ namespace openxr_api_layer {
                                  XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
             }
 
-            // TODO(<<LAYER_NAME>>): Decide here whether your layer
-            // should be active for this app/runtime combination. If
-            // not, set m_bypassApiLayer = true to make every other
-            // override below a no-op pass-through. See CLAUDE.md
-            // rule 9 — never crash the host because your layer can't
-            // do its job; degrade to bypass instead.
+            // Stash the application name — we need it later both for
+            // building CSV paths (auto AND hotkey modes derive the file
+            // name from it) and for the log lines that announce mode
+            // transitions.
+            m_appName = appName;
+
+            // Load the per-app settings file (bootstrap from the global
+            // template if missing). bootstrapAndLoadSettings always
+            // returns a usable struct, even on filesystem or parse
+            // failure — the fallback leaves both features disabled, so a
+            // broken config degrades to a safe pass-through.
+            const auto parsed = bootstrapAndLoadSettings(
+                openxr_api_layer::localAppData, appName);
+            m_settings = parsed.settings;
+
+            // Master kill switch. CLAUDE.md rule 9 (graceful degradation):
+            // if BOTH features are disabled in settings, the layer has
+            // nothing to do for this app — flip m_bypassApiLayer so every
+            // per-frame override forwards through the base class. We
+            // bypass on the AND of the two flags (not just log) so a
+            // user can run overlay-only without the layer disappearing.
+            if (!m_settings.log.enabled && !m_settings.overlay.enabled) {
+                m_bypassApiLayer = true;
+                Log("xr_telemetry: both log.enabled and overlay.enabled are false in "
+                    "settings — layer running as pass-through for this session\n");
+                return result;
+            }
+
+            // ---- log feature -------------------------------------------
+            // Auto mode: open the CSV right now and let xrEndFrame append
+            // rows until xrDestroySession closes it. Hotkey mode: keep
+            // the CSV closed until the user presses the configured combo.
+            // If log.enabled=false but overlay.enabled=true, we skip both
+            // branches — the per-frame instrumentation still runs (to
+            // feed the overlay aggregator) but never writes to disk.
+            if (m_settings.log.enabled) {
+                if (m_settings.log.mode == detail::LogMode::Auto) {
+                    m_csvPath = buildSessionCsvPath(appName);
+                    if (m_csv.start(m_csvPath)) {
+                        m_recording = true;
+                        Log(fmt::format("xr_telemetry: log mode=auto, writing per-frame CSV to {}\n",
+                                         m_csvPath.string()));
+                    } else {
+                        ErrorLog(fmt::format("xr_telemetry: failed to open CSV at {} — "
+                                              "log disabled for this session\n",
+                                              m_csvPath.string()));
+                    }
+                } else {
+                    Log(fmt::format("xr_telemetry: log mode=hotkey, press {} to start/stop "
+                                     "recording (per-frame CSV opens on the next press)\n",
+                                     detail::formatHotkey(m_settings.log.hotkey)));
+                }
+            } else {
+                Log("xr_telemetry: log.enabled=false — no per-frame CSV will be written "
+                    "this session (overlay still active if its own enabled flag is set)\n");
+            }
+
+            // ---- overlay feature ---------------------------------------
+            // The aggregator is constructed up-front so the overlay
+            // renderer can call snapshot() unconditionally. It needs the real
+            // QPC frequency (cached in the constructor) and the user-
+            // configured refresh cadence converted to nanoseconds.
+            const int64_t overlayIntervalNs =
+                1'000'000'000LL / std::max(1, m_settings.overlay.refresh_hz);
+            // 3rd arg: recompute the P95/P99/P99.9 percentiles at most once
+            // per kPercentileRefreshIntervalNs (~1 Hz) rather than on every
+            // publish. The percentile window is 30-48 s, and the ring sort was
+            // the dominant per-publish cost (~150 µs, per the
+            // xr_telemetry_publish ETW span). The rest of the snapshot still
+            // refreshes at overlayIntervalNs.
+            m_overlay = detail::OverlayAggregator(overlayIntervalNs, m_qpcFrequency,
+                                                  kPercentileRefreshIntervalNs);
+
+            // Resolve the quad geometry once — position / scale / offset are
+            // all immutable after this point (no live reload), so the centre
+            // offset + size never change for the session. Both the head-
+            // locked draw path and the world-anchor freeze reuse this.
+            m_overlayGeo = detail::geometryForPosition(m_settings.overlay.position,
+                                                       m_settings.overlay.scale,
+                                                       m_settings.overlay.offset_x,
+                                                       m_settings.overlay.offset_y);
+
+            if (m_settings.overlay.enabled) {
+                if (m_settings.overlay.mode == detail::OverlayMode::Auto) {
+                    m_overlayActive = true;
+                    Log(fmt::format("xr_telemetry: overlay mode=auto, refreshing snapshot "
+                                     "at {} Hz\n",
+                                     m_settings.overlay.refresh_hz));
+                } else {
+                    Log(fmt::format("xr_telemetry: overlay mode=hotkey, press {} to toggle "
+                                     "(refreshes at {} Hz when active)\n",
+                                     detail::formatHotkey(m_settings.overlay.hotkey),
+                                     m_settings.overlay.refresh_hz));
+                }
+            }
+
+            return result;
+        }
+
+        // Build the GPU timer + GPU-telemetry reader (temp / VRAM) from the
+        // graphics binding stashed at xrCreateSession. Idempotent:
+        // m_gpuInitAttempted latches the one build attempt per session (so a
+        // dormant -> active -> idle -> active hotkey cycle never rebuilds;
+        // cleared per session in releaseSessionScopedResources). Called eagerly
+        // at xrCreateSession for Auto mode, lazily from xrEndFrame the first
+        // time the CSV log or overlay is summoned for Hotkey — so an
+        // un-activated hotkey session never creates query heaps on the app's
+        // device/queue, QIs the DXGI adapter, or inits NvAPI. Mirrors
+        // ensureOverlayResources. Any throw is contained inside the C-ABI frame
+        // it's called from (xrCreateSession / xrEndFrame) and degrades to
+        // "gpu_time_ns / temp / VRAM unavailable this session".
+        void ensureGpuInstrumentation() {
+            if (m_gpuInitAttempted) {
+                return;  // one build attempt per session
+            }
+            m_gpuInitAttempted = true;
+            try {
+                // The adapter for the telemetry reader is re-derived from the
+                // stashed device (the binding kind is implied by which pointer
+                // is non-null — xrCreateSession stashes exactly one). ComPtr
+                // drops the refcount at scope exit; GpuTelemetryReader::init
+                // takes its own via QI, so we don't hold it long-term.
+                ComPtr<IDXGIAdapter> dxgiAdapter;
+                if (m_d3d11Device) {
+                    auto timer = std::make_unique<D3D11GpuTimer>();
+                    if (timer->init(m_d3d11Device.Get())) {
+                        m_gpuTimer = std::move(timer);
+                        Log("xr_telemetry: D3D11 GPU timer active\n");
+                    } else {
+                        Log("xr_telemetry: D3D11 binding found but query creation failed; "
+                            "gpu_time_ns will be 0 for this session\n");
+                    }
+                    // Walk ID3D11Device -> IDXGIDevice -> IDXGIAdapter.
+                    ComPtr<IDXGIDevice> dxgiDevice;
+                    if (SUCCEEDED(m_d3d11Device->QueryInterface(
+                            __uuidof(IDXGIDevice),
+                            reinterpret_cast<void**>(dxgiDevice.GetAddressOf())))) {
+                        dxgiDevice->GetAdapter(dxgiAdapter.GetAddressOf());
+                    }
+                } else if (m_d3d12Device) {
+                    // Gate the timer on the queue but the adapter only on the
+                    // device: a (non-conformant) D3D12 binding with a null queue
+                    // still gets VRAM/temp via the adapter — only the GPU timer
+                    // drops out, instead of losing telemetry for the session.
+                    if (m_d3d12Queue) {
+                        auto timer = std::make_unique<D3D12GpuTimer>();
+                        if (timer->init(m_d3d12Device.Get(), m_d3d12Queue.Get())) {
+                            m_gpuTimer = std::move(timer);
+                            Log("xr_telemetry: D3D12 GPU timer active (native query heap)\n");
+                        } else {
+                            Log("xr_telemetry: D3D12 binding found but query / fence / command-list "
+                                "creation failed; gpu_time_ns will be 0 for this session\n");
+                        }
+                    }
+                    // ID3D12Device::GetAdapterLuid -> IDXGIFactory4::EnumAdapterByLuid.
+                    const LUID luid = m_d3d12Device->GetAdapterLuid();
+                    ComPtr<IDXGIFactory4> factory;
+                    if (SUCCEEDED(::CreateDXGIFactory1(
+                            __uuidof(IDXGIFactory4),
+                            reinterpret_cast<void**>(factory.GetAddressOf())))) {
+                        factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter),
+                                                    reinterpret_cast<void**>(
+                                                        dxgiAdapter.GetAddressOf()));
+                    }
+                }
+
+                // GPU telemetry reader (temp + VRAM). Best-effort: even with a
+                // null adapter (Vulkan / OpenGL host), init() still tries NvAPI
+                // for temperature. Kept live regardless of outcome so the
+                // xrEndFrame poll site stays branchless on "is the reader alive".
+                m_gpuTelemetry = std::make_unique<detail::GpuTelemetryReader>();
+                m_gpuTelemetry->init(dxgiAdapter.Get());
+                if (m_gpuTelemetry->isReady()) {
+                    Log("xr_telemetry: GPU telemetry active (NvAPI / DXGI VRAM)\n");
+                } else {
+                    Log("xr_telemetry: GPU telemetry unavailable (non-NVIDIA host "
+                        "and/or DXGI VRAM not supported); gpu_temp_c / vram_used_bytes "
+                        "will be NaN / 0 for this session\n");
+                }
+            } catch (...) {
+                Log("xr_telemetry: GPU instrumentation init threw — gpu_time_ns / "
+                    "temp / VRAM unavailable this session\n");
+            }
+        }
+
+        // ---- xrCreateSession ----------------------------------------------
+        // Inspects createInfo->next for a graphics binding we support and
+        // STASHES it (device / queue). The GPU timer + telemetry reader are
+        // NOT built here — ensureGpuInstrumentation() builds them from the
+        // stashed binding (eagerly for Auto, lazily on first activation for
+        // Hotkey), so an un-activated hotkey session never touches the app's
+        // graphics device or NvAPI. Supported bindings:
+        //
+        //   D3D11 → D3D11GpuTimer (D3D11 timestamp queries on the app's
+        //           immediate context)
+        //   D3D12 → D3D12GpuTimer (native D3D12_QUERY_TYPE_TIMESTAMP on the
+        //           app's command queue; no D3D11On12 bridge)
+        //   any other (Vulkan / OpenGL / null) → no timer, gpu_time_ns
+        //           reads as 0 in the CSV.
+        //
+        // We never mutate createInfo and we never fail the host's
+        // xrCreateSession over GPU-timer init issues (CLAUDE.md rule 9:
+        // degrade gracefully).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
+        XrResult xrCreateSession(XrInstance instance,
+                                 const XrSessionCreateInfo* createInfo,
+                                 XrSession* session) override {
+            const XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
+            // log.enabled=false → don't stand up the GPU timer either.
+            // The session is created normally by the base call above;
+            // we just skip our own instrumentation hooks.
+            if (m_bypassApiLayer || XR_FAILED(result) || !createInfo) {
+                return result;
+            }
+            // Reset session-scoped one-shot warnings — m_loggedLayerCap
+            // Exceeded is logged at most once per session because a
+            // sustained "app submits 17+ composition layers" condition
+            // could otherwise flood the log file. A new session is the
+            // natural granularity to give the user another chance to
+            // see the warning if their composition pattern changes
+            // (e.g. they restarted the headset between sessions and
+            // the runtime's quad-layer setup differs). The flag itself
+            // lives on the OpenXrLayer instance because the layer cap
+            // applies to the augmented-layer scratch buffer in
+            // xrEndFrame, which uses stack memory not tied to any
+            // particular session handle.
+            m_loggedLayerCapExceeded = false;
+            // Detect the app's graphics binding and STASH the device / queue.
+            // We must read createInfo->next here (it isn't valid later), but we
+            // do NOT build the GPU timer or telemetry reader yet — that's
+            // ensureGpuInstrumentation()'s job, run eagerly below for Auto or
+            // lazily on first activation for Hotkey, so an un-activated hotkey
+            // session never touches the app's graphics device or NvAPI. The
+            // binding kind is implied by which stashed pointer is non-null
+            // (mutually exclusive); the same stash also feeds the lazy overlay
+            // renderer (ensureOverlayResources).
+            if (const auto* d3d11 = findD3D11Binding(createInfo->next)) {
+                m_d3d11Device = d3d11->device;
+            } else if (const auto* d3d12 = findD3D12Binding(createInfo->next)) {
+                m_d3d12Device = d3d12->device;
+                m_d3d12Queue = d3d12->queue;
+            } else {
+                Log("xr_telemetry: no D3D11 or D3D12 binding in xrCreateSession.next "
+                    "(Vulkan / OpenGL / null); gpu_time_ns will be 0 for this session\n");
+                if (m_settings.overlay.enabled) {
+                    Log("xr_telemetry: overlay disabled — Vulkan / OpenGL hosts not "
+                        "supported by the renderer (CSV writing still active)\n");
+                }
+            }
+
+            // CPU usage sampler for the overlay's "CPUs" cell (busiest
+            // logical-processor utilisation). Unlike the GPU reader this
+            // needs no adapter — it reads system-wide scheduler counters
+            // via a documented user-mode NT call (see cpu_usage.h). Kept
+            // alive regardless of init() outcome so the xrEndFrame poll
+            // site stays branchless on "is the reader alive"; poll()
+            // returns NaN (→ "--") on the rare host where it didn't init.
+            m_cpuUsage = std::make_unique<detail::CpuUsageReader>();
+            if (m_cpuUsage->init()) {
+                if (m_cpuUsage->groupTruncated()) {
+                    // > 64 logical processors: we sample processor group 0
+                    // only, so "CPUs LOAD" can under-read a core pinned in
+                    // another group (Threadripper / dual-socket EPYC).
+                    Log("xr_telemetry: CPU usage telemetry active; host has "
+                        ">64 logical processors — sampling processor group 0 "
+                        "only, so \"CPUs LOAD\" may miss a core in another "
+                        "group\n");
+                } else {
+                    Log("xr_telemetry: CPU usage telemetry active (CPUs cell)\n");
+                }
+            } else {
+                Log("xr_telemetry: CPU usage telemetry unavailable "
+                    "(NtQuerySystemInformation did not resolve); the CPUs "
+                    "cell will show \"--\" for this session\n");
+            }
+
+            // GPU instrumentation: built now if a feature is already active
+            // (Auto mode → m_recording / m_overlayActive were set at
+            // xrCreateInstance), else deferred to first activation for Hotkey
+            // via ensureGpuInstrumentation() in xrEndFrame — so an un-activated
+            // hotkey session never creates query heaps on the app's device,
+            // QIs the DXGI adapter, or inits NvAPI.
+            if (m_recording || m_overlayActive) {
+                ensureGpuInstrumentation();
+            }
+
+            // Overlay resources: built now for Auto (HUD up from the first
+            // frame), or deferred to first activation for Hotkey
+            // (ensureOverlayResources, called from xrEndFrame) so an
+            // un-activated hotkey session never spins up the renderer's private
+            // D3D device. The view + local spaces moved into that helper so
+            // both the eager and lazy paths create them alongside the renderer.
+            if (m_settings.overlay.enabled &&
+                m_settings.overlay.mode == detail::OverlayMode::Auto) {
+                ensureOverlayResources(*session);
+            }
+            return result;
+        }
+
+        // ---- xrDestroySession ---------------------------------------------
+        // Tears down the GPU timer so we don't leak query heaps / command
+        // lists / D3D objects. The framework does NOT auto-handle
+        // xrDestroySession (only xrCreateInstance, xrDestroyInstance,
+        // xrGetInstanceProcAddr, and xrEnumerateInstanceExtensionProperties
+        // are routed automatically by dispatch_generator.py). We have to
+        // override it ourselves, like fov_crop does.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrDestroySession
+        XrResult xrDestroySession(XrSession session) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrDestroySession(session);
+            }
+            // Session-scoped cleanup only: flush GPU-pending records, drop the
+            // timer/telemetry, release the overlay renderer + view space.
+            // Shared with ~OpenXrLayer (the destroy-instance-without-destroy-
+            // session path) so the two teardowns can't drift apart.
+            releaseSessionScopedResources();
+            // DO NOT touch m_csv / m_recording / m_overlay / m_overlay
+            // Active here. The OpenXR spec allows multiple xrCreateSession
+            // / xrDestroySession cycles within a single xrInstance, and
+            // OpenComposite uses exactly that pattern: a probe session
+            // first (capability check, no frame loop), then the real
+            // gameplay session. If we closed the CsvWriter at the probe's
+            // xrDestroySession, the real session's frames would land in
+            // a now-closed writer (m_csv.push() silently no-ops on
+            // !m_started), and the user would see "no frames; csv
+            // deleted" in the log — exactly the bug live-confirmed on
+            // OpenComposite + LMU. The CsvWriter, m_recording, and the
+            // overlay snapshot log all live for the xrInstance's full
+            // lifetime; they're torn down by ~OpenXrLayer at
+            // xrDestroyInstance instead.
+            return OpenXrApi::xrDestroySession(session);
+        }
+
+        // ---- xrWaitFrame --------------------------------------------------
+        // Pure observation; never mutates frameWaitInfo or frameState. The
+        // QPC samples around the base call let us derive wait_block_ns (how
+        // long the runtime made us wait — high = compositor had headroom).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrWaitFrame
+        XrResult xrWaitFrame(XrSession session,
+                             const XrFrameWaitInfo* frameWaitInfo,
+                             XrFrameState* frameState) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            }
+            const int64_t tWaitIn = QpcNow();
+            const XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            const int64_t tWaitOut = QpcNow();
+
+            if (XR_SUCCEEDED(result) && frameState) {
+                m_tWaitIn.store(tWaitIn, std::memory_order_relaxed);
+                m_tWaitOut.store(tWaitOut, std::memory_order_relaxed);
+                m_predictedPeriodNs.store(frameState->predictedDisplayPeriod, std::memory_order_relaxed);
+                m_lastShouldRender.store(frameState->shouldRender == XR_TRUE, std::memory_order_relaxed);
+            }
+            return result;
+        }
+
+        // ---- xrBeginFrame -------------------------------------------------
+        // Captured for two purposes:
+        //   (1) tBegin sample → pre_begin_ns split (Wait→Begin housekeeping
+        //       vs Begin→End render submission), used in CSV analysis.
+        //   (2) Open the GPU timestamp window. The matching close happens in
+        //       xrEndFrame; the resolved gpu_time_ns lands in a later CSV
+        //       row (3-4 frame deferral due to GPU→CPU result latency).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrBeginFrame
+        XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            }
+            const int64_t tBegin = QpcNow();
+            const XrResult result = OpenXrApi::xrBeginFrame(session, frameBeginInfo);
+            const int64_t tBeginExit = QpcNow();
+            if (XR_SUCCEEDED(result)) {
+                m_tBegin.store(tBegin, std::memory_order_relaxed);
+                // tBeginExit = right AFTER the runtime's xrBeginFrame returns.
+                // render_ns is measured from here (not tBegin) so it excludes
+                // the runtime's begin call — matching OpenXR Toolkit's render
+                // CPU. See the render_ns computation in xrEndFrame.
+                m_tBeginExit.store(tBeginExit, std::memory_order_relaxed);
+                // Only open a GPU timer slot if we have a valid wait pair.
+                // Without one, xrEndFrame's first-frame guard skips the
+                // FrameRecord push but our GpuTimer slot would still be
+                // closed (recorded with frame_index = N), and the next
+                // valid cycle would re-use the same m_frameIndex value N
+                // when its End resolves — mis-attributing the previous
+                // (skipped) cycle's GPU time to the next CPU record.
+                //
+                // Gating the open here on m_tWaitOut > 0 keeps GpuTimer
+                // slots and FrameRecords in lockstep: both are only
+                // produced once we've seen at least one successful
+                // xrWaitFrame. The OpenXR spec forbids the wait-less
+                // pattern anyway, but a hostile or buggy app would
+                // otherwise silently shift gpu_time_ns by one frame.
+                // Open a GPU slot only when something will consume the timing
+                // (m_recording || m_overlayActive) — a suspended idle-hotkey
+                // frame opens none. m_gpuSlotOpenThisFrame records whether we
+                // opened one so xrEndFrame closes EXACTLY this frame's slot,
+                // regardless of how the in-EndFrame hotkey poll later flips that
+                // predicate (see the resolve gate in xrEndFrame).
+                m_gpuSlotOpenThisFrame = false;
+                if (m_gpuTimer && (m_recording || m_overlayActive) &&
+                    m_tWaitOut.load(std::memory_order_relaxed) > 0) {
+                    // peek m_frameIndex without incrementing — xrEndFrame
+                    // does the fetch_add and uses the SAME value.
+                    m_gpuTimer->beginFrame(m_frameIndex.load(std::memory_order_relaxed));
+                    m_gpuSlotOpenThisFrame = true;
+                }
+            }
+            return result;
+        }
+
+        // ---- xrEndFrame ---------------------------------------------------
+        // Closes the per-frame timing window. Samples tEnd BEFORE forwarding
+        // so the measurement matches the moment the app committed the frame,
+        // not the runtime's compositor work that follows.
+        //
+        // Output goes through the async CsvWriter (push() is a try_lock +
+        // deque op, never blocks; the writer thread does the disk I/O).
+        //
+        // IMPORTANT: do NOT call Log() / fmt::format / OutputDebugStringA
+        // on the PER-FRAME path (i.e. unconditionally, every xrEndFrame).
+        // OutputDebugString takes the kernel-wide DBWinMutex; the Pimax
+        // OpenXR compositor (in a separate process) acquires the same
+        // mutex for its own logging and a few-hundred-µs contention spike
+        // at every frame is enough to make the compositor drop frames —
+        // manifesting as a black HMD. Bisected on PR #1: math + ETW
+        // renders fine, math + ETW + 1 Hz Log() kills the HMD.
+        //
+        // Per-EVENT Log calls (hotkey rising-edge toggles, one-shot
+        // "we hit a config limit" warnings) ARE fine. They fire once
+        // per user action / once per session, not every frame, so the
+        // DBWinMutex contention budget stays well below the threshold.
+        //
+        // ETW (TraceLoggingWrite) itself is lock-free and would be safe
+        // even per-frame; we chose CSV instead for the UX (no
+        // wpr/tracerpt round-trip).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrEndFrame
+        XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            if (m_bypassApiLayer) {
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
+
+            // Hotkey combos, throttled to ~kHotkeyPollIntervalNs via the shared
+            // dueForPoll() gate. A deliberate press is held far longer than the
+            // interval, so we still catch the rising edge while dropping the
+            // GetAsyncKeyState win32k round-trip from 90-144 Hz to ~20 Hz.
+            // pollNowNs is a throttle-only clock, kept separate from tEnd below
+            // so tEnd keeps its exact "app xrEndFrame entry" meaning (and
+            // endFrameNs stays uncontaminated). Runs even while collection is
+            // suspended — it's how an un-activated hotkey session detects its
+            // activation press.
+            const int64_t pollNowNs = detail::qpcToNs(QpcNow(), m_qpcFrequency);
+            if (dueForPoll(pollNowNs, m_lastHotkeyPollNs, kHotkeyPollIntervalNs)) {
+                pollAndApplyHotkeys();
+            }
+
+            const int64_t tEnd = QpcNow();
+
+            // Collection gate. The per-frame telemetry feeds two consumers: the
+            // CSV (m_recording) and the HUD aggregator/renderer
+            // (m_overlayActive). When NEITHER is summoned — the steady state of
+            // an un-activated hotkey session — we skip the GPU-timestamp resolve
+            // below and every record-building step after the forward, which
+            // brings the idle cost back down to the disabled-overlay profile.
+            // xrEndFrame itself is still forwarded unconditionally (it's the
+            // app's frame submission); only OUR telemetry is gated. `collecting`
+            // is captured AFTER the lazy overlay build below: a failed overlay
+            // activation clears m_overlayActive, and capturing before it would
+            // leave `collecting` stale-true and spin up the GPU/NvAPI pipeline
+            // for a session that can't draw.
+
+            // Lazy overlay build (overlay.mode == Hotkey): the renderer + its
+            // private D3D device aren't created until the HUD is first summoned.
+            // This also covers a fresh session that inherited m_overlayActive ==
+            // true from a prior one (the renderer is session-scoped — released
+            // at xrDestroySession — but m_overlayActive deliberately is not).
+            // Idempotent; a one-time ~frame hitch on first activation.
+            if (m_overlayActive && !m_overlayRenderer) {
+                ensureOverlayResources(session);
+            }
+
+            // Collection gate, evaluated now that any failed activation has
+            // settled m_overlayActive (see above).
+            const bool collecting = m_recording || m_overlayActive;
+
+            // Lazy GPU instrumentation (Hotkey mode): the GPU timer + telemetry
+            // reader aren't built until the CSV log or overlay is first
+            // summoned, so a dormant hotkey session never touches the app's
+            // graphics device or NvAPI. The GPU timer's beginFrame is in
+            // xrBeginFrame, so the first GPU-measured frame is the one after
+            // activation — the same one-frame build hitch the renderer has.
+            if (collecting && !m_gpuInitAttempted) {
+                ensureGpuInstrumentation();
+            }
+
+            // CLOSE THE GPU TIMESTAMP WINDOW BEFORE FORWARDING.
+            //
+            // GPU timestamps record the GPU's wall clock at the moment a
+            // query command is executed in the command stream — they do
+            // NOT depend on CPU-side timing. So the placement of
+            // End(end)/End(disjoint) in the *stream* is what determines
+            // what the gpu_time delta covers.
+            //
+            // If we issued these after OpenXrApi::xrEndFrame, the runtime
+            // would have appended its own compositor / layer-composition
+            // / projection-correction work to the stream first, and our
+            // End commands would land AFTER it — folding the runtime's
+            // GPU work into our app-frame measurement. On DR2 +
+            // OpenComposite + Pimax OpenXR 0.1.0 that's ~7 ms of texture
+            // copy and handoff, swamping the app's actual ~4 ms of work
+            // and reporting ~0% GPU headroom instead of the ~64% an
+            // OpenXR Toolkit overlay shows.
+            //
+            // Issuing them BEFORE the forward puts them in the stream
+            // right after the app's last draw call, matching OXRT's
+            // appGpuTimer.stop() position. The runtime's xrEndFrame
+            // commands queue AFTER ours and are excluded from the
+            // measurement.
+            // Close the GPU slot IFF this frame's xrBeginFrame opened one —
+            // pairing on m_gpuSlotOpenThisFrame, NOT on the end-time
+            // `collecting`. The open and close straddle the hotkey poll, so
+            // gating the close on a freshly-sampled predicate could leave a slot
+            // open across an idle gap (deactivate→idle→reactivate) and resolve a
+            // multi-second delta onto the resume frame. The flag is true only
+            // when m_gpuTimer is non-null, so the deref is safe. `resolved` is
+            // consumed only in the collecting path below.
+            const bool gpuSlotOpen = m_gpuSlotOpenThisFrame;
+            m_gpuSlotOpenThisFrame = false;
+            const auto resolved = gpuSlotOpen
+                ? m_gpuTimer->endFrameAndResolveOldest()
+                : std::nullopt;
+
+            // Render the overlay (if active + ready) and build a
+            // modified XrFrameEndInfo that appends our quad to the
+            // app's composition layers. The renderer's paint owns
+            // the swapchain image acquire/wait/release dance, so by
+            // the time renderAndCompose returns the image is fully
+            // committed and the returned XrCompositionLayerBaseHeader*
+            // points to a quad layer the runtime can composite.
+            //
+            // We allocate the modified layer array on the frame
+            // thread's stack (fixed cap of kMaxAppLayers + 1) to
+            // avoid touching the heap inside the hot path. Apps
+            // typically submit 1-2 projection layers; pushing the
+            // cap to 16 leaves headroom for stereoscope + tools.
+            const XrCompositionLayerBaseHeader* overlayLayer = nullptr;
+            if (m_overlayRenderer && m_overlayActive &&
+                m_viewSpace != XR_NULL_HANDLE) {
+                // Resolve the quad's reference frame for this frame.
+                //   Head-locked → VIEW space, no frozen pose. This is the
+                //     default, and also where world mode lands once it has
+                //     given up waiting for a tracked pose.
+                //   World-locked (m_localSpace != NULL — see the member doc;
+                //     it implies anchor==World by construction) → LOCAL space
+                //     + the pose frozen at activation (m_anchorPose).
+                XrSpace overlaySpace = m_viewSpace;
+                const XrPosef* anchorPose = nullptr;
+                bool skipDrawThisFrame = false;
+
+                if (m_localSpace != XR_NULL_HANDLE && !m_worldAnchorGaveUp &&
+                    frameEndInfo) {
+                    if (m_needsReanchor) {
+                        const XrTime now = frameEndInfo->displayTime;
+                        if (m_reanchorStartTime == 0) {
+                            m_reanchorStartTime = now;
+                        }
+                        XrPosef frozen;
+                        if (tryFreezeWorldAnchor(now, frozen)) {
+                            m_anchorPose = frozen;
+                            m_needsReanchor = false;
+                        } else if (now - m_reanchorStartTime >= kReanchorTimeoutNs) {
+                            // Waited past the budget without a tracked head
+                            // pose (e.g. a 3DoF/seated runtime that never
+                            // reports VIEW-in-LOCAL as tracked). Degrade to
+                            // head-locked for the rest of the session so the
+                            // HUD appears rather than silently never drawing.
+                            // Logged once via the latch.
+                            m_worldAnchorGaveUp = true;
+                            Log("xr_telemetry: overlay anchor=world could not "
+                                "acquire a tracked head pose within timeout; "
+                                "falling back to head-locked for this session\n");
+                        } else {
+                            // Still waiting for tracking — don't draw to a
+                            // stale/unfrozen pose this frame.
+                            skipDrawThisFrame = true;
+                        }
+                    }
+                    // Draw world-locked only once a fresh anchor is frozen.
+                    if (!m_needsReanchor) {
+                        overlaySpace = m_localSpace;
+                        anchorPose = &m_anchorPose;
+                    }
+                }
+
+                if (!skipDrawThisFrame) {
+                    overlayLayer = m_overlayRenderer->renderAndCompose(
+                        overlaySpace, anchorPose, m_overlay.snapshot(),
+                        m_overlayGeo);
+                }
+            }
+
+            constexpr uint32_t kMaxAppLayers = 16;
+            const XrCompositionLayerBaseHeader* augmentedLayers[kMaxAppLayers + 1];
+            XrFrameEndInfo augmentedInfo;
+            const XrFrameEndInfo* effectiveInfo = frameEndInfo;
+            if (overlayLayer && frameEndInfo &&
+                frameEndInfo->layerCount <= kMaxAppLayers) {
+                for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                    augmentedLayers[i] = frameEndInfo->layers[i];
+                }
+                augmentedLayers[frameEndInfo->layerCount] = overlayLayer;
+                augmentedInfo = *frameEndInfo;
+                augmentedInfo.layerCount = frameEndInfo->layerCount + 1;
+                augmentedInfo.layers = augmentedLayers;
+                effectiveInfo = &augmentedInfo;
+            } else if (overlayLayer && frameEndInfo &&
+                       frameEndInfo->layerCount > kMaxAppLayers &&
+                       !m_loggedLayerCapExceeded) {
+                // App submits more than 16 composition layers (rare
+                // sim setup: multiple cameras + mirrors + tools).
+                // We could grow kMaxAppLayers but stack arrays scale
+                // poorly, so the trade-off is: HUD silently disappears
+                // for that app, log once so a support ticket has a
+                // hint to grep.
+                m_loggedLayerCapExceeded = true;
+                Log(fmt::format(
+                    "xr_telemetry: overlay skipped — app submitted {} composition "
+                    "layers, our augment cap is {}. HUD will stay hidden for this "
+                    "session; subsequent oversize frames silenced.\n",
+                    frameEndInfo->layerCount, kMaxAppLayers));
+            }
+
+            const XrResult result = OpenXrApi::xrEndFrame(session, effectiveInfo);
+
+            // Suspended (neither recording nor HUD active): skip all timing
+            // capture and FrameRecord work for this frame. Keep m_tEndPrev
+            // current so the first frame after re-activation measures a single
+            // inter-frame interval, not the whole idle gap.
+            if (!collecting) {
+                m_tEndPrev.store(tEnd, std::memory_order_relaxed);
+                return result;
+            }
+            // end_frame_ns isolates the runtime + downstream layers' work
+            // inside xrEndFrame (layer composition, projection correction,
+            // compositor handoff). Useful for diagnosing runtime overhead —
+            // young runtimes (e.g. Pimax OpenXR 0.1.0) can spend ~ms here
+            // where mature compositors stay in the hundreds of µs.
+            const int64_t tEndExit = QpcNow();
+            const int64_t endFrameNs = detail::qpcToNs(tEndExit - tEnd, m_qpcFrequency);
+
+            const int64_t tWaitIn = m_tWaitIn.load(std::memory_order_relaxed);
+            const int64_t tWaitOut = m_tWaitOut.load(std::memory_order_relaxed);
+            const int64_t tBegin = m_tBegin.load(std::memory_order_relaxed);
+            const int64_t periodNs = m_predictedPeriodNs.load(std::memory_order_relaxed);
+            const bool shouldRender = m_lastShouldRender.load(std::memory_order_relaxed);
+
+            // First frame guard: xrEndFrame can fire before we ever observed
+            // a successful xrWaitFrame. Skip the math to avoid bogus deltas.
+            if (tWaitIn == 0 || tWaitOut == 0) {
+                return result;
+            }
+
+            // All four per-frame windows go through qpcDeltaNsOrZero, which
+            // returns 0 for a stale / out-of-order anchor (a skipped
+            // xrWaitFrame / xrBeginFrame leaves last cycle's value behind) —
+            // one skip contract instead of three ad-hoc inline checks.
+            const int64_t waitBlockNs = detail::qpcDeltaNsOrZero(tWaitIn, tWaitOut, m_qpcFrequency);
+            const int64_t appCpuNs    = detail::qpcDeltaNsOrZero(tWaitOut, tEnd, m_qpcFrequency);
+            // pre_begin_ns: the Wait→Begin housekeeping window (a sub-part of
+            // app_cpu_ns). 0 when xrBeginFrame was skipped this cycle.
+            const int64_t preBeginNs  = detail::qpcDeltaNsOrZero(tWaitOut, tBegin, m_qpcFrequency);
+
+            // render_ns: the app's own render-recording window, Begin-exit →
+            // End (xrBeginFrame returning to the app → xrEndFrame entry),
+            // EXCLUDING the runtime's xrBeginFrame call — matches OpenXR
+            // Toolkit's "render CPU" (it starts its render timer after the
+            // downstream xrBeginFrame returns).
+            //
+            // exchange(0) is load-and-clear: it consumes THIS cycle's
+            // begin-exit and resets the anchor to 0, so a cycle where
+            // xrBeginFrame was skipped (session transition, wait-less app)
+            // reads 0 — not a STALE anchor from a prior cycle. Without the
+            // reset, a fresh tEnd minus a stale begin-exit would span more
+            // than one frame and exceed the per-cycle App total, breaking the
+            // Render ≤ App invariant.
+            const int64_t tBeginExit = m_tBeginExit.exchange(0, std::memory_order_relaxed);
+            const int64_t renderNs    = detail::qpcDeltaNsOrZero(tBeginExit, tEnd, m_qpcFrequency);
+
+            // Full-cycle duration: end-to-end wall clock of the previous
+            // frame. This is what fpsVR / OpenXR Toolkit / PresentMon
+            // report as "app frame time" because it includes the
+            // post-xrEndFrame work (sim, physics, AI, input polling) that
+            // appCpuNs above cannot see — the app does that work BEFORE
+            // calling xrWaitFrame for the next frame, so it falls
+            // outside our wait→end window. Gated on tEndPrev > 0 (first
+            // frame of session): 0 means "no previous frame to compare".
+            const int64_t tEndPrev = m_tEndPrev.exchange(tEnd, std::memory_order_relaxed);
+            const int64_t frameTotalNs = (tEndPrev > 0) ? detail::qpcToNs(tEnd - tEndPrev, m_qpcFrequency) : 0;
+
+            // CPU headroom: fraction of the predicted display period that
+            // is NOT spent on app CPU work. Uses the full-cycle metric
+            // (frame_total - wait_block) so the number matches fpsVR /
+            // OpenXR Toolkit — those subtract the compositor wait from
+            // the cycle duration to get "all app CPU per cycle".
+            //
+            // Falls back to the wait→end window (appCpuNs) only on the
+            // first frame where we don't have a previous cycle yet.
+            //
+            // The formula + period <= 0 sentinel live in detail::
+            // (telemetry_internals.h) so they're independently unit-
+            // tested.
+            const int64_t appPerCycleNs =
+                (frameTotalNs > 0) ? (frameTotalNs - waitBlockNs) : appCpuNs;
+            const float headroomPct = detail::computeCpuHeadroomPct(appPerCycleNs, periodNs);
+            const uint64_t frameIndex = m_frameIndex.fetch_add(1, std::memory_order_relaxed);
+
+            // Build the FrameRecord for this frame. gpu_time_ns starts at
+            // 0 (the GPU has barely started this frame's commands, let
+            // alone finished them); patchAndDrainPending() overwrites both
+            // it and gpu_headroom_pct once an older frame's GPU result
+            // resolves.
+            //
+            // gpu_headroom_pct uses the standard formula with gpu_time_ns=0,
+            // which yields 100%. This is what fpsVR / OpenXR Toolkit show
+            // when GPU work isn't measured (e.g. the app uses Vulkan /
+            // OpenGL / D3D12 / no binding — the GpuTimer stays inactive
+            // and gpu_time_ns is 0 for every row of this session). The
+            // alternative — a hardcoded 0.0 placeholder — read as "GPU
+            // 100% saturated" to users comparing with OXRT, which was the
+            // opposite of the intended semantics.
+            //
+            // Analyses that want to exclude unmeasured frames from GPU
+            // statistics should filter `gpu_time_ns > 0`.
+            // gpu_time_ns starts at 0 (the GPU hasn't finished this frame
+            // yet). detail::computeGpuHeadroomPct with gpuTimeNs=0 yields
+            // 100% — the standard "unmeasured" sentinel — and also handles
+            // the periodNs == 0 transient with the same value. If a GPU
+            // result lands later, patchAndDrainPending() recomputes the
+            // pct against the resolved gpu_time_ns.
+            const float gpuHeadroomPct = detail::computeGpuHeadroomPct(/*gpuTimeNs=*/0, periodNs);
+
+            // Shared "now" for both telemetry poll gates below — one
+            // QPC→ns conversion per frame, read by each gate's ~1 s
+            // interval check (rather than converting the same tEnd twice).
+            const int64_t nowNs = detail::qpcToNs(tEnd, m_qpcFrequency);
+
+            // Refresh the cached GPU telemetry (temp + VRAM) at the
+            // aggregator's refresh cadence — drivers update these
+            // counters at ~1 Hz, so polling NvAPI / DXGI per-frame at
+            // 90+ Hz would burn CPU on values that don't change. The
+            // FrameRecord ALWAYS carries the latest cached value
+            // (NaN / 0 when no reader is alive yet), which gives the
+            // CSV a stable, per-frame column and the overlay
+            // aggregator a fresh value for its publish.
+            //
+            // The poll fires at max(aggregator refresh,
+            // kGpuTelemetryMinPollIntervalNs). That floor is 1 s — matching
+            // the ~1 Hz rate at which the driver itself updates these counters
+            // (see the constant for the full rationale) — so in practice the
+            // poll lands at ~1 Hz for every overlay refresh_hz: polling faster
+            // only re-reads identical values.
+            if (m_gpuTelemetry && m_gpuTelemetry->isReady()) {
+                pollGated(nowNs, m_lastGpuTelemetryPollNs,
+                          kGpuTelemetryMinPollIntervalNs, [&] {
+                    // Spike decomposition (perf/overlay-spike-instrumentation):
+                    // poll() runs on the frame thread at the GPU-telemetry
+                    // cadence — ~1 Hz (see kGpuTelemetryMinPollIntervalNs) — so
+                    // it surfaces as one of the periodic target_us contributors.
+                    // ScopedQpcSpan times just the poll() call and is a no-op
+                    // unless a trace session is listening.
+                    log::ScopedQpcSpan span;
+                    m_lastGpuTelemetry = m_gpuTelemetry->poll();
+                    if (span.enabled()) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "xr_telemetry_gpu_poll",
+                                          TLArg(span.elapsedNs(), "duration_ns"),
+                                          TLArg(frameIndex, "frame_index"));
+                    }
+                    // Forward to the aggregator so the next overlay refresh
+                    // publishes the fresh reading. Pushed on every poll
+                    // regardless of m_overlayActive: gating it on the overlay
+                    // being on meant that right after an overlay-hotkey toggle
+                    // the HUD showed a stale (or never-set) temp/VRAM for up to
+                    // a full poll interval. The push is a cheap setter that
+                    // just keeps the aggregator's cached value current.
+                    m_overlay.pushGpuTelemetry(
+                        m_lastGpuTelemetry.gpu_temp_c,
+                        m_lastGpuTelemetry.vram_used_bytes,
+                        m_lastGpuTelemetry.vram_budget_bytes);
+                });
+            }
+
+            // Refresh the cached "CPUs" reading (busiest-core utilisation) on
+            // the SAME ~1 Hz cadence (via pollGated), but on an INDEPENDENT
+            // cursor so it stays alive on hosts where the GPU reader
+            // self-disabled (non-NVIDIA, no DXGI). CPU usage is a delta between
+            // two samples, so a ~1 Hz interval also gives the percentage a
+            // meaningful averaging window. The poll() itself is one NT call +
+            // a loop over ≤ 64 cores.
+            if (m_cpuUsage && m_cpuUsage->isReady()) {
+                pollGated(nowNs, m_lastCpuUsagePollNs,
+                          kCpuUsageMinPollIntervalNs, [&] {
+                    log::ScopedQpcSpan span;
+                    m_lastCpuUsage = m_cpuUsage->poll();
+                    if (span.enabled()) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "xr_telemetry_cpu_poll",
+                                          TLArg(span.elapsedNs(), "duration_ns"),
+                                          TLArg(frameIndex, "frame_index"));
+                    }
+                    // Latch into the aggregator so the next overlay refresh
+                    // publishes the fresh "CPUs" value (cheap setter, pushed
+                    // regardless of m_overlayActive, same as the GPU push).
+                    m_overlay.pushCpuTelemetry(m_lastCpuUsage.cpus_max_pct);
+                });
+            }
+
+            FrameRecord rec{
+                frameIndex,
+                tEnd,
+                waitBlockNs,
+                preBeginNs,
+                appCpuNs,
+                endFrameNs,
+                frameTotalNs,
+                /*gpu_time_ns=*/0,
+                periodNs,
+                headroomPct,
+                gpuHeadroomPct,
+                shouldRender,
+                m_lastGpuTelemetry.gpu_temp_c,
+                m_lastGpuTelemetry.vram_used_bytes,
+                m_lastGpuTelemetry.vram_budget_bytes,
+                m_lastCpuUsage.cpus_max_pct,
+                renderNs,
+            };
+
+            // GPU timestamps were already closed BEFORE the OpenXrApi call
+            // above (see the long comment up top). `resolved` is the
+            // GpuFrameResult for whichever older frame's GPU work has
+            // since finished — or std::nullopt if nothing is ready yet,
+            // or m_gpuTimer is null (no supported binding).
+            //
+            // Queue this frame's record and (if active) wait for GPU.
+            // Pending deque grows by 1 each frame, shrinks by 1 each time
+            // a result resolves. In steady state it stabilises at
+            // ~kGpuRingSize entries.
+            //
+            // The drain sink fans the FULLY-RESOLVED FrameRecord out to
+            // every consumer: CsvWriter when m_recording, OverlayAggregator
+            // when m_overlayActive. Both gates are checked here (not
+            // inside the sinks) so a closed CSV / disabled overlay stays
+            // free of even the inner method-call overhead. The aggregator
+            // wants the final gpu_time_ns, not the placeholder 0 — that's
+            // exactly what patchAndDrainPending hands us once the GPU
+            // result arrives.
+            if (m_gpuTimer) {
+                m_pendingFrames.push_back(rec);
+
+                if (resolved.has_value()) {
+                    patchAndDrainPending(resolved->frame_index, resolved->gpu_time_ns);
+                }
+            } else {
+                // No GPU timer → no deferred path; dispatch immediately,
+                // gpu_time_ns stays at 0 (which the aggregator clamps back
+                // to 100% headroom via the helper formula). Route through
+                // fanoutRecord — NOT a bare m_csv.push + m_overlay.pushFrame
+                // — so the overlay renderer's histogram rings also get fed
+                // via pushFrameSample. The hand-rolled push here used to skip
+                // that, so on a binding with no GPU timer the HUD's CPU/GPU
+                // bar strips stayed empty for the whole session.
+                fanoutRecord(rec);
+            }
 
             return result;
         }
@@ -163,17 +2539,499 @@ namespace openxr_api_layer {
         // ----------------------------------------------------------------
 
       private:
-        // Set to true in xrCreateInstance when the layer determines it
-        // should not do anything for this particular process (wrong
-        // game, wrong runtime, missing system feature, etc.). Every
-        // override should check this and bypass when set.
+        // QPC helpers — QueryPerformanceCounter is monotonic, sub-microsecond,
+        // and free of kernel transitions on modern Windows. We do NOT use
+        // XrFrameState.predictedDisplayTime as a clock: it's a predicted
+        // display point, not a measurement point, and its mapping to QPC is
+        // runtime-defined.
+        int64_t QpcNow() const {
+            LARGE_INTEGER c;
+            QueryPerformanceCounter(&c);
+            return c.QuadPart;
+        }
+
+        // Cadence gate shared by the GPU and CPU telemetry polls in
+        // xrEndFrame. Runs `doPoll` at most once per
+        // max(overlay refresh, minIntervalNs): `nowNs` is the frame clock,
+        // `lastPollNs` the per-reader cursor (advanced in place only when a
+        // poll actually fires). Keeps the "how often do we poll" policy in
+        // one place; the caller's lambda owns the reader-specific work — the
+        // poll() call, the ScopedQpcSpan + TraceLoggingWrite (the ETW event
+        // name must be a compile-time literal, so it can't be a parameter),
+        // and the aggregator push. `doPoll` is invoked synchronously, so a
+        // by-reference capture of frame-local state is safe.
+        // Fixed-interval poll gate: returns true (and advances lastPollNs) iff
+        // at least intervalNs has elapsed since lastPollNs. The shared primitive
+        // behind both the hotkey-poll throttle (fixed cadence, runs while
+        // suspended — see xrEndFrame) and pollGated() below (telemetry polls,
+        // whose effective interval also folds in the overlay refresh rate). All
+        // callers work in ns off the same QPC→ns conversion — one clock unit.
+        static bool dueForPoll(int64_t nowNs, int64_t& lastPollNs,
+                               int64_t intervalNs) {
+            if (nowNs - lastPollNs < intervalNs) {
+                return false;
+            }
+            lastPollNs = nowNs;
+            return true;
+        }
+
+        template <typename PollFn>
+        void pollGated(int64_t nowNs, int64_t& lastPollNs,
+                       int64_t minIntervalNs, PollFn&& doPoll) {
+            if (dueForPoll(nowNs, lastPollNs,
+                           std::max(m_overlay.refreshIntervalNs(), minIntervalNs))) {
+                doPoll();
+            }
+        }
+
+        // GPU-side helpers ------------------------------------------------
+
+        // The GpuTimer resolves frame N's GPU time in xrEndFrame_{N+latency}.
+        // We hold each FrameRecord in m_pendingFrames between its own
+        // xrEndFrame and the call where its GPU result arrives, then patch
+        // the gpu_time_ns + gpu_headroom_pct in and push to the CsvWriter.
+        //
+        // Pending entries are FIFO and ordered by frame_index. When a result
+        // for frame R arrives, every record at the front with frame_index
+        // <= R is settled: the matching one gets the resolved gpu_time,
+        // the older ones (if any — could happen on stutter) get 0.
+        // Thin wrappers around the pure templates in telemetry_internals.h —
+        // the actual drain/patch/flush logic is unit-tested without an
+        // OpenXR session in test_telemetry_math.cpp.
+        //
+        // The sink fans the resolved FrameRecord to BOTH consumers:
+        //   - CsvWriter, gated on m_recording (mode=auto active OR
+        //     mode=hotkey toggled on).
+        //   - OverlayAggregator, gated on m_overlayActive.
+        // Each gate avoids the empty-virtual-call cost when the
+        // corresponding feature is dormant.
+        void fanoutRecord(const FrameRecord& r) {
+            if (m_recording)     m_csv.push(r);
+            if (m_overlayActive) {
+                // Spike decomposition (perf/overlay-spike-instrumentation):
+                // pushFrame() is cheap accumulation on most frames, but every
+                // ~10 Hz it triggers publishAndReset() — which sorts the
+                // ~4320-sample percentile ring. Detect that publish via the
+                // snapshot version bump and time only those frames, as a
+                // discrete ETW span. Gated on IsTraceEnabled() for zero
+                // non-tracing overhead.
+                log::ScopedQpcSpan span;
+                const uint64_t verBefore =
+                    span.enabled() ? m_overlay.snapshot().version : 0;
+                m_overlay.pushFrame(r);
+                const int64_t publishNs = span.enabled() ? span.elapsedNs() : 0;
+                const uint64_t verAfter = m_overlay.snapshot().version;
+                if (span.enabled() && verAfter != verBefore) {
+                    // Log BOTH keys so the three spike spans join on one
+                    // timeline: frame_index links to xr_telemetry_gpu_poll, and
+                    // snapshot_version (the version THIS publish produced) links
+                    // to xr_telemetry_chrome_rebuild, which has only the version
+                    // to key on.
+                    TraceLoggingWrite(g_traceProvider,
+                                      "xr_telemetry_publish",
+                                      TLArg(publishNs, "duration_ns"),
+                                      TLArg(r.frame_index, "frame_index"),
+                                      TLArg(verAfter, "snapshot_version"));
+                }
+                if (m_overlayRenderer) {
+                    // The CPU histogram strip displays per-cycle CPU
+                    // work (frame_total − wait_block), matching the
+                    // cpu_frame_ms value drawn above the strip — that's
+                    // the same per_cycle metric OverlayAggregator uses.
+                    // Fallback to app_cpu_ns on the very first frame
+                    // (no previous tEnd to subtract from), same as
+                    // xrEndFrame's headroom math.
+                    const int64_t cpu_per_cycle_ns =
+                        (r.frame_total_ns > 0)
+                            ? (r.frame_total_ns - r.wait_block_ns)
+                            : r.app_cpu_ns;
+                    m_overlayRenderer->pushFrameSample(cpu_per_cycle_ns,
+                                                       r.gpu_time_ns);
+                }
+            }
+        }
+
+        void patchAndDrainPending(uint64_t resolvedFrameIndex, int64_t gpuTimeNs) {
+            detail::patchAndDrainPending(
+                m_pendingFrames, resolvedFrameIndex, gpuTimeNs,
+                [this](const FrameRecord& r) { fanoutRecord(r); });
+        }
+
+        void flushPendingFramesUnresolved() {
+            detail::flushPendingFramesUnresolved(
+                m_pendingFrames, [this](const FrameRecord& r) { fanoutRecord(r); });
+        }
+
+        // Release every session-scoped handle the layer owns: flush any
+        // GPU-pending FrameRecords to their sinks, drop the GPU timer + its
+        // query heap, release the GPU-telemetry adapter ref (+ reset the
+        // cached sample), drop the overlay renderer (XrSwapchain + D3D
+        // wrapper), and destroy the head-locked view XrSpace. Shared by
+        // xrDestroySession (per-session teardown — all re-created on the next
+        // xrCreateSession) and ~OpenXrLayer (the destroy-instance-without-
+        // destroy-session shutdown, where the runtime never handed us an
+        // xrDestroySession to clean up in). Deliberately does NOT touch
+        // m_csv / m_recording / m_overlay / m_overlayActive — those span
+        // multiple sessions within one xrInstance.
+        void releaseSessionScopedResources() {
+            flushPendingFramesUnresolved();
+            m_gpuTimer.reset();
+            m_gpuTelemetry.reset();
+            m_lastGpuTelemetry = detail::GpuTelemetrySample{};
+            m_lastGpuTelemetryPollNs = 0;
+            m_cpuUsage.reset();
+            m_lastCpuUsage = detail::CpuUsageSample{};
+            m_lastCpuUsagePollNs = 0;
+            // The aggregator spans sessions (FPS / frametime history is kept),
+            // but the GPU + CPU telemetry latches are tied to the readers we
+            // just reset — clear them so a next session whose reader never
+            // reports shows "--" rather than this session's stale value.
+            m_overlay.resetTelemetryLatches();
+            m_overlayRenderer.reset();
+            // Lazy-overlay binding stash is session-scoped: drop the device /
+            // queue refs and clear the attempt latch so the NEXT session
+            // re-stashes from its own xrCreateSession and may retry the build.
+            // m_overlayActive is deliberately NOT reset here (it spans sessions)
+            // — a session that inherits it rebuilds the renderer lazily on its
+            // first xrEndFrame.
+            m_d3d11Device.Reset();
+            m_d3d12Device.Reset();
+            m_d3d12Queue.Reset();
+            m_overlayInitAttempted = false;
+            m_gpuInitAttempted = false;
+            // Clear the GPU-slot pairing flag too: with the timer now built
+            // lazily, a slot left open by an abandoned frame (xrBeginFrame with
+            // no paired xrEndFrame) must not survive into a session whose timer
+            // is still null — xrEndFrame's resolve derefs m_gpuTimer when this
+            // flag is set, and the "flag set ⟹ timer non-null" invariant now
+            // holds only if we reset it per session here.
+            m_gpuSlotOpenThisFrame = false;
+            if (m_viewSpace != XR_NULL_HANDLE) {
+                OpenXrApi::xrDestroySpace(m_viewSpace);
+                m_viewSpace = XR_NULL_HANDLE;
+            }
+            if (m_localSpace != XR_NULL_HANDLE) {
+                OpenXrApi::xrDestroySpace(m_localSpace);
+                m_localSpace = XR_NULL_HANDLE;
+            }
+            // Next session (the spec allows multiple create/destroy cycles
+            // per instance) must re-anchor from its own head pose.
+            requestReanchor();
+        }
+
+        // Raise a fresh world-anchor request: the next world-mode frame will
+        // re-locate the head and freeze the panel. Resets the timeout stamp
+        // and clears any prior give-up so a re-summon retries from scratch.
+        // Cheap no-op for head-locked sessions (the draw path ignores it
+        // when m_localSpace is NULL).
+        void requestReanchor() {
+            m_needsReanchor = true;
+            m_reanchorStartTime = 0;
+            m_worldAnchorGaveUp = false;
+        }
+
+        // Try to freeze the world-anchor pose from the current head pose.
+        // Locates the VIEW space in the LOCAL space at displayTime and, only
+        // if the pose is fully VALID *and* TRACKED, composes it with the
+        // corner offset into a world pose written to `out`. The TRACKED gate
+        // matters: a runtime keeps the *_VALID bits set on a last-known /
+        // extrapolated pose during a tracking blip but clears the *_TRACKED
+        // bits — freezing to that would pin the panel to a stale pose for the
+        // session. Returns true on a clean freeze, false if the locate failed
+        // or the pose wasn't tracked (caller retries next frame / times out).
+        bool tryFreezeWorldAnchor(XrTime displayTime, XrPosef& out) {
+            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+            constexpr XrSpaceLocationFlags kTracked =
+                XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+            if (XR_FAILED(OpenXrApi::xrLocateSpace(
+                    m_viewSpace, m_localSpace, displayTime, &loc)) ||
+                (loc.locationFlags & kTracked) != kTracked) {
+                return false;
+            }
+            const detail::OverlayPose anchored = detail::composeAnchorPose(
+                detail::toOverlayPose(loc.pose),
+                {m_overlayGeo.pos_x, m_overlayGeo.pos_y, m_overlayGeo.pos_z});
+            out = detail::toXrPosef(anchored);
+            return true;
+        }
+
         bool m_bypassApiLayer = false;
+        // Latched true after the first xrCreateInstance completes its
+        // bootstrap. Guards a second xrCreateInstance on the same
+        // singleton (OpenComposite probe-then-real) from re-reading
+        // settings under a possibly different applicationName — see the
+        // idempotency guard in xrCreateInstance.
+        bool m_layerInitialized = false;
+        int64_t m_qpcFrequency = 1;
+
+        // Frame timing state — written from Wait/Begin thread, read from End
+        // thread (may differ under OpenComposite where sim and render threads
+        // are separate). Relaxed atomics are sufficient because the OpenXR
+        // frame-loop contract guarantees at most one frame in flight between
+        // Wait and End, so no field is concurrently written.
+        std::atomic<int64_t> m_tWaitIn{0};
+        std::atomic<int64_t> m_tWaitOut{0};
+        std::atomic<int64_t> m_tBegin{0};
+        std::atomic<int64_t> m_tBeginExit{0};
+        // Previous frame's tEnd (QPC ticks). Used by xrEndFrame to compute
+        // frame_total_ns = tEnd - tEndPrev, which captures the post-end
+        // app work (sim/physics/AI) that wait→end alone misses. Updated
+        // via atomic exchange so the read+write is one operation.
+        std::atomic<int64_t> m_tEndPrev{0};
+        std::atomic<int64_t> m_predictedPeriodNs{0};
+        std::atomic<bool> m_lastShouldRender{true};
+        std::atomic<uint64_t> m_frameIndex{0};
+
+        // Async CSV writer + the path we opened (for the destructor log).
+        // In mode=hotkey, m_csvPath is re-derived on each rising edge of
+        // the hotkey so every recording window gets its own timestamped
+        // file under sessions/.
+        CsvWriter m_csv;
+        std::filesystem::path m_csvPath;
+
+        // Settings + per-app application name, loaded once at
+        // xrCreateInstance. m_settings is read-only after init (we don't
+        // hot-reload — see the README's "live_edit deliberately omitted"
+        // note). m_appName drives both the CSV filename slug and the
+        // hotkey log messages.
+        detail::TelemetrySettings m_settings;
+        std::string m_appName;
+
+        // Hotkey-mode bookkeeping. m_hotkeyDetector rising-edge-filters
+        // pollHotkeyPressed() so a held key fires the toggle exactly
+        // once. m_recording tracks whether the CsvWriter is currently
+        // open — true in auto-mode for the whole session, true between
+        // press(N) and press(N+1) in hotkey-mode.
+        detail::HotkeyEdgeDetector m_hotkeyDetector;
+        bool m_recording = false;
+
+        // Overlay state. Symmetric to the log state above. The aggregator
+        // is constructed late (in xrCreateInstance, once we know the
+        // refresh_hz from settings and have the cached m_qpcFrequency).
+        // The renderer is constructed in xrCreateSession once we know
+        // the graphics binding (D3D11 / D3D12); xrEndFrame paints with
+        // it and appends a composition layer to the runtime's layer
+        // array.
+        //
+        // m_overlayActive mirrors m_recording: true in auto mode, toggled
+        // by press in hotkey mode.
+        detail::OverlayAggregator m_overlay;
+        detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
+        bool m_overlayActive = false;
+        std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+
+        // Hotkey-poll throttle (see kHotkeyPollIntervalNs). ns timestamp of the
+        // last poll (0 = never, so the first frame polls), gated through the
+        // shared dueForPoll() helper — same ns unit + idiom as the telemetry
+        // polls, no separate clock unit.
+        int64_t m_lastHotkeyPollNs = 0;
+
+        // Lazy overlay construction for overlay.mode == Hotkey. The renderer
+        // and its private D3D device are NOT built at xrCreateSession in hotkey
+        // mode — only on the first frame the HUD is actually summoned — so a
+        // hotkey session that's never activated never spins up that device (nor
+        // the driver worker threads behind it). The graphics binding is stashed
+        // here at xrCreateSession to rebuild from; the binding KIND is implied
+        // by which pointer is non-null (D3D11 XOR D3D12 — xrCreateSession
+        // stashes exactly one). Released, and the attempt latch cleared, in
+        // releaseSessionScopedResources() so the next session re-stashes and may
+        // retry. m_overlayInitAttempted gates a failed (or completed) build so
+        // we neither retry nor re-log it every frame.
+        ComPtr<ID3D11Device> m_d3d11Device;
+        ComPtr<ID3D12Device> m_d3d12Device;
+        ComPtr<ID3D12CommandQueue> m_d3d12Queue;
+        bool m_overlayInitAttempted = false;
+
+        // Sibling latch for the GPU timer + telemetry reader, built by
+        // ensureGpuInstrumentation(): true once a build has been attempted this
+        // session, so the dormant -> active hotkey path attempts it exactly
+        // once. Cleared per session in releaseSessionScopedResources.
+        bool m_gpuInitAttempted = false;
+
+        // True between this frame's xrBeginFrame opening a GPU timer slot and
+        // xrEndFrame closing it. The open/close straddle the in-EndFrame hotkey
+        // poll, so we pair them on THIS flag — never on a freshly-sampled
+        // `collecting` — otherwise a deactivate→idle→reactivate cycle could
+        // leave a slot open across the idle gap and resolve a multi-second
+        // delta onto the resume frame.
+        bool m_gpuSlotOpenThisFrame = false;
+
+        // Quad geometry (centre offset + size), resolved once in
+        // xrCreateInstance from the immutable overlay settings (position /
+        // scale / offset_x / offset_y). The renderer no longer derives it;
+        // we hand it to renderAndCompose every frame and use its offset when
+        // freezing a world anchor.
+        detail::OverlayGeometry m_overlayGeo{};
+
+        // View space (XR_REFERENCE_SPACE_TYPE_VIEW) — head-locked
+        // reference frame the overlay quad lives in. Created at xrCreate
+        // Session, destroyed at xrDestroySession. NULL when the layer
+        // hasn't bound a session yet.
+        XrSpace m_viewSpace = XR_NULL_HANDLE;
+
+        // Local space (XR_REFERENCE_SPACE_TYPE_LOCAL) — the play-space
+        // frame the overlay quad is frozen into for a world-locked anchor.
+        // Created at xrCreateSession ONLY when overlay.anchor == World (and
+        // the create succeeds); head-locked sessions leave it NULL.
+        // Destroyed at xrDestroySession. A non-null m_localSpace is the
+        // single signal the xrEndFrame draw path uses to mean "world mode"
+        // — it implies anchor==World by construction, so nothing downstream
+        // re-reads the setting.
+        XrSpace m_localSpace = XR_NULL_HANDLE;
+
+        // World-anchor state (world mode only — i.e. m_localSpace != NULL).
+        // m_anchorPose is the quad's frozen pose in m_localSpace.
+        // m_needsReanchor asks xrEndFrame to recompute it from the current
+        // head pose; it's (re-)raised by requestReanchor() at session start
+        // and on every rising edge of m_overlayActive, so the panel
+        // re-centres each time the HUD is summoned. Until a tracked locate
+        // succeeds we don't draw — we never freeze to an untracked pose.
+        // m_reanchorStartTime stamps the first attempt (0 = unset) so we can
+        // time out; m_worldAnchorGaveUp latches true once we've waited past
+        // the budget without a tracked pose and degraded to head-locked for
+        // the rest of the session (logged once).
+        XrPosef m_anchorPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        bool m_needsReanchor = true;
+        XrTime m_reanchorStartTime = 0;
+        bool m_worldAnchorGaveUp = false;
+
+        // Max wall-clock we wait for a tracked head pose before giving up on
+        // the world anchor and degrading to head-locked. Tracking blips
+        // (inside-out occlusion, just-resumed session) recover in well under
+        // a second; 2 s is generous headroom while still guaranteeing the
+        // HUD appears rather than black-holing if a runtime never reports a
+        // tracked VIEW-in-LOCAL pose (e.g. a 3DoF/seated runtime).
+        static constexpr XrTime kReanchorTimeoutNs = 2'000'000'000;
+
+        // One-shot: an app submits more composition layers than our
+        // stack-allocated augmentation array can hold (16). We can't
+        // append our quad in that case, so the HUD goes silently
+        // hidden — log once per session to leave a breadcrumb in
+        // support reports.
+        bool m_loggedLayerCapExceeded = false;
+
+        // GPU timing — owned by unique_ptr so the concrete type (D3D11 or
+        // D3D12) is picked at xrCreateSession based on the binding. Null
+        // when the app uses Vulkan / OpenGL / no binding, in which case
+        // m_pendingFrames stays empty and FrameRecords are pushed to the
+        // CsvWriter immediately with gpu_time_ns = 0.
+        //
+        // Single-threaded access from the frame-loop thread: every call
+        // into beginFrame / endFrameAndResolveOldest is from xrBeginFrame /
+        // xrEndFrame, which the OpenXR spec serialises within a session.
+        // The pending deque holds FrameRecords waiting on a GPU result to
+        // land — typically kGpuRingSize entries in steady state, drains
+        // when xrDestroySession is called.
+        std::unique_ptr<IGpuTimer> m_gpuTimer;
+        std::deque<FrameRecord> m_pendingFrames;
+
+        // GPU package temperature + VRAM polling. Constructed in
+        // xrCreateSession once we have an IDXGIAdapter; isReady()
+        // returns false when neither source initialised (non-NVIDIA
+        // host on a pre-Win10-RS1 build, or stub adapter), in which
+        // case poll() returns a default sample and the layer keeps
+        // working with NaN / 0 in those columns.
+        //
+        // Polled on the frame thread at kGpuTelemetryPollIntervalNs
+        // cadence — every FrameRecord copies the cached value, so
+        // each CSV row has a numeric column even though the
+        // underlying driver only updates at ~1 Hz.
+        std::unique_ptr<detail::GpuTelemetryReader> m_gpuTelemetry;
+        detail::GpuTelemetrySample m_lastGpuTelemetry{};
+        int64_t m_lastGpuTelemetryPollNs = 0;
+
+        // CPU usage sampler ("CPUs" cell = busiest logical-processor %).
+        // Polled on the frame thread at max(refresh, kCpuUsageMinPollIntervalNs)
+        // — see the poll site in xrEndFrame. The latest reading is cached so
+        // the value survives between polls; latched into the aggregator on
+        // each poll via pushCpuTelemetry.
+        std::unique_ptr<detail::CpuUsageReader> m_cpuUsage;
+        detail::CpuUsageSample m_lastCpuUsage{};
+        int64_t m_lastCpuUsagePollNs = 0;
+        // 1 s — the minimum interval between GPU telemetry polls. NvAPI/DXGI
+        // thermal + VRAM counters refresh at ~1 Hz on the driver side, so
+        // polling faster returns identical values and just burns frame-thread
+        // CPU. The xr_telemetry_gpu_poll ETW span measured poll() at ~37 µs
+        // (mean) / ~114 µs (max) on the frame thread; at the old 100 ms (10 Hz)
+        // floor that landed on ~1 frame in 9 and was a top-3 contributor to
+        // the periodic target_us spike. Matching the floor to the ~1 Hz driver
+        // cadence keeps the cached temp/VRAM just as fresh while taking the
+        // poll off all but ~1 frame per second. The effective interval stays
+        // max(this, m_overlay.refreshIntervalNs()); since refresh_hz is capped
+        // at 60 (>= 16.6 ms) this 1 s floor now dominates for every refresh
+        // rate, which is intended.
+        static constexpr int64_t kGpuTelemetryMinPollIntervalNs = 1'000'000'000LL;
+
+        // 1 s — the minimum interval between CPU usage polls. Two reasons,
+        // both pointing at ~1 Hz: (1) CPU utilisation is a delta between two
+        // samples, and a ~1 s window is what fpsVR-style "CPUs" readings use
+        // to stay readable rather than shimmering; (2) it keeps the NT query
+        // off all but ~1 frame per second, same frame-thread-cost argument as
+        // the GPU poll floor. A SEPARATE constant from the GPU one on purpose
+        // — they happen to coincide at 1 s today but track different facts.
+        static constexpr int64_t kCpuUsageMinPollIntervalNs = 1'000'000'000LL;
+
+        // Minimum spacing between overlay percentile (P95/P99/P99.9) re-sorts,
+        // passed to OverlayAggregator. ~1 Hz like the poll floor above, but for
+        // an UNRELATED reason — the percentiles describe a 30-48 s window, so
+        // re-sorting faster adds no signal. Kept a SEPARATE constant from
+        // kGpuTelemetryMinPollIntervalNs on purpose: they coincide at 1 s today
+        // but track different facts (a slow-moving statistic vs. the driver
+        // counter cadence), so they must be free to move independently.
+        static constexpr int64_t kPercentileRefreshIntervalNs = 1'000'000'000LL;
+
+        // Hotkey-poll cadence. The log + overlay hotkeys are level-triggered
+        // combos detected with GetAsyncKeyState — a win32k round-trip we'd
+        // otherwise pay on EVERY xrEndFrame (90-144 Hz). A deliberate combo
+        // press is held far longer than this, so sampling at ~20 Hz still
+        // catches the rising edge while cutting the GetAsyncKeyState traffic
+        // ~5-7x. 50 ms = worst-case activation latency, imperceptible for a
+        // HUD / recording toggle. (The edge detector still fires exactly once
+        // per press; throttling only changes how often we sample its input.)
+        static constexpr int64_t kHotkeyPollIntervalNs = 50'000'000LL;  // ~20 Hz
     };
 
     // Singleton accessor used by framework/dispatch.cpp.
+    //
+    // IMPORTANT — uses the framework's g_instance (declared in
+    // dispatch.gen.h, defined in dispatch.gen.cpp). The auto-generated
+    // xrDestroyInstance calls ResetInstance() which does
+    // `g_instance.reset()`, so each XrInstance gets a fresh OpenXrLayer
+    // with a fresh CsvWriter, fresh thread, fresh state. ~OpenXrLayer()
+    // therefore runs DURING the application's lifetime (threads alive,
+    // mutexes sane), not at static-destruction time after ExitProcess()
+    // has killed every other thread.
+    //
+    // Do NOT replace this with `static std::unique_ptr<OpenXrLayer>
+    // instance = std::make_unique<OpenXrLayer>();` — that anti-pattern
+    // makes the singleton process-lifetime and ResetInstance() a no-op,
+    // which silently breaks the OpenComposite probe-then-real init flow
+    // (the writer thread from the probe instance is still alive when
+    // the real instance tries to start its own). See
+    // docs/DEVELOPMENT.md in OpenXR-Layer-Template-Plus for the full
+    // story.
     OpenXrApi* GetInstance() {
-        static std::unique_ptr<OpenXrLayer> instance = std::make_unique<OpenXrLayer>();
-        return instance.get();
+        if (!g_instance) {
+            g_instance = std::make_unique<OpenXrLayer>();
+        }
+        return g_instance.get();
+    }
+
+    // Test seam — see layer.h. GetInstance() always returns the concrete
+    // OpenXrLayer singleton (creating it if needed), so the static_cast is
+    // safe.
+    void ForceOverlayActiveForTest(
+            std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace,
+            XrSpace localSpace) {
+        static_cast<OpenXrLayer*>(GetInstance())
+            ->forceOverlayActiveForTest(std::move(renderer), viewSpace, localSpace);
+    }
+
+    uint64_t FrameIndexForTest() {
+        return static_cast<OpenXrLayer*>(GetInstance())->frameIndexForTest();
     }
 
     // dllHome / localAppData are defined in framework/entry.cpp for the

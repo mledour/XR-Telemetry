@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) 2026 <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Based on https://github.com/mbucchia/OpenXR-Layer-Template.
 // Copyright(c) 2022-2023 Matthieu Bucchianeri
@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>

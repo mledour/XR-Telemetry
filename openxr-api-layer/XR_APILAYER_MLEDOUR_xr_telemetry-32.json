@@ -2,10 +2,10 @@
   "file_format_version" : "1.0.0",
   "api_layer": {
     "name": "XR_APILAYER_name",
-    "library_path": ".\\XR_APILAYER_name.dll",
+    "library_path": ".\\XR_APILAYER_name-32.dll",
     "api_version": "1.0",
     "implementation_version": "2",
-    "description": "Narrows the effective field of view and swapchain resolution to reduce GPU load.",
+    "description": "Captures per-frame timing telemetry (CPU headroom, compositor wait block) to a per-session CSV in %LOCALAPPDATA%.",
     "functions": {
       "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
     },

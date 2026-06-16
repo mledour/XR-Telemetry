@@ -1,0 +1,146 @@
+name: GC snapshot-previews on PR close
+
+# Bounded growth of the `snapshot-previews` orphan branch. The push
+# step in build-and-release.yml drops earlier ATTEMPTS of a given
+# PR before adding the latest one, so the in-flight footprint of any
+# single PR stays at one folder. This workflow handles the cross-PR
+# axis: once a PR is closed (merged or otherwise), nothing should
+# ever reference its diff PNGs again, so we delete the `pr-<n>/`
+# folder.
+#
+# Tradeoffs of doing it event-driven (this workflow) vs. scheduled:
+#   + Atomic — cleanup fires once per close, no batch traversal of
+#     all `pr-*` folders.
+#   + Simple — no GitHub API calls to determine PR state; the
+#     event payload IS the source of truth.
+#   - Misses abandoned-but-never-closed PRs. A long-lived
+#     never-closed PR's folder will linger. For this project's
+#     volume that's negligible; if it ever stops being so a
+#     periodic scheduled GC can be added on top with no rework
+#     here.
+#
+# `workflow_dispatch` is the manual-catchup escape hatch: if a
+# `pull_request: closed` event ever fired during a transient git
+# failure (push collision retry exhausted, etc.) the maintainer
+# can re-run cleanup for a specific PR number from the Actions UI.
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number whose pr-<n>/ folder to delete from snapshot-previews"
+        required: true
+        type: string
+
+# contents: write is the ONLY permission we need — push the
+# cleanup commit to the snapshot-previews orphan branch. The PR
+# number comes from the event payload (or the workflow_dispatch
+# input), so no pull-requests / API permissions are required.
+permissions:
+  contents: write
+
+env:
+  # Single source of truth for the branch name. Must match the
+  # PREVIEW_BRANCH env in build-and-release.yml (the workflow that
+  # writes to this branch). Drift would mean this GC step targets
+  # a branch nobody writes to — silent no-op.
+  PREVIEW_BRANCH: snapshot-previews
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+
+    # Skip fork PRs. build-and-release.yml gates its writes to
+    # snapshot-previews on `head.repo.full_name == github.repository`,
+    # so a fork PR never created a pr-<n>/ folder we'd have to
+    # clean up. workflow_dispatch always runs — the manual trigger
+    # implies the maintainer knows which PR they're targeting.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Remove PR folder from snapshot-previews
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Defence-in-depth sanitisation. For pull_request the
+          # platform guarantees PR_NUMBER is an int; for
+          # workflow_dispatch the input is free-form text typed by
+          # a maintainer in the Actions UI, so strip everything
+          # that isn't a digit before using it in a path.
+          PR_NUMBER="${PR_NUMBER//[^0-9]/}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::PR_NUMBER resolved to empty after sanitisation."
+            exit 1
+          fi
+
+          # Authentication: same extraheader + HTTP Basic pattern
+          # as build-and-release.yml's push step. See the long
+          # comment there for the rationale (bearer is REST-only;
+          # git operations require Basic with the token wrapped as
+          # the password). Keeping the token out of the remote URL
+          # avoids leaking it into `git remote -v` / `git config
+          # --list` output / any error message that echoes the
+          # remote.
+          PREVIEW_DIR="$(mktemp -d)"
+          cd "$PREVIEW_DIR"
+          git init -q
+          git remote add origin "${GITHUB_SERVER_URL}/${REPO}.git"
+          BASIC_AUTH=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')
+          git config --local http.extraheader "AUTHORIZATION: basic ${BASIC_AUTH}"
+          unset BASIC_AUTH
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Branch may not exist yet on a fresh repo (no snapshot
+          # test failure has ever fired) or after a manual wipe.
+          # Nothing to GC in either case — exit cleanly.
+          if ! git ls-remote --exit-code --heads origin "$PREVIEW_BRANCH" >/dev/null 2>&1; then
+            echo "$PREVIEW_BRANCH does not exist on remote — nothing to GC."
+            exit 0
+          fi
+
+          git fetch --depth=1 origin "$PREVIEW_BRANCH"
+          git checkout -q "$PREVIEW_BRANCH"
+
+          PR_PREFIX="pr-${PR_NUMBER}"
+          if [ ! -d "$PR_PREFIX" ]; then
+            echo "No $PR_PREFIX folder on $PREVIEW_BRANCH — PR never failed a snapshot test, nothing to do."
+            exit 0
+          fi
+
+          # `git rm -rqf` records the deletion in the staged tree
+          # (vs `rm -rf` which would leave git unaware that the
+          # files are gone). -q to keep the log readable when a
+          # PR folder contains many run-attempt subdirectories.
+          git rm -rqf "$PR_PREFIX"
+          git commit -m "gc: remove snapshot diff folder for closed PR #${PR_NUMBER}"
+
+          # Single retry on push collision. The most likely
+          # collision source is build-and-release.yml's failure-
+          # path push running concurrently for an actively-failing
+          # PR. Rare on a close event (closing the PR usually
+          # cancels CI via the concurrency block in build-and-
+          # release.yml), but handle defensively. On retry-exhaust
+          # we warn and exit 0 — the orphan folder stays in place
+          # and can be cleaned up via workflow_dispatch later.
+          if ! git push origin "$PREVIEW_BRANCH"; then
+            echo "Push collided — rebasing and retrying..."
+            git fetch origin "$PREVIEW_BRANCH"
+            if ! git rebase "origin/$PREVIEW_BRANCH"; then
+              git rebase --abort 2>/dev/null || true
+              echo "::warning::Rebase failed; $PR_PREFIX left in place. Re-trigger via workflow_dispatch on PR #${PR_NUMBER}."
+              exit 0
+            fi
+            if ! git push origin "$PREVIEW_BRANCH"; then
+              echo "::warning::Push retry failed; $PR_PREFIX left in place. Re-trigger via workflow_dispatch on PR #${PR_NUMBER}."
+              exit 0
+            fi
+          fi
+
+          echo "Deleted $PR_PREFIX from $PREVIEW_BRANCH."

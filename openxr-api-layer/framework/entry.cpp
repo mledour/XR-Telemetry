@@ -109,3 +109,33 @@ XrResult __declspec(dllexport) XRAPI_CALL
     return XR_SUCCESS;
 }
 }
+
+// -----------------------------------------------------------------------------
+// DllMain — register the ETW provider for the layer's lifetime.
+//
+// g_traceProvider is DEFINED in log.cpp (TRACELOGGING_DEFINE_PROVIDER) but that
+// only allocates the handle + GUID; it does NOT connect the provider to ETW.
+// Without a runtime TraceLoggingRegister, the provider stays inert: every
+// TraceLoggingWrite in the layer (xrNegotiate, the generated xrEndFrame
+// Start/Stop activities, the overlay-spike spans) is a silent no-op, and a WPR
+// session enabling the provider GUID captures nothing — which is exactly the
+// empty trace we hit. The canonical fix for a DLL is to register on
+// PROCESS_ATTACH / unregister on PROCESS_DETACH; TraceLoggingRegister is
+// documented as safe to call under loader lock. DisableThreadLibraryCalls drops
+// the per-thread ATTACH/DETACH callbacks we don't use.
+//
+// NOTE: this is THE DllMain for the layer DLL (there was none before). If a
+// future change needs more PROCESS_ATTACH work, add it here.
+// -----------------------------------------------------------------------------
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hModule);
+        TraceLoggingRegister(openxr_api_layer::log::g_traceProvider);
+        break;
+    case DLL_PROCESS_DETACH:
+        TraceLoggingUnregister(openxr_api_layer::log::g_traceProvider);
+        break;
+    }
+    return TRUE;
+}

@@ -1,6 +1,6 @@
 // MIT License
 //
-// Copyright (c) <<YEAR>> <<AUTHOR_NAME>>
+// Copyright (c) 2026 Michael Ledour
 //
 // Based on https://github.com/mbucchia/OpenXR-Layer-Template.
 // Copyright (c) 2022-2023 Matthieu Bucchianeri
@@ -39,6 +39,8 @@
 // File Explorer properties.
 #include "version.h"
 
+#include <memory>
+
 namespace openxr_api_layer {
 
     const std::string LayerName = LAYER_NAME;
@@ -47,6 +49,31 @@ namespace openxr_api_layer {
     // Singleton accessor used by framework/dispatch.cpp to dispatch
     // intercepted calls to your OpenXrLayer subclass.
     OpenXrApi* GetInstance();
+
+    // Forward declaration for the test seam below; the full renderer
+    // interface lives in utils/overlay_renderer.h.
+    namespace detail { class OverlayRenderer; }
+
+    // Test-only seam: force the singleton's overlay into the active state
+    // with the given (typically mock) renderer + view-space handle, as if
+    // xrCreateSession had built a D3D-backed overlay. Lets the headless
+    // integration tests drive the xrEndFrame overlay fanout / layer-
+    // injection and the teardown paths, which otherwise need a real GPU
+    // device + an OpenXR swapchain. No effect in production (never called).
+    //
+    // Pass a non-null `localSpace` to also drive the world-locked anchor
+    // path: the layer then locates `viewSpace` in `localSpace` at the next
+    // frame and freezes the quad there. Defaults keep the stock head-locked
+    // behaviour so existing call sites are unaffected.
+    void ForceOverlayActiveForTest(
+        std::unique_ptr<detail::OverlayRenderer> renderer, XrSpace viewSpace,
+        XrSpace localSpace = XR_NULL_HANDLE);
+
+    // Test-only seam: read the layer singleton's monotonic frame counter. Used
+    // to assert that an un-activated hotkey overlay suspends per-frame
+    // collection — a suspended frame never advances the counter. No effect in
+    // production (never called).
+    uint64_t FrameIndexForTest();
 
     // The path where the DLL is loaded from (e.g. to find a data file
     // shipped next to the DLL in the install directory).

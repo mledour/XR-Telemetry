@@ -1,0 +1,284 @@
+name: Update overlay snapshot golden
+
+# Manual workflow to regenerate screenshots/overlay_snapshot.png on a
+# branch where the renderer has been intentionally changed and the
+# baked-in visual-regression test now fails the pixel diff.
+#
+# Usage:
+#   1. Push your renderer change to a feature branch and confirm the
+#      regular CI fails with "snapshot diverges from golden: N pixels
+#      differ; first at (x=…, y=…)".
+#   2. From the GitHub Actions tab, pick this workflow → "Run workflow"
+#      → select your branch in the ref dropdown → leave `commit` set
+#      to false (the default) → "Run workflow".
+#   3. Download the artifact `overlay-snapshot-regen-<branch>` and
+#      visually compare the new render against the existing golden.
+#      Both files are inside the artifact so a 2-pane image viewer is
+#      enough to spot what changed.
+#   4. If the new render is what you want, re-run the workflow with
+#      the `commit` checkbox TICKED. The bot will overwrite
+#      screenshots/overlay_snapshot.png on the source branch and
+#      push the commit; the normal CI then re-runs and the snapshot
+#      test passes against the new baseline.
+#
+# Why a 2-step flow (dry-run → commit) instead of a single click:
+# the golden is the visual contract for the HUD. An accidental click
+# on "Run workflow" silently overwriting the file would let layout /
+# colour regressions sneak in. Forcing a deliberate second click
+# after eyeballing the artifact is a 30-second safety net.
+#
+# Only collaborators with write access to the repo can trigger
+# workflow_dispatch — GitHub gates this by default. The token used to
+# push back is the workflow's GITHUB_TOKEN (contents:write below),
+# which inherits branch-protection rules: a protected branch (e.g.
+# main) WILL refuse the push. That's a feature — golden updates
+# should land via a PR, not a direct push to main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit + push the new golden to the source branch (uncheck for dry-run preview via artifact)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  # contents:write lets the workflow push the regenerated golden back
+  # to the source branch via GITHUB_TOKEN. Without this the final
+  # `git push` returns 403. Read-only is enough for the dry-run
+  # branch — bumping the whole workflow to write is still safe
+  # because the only place we write is the gated commit step below.
+  contents: write
+
+env:
+  SOLUTION: XR_APILAYER_MLEDOUR_xr_telemetry.sln
+
+jobs:
+  regenerate:
+    name: Regenerate overlay snapshot golden
+    runs-on: windows-2022
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # fetch-depth: 0 so `git push` doesn't have to round-trip
+          # for the upstream branch's history if branch-protection
+          # status checks need it. Same cost as the main workflow.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore "${{ env.SOLUTION }}"
+
+      # Placeholder LAYER_VERSION so the layer .vcxproj's pre-build
+      # Generate-VersionRc.ps1 step has a value to bake. We don't
+      # produce release artifacts on this workflow — the version
+      # string is irrelevant to the snapshot output (the renderer
+      # doesn't read it).
+      - name: Set placeholder layer version
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          "LAYER_VERSION=0.0.0-dev-$shortSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Release build only (Debug is unnecessary — the snapshot test
+      # produces bit-identical output across configurations because
+      # the entire WIC + D2D pipeline is software).
+      - name: Build Release | x64
+        run: >-
+          msbuild "${{ env.SOLUTION }}"
+          /p:Configuration=Release
+          /p:Platform=x64
+          /m
+          /verbosity:minimal
+          /nologo
+
+      # Run the test runner. We deliberately do NOT propagate the exit
+      # code: the snapshot CHECK is expected to fail when the golden
+      # is stale (which is the whole reason we're here). overlay_snapshot.png
+      # is written to disk BEFORE the comparison check, so the fresh
+      # render is always available regardless of exit status.
+      #
+      # The other 180+ tests still run as a sanity gate — if any of
+      # them fails (real regression unrelated to the snapshot) the
+      # output will surface it in the job log, and the maintainer
+      # can decide to abort regeneration.
+      #
+      # GitHub Actions runner trap: the `shell: pwsh` runtime
+      # appends the following suffix to every user script:
+      #
+      #     if ((Test-Path -LiteralPath variable:\LASTEXITCODE))
+      #         { exit $LASTEXITCODE }
+      #
+      # So even when the user script's own statements complete
+      # successfully (the Write-Host below proves it ran), this
+      # injected suffix picks up the test binary's exit code from
+      # $LASTEXITCODE and propagates it as the step's exit code —
+      # marking the step as failed and skipping every downstream
+      # step.
+      #
+      # Adding an explicit `exit 0` here pre-empts the injected
+      # suffix: the script terminates with a clean exit BEFORE the
+      # runner's wrapper runs, so GitHub Actions sees the step as
+      # successful — which is what "regeneration mode does not gate
+      # on this" promises.
+      #
+      # (Alternative: `$global:LASTEXITCODE = 0` would also work and
+      # is preferable if more statements were ever added after the
+      # test runner — `exit 0` would silently skip them. With
+      # nothing else following, `exit 0` is the clearer intent.)
+      #
+      # First observed on run 26281392401 — Write-Host printed
+      # `Test runner finished (exit code 1; regeneration mode does
+      # not gate on this)`, then immediately after,
+      # `##[error]Process completed with exit code 1`.
+      - name: Run test suite (writes overlay_snapshot.png; ignores snapshot comparison failure)
+        shell: pwsh
+        run: |
+          $exe = "bin\x64\Release\openxr-api-layer-tests.exe"
+          if (-not (Test-Path $exe)) { throw "Test binary missing at $exe" }
+          & $exe --reporters=console --force-colors
+          Write-Host "Test runner finished (exit code $LASTEXITCODE; regeneration mode does not gate on this)"
+          exit 0
+
+      - name: Verify the fresh PNG was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path overlay_snapshot.png)) {
+            throw @"
+          overlay_snapshot.png was not produced by the test.
+          Likely cause: the snapshot TEST_CASE bailed at an earlier REQUIRE
+          (CoInitializeEx / WIC factory / D2D factory / renderOverlayToTarget)
+          before the PNG encoder ran. Check the test log above for the
+          first FATAL ERROR — fix that, then re-run this workflow.
+          "@
+          }
+          $sz = (Get-Item overlay_snapshot.png).Length
+          Write-Host "Fresh overlay_snapshot.png: $sz bytes"
+
+      # Hash both the existing golden and the freshly-rendered PNG to
+      # decide whether there's anything to update. SHA256 because Git
+      # compares file content the same way and a hash mismatch IS the
+      # ground truth — anything weaker (file size, mtime) would
+      # produce false positives.
+      - name: Compare new PNG with current golden
+        shell: pwsh
+        id: diff
+        run: |
+          if (Test-Path screenshots/overlay_snapshot.png) {
+            $oldHash = (Get-FileHash screenshots/overlay_snapshot.png -Algorithm SHA256).Hash
+            $newHash = (Get-FileHash overlay_snapshot.png -Algorithm SHA256).Hash
+            Write-Host "Old golden SHA256: $oldHash"
+            Write-Host "New render SHA256: $newHash"
+            if ($oldHash -eq $newHash) {
+              Write-Host "::notice::Golden already matches the fresh render — nothing to update."
+              "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            } else {
+              Write-Host "::notice::Fresh render differs from current golden."
+              "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            }
+          } else {
+            Write-Host "::notice::No existing golden — first-time seed."
+            "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      # Stage a renamed copy of the current golden so the artifact has
+      # both files at distinguishable paths (otherwise the upload
+      # collapses two files named overlay_snapshot.png into a folder).
+      # Reviewer downloads the artifact, sees `new/overlay_snapshot.png`
+      # and `old/overlay_snapshot.png`, diffs them in their image
+      # viewer of choice.
+      - name: Stage before/after for artifact
+        if: steps.diff.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact/new | Out-Null
+          New-Item -ItemType Directory -Force -Path artifact/old | Out-Null
+          Copy-Item overlay_snapshot.png artifact/new/overlay_snapshot.png
+          if (Test-Path screenshots/overlay_snapshot.png) {
+            Copy-Item screenshots/overlay_snapshot.png artifact/old/overlay_snapshot.png
+          }
+
+          # actions/upload-artifact@v4 rejects names containing any of
+          # / \ : * ? " < > | (NTFS path-illegal chars). For
+          # workflow_dispatch on a branch like `feat/overlay-font`,
+          # github.ref_name IS the branch name verbatim — so any slash
+          # in the convention (feat/, ci-test/, fix/, …) breaks the
+          # upload below. Same sanitisation as build-and-release.yml's
+          # snapshot-diff artifact (see PR #18) — replace anything that
+          # isn't [A-Za-z0-9-_.] with a dash, publish as ARTIFACT_REF_TAG
+          # for the upload step.
+          $rawRef = '${{ github.ref_name }}'
+          $safeRef = $rawRef -replace '[^a-zA-Z0-9\-_.]', '-'
+          Write-Host "ref_name raw='$rawRef' sanitised='$safeRef'"
+          "ARTIFACT_REF_TAG=$safeRef" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload before / after PNGs for review
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          # ARTIFACT_REF_TAG comes from the staging step above — it's
+          # github.ref_name sanitised against actions/upload-artifact
+          # @v4's naming rules. Branch name in the tag so a reviewer
+          # can tell at a glance which session produced the artifact
+          # when several regenerations have happened on different
+          # branches.
+          name: overlay-snapshot-regen-${{ env.ARTIFACT_REF_TAG }}
+          path: artifact/
+          if-no-files-found: warn
+
+      # Gated step: only fires when the user ticked the commit
+      # checkbox AND the PNG actually changed. Dry-run preserves the
+      # repo untouched.
+      - name: Commit + push new golden
+        if: steps.diff.outputs.changed == 'true' && inputs.commit == true
+        shell: bash
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p screenshots
+          cp overlay_snapshot.png screenshots/overlay_snapshot.png
+
+          # Identify the bot — matches GitHub Actions' canonical
+          # web UI labelling. The 41898282 ID is the global
+          # github-actions[bot] account; using the noreply email
+          # avoids surfacing a real maintainer address.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add screenshots/overlay_snapshot.png
+          git commit -m "test(overlay): regenerate snapshot golden via workflow_dispatch
+
+          Regenerated screenshots/overlay_snapshot.png from a manual run of the
+          'Update overlay snapshot golden' workflow on branch '${GITHUB_REF_NAME}'.
+          The fresh render now becomes the new visual-regression baseline;
+          the next normal CI run on this branch will confirm the snapshot
+          test passes against it.
+
+          Co-Authored-By: github-actions[bot] <noreply@github.com>"
+          git push
+
+      - name: Dry-run summary (changes detected but not committed)
+        if: steps.diff.outputs.changed == 'true' && inputs.commit != true
+        shell: pwsh
+        run: |
+          Write-Host "::notice::Dry-run mode — new golden NOT committed. Download the 'overlay-snapshot-regen-${{ github.ref_name }}' artifact above to compare new/ vs old/, then re-run with the 'commit' checkbox enabled to apply."
+
+      - name: No-op summary (golden already matches)
+        if: steps.diff.outputs.changed == 'false'
+        shell: pwsh
+        run: |
+          Write-Host "::notice::Fresh render matches the committed golden byte-for-byte. Nothing to update."

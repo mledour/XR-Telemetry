@@ -1,0 +1,284 @@
+// MIT License
+//
+// Copyright(c) 2025 Michael Ledour
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#pragma once
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+#include <d3d11.h>
+#include <wrl/client.h>
+
+#include "glyph_atlas.h"
+#include "instanced_batch.h"
+
+namespace openxr_api_layer::utils::glyph_atlas {
+
+    // ===================================================================
+    // GlyphAtlas Renderer — D3D11 pipeline that paints text by sampling a
+    // pre-baked glyph atlas. Replaces the per-character D2D drawText /
+    // DrawTextLayout path inside the overlay's hot frame.
+    //
+    // Lifecycle:
+    //   * init(device, ctx, renderTarget, atlas) — reads the atlas
+    //     BuildResult by const-ref: creates a GPU texture from the R8
+    //     bitmap, copies the glyph + metrics tables, and primes the
+    //     pipeline state (VS/PS, input layout, sampler, blend, RTV
+    //     from the supplied target texture). The atlas can be shared
+    //     across multiple renderers on different D3D11 devices.
+    //   * One frame is up to two batches — static (labels / titles,
+    //     baked once) and dynamic (values, rebuilt each version bump):
+    //         beginStaticBatch();  drawRun(...); ...   // once, cached
+    //         beginDynamicBatch(); drawRun(...); ...   // every bump
+    //         flush();
+    //     begin*Batch clears + targets that tier's scratch; drawRun
+    //     appends one TextInstance per glyph to the active tier; flush
+    //     uploads static-then-dynamic contiguously in one DISCARD-mapped
+    //     write + a single DrawInstanced. The pipeline state is set inside
+    //     flush() — the renderer assumes the caller (bars / external
+    //     paint) has clobbered everything.
+    //
+    // Coordinate convention:
+    //   * Destination space matches the rest of the overlay: pixel-space
+    //     on a (kTexW × kTexH) target, top-left origin, Y down. The VS
+    //     handles the Y-flip into clip space.
+    //   * `penX` is the absolute pixel X of the FIRST glyph's left side;
+    //     `baselineY` is the absolute pixel Y of the baseline. drawRun
+    //     advances internally by each glyph's `advanceX` from the atlas
+    //     table and returns the final pen position so the caller can
+    //     chain runs (e.g. mixed Rajdhani + Rajdhani on one line).
+    //   * Alignment isn't done inside drawRun. The caller picks the
+    //     anchor: LEADING is penX directly; TRAILING is penX = anchorX -
+    //     measure(...); CENTER is penX = anchorX - 0.5 * measure(...).
+    //     This mirrors how D2D's TEXT_ALIGNMENT_TRAILING / _CENTER are
+    //     resolved at the layout level, kept explicit here so layout
+    //     code can mix faces inside a single anchored block.
+    //
+    // Thread model:
+    //   * All public methods touch the immediate D3D11 context captured
+    //     at init() time. Same constraint as the rest of the overlay —
+    //     paint happens on the xrEndFrame thread, no cross-thread use.
+    // ===================================================================
+    class Renderer {
+      public:
+        // -------- Lifecycle --------------------------------------------
+        //
+        // `dstWidth` / `dstHeight` are the fixed pixel dimensions of
+        // the render target(s) the renderer paints into; they
+        // pre-populate the cbuffer's texSize. The actual RTV is
+        // supplied per-flush (not stored), so one pipeline can serve
+        // the in-engine paint texture / shim and the snapshot test's
+        // own texture.
+        //
+        // `atlas` is taken by const-ref: each renderer creates its own
+        // ID3D11Texture2D from the bitmap (the bitmap copy happens via
+        // CreateTexture2D's SUBRESOURCE_DATA — D3D11 reads it once and
+        // owns the GPU copy), and copies the glyph + metrics tables.
+        // This lets a single BuildResult (typically built once on
+        // CoreRenderer's DirectWrite factory) feed multiple renderers
+        // sitting on different ID3D11Devices — today the app-D3D11
+        // device and the D3D11-on-12 shim device, tomorrow potentially
+        // additional debug viewers.
+        //
+        // `renderWidth` / `renderHeight` are the PHYSICAL render-target
+        // (swapchain image / viewport) dimensions. They differ from
+        // dstWidth/dstHeight — the LOGICAL design space the cbuffer's
+        // texSize uses — only when the overlay is supersampled. Default 0
+        // means "= dst" (supersample factor 1.0): the legacy path, and what
+        // the snapshot/golden test uses, so its goldens stay byte-stable.
+        // When they differ, the atlas passed in MUST have been baked at the
+        // physical glyph sizes (CoreRenderer::init does this with the same
+        // factor) — the renderer looks glyphs up at the physical size and
+        // folds the factor back out into logical dest rects + metrics.
+        //
+        // Returns false on any pipeline-creation failure. Caller logs +
+        // degrades to bypass — never crashes the host.
+        bool init(Microsoft::WRL::ComPtr<ID3D11Device>          device,
+                  Microsoft::WRL::ComPtr<ID3D11DeviceContext>   ctx,
+                  UINT                                          dstWidth,
+                  UINT                                          dstHeight,
+                  const BuildResult&                            atlas,
+                  UINT                                          renderWidth  = 0,
+                  UINT                                          renderHeight = 0);
+
+        bool isReady() const noexcept { return m_ready; }
+
+        // -------- Batched draw ----------------------------------------
+        //
+        // Two scratch tiers so static text (labels / titles, laid out
+        // once) survives across version bumps while only the dynamic
+        // text (values) is re-laid-out each bump. flush() uploads both
+        // contiguously in one DrawInstanced. beginStaticBatch clears +
+        // targets the static scratch; beginDynamicBatch clears + targets
+        // the dynamic one. drawRun appends to whichever was last selected
+        // (dynamic by default, so a stray drawRun can't corrupt the
+        // cached static layout).
+        void beginStaticBatch() noexcept;
+        void beginDynamicBatch() noexcept;
+
+        // Emit one glyph quad per character. Missing glyphs (no entry in
+        // the atlas table) advance the pen by a fallback width but emit
+        // no instance — keeps a stray Unicode codepoint from blocking
+        // the whole frame. Returns the pen position after the run.
+        float drawRun(GlyphFace            face,
+                      uint16_t             sizePx,
+                      float                penX,
+                      float                baselineY,
+                      const wchar_t*       s,
+                      std::size_t          n,
+                      const float          color[4]);
+
+        // std::wstring convenience overload — most callers already have
+        // a wstring on hand.
+        float drawRun(GlyphFace            face,
+                      uint16_t             sizePx,
+                      float                penX,
+                      float                baselineY,
+                      const std::wstring&  s,
+                      const float          color[4]) {
+            return drawRun(face, sizePx, penX, baselineY,
+                            s.c_str(), s.size(), color);
+        }
+
+        // -------- Layout helpers --------------------------------------
+        //
+        // Measure the total advance of a string at (face, sizePx) — the
+        // sum of each glyph's advanceX. Used by the caller to compute
+        // TRAILING / CENTER anchors before calling drawRun.
+        float measure(GlyphFace      face,
+                      uint16_t       sizePx,
+                      const wchar_t* s,
+                      std::size_t    n) const;
+
+        // Per-(face, sizePx) baseline metrics — ascent / descent / line
+        // gap / cap height, in pixels. Returns nullptr if the (face,
+        // sizePx) wasn't baked into the atlas. Callers use ascent to
+        // turn a "top-of-text Y" into a baseline Y.
+        const FaceMetrics* metrics(GlyphFace face, uint16_t sizePx) const;
+
+        // -------- Flush -----------------------------------------------
+        //
+        // Sets the full pipeline state on the immediate context
+        // (targeting `rtv`) and emits one DrawInstanced for all queued
+        // instances. Returns true on success (incl. an empty no-op),
+        // false only on a real GPU failure (buffer-grow / Map) — the
+        // caller uses that to suppress a frame that would otherwise
+        // composite over a freshly-cleared target.
+        bool flush(ID3D11RenderTargetView* rtv);
+
+      private:
+        // CPU-side mirror of the per-instance vertex data — must match
+        // the HLSL `TextVSInput` semantics byte-for-byte (see
+        // overlay_text.hlsli).
+        struct TextInstance {
+            float rect[4];     // dest x, y, w, h (pixels)
+            float uvRect[4];   // atlas u, v, w, h (pixels)
+            float color[4];    // straight-alpha RGBA
+        };
+
+        // Cbuffer mirror — two 16-byte registers. reg0 = texSize + atlasSize
+        // (2× float2); reg1 = supersample + pad. Must match overlay_text.hlsli.
+        struct TextConstants {
+            float texSize[2];     // dest tex (kTexW, kTexH)
+            float atlasSize[2];   // atlas (atlasWidth, atlasHeight)
+            float supersample;    // = m_ss; PS gates its corrections on > 1
+            float pad[3];
+        };
+        static_assert(sizeof(TextConstants) == 32,
+                      "TextConstants must mirror overlay_text.hlsli's cbuffer "
+                      "(2 x float4 = 32 B); the immutable cbuffer relies on it");
+
+        // Instance-buffer sizing, handed to m_batch (InstancedBatchBuffer),
+        // which owns the power-of-two growth + DISCARD-map upload. Initial
+        // GPU capacity / dynamic-tier vector reserve, the static-tier vector
+        // reserve, and the hard cap (runaway-growth guard).
+        static constexpr UINT kInitialInstances       = 1024;   // ~48 KB (dynamic tier reserve)
+        static constexpr UINT kInitialStaticInstances = 256;    // labels / titles reserve
+        static constexpr UINT kMaxInstances           = 65536;  // ~3 MB
+
+        bool createPipeline();              // shaders + input layout + states
+        bool createBuffers();               // VB + IB + CB
+        bool createAtlasTexture(const BuildResult& atlas);
+
+        // Map a fallback advance for a missing glyph: use ' ' at the same
+        // (face, sizePx). If even that's missing, return 0 — the caller's
+        // string just collapses on that glyph.
+        float fallbackAdvance(GlyphFace face, uint16_t sizePx) const;
+
+        bool m_ready = false;
+
+        Microsoft::WRL::ComPtr<ID3D11Device>           m_device;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext>    m_ctx;
+        // LOGICAL target dimensions snapshotted at init for the cbuffer's
+        // texSize (the design space layout code positions text in).
+        UINT                                            m_dstW = 0;
+        UINT                                            m_dstH = 0;
+        // PHYSICAL render dimensions (viewport) and the derived supersample
+        // factor m_ss = renderW / dstW. At m_ss == 1 the renderer is the
+        // legacy path: glyphs looked up + emitted at the logical size, no
+        // metric folding, viewport == texSize.
+        UINT                                            m_renderW = 0;
+        UINT                                            m_renderH = 0;
+        float                                           m_ss      = 1.0f;
+
+        Microsoft::WRL::ComPtr<ID3D11VertexShader>     m_vs;
+        Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;
+        Microsoft::WRL::ComPtr<ID3D11InputLayout>      m_layout;
+
+        Microsoft::WRL::ComPtr<ID3D11Buffer>           m_quadVB;
+        // Dynamic instance VB + its growth + DISCARD-map upload, shared
+        // with chrome_shapes::Renderer (see instanced_batch.h). Holds the
+        // static + dynamic glyph tiers, uploaded contiguously in one flush.
+        InstancedBatchBuffer                           m_batch;
+        Microsoft::WRL::ComPtr<ID3D11Buffer>           m_cb;
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>          m_atlasTex;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_atlasSRV;
+        Microsoft::WRL::ComPtr<ID3D11SamplerState>       m_sampler;
+        Microsoft::WRL::ComPtr<ID3D11BlendState>         m_blend;
+        Microsoft::WRL::ComPtr<ID3D11RasterizerState>    m_raster;
+
+        // Atlas tables — populated by init from BuildResult, queried
+        // every drawRun / measure / metrics call. unordered_map is hot;
+        // the GlyphKey is a packed uint32_t (cheap hash).
+        std::unordered_map<GlyphKey, GlyphInfo>         m_glyphs;
+        std::unordered_map<FaceMetricsKey, FaceMetrics> m_faceMetrics;
+
+        // Atlas pixel dimensions, snapshotted for the cbuffer.
+        uint16_t m_atlasW = 0;
+        uint16_t m_atlasH = 0;
+
+        // Scratch storage for queued instances, split into two tiers.
+        // m_staticScratch holds the labels / titles laid out once and
+        // reused across version bumps; m_dynamicScratch holds the values,
+        // cleared + rebuilt each bump. flush() uploads static then dynamic
+        // contiguously in a single DrawInstanced. m_activeStatic selects
+        // which one drawRun appends to (set by beginStaticBatch /
+        // beginDynamicBatch); defaults to the dynamic tier so a stray
+        // drawRun can never corrupt the cached static layout.
+        std::vector<TextInstance> m_staticScratch;
+        std::vector<TextInstance> m_dynamicScratch;
+        bool                      m_activeStatic = false;
+    };
+
+}   // namespace openxr_api_layer::utils::glyph_atlas

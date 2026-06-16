@@ -38,8 +38,54 @@
     <ClInclude Include="framework\util.h">
       <Filter>Framework</Filter>
     </ClInclude>
-    <!-- Place your layer-specific headers under utils\ and add them
-         here under <Filter>Utilities</Filter>. -->
+    <ClInclude Include="telemetry_internals.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\chrome_shape_renderer.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\default_settings_template.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\glyph_atlas.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\glyph_atlas_renderer.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\cpu_usage.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\gpu_telemetry.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\histogram_ring.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\hotkey.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\instanced_batch.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\name_utils.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_aggregator.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_cadence.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_layout.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\overlay_renderer.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\settings.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
@@ -60,6 +106,27 @@
     <ClCompile Include="framework\log.cpp">
       <Filter>Framework</Filter>
     </ClCompile>
+    <ClCompile Include="utils\chrome_shape_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\glyph_atlas.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\glyph_atlas_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\cpu_usage.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\gpu_telemetry.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\my_logic.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\overlay_renderer.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
     <!-- Place your layer-specific .cpp files under utils\ and add them
          here under <Filter>Utilities</Filter>. -->
   </ItemGroup>
@@ -72,8 +139,8 @@
     <None Include="framework\layer_apis.py">
       <Filter>Framework</Filter>
     </None>
-    <None Include="XR_APILAYER_NOVENDOR_template.json" />
-    <None Include="XR_APILAYER_NOVENDOR_template-32.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry.json" />
+    <None Include="XR_APILAYER_MLEDOUR_xr_telemetry-32.json" />
     <None Include="packages.config" />
     <None Include="module.def" />
     <None Include="openxr-api-layer.rc.in">
@@ -82,6 +149,41 @@
     <None Include="version.h.in">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="shaders\overlay_bars.hlsli">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="shaders\overlay_quad.hlsli">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="shaders\overlay_text.hlsli">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="fonts\Rajdhani-SemiBold.ttf">
+      <Filter>Assets</Filter>
+    </None>
+    <None Include="fonts\OFL.txt">
+      <Filter>Assets</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="shaders\overlay_bars_vs.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_bars_ps.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_vs.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_quad_ps.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_vs.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\overlay_text_ps.hlsl">
+      <Filter>Assets</Filter>
+    </FxCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="openxr-api-layer.rc">

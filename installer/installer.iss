@@ -1,4 +1,4 @@
-; installer.iss — Inno Setup script for XR_APILAYER_NOVENDOR_template
+; installer.iss — Inno Setup script for XR_APILAYER_MLEDOUR_xr_telemetry
 ;
 ; Builds a single-file Setup.exe that:
 ;   1. Copies the DLL + JSON manifest to Program Files (correct ACLs for
@@ -12,7 +12,7 @@
 ; The /DMyAppVersion flag is mandatory for tagged builds; for local dev
 ; builds without it, the fallback "0.0.0-dev" is used.
 
-#define MyAppName "XR_APILAYER_NOVENDOR_template"
+#define MyAppName "XR_APILAYER_MLEDOUR_xr_telemetry"
 
 ; Accept version from the ISCC command line (/DMyAppVersion=x.y.z).
 ; Fall back to a dev placeholder when compiling interactively.
@@ -22,16 +22,23 @@
 
 [Setup]
 ; AppId is a fixed GUID that identifies this product across upgrades.
-; Do NOT change it between releases — Inno Setup uses it to detect an
-; existing installation and offer an upgrade instead of a side-by-side.
-AppId={{60C13550-5D5E-446A-BD00-E85112A7D6A2}
+; Do NOT change it between releases of THIS layer — Inno Setup uses it
+; to detect an existing installation and offer an upgrade instead of a
+; side-by-side. DO change it when forking the template into a new
+; layer: two products sharing the same AppId make Inno Setup treat the
+; second install as an upgrade of the first, planting your DLL in the
+; OTHER layer's install dir (e.g. xr_telemetry's setup ended up under
+; OpenXR-Layer-fov-crop because both inherited the template's GUID
+; verbatim). Generate a fresh one with `[guid]::NewGuid()` /
+; `uuidgen` when you spin off a new layer from this template.
+AppId={{9E4F9A36-4E64-4EDD-B8B1-17AF01C22B0F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
-AppPublisher=<<AUTHOR_NAME>>
-AppPublisherURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>
-AppSupportURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>/issues
-DefaultDirName={autopf}\OpenXR-Layer-<<LAYER_NAME>>
+AppPublisher=Michael Ledour
+AppPublisherURL=https://github.com/mledour/XR-Telemetry
+AppSupportURL=https://github.com/mledour/XR-Telemetry/issues
+DefaultDirName={autopf}\XR-Telemetry
 ; No Start Menu group — this layer has no user-facing executable.
 DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE
