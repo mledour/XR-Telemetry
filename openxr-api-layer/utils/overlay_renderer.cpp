@@ -141,11 +141,11 @@ namespace openxr_api_layer::detail {
         //   kFrameStroke         (2)
         //   inner padding        (4)   ← see kInnerT below
         //   kHeaderHeight       (90)
-        //   kSectionGap          (8)
-        //   kFrametimeHeight   (100) — GPU panel
-        //   kSectionGap          (8)
-        //   kFrametimeHeight   (100) — CPU panel
-        //   kSectionGap          (8)
+        //   kSectionGap          (4)
+        //   kFrametimeHeight   (106) — GPU panel
+        //   kSectionGap          (4)
+        //   kFrametimeHeight   (106) — CPU panel
+        //   kSectionGap          (4)
         //   kBottomHeight       (90)
         //   inner padding        (4)
         //   kFrameStroke         (2)
@@ -236,7 +236,16 @@ namespace openxr_api_layer::detail {
 
         constexpr float kOuterPad       = 10.0f;
         constexpr float kFrameStroke    = 2.0f;
-        constexpr float kSectionGap     =  8.0f;
+        constexpr float kSectionGap     =  4.0f;  // gap between every framed box; set
+                                                  // equal to the outer frame's inner
+                                                  // padding (the +4 in kInnerL/T below)
+                                                  // so the inter-box gaps and the frame-
+                                                  // to-content margin read identically.
+                                                  // The 12 px reclaimed from the old 8 px
+                                                  // (3 vertical band gaps) is absorbed by
+                                                  // the two frametime panels (see
+                                                  // kFrametimeHeight) so the budget still
+                                                  // sums to kTexH.
         constexpr float kSectionInnerPad = 12.0f;  // padding INSIDE each panel
 
         // Thin structural line width — panel borders, column separators, AND
@@ -272,15 +281,16 @@ namespace openxr_api_layer::detail {
         // plus paragraph-centring margins on both. Without the bump,
         // the FPS glyph's descender clipped at the panel bottom.
         constexpr float kHeaderHeight     = 90.0f;
-        constexpr float kFrametimeHeight  = 100.0f;  // strip height ≈ 52 px after the
-                                                      // title row (100 − 36 title − 12
+        constexpr float kFrametimeHeight  = 106.0f;  // strip height ≈ 58 px after the
+                                                      // title row (106 − 36 title − 12
                                                       // bottom pad). Bumped 90 → 100 to
-                                                      // give the left-hand ms axis room:
-                                                      // up to 5 tick labels (e.g. 0/2/4/
-                                                      // 6/8 at 144 Hz) read cleanly at
-                                                      // ~10 px spacing. The +10 per panel
-                                                      // is matched by kTexH 416 → 436 so
-                                                      // the vertical budget stays exact.
+                                                      // give the left-hand ms axis room
+                                                      // (up to 5 tick labels, e.g. 0/2/4/
+                                                      // 6/8 at 144 Hz, at ~10 px spacing),
+                                                      // then → 106 to absorb the 12 px
+                                                      // reclaimed when kSectionGap
+                                                      // tightened 8 → 4 (two panels × 6).
+                                                      // kTexH stays 436, budget exact.
         constexpr float kBottomHeight     = 90.0f;   // matches kHeaderHeight: the
                                                       // bottom TEMP/LOAD/VRAM row now
                                                       // reads at the same box height
