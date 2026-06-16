@@ -754,6 +754,22 @@ TEST_CASE("computeMsAxis: 60 Hz → step 6, ticks 0/6/12/18") {
     CHECK(tickValues(a) == std::vector<int>{0, 6, 12, 18});
 }
 
+TEST_CASE("computeMsAxis: 200 Hz → top tick lands exactly on topMs (boundary)") {
+    const MsAxis a = computeMsAxis(200.0f);
+    REQUIRE(a.valid);
+    CHECK(a.budgetMs == doctest::Approx(5.0f).epsilon(0.01));
+    CHECK(a.topMs    == doctest::Approx(6.0f).epsilon(0.01));
+    CHECK(a.step == 2);
+    CHECK(tickValues(a) == std::vector<int>{0, 2, 4, 6});
+    // The 6-ms top tick sits EXACTLY on topMs — the one case exercising
+    // computeMsAxis's inclusive `v <= topMs + eps` admission together with the
+    // heightFrac clamp to 1.0. The old 60 Hz case (0/5/10/15/20, 20 == topMs)
+    // covered this before the budget-proportional step pushed every rate's top
+    // tick strictly below topMs.
+    CHECK(a.ticks[a.tickCount - 1].ms == 6);
+    CHECK(a.ticks[a.tickCount - 1].heightFrac == doctest::Approx(1.0f));
+}
+
 TEST_CASE("computeMsAxis: never emits more than kMaxMsAxisTicks") {
     for (float hz : {30.0f, 45.0f, 60.0f, 72.0f, 90.0f, 120.0f, 144.0f,
                      165.0f, 240.0f}) {
@@ -776,9 +792,14 @@ TEST_CASE("computeMsAxis: heightFrac == ms / topMs for every tick") {
         CHECK(a.ticks[i].heightFrac ==
               doctest::Approx(a.ticks[i].ms / a.topMs).epsilon(1e-4));
     }
-    // First tick is always 0 ms, pinned to the strip bottom.
+    // First tick is always 0 ms, pinned to the strip bottom, and is the ONLY
+    // tick flagged atBottomEdge — the renderer baseline-aligns just that one.
     CHECK(a.ticks[0].ms == 0);
     CHECK(a.ticks[0].heightFrac == doctest::Approx(0.0f));
+    CHECK(a.ticks[0].atBottomEdge);
+    for (int i = 1; i < a.tickCount; ++i) {
+        CHECK_FALSE(a.ticks[i].atBottomEdge);
+    }
 }
 
 TEST_CASE("computeMsAxis: budget always lands at 1 − budgetLineFraction") {

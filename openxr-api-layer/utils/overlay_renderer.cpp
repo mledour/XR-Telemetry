@@ -1578,9 +1578,11 @@ namespace openxr_api_layer::detail {
                             (1.0f - axis.ticks[i].heightFrac);
                         // Centre on the line's mid-line: interior ticks have
                         // their line TOP at the tick Y (+ half the width); the
-                        // ms==0 baseline is bottom-aligned at histoB (= its tick
-                        // Y), so − half the width.
-                        const float gridCenterY = (axis.ticks[i].ms != 0)
+                        // bottom-edge baseline is bottom-aligned at histoB (= its
+                        // tick Y), so − half the width. atBottomEdge is the single
+                        // source of this split (it also drives the renderer's
+                        // gridline-skip), so the line and its label can't drift.
+                        const float gridCenterY = !axis.ticks[i].atBottomEdge
                             ? yTick + kChromeLineW * 0.5f
                             : yTick - kChromeLineW * 0.5f;
                         const float y = std::max(gridCenterY, minCenterY);
@@ -2200,8 +2202,8 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // --- refill quads: [0]=bg, [1..4]=grid, [5]=axis, [6]=budget,
-                //     [7]=0-ms baseline ---
+                // --- refill quads. UNDER bars: [0]=bg, [1..4]=grid. OVER bars:
+                //     [5]=axis, [6]=budget, [7]=0-ms baseline (see kSlot*) ---
                 bool quadOk = false;
                 {
                     D3D11_MAPPED_SUBRESOURCE map{};
@@ -2220,7 +2222,7 @@ namespace openxr_api_layer::detail {
                         // interior lines occur (the 5-tick case has ticks
                         // 0/2/4/6/8 → 4 interior), which fits the 4 grid
                         // slots [1..4]; any unused slot collapses to a
-                        // zero-area quad so the fixed bg+grid+axis draw paints
+                        // zero-area quad so the fixed bg+grid draw paints
                         // nothing for it. heightFrac is measured from the
                         // bottom, so the top-down Y is histoT + stripH·(1 −
                         // heightFrac). The dash pattern (kGridDashPeriod/On)
@@ -2228,11 +2230,11 @@ namespace openxr_api_layer::detail {
                         // dashes line up column-to-column. kGridLine matches the
                         // panel-border chrome (weight + tone).
                         const MsAxis axis = computeMsAxis(targetFps);
-                        int slot = 1;
+                        UINT slot = kSlotGridFirst;
                         if (axis.valid) {
                             for (int i = 0;
-                                 i < axis.tickCount && slot <= 4; ++i) {
-                                if (axis.ticks[i].ms == 0) continue;
+                                 i < axis.tickCount && slot < kSlotAxis; ++i) {
+                                if (axis.ticks[i].atBottomEdge) continue;
                                 const float y = histoT + stripH *
                                     (1.0f - axis.ticks[i].heightFrac);
                                 q[slot++] =
@@ -2241,40 +2243,42 @@ namespace openxr_api_layer::detail {
                                               kGridDashPeriod, kGridDashOn);
                             }
                         }
-                        for (; slot <= 4; ++slot) {
+                        for (; slot < kSlotAxis; ++slot) {
                             q[slot] =
                                 makeQuad(plotL, histoT, 0.0f, 0.0f, kGridLine);
                         }
-                        // Vertical ms-axis down the left edge of the plot
-                        // (x = plotL), dashed to match the horizontal grid.
-                        // The PS auto-orients the dash along the long axis, so
-                        // this one runs along Y. Painted in the bg+grid pass so
-                        // the bars composite over it, same as the gridlines.
-                        q[5] = makeQuad(plotL, histoT, kChromeLineW, stripH,
-                                         kGridLine,
-                                         kGridDashPeriod, kGridDashOn);
+                        // Vertical ms-axis down the left edge (x = plotL),
+                        // dashed to match the horizontal grid. The PS auto-
+                        // orients the dash along the long axis, so this runs
+                        // along Y. Drawn OVER the bars (pass 2, with the budget +
+                        // baseline): the negative-slack run puts bar[0] flush
+                        // against plotL, so an under-bars axis would be occluded
+                        // with no inter-bar gap to show through (unlike the
+                        // horizontal gridlines). Over the bars the L-frame's
+                        // vertical arm reads at full weight, like the baseline.
+                        q[kSlotAxis] = makeQuad(plotL, histoT, kChromeLineW,
+                                                 stripH, kGridLine,
+                                                 kGridDashPeriod, kGridDashOn);
                         const float by =
                             histoT + stripH * budgetLineFraction();
                         // Same kChromeLineW as the panel borders / separators /
                         // grid: LOGICAL px → constant angular thickness across
                         // supersample factors, while a higher factor gives more
-                        // physical texels = better off-axis warp survival. The
-                        // dim kBudgetLine colour keeps it from CA-fringing (a
-                        // brighter line shows the off-axis warp aliasing more).
-                        // SOLID (no dash args) — the one reference line that
-                        // stays unbroken so it reads apart from the grid.
-                        q[6] = makeQuad(plotL, by, fullW, kChromeLineW,
-                                         kBudgetLine);
+                        // physical texels = better off-axis warp survival.
+                        // SOLID (no dash args) — now that the grid is opaque, the
+                        // budget line is told apart by being unbroken vs dashed.
+                        q[kSlotBudget] = makeQuad(plotL, by, fullW, kChromeLineW,
+                                                   kBudgetLine);
                         // 0-ms baseline: dashed line flush with the strip bottom,
                         // same weight/tone/dash as the grid + axis so it closes
-                        // the L with the vertical axis. Drawn OVER the bars (with
-                        // the budget line) — every bar starts at the baseline, so
-                        // an under-bars line would be hidden. Bottom-aligned (top
-                        // at histoB − kChromeLineW) to sit inside the strip
-                        // scissor at full width.
-                        q[7] = makeQuad(plotL, histoB - kChromeLineW,
-                                         fullW, kChromeLineW, kGridLine,
-                                         kGridDashPeriod, kGridDashOn);
+                        // the L with the vertical axis. Drawn OVER the bars too
+                        // (every bar starts at the baseline, so an under-bars
+                        // line would be hidden). Bottom-aligned (top at histoB −
+                        // kChromeLineW) to sit inside the strip scissor.
+                        q[kSlotBaseline] = makeQuad(plotL, histoB - kChromeLineW,
+                                                     fullW, kChromeLineW,
+                                                     kGridLine, kGridDashPeriod,
+                                                     kGridDashOn);
                         m_ctx->Unmap(m_quadInstances.Get(), 0);
                         quadOk = true;
                     }
@@ -2342,7 +2346,7 @@ namespace openxr_api_layer::detail {
 
                 // Three draw passes per panel. Layering relies on D3D11's
                 // documented in-order primitive submission: bg + 4 grid lines
-                // + left axis (alpha-over) → opaque bars → budget line + 0-ms
+                // (alpha-over) → opaque bars → left axis + budget line + 0-ms
                 // baseline (alpha-over). Without that guarantee the alpha-
                 // blended grid and the over-bar lines could land on the wrong
                 // side of the bars.
@@ -2357,11 +2361,11 @@ namespace openxr_api_layer::detail {
                 // removed), so dropping the panel for that frame is the right
                 // trade.
                 //
-                // quad pass 1 — bg (instance 0) + 4 grid lines (1..4) + the
-                // left ms-axis (instance 5).
+                // quad pass 1 — the UNDER-bars slots [0, kSlotAxis): bg (0) +
+                // interior grid lines [1..4]. Count tracks kSlotAxis.
                 if (quadOk) {
                     bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, 6, 0, 0);
+                    m_ctx->DrawInstanced(4, kSlotAxis, 0, 0);
                 }
 
                 // bar pass — samples on top of bg/grid (instances 0..barCount).
@@ -2370,11 +2374,13 @@ namespace openxr_api_layer::detail {
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
                 }
 
-                // quad pass 2 — budget line + 0-ms baseline on top of the bars
-                // (instances 6..7).
+                // quad pass 2 — the OVER-bars slots [kSlotAxis, kQuadSlots):
+                // left axis + budget line + 0-ms baseline. Count + offset
+                // derived from the slot layout so they can't drift.
                 if (quadOk) {
                     bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, 2, 0, 6);
+                    m_ctx->DrawInstanced(4, kQuadSlots - kSlotAxis, 0,
+                                          kSlotAxis);
                 }
             }
 
@@ -2414,7 +2420,24 @@ namespace openxr_api_layer::detail {
             // QuadInstance's size assert lives with the shared definition
             // in chrome_shape_renderer.h (overlay_quad_layout).
 
-            static constexpr UINT kQuadSlots = 8;  // bg + 4 grid + axis + budget + 0ms
+            // Quad slot layout for the histogram region. q[0] = bg, then the
+            // interior gridlines; [kSlotGridFirst, kSlotAxis) composite UNDER
+            // the bars, [kSlotAxis, kQuadSlots) (axis, budget, 0-ms baseline)
+            // OVER them. The draw ranges in drawPanel derive their counts from
+            // these constants, so adding a slot can't silently desync the pass
+            // boundary (no hardcoded 6 / 2 / offset-6 literals).
+            static constexpr UINT kSlotGridFirst = 1;  // interior gridlines [1..4]
+            static constexpr UINT kSlotAxis      = 5;  // first OVER-bars slot
+            static constexpr UINT kSlotBudget    = 6;
+            static constexpr UINT kSlotBaseline  = 7;
+            static constexpr UINT kQuadSlots     = 8;  // total
+            // The [kSlotGridFirst, kSlotAxis) gridline slots must cover every
+            // non-zero tick (kMaxMsAxisTicks counts the 0 tick, drawn as the
+            // baseline rather than an interior line). Catches a kMaxMsAxisTicks
+            // bump that would otherwise overflow the grid slots at runtime.
+            static_assert(kSlotAxis - kSlotGridFirst >=
+                              static_cast<UINT>(kMaxMsAxisTicks - 1),
+                          "too few interior-gridline slots for kMaxMsAxisTicks");
 
             // Dash pattern for the grid lines + the left ms-axis, in LOGICAL
             // px (constant angular size across supersample factors, like
@@ -2435,23 +2458,22 @@ namespace openxr_api_layer::detail {
             // Dim placeholder dash for an empty (no-sample-yet) histogram slot —
             // kept subtle (low alpha) so warm-up empties don't shout.
             static constexpr float kEmptyDash[4]  = {0.353f, 0.431f, 0.451f, 0.30f};
-            // Budget reference line. Key HMD finding: dim, low-contrast grid
-            // ticks render CLEAN at the same thickness + position, while a
-            // bright near-white budget line
-            // CA-fringed (violet/pink magenta fringe) and showed aliasing — so
-            // the cause is BRIGHTNESS, not geometry. A bright near-white thin
-            // line on dark is the worst case for the HMD lens to split and
-            // makes any residual aliasing visible; a dim line hides both.
-            //
-            // So drop into the grid's clean low-contrast regime. Once the grid
-            // and budget lines were the same thickness, ~2.5x the grid's
-            // brightness still read "too contrasted" off-axis — the brighter
-            // line just makes its (identical) off-axis aliasing more visible,
-            // while the dim grid hides it. Dim further to ~1.5x the grid: dark
-            // enough to share the grid's clean off-axis behaviour, a touch
-            // brighter + neutral (vs the grid's cool tint) to stay readable as
-            // the budget. Tune here: brighter = more prominent but more visible
-            // aliasing; dimmer = cleaner but closer to the ticks.
+            // Budget reference line. Two findings drive its colour:
+            //  (1) HMD: a bright near-white thin line CA-fringes (violet/pink
+            //      magenta) and aliases off-axis, while a dim low-contrast line
+            //      renders CLEAN at the same thickness + position — the cause is
+            //      BRIGHTNESS, not geometry. So it stays in the grid's clean
+            //      low-contrast regime.
+            //  (2) The grid is now OPAQUE (kGridLine ≈ the separator chrome), so
+            //      this line no longer outshines it: at {0.50,0.52,0.55,0.35} it
+            //      sits at roughly the SAME luma as the grid (~0.20 over the
+            //      panel bg). The budget is therefore told apart by being SOLID
+            //      vs the dashed grid, NOT by brightness — it used to be tuned to
+            //      ~1.5× the old translucent (0.30-alpha) grid, a relationship
+            //      the grid brightening retired.
+            // Tune here: brighter = more prominent but more off-axis aliasing;
+            // dimmer = cleaner but closer to the ticks. Bump it if the
+            // solid-vs-dashed cue reads too weak on the HMD.
             static constexpr float kBudgetLine[4] = {0.50f, 0.52f, 0.55f, 0.35f};
             static constexpr float kGpuGradTop[4] = {0.157f, 0.878f, 0.898f, 1.00f};
             static constexpr float kGpuGradBot[4] = {0.075f, 0.682f, 0.710f, 1.00f};

@@ -549,8 +549,8 @@ namespace openxr_api_layer::detail {
     // barVisualForSample). To label that vertical span in absolute
     // milliseconds, we drop a handful of evenly-spaced ticks along it, with
     // a BUDGET-PROPORTIONAL step (= round(0.35 × budget); see msAxisStep) so
-    // every refresh rate gets ~3–4 ticks instead of the sparse 0/5/10 a
-    // fixed "nice number" step left at 90 / 120 Hz.
+    // every refresh rate gets 4–5 ticks (≤ kMaxMsAxisTicks) instead of the
+    // sparse 0/5/10 a fixed "nice number" step left at 90 / 120 Hz.
     //
     // The scale is therefore DERIVED FROM THE REFRESH RATE — nothing is
     // hard-coded:
@@ -575,8 +575,14 @@ namespace openxr_api_layer::detail {
     inline constexpr int kMaxMsAxisTicks = 5;
 
     struct MsAxisTick {
-        int   ms;          // round tick value in milliseconds (0, 5, 10, …)
-        float heightFrac;  // 0..1 up from the strip bottom (= ms / topMs)
+        int   ms;            // round tick value in milliseconds (0, 5, 10, …)
+        float heightFrac;    // 0..1 up from the strip bottom (= ms / topMs)
+        bool  atBottomEdge;  // sits on the strip's bottom edge (the 0 tick).
+                             // SINGLE source of the "bottom-aligned" policy so
+                             // the renderer's gridline-skip and the label's
+                             // half-line offset can't drift apart: the renderer
+                             // draws a baseline (not an interior line) for it and
+                             // the label offsets DOWN onto that baseline.
     };
 
     struct MsAxis {
@@ -590,8 +596,8 @@ namespace openxr_api_layer::detail {
 
     // Tick step (ms) for the frametime ms-axis: BUDGET-PROPORTIONAL, not a
     // fixed 1-2-5 "nice number" ladder. step = round(0.35 × budget) gives
-    // ~3–4 evenly-spaced ticks at every refresh rate, where a fixed step
-    // left 90 / 120 Hz with just 0/5/10:
+    // 4–5 evenly-spaced ticks (≤ kMaxMsAxisTicks) at every refresh rate, where
+    // a fixed step left 90 / 120 Hz with just 0/5/10:
     //   72 Hz (13.9 ms) → 5   90 Hz (11.1 ms) → 4   120 Hz (8.3 ms) → 3
     //   75 Hz (13.3 ms) → 5   144 Hz (6.9 ms) → 2
     // The top tick then sits a touch above the budget line (~1.08×budget).
@@ -631,7 +637,7 @@ namespace openxr_api_layer::detail {
             // 60–240 Hz refresh rates, but keep the invariant exact.)
             const float frac = std::clamp(
                 static_cast<float>(v) / axis.topMs, 0.0f, 1.0f);
-            axis.ticks[axis.tickCount] = {v, frac};
+            axis.ticks[axis.tickCount] = {v, frac, (v == 0)};
             ++axis.tickCount;
             v += axis.step;
         }
