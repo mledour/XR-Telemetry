@@ -547,15 +547,20 @@ namespace openxr_api_layer::detail {
     // The histogram strip maps frametime 0..(1.2 × budget) onto its full
     // height — a sample at 1.2×budget fills the strip (see
     // barVisualForSample). To label that vertical span in absolute
-    // milliseconds, we drop a handful of "nice" round-number ticks
-    // (multiples of 1 / 2 / 5 / 10 ms) along it.
+    // milliseconds, we drop a handful of evenly-spaced ticks along it, with
+    // a BUDGET-PROPORTIONAL step (= round(0.35 × budget); see msAxisStep) so
+    // every refresh rate gets 4–5 ticks (≤ kMaxMsAxisTicks) instead of the
+    // sparse 0/5/10 a fixed "nice number" step left at 90 / 120 Hz.
     //
     // The scale is therefore DERIVED FROM THE REFRESH RATE — nothing is
     // hard-coded:
-    //   * 72 Hz  → budget 13.9 ms, top 16.7 ms → ticks 0 / 5 / 10 / 15
-    //   * 90 Hz  → budget 11.1 ms, top 13.3 ms → ticks 0 / 5 / 10
-    //   * 120 Hz → budget  8.3 ms, top 10.0 ms → ticks 0 / 5 / 10
-    //   * 144 Hz → budget  6.9 ms, top  8.3 ms → ticks 0 / 2 / 4 / 6 / 8
+    //   * 72 Hz  → budget 13.9 ms, top 16.7 ms → step 5 → 0 / 5 / 10 / 15
+    //   * 90 Hz  → budget 11.1 ms, top 13.3 ms → step 4 → 0 / 4 / 8 / 12
+    //   * 120 Hz → budget  8.3 ms, top 10.0 ms → step 3 → 0 / 3 / 6 / 9
+    //   * 144 Hz → budget  6.9 ms, top  8.3 ms → step 2 → 0 / 2 / 4 / 6 / 8
+    //
+    // The top tick therefore sits a touch ABOVE the budget line (~1.08×
+    // budget) at most rates — the same look 72 Hz already had.
     //
     // The budget reference line (budgetLineFraction) always sits at the
     // SAME height (5/6 up the strip) whatever the rate — only its ms VALUE
@@ -570,8 +575,14 @@ namespace openxr_api_layer::detail {
     inline constexpr int kMaxMsAxisTicks = 5;
 
     struct MsAxisTick {
-        int   ms;          // round tick value in milliseconds (0, 5, 10, …)
-        float heightFrac;  // 0..1 up from the strip bottom (= ms / topMs)
+        int   ms;            // round tick value in milliseconds (0, 5, 10, …)
+        float heightFrac;    // 0..1 up from the strip bottom (= ms / topMs)
+        bool  atBottomEdge;  // sits on the strip's bottom edge (the 0 tick).
+                             // SINGLE source of the "bottom-aligned" policy so
+                             // the renderer's gridline-skip and the label's
+                             // half-line offset can't drift apart: the renderer
+                             // draws a baseline (not an interior line) for it and
+                             // the label offsets DOWN onto that baseline.
     };
 
     struct MsAxis {
@@ -583,23 +594,22 @@ namespace openxr_api_layer::detail {
         bool  valid     = false; // false when targetFps is non-finite / <= 0
     };
 
-    // Smallest "nice" step (1, 2, 5, 10, 20, 50, …) such that the strip
-    // top carries at most kMaxMsAxisTicks ticks (the 0 tick included).
-    // Walks the 1-2-5 decade ladder; the outer loop is bounded defensively
-    // (a frametime top is a few tens of ms at most).
-    inline int niceMsStep(float topMs) noexcept {
-        if (!(topMs > 0.0f)) return 1;
-        static constexpr int kLadder[] = {1, 2, 5};
-        for (int decade = 1; decade <= 1000; decade *= 10) {
-            for (int m : kLadder) {
-                const int step = m * decade;
-                // ticks at 0, step, 2·step, … ≤ topMs → floor(topMs/step)+1
-                const int count =
-                    static_cast<int>(topMs / static_cast<float>(step)) + 1;
-                if (count <= kMaxMsAxisTicks) return step;
-            }
-        }
-        return 1000;
+    // Tick step (ms) for the frametime ms-axis: BUDGET-PROPORTIONAL, not a
+    // fixed 1-2-5 "nice number" ladder. step = round(0.35 × budget) gives
+    // 4–5 evenly-spaced ticks (≤ kMaxMsAxisTicks) at every refresh rate, where
+    // a fixed step left 90 / 120 Hz with just 0/5/10:
+    //   72 Hz (13.9 ms) → 5   90 Hz (11.1 ms) → 4   120 Hz (8.3 ms) → 3
+    //   75 Hz (13.3 ms) → 5   144 Hz (6.9 ms) → 2
+    // The top tick then sits a touch above the budget line (~1.08×budget).
+    // Clamped to ≥ 1 so a degenerate / tiny budget can't yield a 0 or
+    // negative step (which would spin computeMsAxis's tick loop forever).
+    // 0.35 is the one tuning knob — larger = coarser, smaller = denser. At
+    // ≥ ~233 Hz the step floors to 1 ms (0/1/2/3/4); computeMsAxis's
+    // kMaxMsAxisTicks cap then truncates the run, which is fine.
+    inline int msAxisStep(float budgetMs) noexcept {
+        if (!(budgetMs > 0.0f)) return 1;
+        const int step = static_cast<int>(std::lround(0.35f * budgetMs));
+        return step < 1 ? 1 : step;
     }
 
     // Build the ms-axis tick set for a given predicted display rate.
@@ -613,7 +623,7 @@ namespace openxr_api_layer::detail {
         axis.topMs    = 1.2f * axis.budgetMs;
         // Guard a degenerate / overflowed top (absurdly low targetFps).
         if (!std::isfinite(axis.topMs) || axis.topMs <= 0.0f) return axis;
-        axis.step  = niceMsStep(axis.topMs);
+        axis.step  = msAxisStep(axis.budgetMs);
         axis.valid = true;
 
         int v = 0;
@@ -627,7 +637,7 @@ namespace openxr_api_layer::detail {
             // 60–240 Hz refresh rates, but keep the invariant exact.)
             const float frac = std::clamp(
                 static_cast<float>(v) / axis.topMs, 0.0f, 1.0f);
-            axis.ticks[axis.tickCount] = {v, frac};
+            axis.ticks[axis.tickCount] = {v, frac, (v == 0)};
             ++axis.tickCount;
             v += axis.step;
         }
