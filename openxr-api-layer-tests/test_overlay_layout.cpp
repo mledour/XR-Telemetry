@@ -52,7 +52,7 @@ using openxr_api_layer::detail::budgetLineFraction;
 using openxr_api_layer::detail::MsAxis;
 using openxr_api_layer::detail::MsAxisTick;
 using openxr_api_layer::detail::computeMsAxis;
-using openxr_api_layer::detail::niceMsStep;
+using openxr_api_layer::detail::msAxisStep;
 using openxr_api_layer::detail::kMaxMsAxisTicks;
 
 // =============================================================================
@@ -680,9 +680,10 @@ TEST_CASE("tierForUtilisation: NaN defaults to green (safe default)") {
 
 // =============================================================================
 // computeMsAxis — refresh-rate-derived ms ticks for the frametime histograms.
-// The vertical span is 0..1.2×budget (budget = 1000/targetFps), and ticks land
-// on round 1/2/5/10-ms values. The budget reference line is always at 5/6 of
-// the strip (= 1 − budgetLineFraction); only the ms labels rescale per rate.
+// The vertical span is 0..1.2×budget (budget = 1000/targetFps), and ticks use a
+// budget-proportional step (= round(0.35×budget); see msAxisStep). The budget
+// reference line is always at 5/6 of the strip (= 1 − budgetLineFraction); only
+// the ms labels rescale per rate.
 // =============================================================================
 
 // Helper: collect the integer tick values for terser assertions.
@@ -692,13 +693,13 @@ static std::vector<int> tickValues(const MsAxis& a) {
     return v;
 }
 
-TEST_CASE("computeMsAxis: 90 Hz → budget 11.1 ms, top 13.3 ms, ticks 0/5/10") {
+TEST_CASE("computeMsAxis: 90 Hz → budget 11.1 ms, top 13.3 ms, ticks 0/4/8/12") {
     const MsAxis a = computeMsAxis(90.0f);
     REQUIRE(a.valid);
     CHECK(a.budgetMs == doctest::Approx(11.111f).epsilon(0.01));
     CHECK(a.topMs    == doctest::Approx(13.333f).epsilon(0.01));
-    CHECK(a.step == 5);
-    CHECK(tickValues(a) == std::vector<int>{0, 5, 10});
+    CHECK(a.step == 4);
+    CHECK(tickValues(a) == std::vector<int>{0, 4, 8, 12});
 }
 
 TEST_CASE("computeMsAxis: 72 Hz → ticks 0/5/10/15") {
@@ -717,21 +718,22 @@ TEST_CASE("computeMsAxis: 75 Hz → ticks 0/5/10/15") {
     CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15});
 }
 
-TEST_CASE("computeMsAxis: 80 Hz → ticks 0/5/10/15, budget 12.5 ms") {
+TEST_CASE("computeMsAxis: 80 Hz → ticks 0/4/8/12, budget 12.5 ms") {
     const MsAxis a = computeMsAxis(80.0f);
     REQUIRE(a.valid);
     CHECK(a.budgetMs == doctest::Approx(12.5f).epsilon(0.01));
     CHECK(a.topMs    == doctest::Approx(15.0f).epsilon(0.01));
-    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15});
+    CHECK(a.step == 4);
+    CHECK(tickValues(a) == std::vector<int>{0, 4, 8, 12});
 }
 
-TEST_CASE("computeMsAxis: 120 Hz → ticks 0/5/10 (top is exactly 10 ms)") {
+TEST_CASE("computeMsAxis: 120 Hz → ticks 0/3/6/9 (top is exactly 10 ms)") {
     const MsAxis a = computeMsAxis(120.0f);
     REQUIRE(a.valid);
     CHECK(a.budgetMs == doctest::Approx(8.333f).epsilon(0.01));
     CHECK(a.topMs    == doctest::Approx(10.0f).epsilon(0.01));
-    CHECK(a.step == 5);
-    CHECK(tickValues(a) == std::vector<int>{0, 5, 10});
+    CHECK(a.step == 3);
+    CHECK(tickValues(a) == std::vector<int>{0, 3, 6, 9});
 }
 
 TEST_CASE("computeMsAxis: 144 Hz → finer 2-ms step, ticks 0/2/4/6/8") {
@@ -744,11 +746,12 @@ TEST_CASE("computeMsAxis: 144 Hz → finer 2-ms step, ticks 0/2/4/6/8") {
     CHECK(a.tickCount == kMaxMsAxisTicks);
 }
 
-TEST_CASE("computeMsAxis: 60 Hz → step 5 fills exactly 5 ticks 0..20") {
+TEST_CASE("computeMsAxis: 60 Hz → step 6, ticks 0/6/12/18") {
     const MsAxis a = computeMsAxis(60.0f);
     REQUIRE(a.valid);
     CHECK(a.topMs == doctest::Approx(20.0f).epsilon(0.01));
-    CHECK(tickValues(a) == std::vector<int>{0, 5, 10, 15, 20});
+    CHECK(a.step == 6);
+    CHECK(tickValues(a) == std::vector<int>{0, 6, 12, 18});
 }
 
 TEST_CASE("computeMsAxis: never emits more than kMaxMsAxisTicks") {
@@ -804,11 +807,14 @@ TEST_CASE("computeMsAxis: non-finite / non-positive targetFps → invalid") {
     CHECK(computeMsAxis(0.0f).tickCount == 0);
 }
 
-TEST_CASE("niceMsStep: walks the 1-2-5 ladder to cap tick count") {
-    CHECK(niceMsStep(8.33f)  == 2);   // 144 Hz top
-    CHECK(niceMsStep(10.0f)  == 5);   // 120 Hz top
-    CHECK(niceMsStep(13.33f) == 5);   // 90 Hz top
-    CHECK(niceMsStep(20.0f)  == 5);   // 60 Hz top
-    CHECK(niceMsStep(30.0f)  == 10);  // very low rate → coarse 10-ms step
-    CHECK(niceMsStep(0.0f)   == 1);   // degenerate guard
+TEST_CASE("msAxisStep: budget-proportional step = round(0.35 × budget)") {
+    CHECK(msAxisStep(13.889f) == 5);  // 72 Hz  (4.86 → 5)
+    CHECK(msAxisStep(13.333f) == 5);  // 75 Hz  (4.67 → 5)
+    CHECK(msAxisStep(12.5f)   == 4);  // 80 Hz  (4.38 → 4)
+    CHECK(msAxisStep(11.111f) == 4);  // 90 Hz  (3.89 → 4)
+    CHECK(msAxisStep(8.333f)  == 3);  // 120 Hz (2.92 → 3)
+    CHECK(msAxisStep(6.944f)  == 2);  // 144 Hz (2.43 → 2)
+    CHECK(msAxisStep(4.167f)  == 1);  // 240 Hz (1.46 → 1)
+    CHECK(msAxisStep(0.0f)    == 1);  // degenerate guard
+    CHECK(msAxisStep(-5.0f)   == 1);  // degenerate guard
 }
