@@ -1536,14 +1536,19 @@ namespace openxr_api_layer::detail {
                     // labels right-aligned beneath the units column — the
                     // reference look ("16 ms / 11 ms / 6 ms / 0 ms").
                     //
-                    // Vertically drawTextGpu centres each glyph on the tick Y
-                    // and never clips, so clamp the centre DOWN to >=
-                    // histoT+halfH to keep a top-edge tick (a top tick at an
-                    // exact step multiple, e.g. 10 ms @ 120 Hz) out of the
-                    // title gap. The floor "0" is NOT clamped at the bottom: a
-                    // "0 ms" on the strip baseline is the conventional axis
-                    // look and has no gridline to diverge from. At 90 Hz
-                    // (0/5/10) no tick is near either edge, so nothing clamps.
+                    // Vertically drawTextGpu centres each glyph on the rect's
+                    // mid-Y, so centre that on the gridline's VISUAL centre: the
+                    // line is a kChromeLineW-tall quad whose TOP sits at the tick
+                    // Y, so its centre is half a line-width lower (without this
+                    // the number rode ~0.75 px above its dash). The centre is
+                    // then clamped DOWN only enough to keep the glyph clear of
+                    // the TITLE text — its top may sit in the title gap (empty
+                    // space, kHistoTitleGap above histoT). The old histoT+halfH
+                    // threshold kept the WHOLE glyph below histoT, which yanked a
+                    // near-top tick's label off its line (12 ms @ 90 Hz sits 90 %
+                    // up the strip). The floor "0" has no gridline (it IS the
+                    // strip baseline), so it takes neither the half-line offset
+                    // nor the clamp.
                     const auto* lm = m_textRenderer
                         ? m_textRenderer->metrics(kFmtAxisLabelGpu.face,
                                                    kFmtAxisLabelGpu.sizePx)
@@ -1564,10 +1569,20 @@ namespace openxr_api_layer::detail {
                         }
                     }
                     const float labelRight = histoL + maxW;
+                    // Lowest centre that still clears the title text: the glyph
+                    // top (centre − halfH) may reach the title gap but not the
+                    // title row, which ends kHistoTitleGap above histoT.
+                    const float minCenterY = (histoT - kHistoTitleGap) + halfH;
                     for (int i = 0; i < axis.tickCount; ++i) {
                         const float yTick = histoT + stripH *
                             (1.0f - axis.ticks[i].heightFrac);
-                        const float y = std::max(yTick, histoT + halfH);
+                        // ms==0 is the strip baseline (no gridline quad) → centre
+                        // on it directly; every other tick centres on its line's
+                        // mid-line (tick Y + half the line width).
+                        const float gridCenterY = (axis.ticks[i].ms != 0)
+                            ? yTick + kChromeLineW * 0.5f
+                            : yTick;
+                        const float y = std::max(gridCenterY, minCenterY);
                         const D2D1_RECT_F labelRect = D2D1::RectF(
                             histoL, y, labelRight, y);
                         drawAscii(kFmtAxisLabelGpu,
