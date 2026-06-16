@@ -347,11 +347,23 @@ namespace openxr_api_layer::detail {
         constexpr float kFontTinyLabel    = 17.0f;  // "FPS", "P95", "TEMP", "VRAM"
         constexpr float kFontSectionTitle = 18.0f;  // "GPU FRAMETIME"
         // Labels and section titles render in Rajdhani SemiBold.
-        constexpr float kFontMs           = 18.0f;  // GPU panel "6.7 ms" current value
+        constexpr float kFontMs           = 22.0f;  // frametime panels' current value
+                                                     // ("6.7 ms", "Render…/App…") —
+                                                     // sized up from 18 so it reads
+                                                     // larger than the 18 px section
+                                                     // title, matching the reference
+                                                     // HUD. Capped at ≤ kHistoTitleH
+                                                     // (24) so it centres in the
+                                                     // title row without clipping.
         constexpr float kFontBigNumber    = 52.0f;  // "142" FPS number — the
                                                      // single biggest text on
                                                      // the HUD, primary anchor.
-        constexpr float kFontAccentNumber = 32.0f;  // "138", "124", "108", "98"
+        constexpr float kFontAccentNumber = 40.0f;  // "138", "124", "108", "98" —
+                                                     // up from 32 so the percentile
+                                                     // numbers sit closer to the
+                                                     // 52 px hero number, as in the
+                                                     // reference HUD (header cells
+                                                     // are ~130 px wide, ample room).
         constexpr float kFontTemp         = 43.0f;  // bottom panel TEMP / LOAD /
                                                      // VRAM values
         constexpr float kFontTempUnit     = 19.0f;  // " °C" / " %" / " GB" unit
@@ -423,16 +435,19 @@ namespace openxr_api_layer::detail {
         // CoreRenderer::init. Kept at namespace scope (no member-class
         // qualification needed at the leaf call sites).
         constexpr GpuTextFormat kFmtBigNumberGpu    {glyph_atlas::GlyphFace::RajdhaniUpright, 52, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::RajdhaniUpright, 32, GpuTextFormat::Alignment::Center  };
+        constexpr GpuTextFormat kFmtAccentNumberGpu {glyph_atlas::GlyphFace::RajdhaniUpright, 40, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtTempGpu        {glyph_atlas::GlyphFace::RajdhaniUpright, 43, GpuTextFormat::Alignment::Center  };
-        constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Trailing };
+        constexpr GpuTextFormat kFmtMsValueGpu     {glyph_atlas::GlyphFace::RajdhaniUpright, 22, GpuTextFormat::Alignment::Trailing };
         constexpr GpuTextFormat kFmtTinyLabelGpu   {glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Center  };
         constexpr GpuTextFormat kFmtSectionTitleGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 18, GpuTextFormat::Alignment::Leading  };
         // CPU frametime panel: Render + App (the per-cycle total) as one
-        // right-aligned compound. 17 px — baked in kSizes (Rajdhani). The
-        // two "X.X ms" terms fit the 360 px value rect (see
-        // drawFrametimePanel's CPU branch).
-        constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 17, GpuTextFormat::Alignment::Trailing };
+        // right-aligned compound. 22 px (matches kFmtMsValueGpu so both
+        // frametime panels' top-right read-outs are the same size) — baked
+        // in kSizes (Rajdhani). The two "X.X ms" terms still fit the 360 px
+        // value rect: the worst case "Render 22.1 ms / App 41.5 ms" is
+        // ≈ 323 px at 22 px (was ≈ 250 px at 17 px), clear of the left-aligned
+        // "CPU FRAMETIME" title. See drawFrametimePanel's CPU branch.
+        constexpr GpuTextFormat kFmtCpuBreakdownGpu{glyph_atlas::GlyphFace::RajdhaniUpright, 22, GpuTextFormat::Alignment::Trailing };
         // Histogram ms-axis tick labels ("0 ms", "5 ms", "10 ms", …) —
         // small, RIGHT-aligned so the "ms" suffixes line up and the widest
         // label's leading digit lands at histoL, under the section title.
@@ -776,10 +791,10 @@ namespace openxr_api_layer::detail {
             //     '-', so the numbers bake from the same set as the labels
             //     — no separate digit face.
             //
-            // Sizes are the union of every kFont* constant used in
-            // makeFormat() above: 17 (tiny label), 18 (ms / section title),
-            // 32 (accent number), 43 (temp), 52 (big FPS) — plus 19
-            // (kFontTempUnit) for the GPU-text path. The D2D path
+            // Sizes are the union of every kFont* / kFmt*Gpu constant: 17
+            // (tiny label), 18 (section title), 22 (frametime ms value + CPU
+            // breakdown), 40 (accent number), 43 (temp), 52 (big FPS) — plus
+            // 19 (kFontTempUnit) for the GPU-text path. The D2D path
             // pulls 19 via an IDWriteTextLayout::SetFontSize override
             // on the unit range, but the GPU renderer can't override
             // size per-glyph: each (face, sizePx) lives in the atlas
@@ -800,7 +815,7 @@ namespace openxr_api_layer::detail {
                 // maps the same logical size to the same physical size at
                 // lookup — samples each glyph 1:1 at the render resolution. At
                 // ss == 1 these bake unchanged.
-                static constexpr uint16_t kSizes[] = {13, 17, 18, 19, 32, 43, 52};
+                static constexpr uint16_t kSizes[] = {13, 17, 18, 19, 22, 40, 43, 52};
 
                 std::vector<wchar_t> rajdhaniSet;
                 rajdhaniSet.reserve(97 + 1);
@@ -1529,7 +1544,8 @@ namespace openxr_api_layer::detail {
                     //
                     // Width: 360 px (left edge ~332 px) comfortably fits the
                     // two terms even at double-digit ms — e.g. "Render 22.1 ms
-                    // / App 41.5 ms" ≈ 250 px — well clear of the title.
+                    // / App 41.5 ms" ≈ 323 px at the 22 px kFmtCpuBreakdownGpu
+                    // size — well clear of the left-aligned title.
                     const std::string compound =
                         breakdown + " / App " + currentValue + " ms";
                     const D2D1_RECT_F valueRect = D2D1::RectF(
