@@ -59,6 +59,8 @@
 #include "utils/overlay_renderer.h"
 #include "utils/settings.h"
 
+#include <xrprof.h>  // inline self-profiler (external/xrprof submodule)
+
 #include <dxgi1_4.h>  // IDXGIFactory4::EnumAdapterByLuid for the D3D12 path
 #include <log.h>
 #include <util.h>
@@ -1934,6 +1936,15 @@ namespace openxr_api_layer {
                 m_settings.overlay.mode == detail::OverlayMode::Auto) {
                 ensureOverlayResources(*session);
             }
+
+            // Self-profiler (xrprof). Built unconditionally when not bypassed so
+            // the call sites need no null-checks; INERT unless self_profile is on
+            // (Create with enabled=false -> scopes/endFrame no-op, no CSV). The
+            // GPU device is attached later, inside the overlay renderer (it paints
+            // on a private D3D11 device -- even for D3D12 hosts, via D3D11On12).
+            m_probe = xrprof::Probe::Create(
+                {openxr_api_layer::localAppData, LAYER_NAME, m_settings.self_profile});
+
             return result;
         }
 
@@ -2233,9 +2244,21 @@ namespace openxr_api_layer {
                 }
 
                 if (!skipDrawThisFrame) {
-                    overlayLayer = m_overlayRenderer->renderAndCompose(
-                        overlaySpace, anchorPose, m_overlay.snapshot(),
-                        m_overlayGeo);
+                    // Self-profile the overlay render (CPU). CpuScope sums QPC +
+                    // thread cycles over renderAndCompose; endFrame commits the
+                    // row immediately after (before the forward), keyed on
+                    // displayTime. No-op unless self_profile is on. The GPU span
+                    // is added inside the renderer in a follow-up commit.
+                    {
+                        xrprof::Probe::CpuScope cpu(*m_probe);
+                        overlayLayer = m_overlayRenderer->renderAndCompose(
+                            overlaySpace, anchorPose, m_overlay.snapshot(),
+                            m_overlayGeo);
+                    }
+                    if (frameEndInfo) {
+                        m_probe->endFrame(
+                            static_cast<uint64_t>(frameEndInfo->displayTime));
+                    }
                 }
             }
 
@@ -2688,6 +2711,7 @@ namespace openxr_api_layer {
             // reports shows "--" rather than this session's stale value.
             m_overlay.resetTelemetryLatches();
             m_overlayRenderer.reset();
+            m_probe.reset();  // flushes pending rows + joins the xrprof writer thread
             // Lazy-overlay binding stash is session-scoped: drop the device /
             // queue refs and clear the attempt latch so the NEXT session
             // re-stashes from its own xrCreateSession and may retry the build.
@@ -2822,6 +2846,11 @@ namespace openxr_api_layer {
         detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
         bool m_overlayActive = false;
         std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+        // Self-profiler (xrprof): measures THIS layer's own overlay-render
+        // CPU/GPU cost into its own CSV. Inert unless settings.self_profile.
+        // Session-scoped (built in xrCreateSession, released in
+        // releaseSessionScopedResources), like the renderer / GPU timer.
+        std::unique_ptr<xrprof::Probe> m_probe;
 
         // Hotkey-poll throttle (see kHotkeyPollIntervalNs). ns timestamp of the
         // last poll (0 = never, so the first frame polls), gated through the
