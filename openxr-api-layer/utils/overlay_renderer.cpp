@@ -3271,8 +3271,9 @@ namespace openxr_api_layer::detail {
                 m_probe = probe;  // assigned (not init-list) to avoid -Wreorder
                 m_ready = init();
                 // Attach the inline GPU timer to the D3D11On12-bridged device we
-                // paint on (built in init()). The GpuScope around this path's
-                // paint lands in a follow-up; for now D3D12 hosts get CPU only.
+                // paint on (built in init()). renderAndCompose brackets the paint
+                // with a GpuScope on that bridge context, so D3D12 hosts get GPU
+                // timing too (timestamps ride the same Flush to the D3D12 queue).
                 if (m_ready && m_probe && m_d3d11Device) {
                     m_probe->attachD3D11(m_d3d11Device.Get());
                 }
@@ -3388,6 +3389,15 @@ namespace openxr_api_layer::detail {
                     } releaseGuard{m_d3d11On12.Get(), m_d3d11Context.Get(),
                                     wrapped};
                     try {
+                        // GPU self-profiling: bracket the D3D11On12 paint with an
+                        // inline GPU span on the bridge context. The Flush below
+                        // pushes our timestamps + the paint to the app's D3D12
+                        // queue together, so the span measures the overlay's GPU
+                        // work. No-op if profiling is off.
+                        std::optional<xrprof::Probe::GpuScope> gpu;
+                        if (m_probe) {
+                            gpu.emplace(*m_probe, m_d3d11Context.Get());
+                        }
                         painted =
                             paintOverlay(m_core, m_bars, m_barsCadence,
                                           m_d3d11Context.Get(),
@@ -3395,6 +3405,7 @@ namespace openxr_api_layer::detail {
                                           m_glyphRenderer,
                                           m_chromeShapeRenderer,
                                           m_cpuRing, m_gpuRing, snap);
+                        gpu.reset();  // close the GPU span (before the Flush)
                     } catch (...) {
                         painted = false;
                     }
