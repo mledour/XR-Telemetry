@@ -733,32 +733,37 @@ jobs:
           # Compose the diff body conditionally on which PNGs the
           # push step managed to upload. Most common case is both
           # present (standard pixel diff).
-          # Table header labels are intentionally short and symmetric
-          # ("Actual" / "Expected") so the two markdown columns get
-          # the same auto-layout width — long asymmetric labels make
-          # the right column narrower and the image inside it visually
-          # smaller. Column order matches the typical test-runner
-          # ordering: actual (what we got, this PR's fresh render)
-          # first, expected (golden) second.
+          # The two renders go side by side as raw <img width="49%">
+          # tags, NOT a markdown table. A markdown table auto-sizes its
+          # columns from their content (including the header label text),
+          # so "Actual" (6 chars) and "Expected" (8 chars) gave the two
+          # columns unequal widths — which scaled the two same-size PNGs
+          # to visibly different display sizes in the comment. Pinned at
+          # 49% of the comment width each (a % inside a table cell would
+          # be relative to the unequal cell, so it has to be outside the
+          # table), they always render equal, like the full-width diff
+          # <img> below. GitHub's HTML sanitiser allows the width
+          # attribute on <img>. Order: actual (this PR's fresh render)
+          # left, expected (golden) right.
           if [ "$PREVIEW_HAS_OLD" = "true" ] && [ "$PREVIEW_HAS_NEW" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
-          | Actual | Expected |
-          |:--:|:--:|
-          | ![actual](${BASE_URL}/new.png) | ![expected](${BASE_URL}/old.png) |
+          <img src="${BASE_URL}/new.png" alt="actual" width="49%"> <img src="${BASE_URL}/old.png" alt="expected" width="49%">
+
+          <sub>Left: **Actual** (this PR) · Right: **Expected** (golden)</sub>
           EOF
           )
           elif [ "$PREVIEW_HAS_OLD" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
           **Only the expected golden was captured** — the test bailed before producing the actual render. See the [run log](${RUN_URL}) for the first failed REQUIRE.
 
-          ![expected](${BASE_URL}/old.png)
+          <img src="${BASE_URL}/old.png" alt="expected" width="100%">
           EOF
           )
           elif [ "$PREVIEW_HAS_NEW" = "true" ]; then
             DIFF_BODY=$(cat <<EOF
           **Only the actual render was captured** — no expected golden exists yet (first-time seed).
 
-          ![actual](${BASE_URL}/new.png)
+          <img src="${BASE_URL}/new.png" alt="actual" width="100%">
           EOF
           )
           else
