@@ -55,6 +55,13 @@ namespace openxr_api_layer {
     class OpenXrApi;
 }
 
+// Inline self-profiler — forward-declared so this header stays light (no
+// <xrprof.h> pulled into every consumer). The renderer holds a non-owning
+// Probe* and times its own paint with it.
+namespace xrprof {
+    class Probe;
+}
+
 namespace openxr_api_layer::detail {
 
     // Field-for-field bridges between the OpenXR XrPosef and the OpenXR-free
@@ -144,7 +151,8 @@ namespace openxr_api_layer::detail {
     // xrCreateSession. Returns nullptr if anything in the init path
     // fails (the caller logs and degrades).
     std::unique_ptr<OverlayRenderer> makeD3D11OverlayRenderer(
-        OpenXrApi* api, XrSession session, ID3D11Device* device);
+        OpenXrApi* api, XrSession session, ID3D11Device* device,
+        xrprof::Probe* probe);
 
     // Factory: app uses D3D12. We bridge via D3D11On12 (the wrapper that
     // exposes the D3D12 device as an ID3D11Device so our D3D11 shader
@@ -153,7 +161,8 @@ namespace openxr_api_layer::detail {
     // D3D12KHR. Returns nullptr if init fails.
     std::unique_ptr<OverlayRenderer> makeD3D12OverlayRenderer(
         OpenXrApi* api, XrSession session,
-        ID3D12Device* device, ID3D12CommandQueue* queue);
+        ID3D12Device* device, ID3D12CommandQueue* queue,
+        xrprof::Probe* probe);
 
     // -------- Snapshot / test entry point ---------------------------------
     //

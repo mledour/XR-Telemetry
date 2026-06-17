@@ -1334,10 +1334,11 @@ namespace openxr_api_layer {
                 // (xrCreateSession stashes exactly one; mutually exclusive).
                 if (m_d3d11Device) {
                     m_overlayRenderer = detail::makeD3D11OverlayRenderer(
-                        this, session, m_d3d11Device.Get());
+                        this, session, m_d3d11Device.Get(), m_probe.get());
                 } else if (m_d3d12Device && m_d3d12Queue) {
                     m_overlayRenderer = detail::makeD3D12OverlayRenderer(
-                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get());
+                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get(),
+                        m_probe.get());
                 }
             } catch (...) {
                 m_overlayRenderer.reset();
@@ -1916,6 +1917,16 @@ namespace openxr_api_layer {
                     "cell will show \"--\" for this session\n");
             }
 
+            // Self-profiler (xrprof). Built BEFORE the GPU/overlay setup below so
+            // the eager (Auto-mode) overlay renderer can be handed the probe to
+            // attach + GpuScope its own paint. Built whenever not bypassed -> call
+            // sites need no null-checks; INERT unless self_profile is on (Create
+            // with enabled=false: scopes/endFrame no-op, no CSV). attachD3D11
+            // happens inside the renderer ctor (it paints on the app's D3D11
+            // device, or the D3D11On12-bridged device for D3D12 hosts).
+            m_probe = xrprof::Probe::Create(
+                {openxr_api_layer::localAppData, LAYER_NAME, m_settings.self_profile});
+
             // GPU instrumentation: built now if a feature is already active
             // (Auto mode → m_recording / m_overlayActive were set at
             // xrCreateInstance), else deferred to first activation for Hotkey
@@ -1936,14 +1947,6 @@ namespace openxr_api_layer {
                 m_settings.overlay.mode == detail::OverlayMode::Auto) {
                 ensureOverlayResources(*session);
             }
-
-            // Self-profiler (xrprof). Built unconditionally when not bypassed so
-            // the call sites need no null-checks; INERT unless self_profile is on
-            // (Create with enabled=false -> scopes/endFrame no-op, no CSV). The
-            // GPU device is attached later, inside the overlay renderer (it paints
-            // on a private D3D11 device -- even for D3D12 hosts, via D3D11On12).
-            m_probe = xrprof::Probe::Create(
-                {openxr_api_layer::localAppData, LAYER_NAME, m_settings.self_profile});
 
             return result;
         }

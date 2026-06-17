@@ -46,8 +46,11 @@
 // path). pch.h's <d3d11.h> only exposes the base interfaces.
 #include <d3d11_1.h>
 
+#include <xrprof.h>   // inline self-profiler (external/xrprof submodule)
+
 #include <cmath>
 #include <cstring>     // std::memcpy for constant-buffer uploads
+#include <optional>
 #include <cwchar>      // std::wcslen for the wide-literal degree-symbol path
 #include <string>
 #include <vector>
@@ -2808,10 +2811,17 @@ namespace openxr_api_layer::detail {
         class D3D11OverlayRenderer final : public OverlayRenderer {
           public:
             D3D11OverlayRenderer(OpenXrApi* api, XrSession session,
-                                  ID3D11Device* device)
+                                  ID3D11Device* device, xrprof::Probe* probe)
                 : m_api(api), m_session(session), m_device(device) {
+                m_probe = probe;  // assigned (not init-list) to avoid -Wreorder
                 if (m_device) m_device->GetImmediateContext(m_context.GetAddressOf());
                 m_ready = init();
+                // Attach the inline GPU timer to the device we paint on (the
+                // app's D3D11 device, shared via SwapDeviceContextState). No-op
+                // if profiling is off / device null.
+                if (m_ready && m_probe && m_device) {
+                    m_probe->attachD3D11(m_device.Get());
+                }
             }
 
             ~D3D11OverlayRenderer() override {
@@ -2917,6 +2927,15 @@ namespace openxr_api_layer::detail {
 
                     try {
                         if (imageIdx < m_imageRtvs.size()) {
+                            // GPU self-profiling: bracket the overlay paint with
+                            // an inline GPU span on our context. No-op if the
+                            // probe is absent / profiling off. endFrame (layer.cpp)
+                            // commits the matching row; gpu_ns resolves a few
+                            // frames later.
+                            std::optional<xrprof::Probe::GpuScope> gpu;
+                            if (m_probe) {
+                                gpu.emplace(*m_probe, m_context.Get());
+                            }
                             painted =
                                 paintOverlay(m_core, m_bars, m_barsCadence,
                                               m_context.Get(),
@@ -2924,6 +2943,7 @@ namespace openxr_api_layer::detail {
                                               m_glyphRenderer,
                                               m_chromeShapeRenderer,
                                               m_cpuRing, m_gpuRing, snap);
+                            gpu.reset();  // record the close timestamp after the draws
                             // Unbind our RTV so the swapchain image isn't
                             // left OM-bound when the runtime composites it.
                             ID3D11RenderTargetView* nullRtv = nullptr;
@@ -3177,6 +3197,7 @@ namespace openxr_api_layer::detail {
             // share, no keyed mutex.
             ComPtr<ID3D11Device>        m_device;
             ComPtr<ID3D11DeviceContext> m_context;
+            xrprof::Probe*              m_probe = nullptr;  // not owned; inline GPU timer
             // D3D11.1 views of the same device/context, for state
             // isolation (SwapDeviceContextState). m_overlayState is
             // our private pipeline-state block; m_savedState holds the
@@ -3244,10 +3265,17 @@ namespace openxr_api_layer::detail {
           public:
             D3D12OverlayRenderer(OpenXrApi* api, XrSession session,
                                   ID3D12Device* device,
-                                  ID3D12CommandQueue* queue)
+                                  ID3D12CommandQueue* queue, xrprof::Probe* probe)
                 : m_api(api), m_session(session),
                   m_d3d12Device(device), m_d3d12Queue(queue) {
+                m_probe = probe;  // assigned (not init-list) to avoid -Wreorder
                 m_ready = init();
+                // Attach the inline GPU timer to the D3D11On12-bridged device we
+                // paint on (built in init()). The GpuScope around this path's
+                // paint lands in a follow-up; for now D3D12 hosts get CPU only.
+                if (m_ready && m_probe && m_d3d11Device) {
+                    m_probe->attachD3D11(m_d3d11Device.Get());
+                }
             }
 
             ~D3D12OverlayRenderer() override {
@@ -3587,6 +3615,7 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3D12CommandQueue>            m_d3d12Queue;
             ComPtr<ID3D11Device>                  m_d3d11Device;
             ComPtr<ID3D11DeviceContext>           m_d3d11Context;
+            xrprof::Probe*                        m_probe = nullptr;  // not owned
             ComPtr<ID3D11On12Device>              m_d3d11On12;
             XrSwapchain                           m_swapchain = XR_NULL_HANDLE;
             std::vector<ComPtr<ID3D11Resource>>   m_wrappedResources;
@@ -3625,16 +3654,18 @@ namespace openxr_api_layer::detail {
     // -------- Factory functions ----------------------------------------------
 
     std::unique_ptr<OverlayRenderer> makeD3D11OverlayRenderer(
-        OpenXrApi* api, XrSession session, ID3D11Device* device) {
-        auto r = std::make_unique<D3D11OverlayRenderer>(api, session, device);
+        OpenXrApi* api, XrSession session, ID3D11Device* device,
+        xrprof::Probe* probe) {
+        auto r = std::make_unique<D3D11OverlayRenderer>(api, session, device, probe);
         return r->isReady() ? std::unique_ptr<OverlayRenderer>(std::move(r))
                             : nullptr;
     }
 
     std::unique_ptr<OverlayRenderer> makeD3D12OverlayRenderer(
         OpenXrApi* api, XrSession session,
-        ID3D12Device* device, ID3D12CommandQueue* queue) {
-        auto r = std::make_unique<D3D12OverlayRenderer>(api, session, device, queue);
+        ID3D12Device* device, ID3D12CommandQueue* queue,
+        xrprof::Probe* probe) {
+        auto r = std::make_unique<D3D12OverlayRenderer>(api, session, device, queue, probe);
         return r->isReady() ? std::unique_ptr<OverlayRenderer>(std::move(r))
                             : nullptr;
     }
