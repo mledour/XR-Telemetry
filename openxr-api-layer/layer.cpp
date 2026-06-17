@@ -2247,15 +2247,19 @@ namespace openxr_api_layer {
                     // Self-profile the overlay render (CPU). CpuScope sums QPC +
                     // thread cycles over renderAndCompose; endFrame commits the
                     // row immediately after (before the forward), keyed on
-                    // displayTime. No-op unless self_profile is on. The GPU span
-                    // is added inside the renderer in a follow-up commit.
-                    {
-                        xrprof::Probe::CpuScope cpu(*m_probe);
-                        overlayLayer = m_overlayRenderer->renderAndCompose(
-                            overlaySpace, anchorPose, m_overlay.snapshot(),
-                            m_overlayGeo);
+                    // displayTime. No-op unless self_profile is on. The optional
+                    // guards m_probe being null on a path that renders without a
+                    // live session (e.g. a unit test) — no-op rather than a deref.
+                    // The GPU span is added inside the renderer in a follow-up.
+                    std::optional<xrprof::Probe::CpuScope> cpu;
+                    if (m_probe) {
+                        cpu.emplace(*m_probe);
                     }
-                    if (frameEndInfo) {
+                    overlayLayer = m_overlayRenderer->renderAndCompose(
+                        overlaySpace, anchorPose, m_overlay.snapshot(),
+                        m_overlayGeo);
+                    cpu.reset();  // close the CPU scope before endFrame
+                    if (m_probe && frameEndInfo) {
                         m_probe->endFrame(
                             static_cast<uint64_t>(frameEndInfo->displayTime));
                     }
