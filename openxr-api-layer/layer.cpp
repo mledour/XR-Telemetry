@@ -2281,7 +2281,8 @@ namespace openxr_api_layer {
                     cpu.reset();  // close the CPU scope before endFrame
                     if (m_probe) {
                         m_probe->endFrame(
-                            static_cast<uint64_t>(frameEndInfo->displayTime));
+                            static_cast<uint64_t>(frameEndInfo->displayTime),
+                            m_predictedPeriodNs.load(std::memory_order_relaxed));
                     }
                 }
             }
