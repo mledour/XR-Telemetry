@@ -1917,15 +1917,25 @@ namespace openxr_api_layer {
                     "cell will show \"--\" for this session\n");
             }
 
-            // Self-profiler (xrprof). Built BEFORE the GPU/overlay setup below so
-            // the eager (Auto-mode) overlay renderer can be handed the probe to
-            // attach + GpuScope its own paint. Built whenever not bypassed -> call
-            // sites need no null-checks; INERT unless self_profile is on (Create
-            // with enabled=false: scopes/endFrame no-op, no CSV). attachD3D11
-            // happens inside the renderer ctor (it paints on the app's D3D11
-            // device, or the D3D11On12-bridged device for D3D12 hosts).
-            m_probe = xrprof::Probe::Create(
-                {openxr_api_layer::localAppData, LAYER_NAME, m_settings.self_profile});
+            // Self-profiler (xrprof). Built ONLY when self_profile is on, so a
+            // default (off) session pays NOTHING -- no writer thread, no per-game
+            // GPU query objects (review #1; CLAUDE.md: this DLL loads into every
+            // OpenXR game). When off, m_probe stays null and every call site is
+            // already if(m_probe)-guarded. Built BEFORE the GPU/overlay setup
+            // below so the eager (Auto-mode) renderer receives it; attachD3D11
+            // happens in the renderer ctor (app D3D11 device, or D3D11On12 for
+            // D3D12 hosts).
+            if (m_settings.self_profile) {
+                // Drop any stale renderer first: it holds a NON-owning Probe*, so a
+                // re-entrant xrCreateSession (no intervening xrDestroySession --
+                // non-conformant, but be safe) must not leave it pointing at the
+                // Probe freed on the next line (review #5).
+                m_overlayRenderer.reset();
+                m_probe = xrprof::Probe::Create(
+                    {openxr_api_layer::localAppData, LAYER_NAME, true});
+            } else {
+                m_probe.reset();
+            }
 
             // GPU instrumentation: built now if a feature is already active
             // (Auto mode → m_recording / m_overlayActive were set at
@@ -2246,14 +2256,21 @@ namespace openxr_api_layer {
                     }
                 }
 
-                if (!skipDrawThisFrame) {
-                    // Self-profile the overlay render (CPU). CpuScope sums QPC +
-                    // thread cycles over renderAndCompose; endFrame commits the
-                    // row immediately after (before the forward), keyed on
-                    // displayTime. No-op unless self_profile is on. The optional
-                    // guards m_probe being null on a path that renders without a
-                    // live session (e.g. a unit test) — no-op rather than a deref.
-                    // The GPU span is added inside the renderer in a follow-up.
+                // Gated on frameEndInfo so the profiling scopes and endFrame stay
+                // in LOCKSTEP (review #2): the CpuScope here and the GpuScope
+                // inside renderAndCompose both open on a paint; if endFrame were
+                // skipped (null frameEndInfo) the CPU accumulator + the reserved
+                // GPU slot would leak into the NEXT painted frame (double-counted
+                // CPU, mis-keyed GPU). A null frameEndInfo is a broken frame the
+                // runtime rejects and the overlay couldn't be appended anyway, so
+                // skipping the paint costs nothing.
+                if (!skipDrawThisFrame && frameEndInfo) {
+                    // Self-profile the overlay render. CpuScope (here) sums QPC +
+                    // thread cycles over renderAndCompose; the GpuScope lives
+                    // INSIDE the renderer (on its D3D device). endFrame commits the
+                    // row right after, keyed on displayTime. The optional guards a
+                    // null m_probe (profiling off, or a unit test) -> no-op, not a
+                    // deref.
                     std::optional<xrprof::Probe::CpuScope> cpu;
                     if (m_probe) {
                         cpu.emplace(*m_probe);
@@ -2262,7 +2279,7 @@ namespace openxr_api_layer {
                         overlaySpace, anchorPose, m_overlay.snapshot(),
                         m_overlayGeo);
                     cpu.reset();  // close the CPU scope before endFrame
-                    if (m_probe && frameEndInfo) {
+                    if (m_probe) {
                         m_probe->endFrame(
                             static_cast<uint64_t>(frameEndInfo->displayTime));
                     }
