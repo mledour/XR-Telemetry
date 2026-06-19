@@ -2236,8 +2236,8 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // --- refill quads. UNDER bars: [0]=bg, [1..4]=grid, [5]=budget.
-                //     OVER bars: [6]=axis, [7]=0-ms baseline (see kSlot*) ---
+                // --- refill quads. UNDER bars: [0]=bg, [1..4]=grid, [5]=budget,
+                //     [6]=0-ms baseline. OVER bars: [7]=axis (see kSlot*) ---
                 bool quadOk = false;
                 {
                     D3D11_MAPPED_SUBRESOURCE map{};
@@ -2284,12 +2284,13 @@ namespace openxr_api_layer::detail {
                         // Vertical ms-axis down the left edge (x = plotL),
                         // dashed to match the horizontal grid. The PS auto-
                         // orients the dash along the long axis, so this runs
-                        // along Y. Drawn OVER the bars (pass 2, with the
-                        // baseline): the negative-slack run puts bar[0] flush
-                        // against plotL, so an under-bars axis would be occluded
-                        // with no inter-bar gap to show through (unlike the
-                        // horizontal gridlines). Over the bars the L-frame's
-                        // vertical arm reads at full weight, like the baseline.
+                        // along Y. Drawn OVER the bars (pass 2 — now the ONLY
+                        // over-bars slot): the negative-slack run puts bar[0]
+                        // flush against plotL, so an under-bars axis would be
+                        // occluded with no inter-bar gap to show through (unlike
+                        // the horizontal gridlines). The left arm of the L-frame
+                        // therefore stays over the bars even though the budget +
+                        // baseline now sit under them.
                         q[kSlotAxis] = makeQuad(plotL, histoT, kChromeLineW,
                                                  stripH, kGridLine,
                                                  kGridDashPeriod, kGridDashOn);
@@ -2297,7 +2298,7 @@ namespace openxr_api_layer::detail {
                             histoT + stripH * budgetLineFraction();
                         // Budget reference line. Slotted UNDER the bars
                         // (kSlotBudget < kSlotAxis → drawn in pass 1, even though
-                        // it's filled here next to the OVER-bars slots) so a bar
+                        // the q[] write sits here next to the axis fill) so a bar
                         // that exceeds the budget draws IN FRONT of the line
                         // instead of the line cutting across the bar top.
                         // Same kChromeLineW as the panel borders / separators /
@@ -2309,10 +2310,13 @@ namespace openxr_api_layer::detail {
                         q[kSlotBudget] = makeQuad(plotL, by, fullW, kChromeLineW,
                                                    kBudgetLine);
                         // 0-ms baseline: dashed line flush with the strip bottom,
-                        // same weight/tone/dash as the grid + axis so it closes
-                        // the L with the vertical axis. Drawn OVER the bars, like
-                        // the axis (every bar starts at the baseline, so an
-                        // under-bars line would be hidden). Bottom-aligned (top at histoB −
+                        // same weight/tone/dash as the grid so it matches the
+                        // vertical axis. Drawn UNDER the bars (with the budget):
+                        // every bar starts at the baseline, so wherever a bar (or
+                        // an empty-slot dash) sits the line is occluded — by
+                        // request the bars read in front of it, same as the
+                        // budget; it stays visible only in any truly empty column.
+                        // Bottom-aligned (top at histoB −
                         // kChromeLineW) to sit inside the strip scissor.
                         q[kSlotBaseline] = makeQuad(plotL, histoB - kChromeLineW,
                                                      fullW, kChromeLineW,
@@ -2401,8 +2405,8 @@ namespace openxr_api_layer::detail {
                 // trade.
                 //
                 // quad pass 1 — the UNDER-bars slots [0, kSlotAxis): bg (0) +
-                // interior grid lines [1..4] + budget line (5). Count tracks
-                // kSlotAxis.
+                // interior grid lines [1..4] + budget line (5) + 0-ms baseline
+                // (6). Count tracks kSlotAxis.
                 if (quadOk) {
                     bindQuadPipeline();
                     m_ctx->DrawInstanced(4, kSlotAxis, 0, 0);
@@ -2414,8 +2418,8 @@ namespace openxr_api_layer::detail {
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
                 }
 
-                // quad pass 2 — the OVER-bars slots [kSlotAxis, kQuadSlots):
-                // left axis + 0-ms baseline. Count + offset derived from the
+                // quad pass 2 — the OVER-bars slot [kSlotAxis, kQuadSlots): the
+                // left vertical axis only. Count + offset derived from the
                 // slot layout so they can't drift.
                 if (quadOk) {
                     bindQuadPipeline();
@@ -2461,21 +2465,22 @@ namespace openxr_api_layer::detail {
             // in chrome_shape_renderer.h (overlay_quad_layout).
 
             // Quad slot layout for the histogram region. q[0] = bg, then the
-            // interior gridlines [kSlotGridFirst, kSlotGridEnd) and the budget
-            // line — all composite UNDER the bars, so a bar that crosses the
-            // budget OCCLUDES the line (the bars read in FRONT of it).
-            // [kSlotAxis, kQuadSlots) (left axis, 0-ms baseline) composite OVER
-            // the bars. The pass boundary is kSlotAxis (one past the last
-            // under-bars slot); the draw ranges in drawPanel derive their
-            // counts from these constants, so adding a slot can't silently
-            // desync the pass boundary (no hardcoded literals). NB kSlotGridEnd
-            // (end of the grid run) and kSlotAxis (start of the OVER pass) are
-            // now distinct: the budget slot sits between them, still under bars.
+            // interior gridlines [kSlotGridFirst, kSlotGridEnd), the budget
+            // line, and the 0-ms baseline — all composite UNDER the bars, so a
+            // bar OCCLUDES them where it overlaps (the bars read in FRONT of the
+            // budget + baseline). Only [kSlotAxis, kQuadSlots) — the left
+            // vertical axis — composites OVER the bars. The pass boundary is
+            // kSlotAxis (one past the last under-bars slot); the draw ranges in
+            // drawPanel derive their counts from these constants, so adding a
+            // slot can't silently desync the pass boundary (no hardcoded
+            // literals). NB kSlotGridEnd (end of the grid run) and kSlotAxis
+            // (start of the OVER pass) are distinct: the budget + baseline slots
+            // sit between them, still under bars.
             static constexpr UINT kSlotGridFirst = 1;  // interior gridlines [1..4]
             static constexpr UINT kSlotGridEnd   = 5;  // one past the last grid slot
-            static constexpr UINT kSlotBudget    = 5;  // budget line — UNDER bars
-            static constexpr UINT kSlotAxis      = 6;  // first OVER-bars slot
-            static constexpr UINT kSlotBaseline  = 7;
+            static constexpr UINT kSlotBudget    = 5;  // budget line   — UNDER bars
+            static constexpr UINT kSlotBaseline  = 6;  // 0-ms baseline — UNDER bars
+            static constexpr UINT kSlotAxis      = 7;  // left axis — only OVER-bars slot
             static constexpr UINT kQuadSlots     = 8;  // total
             // The [kSlotGridFirst, kSlotGridEnd) gridline slots must cover every
             // non-zero tick (kMaxMsAxisTicks counts the 0 tick, drawn as the
