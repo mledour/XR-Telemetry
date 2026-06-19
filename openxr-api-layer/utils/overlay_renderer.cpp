@@ -327,17 +327,18 @@ namespace openxr_api_layer::detail {
         // aligned within it so the "ms" suffixes line up and the widest
         // label's leading digit sits at histoL, under the panel title.
         // 44 px holds "XX ms" at 13 px plus a gap before the first bar. The
-        // bars keep their fixed 4+1-px geometry, so the gutter costs the
-        // oldest ~9 of the 133 samples on the left via the strip's negative-
-        // slack clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
+        // bars keep their fixed 5-px / no-gap geometry, so the gutter costs
+        // the oldest ~9 of the 133 samples on the left via the strip's
+        // negative-slack clip (see drawPanel) — ≈1.4 s of history instead of
+        // 1.5 s.
         constexpr float kAxisGutter      = 44.0f;
-        // 133 bars at the fixed 4-px-bar / 1-px-gap layout span
-        // 133×4 + 132×1 = 664 px. Since the ms-axis gutter narrows the plot
-        // to 664 − kAxisGutter = 630 px, the run no longer fits flush: the
-        // negative-slack path in drawPanel keeps the NEWEST bars against the
-        // right edge and the scissor clips the oldest ~7 (every bar still
-        // pixel-aligned at its 5-px step). Window covered ≈ 1.4 s @ 90 Hz /
-        // 0.9 s @ 144 Hz — still short enough to react within ~a second.
+        // 133 bars at the fixed 5-px-bar / no-gap layout span 133×5 = 665 px.
+        // Since the ms-axis gutter narrows the plot below that, the run no
+        // longer fits flush: the negative-slack path in drawPanel keeps the
+        // NEWEST bars against the right edge and the scissor clips the oldest
+        // few (every bar still pixel-aligned at its 5-px step). Window
+        // covered ≈ 1.4 s @ 90 Hz / 0.9 s @ 144 Hz — still short enough to
+        // react within ~a second.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
         static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
@@ -2181,17 +2182,20 @@ namespace openxr_api_layer::detail {
                 if (fullW <= 0.0f || stripH <= 0.0f) return;
 
                 const std::size_t n = ring.size();
-                // Fixed integer bar geometry: 4-px bars + 1-px gaps
-                // (step 5). Integer width AND integer positions make every
-                // bar pixel-identical — no sub-pixel width/gap variation,
-                // no AA needed. kRingSize bars span n*5 - 1 px; the histo
-                // region is wider, so the run is centred and the slack
-                // splits into equal left/right margins. (The strip width
-                // can be adapted later if the bars should sit flush to the
-                // panel edges.)
-                constexpr float kBarPx  = 4.0f;
-                constexpr float kStepPx = 5.0f;   // 4-px bar + 1-px gap
-                const float usedW = static_cast<float>(n) * kStepPx - 1.0f;
+                // Fixed integer bar geometry: 5-px bars at a 5-px step, so
+                // adjacent bars touch (no inter-bar gap). Integer width AND
+                // integer positions make every bar pixel-identical — no
+                // sub-pixel width variation, no AA needed. kRingSize bars
+                // span n*5 px; the histo region is wider, so the run is
+                // centred and the slack splits into equal left/right
+                // margins. (The strip width can be adapted later if the bars
+                // should sit flush to the panel edges.)
+                constexpr float kBarPx  = 5.0f;
+                constexpr float kStepPx = 5.0f;   // bar fills the step — no gap
+                // (n−1) full steps + one final bar; reduces to n·step when the
+                // bar fills the step (gap 0), i.e. the current geometry.
+                const float usedW =
+                    static_cast<float>(n) * kStepPx - (kStepPx - kBarPx);
                 const float slack = fullW - usedW;
                 // Positive slack → centre the run (equal L/R margins).
                 // Negative slack (strip narrower than the run, e.g. if a
@@ -2331,7 +2335,7 @@ namespace openxr_api_layer::detail {
                     // cbuffer describes the actual plot rect.
                     bc.histoTL[0] = plotL;  bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
-                    bc.barWidth = kBarPx;   // fixed 4-px integer width
+                    bc.barWidth = kBarPx;   // fixed 5-px width — fills the step
                     bc.dashHeight = kDashPlaceholderH;  // tier-3 "no data" dash
                     bc.supersample = m_ss;  // logical→physical for the PS edge AA
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
