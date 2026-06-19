@@ -137,6 +137,11 @@ namespace openxr_api_layer::detail {
     struct TelemetrySettings {
         LogSettings log{};
         OverlaySettings overlay{};
+        // Opt-in: measure THIS layer's OWN per-frame CPU/GPU cost via the
+        // xrprof inline profiler (writes xrprof-<layer>-<pid>.csv under
+        // localAppData). Off by default — pure self-diagnostics, separate from
+        // the app-facing telemetry CSV/overlay.
+        bool self_profile = false;
     };
 
     // Result of parseSettings — the parsed struct plus an optional diagnostic
@@ -246,6 +251,7 @@ namespace openxr_api_layer::detail {
         result.settings.overlay.anchor = OverlayAnchor::Head;
         result.settings.overlay.offset_x = 0.0f;
         result.settings.overlay.offset_y = 0.0f;
+        result.settings.self_profile = false;
 
         if (jsonText.empty()) {
             // Treat an empty file as "use defaults", silently. Matches the
@@ -388,6 +394,11 @@ namespace openxr_api_layer::detail {
             result.settings.overlay.offset_x = std::clamp(rawOffX, -1.0f, 1.0f);
             result.settings.overlay.offset_y = std::clamp(rawOffY, -1.0f, 1.0f);
         }
+
+        // Top-level opt-in profiling flag (xrprof). Permissive: missing /
+        // wrong-type -> false (never auto-arms self-profiling).
+        result.settings.self_profile =
+            getBoolOr(doc, "self_profile", false);
 
         return result;
     }

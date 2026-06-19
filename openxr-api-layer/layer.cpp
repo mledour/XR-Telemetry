@@ -59,6 +59,8 @@
 #include "utils/overlay_renderer.h"
 #include "utils/settings.h"
 
+#include <xrprof.h>  // inline self-profiler (external/xrprof submodule)
+
 #include <dxgi1_4.h>  // IDXGIFactory4::EnumAdapterByLuid for the D3D12 path
 #include <log.h>
 #include <util.h>
@@ -1332,10 +1334,11 @@ namespace openxr_api_layer {
                 // (xrCreateSession stashes exactly one; mutually exclusive).
                 if (m_d3d11Device) {
                     m_overlayRenderer = detail::makeD3D11OverlayRenderer(
-                        this, session, m_d3d11Device.Get());
+                        this, session, m_d3d11Device.Get(), m_probe.get());
                 } else if (m_d3d12Device && m_d3d12Queue) {
                     m_overlayRenderer = detail::makeD3D12OverlayRenderer(
-                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get());
+                        this, session, m_d3d12Device.Get(), m_d3d12Queue.Get(),
+                        m_probe.get());
                 }
             } catch (...) {
                 m_overlayRenderer.reset();
@@ -1914,6 +1917,26 @@ namespace openxr_api_layer {
                     "cell will show \"--\" for this session\n");
             }
 
+            // Self-profiler (xrprof). Built ONLY when self_profile is on, so a
+            // default (off) session pays NOTHING -- no writer thread, no per-game
+            // GPU query objects (review #1; CLAUDE.md: this DLL loads into every
+            // OpenXR game). When off, m_probe stays null and every call site is
+            // already if(m_probe)-guarded. Built BEFORE the GPU/overlay setup
+            // below so the eager (Auto-mode) renderer receives it; attachD3D11
+            // happens in the renderer ctor (app D3D11 device, or D3D11On12 for
+            // D3D12 hosts).
+            if (m_settings.self_profile) {
+                // Drop any stale renderer first: it holds a NON-owning Probe*, so a
+                // re-entrant xrCreateSession (no intervening xrDestroySession --
+                // non-conformant, but be safe) must not leave it pointing at the
+                // Probe freed on the next line (review #5).
+                m_overlayRenderer.reset();
+                m_probe = xrprof::Probe::Create(
+                    {openxr_api_layer::localAppData, LAYER_NAME, true});
+            } else {
+                m_probe.reset();
+            }
+
             // GPU instrumentation: built now if a feature is already active
             // (Auto mode → m_recording / m_overlayActive were set at
             // xrCreateInstance), else deferred to first activation for Hotkey
@@ -1934,6 +1957,7 @@ namespace openxr_api_layer {
                 m_settings.overlay.mode == detail::OverlayMode::Auto) {
                 ensureOverlayResources(*session);
             }
+
             return result;
         }
 
@@ -2232,10 +2256,34 @@ namespace openxr_api_layer {
                     }
                 }
 
-                if (!skipDrawThisFrame) {
+                // Gated on frameEndInfo so the profiling scopes and endFrame stay
+                // in LOCKSTEP (review #2): the CpuScope here and the GpuScope
+                // inside renderAndCompose both open on a paint; if endFrame were
+                // skipped (null frameEndInfo) the CPU accumulator + the reserved
+                // GPU slot would leak into the NEXT painted frame (double-counted
+                // CPU, mis-keyed GPU). A null frameEndInfo is a broken frame the
+                // runtime rejects and the overlay couldn't be appended anyway, so
+                // skipping the paint costs nothing.
+                if (!skipDrawThisFrame && frameEndInfo) {
+                    // Self-profile the overlay render. CpuScope (here) sums QPC +
+                    // thread cycles over renderAndCompose; the GpuScope lives
+                    // INSIDE the renderer (on its D3D device). endFrame commits the
+                    // row right after, keyed on displayTime. The optional guards a
+                    // null m_probe (profiling off, or a unit test) -> no-op, not a
+                    // deref.
+                    std::optional<xrprof::Probe::CpuScope> cpu;
+                    if (m_probe) {
+                        cpu.emplace(*m_probe);
+                    }
                     overlayLayer = m_overlayRenderer->renderAndCompose(
                         overlaySpace, anchorPose, m_overlay.snapshot(),
                         m_overlayGeo);
+                    cpu.reset();  // close the CPU scope before endFrame
+                    if (m_probe) {
+                        m_probe->endFrame(
+                            static_cast<uint64_t>(frameEndInfo->displayTime),
+                            m_predictedPeriodNs.load(std::memory_order_relaxed));
+                    }
                 }
             }
 
@@ -2688,6 +2736,7 @@ namespace openxr_api_layer {
             // reports shows "--" rather than this session's stale value.
             m_overlay.resetTelemetryLatches();
             m_overlayRenderer.reset();
+            m_probe.reset();  // flushes pending rows + joins the xrprof writer thread
             // Lazy-overlay binding stash is session-scoped: drop the device /
             // queue refs and clear the attempt latch so the NEXT session
             // re-stashes from its own xrCreateSession and may retry the build.
@@ -2822,6 +2871,11 @@ namespace openxr_api_layer {
         detail::HotkeyEdgeDetector m_overlayHotkeyDetector;
         bool m_overlayActive = false;
         std::unique_ptr<detail::OverlayRenderer> m_overlayRenderer;
+        // Self-profiler (xrprof): measures THIS layer's own overlay-render
+        // CPU/GPU cost into its own CSV. Inert unless settings.self_profile.
+        // Session-scoped (built in xrCreateSession, released in
+        // releaseSessionScopedResources), like the renderer / GPU timer.
+        std::unique_ptr<xrprof::Probe> m_probe;
 
         // Hotkey-poll throttle (see kHotkeyPollIntervalNs). ns timestamp of the
         // last poll (0 = never, so the first frame polls), gated through the
