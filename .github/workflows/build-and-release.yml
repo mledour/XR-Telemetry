@@ -9,6 +9,19 @@ on:
       - 'v*.*.*'
   pull_request:
     branches: [main]
+    # Skip release-please's release PR: it only edits the version file, the
+    # changelog, and the manifest, so a full Windows build + snapshot test
+    # would just duplicate the push-to-main build that already ran on the
+    # same code. Keying on the changed FILES — not release-please's
+    # `release-please--*` branch name, which is configurable — is the robust,
+    # contractual gate: it never skips a real code PR, and a normal PR that
+    # happens to touch only these files (e.g. a changelog typo fix) is also
+    # skipped, which is harmless. push and tag events carry no paths filter,
+    # so the signed release build still runs on the v*.*.* tag.
+    paths-ignore:
+      - 'version.txt'
+      - 'CHANGELOG.md'
+      - '.release-please-manifest.json'
   workflow_dispatch:
 
 # Top-level permissions cover both jobs:
@@ -76,24 +89,14 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Build: Debug + Release in parallel via matrix. Runs on every feature PR,
-  # every push to main, and every v*.*.* tag — EXCEPT release-please's own
-  # release PR (see the `if:` below).
+  # every push to main, and every v*.*.* tag. release-please's release PR is
+  # filtered out up front by the `paths-ignore` on the pull_request trigger
+  # (see `on:` above) — it touches only version.txt / CHANGELOG.md / the
+  # manifest, so it never reaches this job and costs no redundant Windows
+  # build.
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.configuration }} x64
-    # Skip this verification build on release-please's release PR
-    # (head branch `release-please--branches--main`). That PR only bumps
-    # version.txt + CHANGELOG.md — no code — so a full Windows build +
-    # snapshot test would merely duplicate the push-to-main build that
-    # already ran on the same tree when the previous commit landed. Without
-    # this skip, EVERY push to main costs two build runs: the push build
-    # plus a re-build of the release PR that release-please force-updates on
-    # each main push. The real, signed release build still runs later, on
-    # the v*.*.* tag this PR creates when merged. `github.head_ref` is empty
-    # for push and tag events, so startsWith() is false there and they build
-    # as before — only pull_request events from a release-please-* branch
-    # are skipped.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -997,23 +1000,54 @@ jobs:
           done
           ls -la ../release/
 
-      # release-please (.github/workflows/release-please.yml) already created
-      # this tag's GitHub Release with the auto-generated changelog as the
-      # body. This step does NOT create a release — softprops finds the
-      # existing one (matched by the tag) and (a) uploads the built + signed
-      # assets and (b) APPENDS the static install instructions below the
-      # changelog. `append_body: true` is what preserves release-please's
-      # changelog instead of overwriting it; we deliberately drop
-      # `generate_release_notes` and `name:` so we don't fight release-please
-      # for ownership of those fields.
+      # release-please normally created this tag's GitHub Release (with the
+      # changelog as the body) before this build finishes. Two robustness
+      # guards before we attach assets:
       #
-      # Caveat: append_body is NOT idempotent — it re-appends the install
-      # block every time this job's attach step runs again for the same tag
-      # (e.g. the Actions "Re-run jobs" button on an already-green release).
-      # A failed signing/build re-run never reaches this step, so that common
-      # path is safe; if a duplicate does land, trim it from the release body
-      # by hand.
+      #   1. Ensure the Release EXISTS. On a hand-pushed tag — or if
+      #      release-please raced behind this fast job — there'd be no
+      #      Release, and the softprops append below would CREATE one whose
+      #      body is ONLY the static install block: no changelog, no notes.
+      #      Create it here with GitHub's auto-generated notes instead, so a
+      #      Release is never shipped notes-less.
+      #   2. Decide whether to append the install block. The block carries an
+      #      HTML-comment marker; if a previous successful run already
+      #      appended it, skip — so re-running this job (Actions "Re-run
+      #      jobs") can't stack duplicate copies in the public release body.
+      #      A failed view/grep defaults to append_notes=true (fail-safe:
+      #      better a rare duplicate than a missing install block).
+      #
+      # gh needs the repo context without a checkout, hence GH_REPO.
+      - name: Ensure release exists and decide on install-note append
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::No Release for $TAG (hand-pushed tag, or release-please lagged) — creating with auto-generated notes."
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+          if gh release view "$TAG" --json body -q .body | grep -qF '<!-- xrt:install-block -->'; then
+            echo "append_notes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "append_notes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Attach the built + signed assets and APPEND the static install
+      # instructions below release-please's changelog. `append_body: true`
+      # preserves that changelog (we drop `generate_release_notes` / `name:`
+      # so we don't fight release-please for those fields). Gated on the
+      # marker check above, so re-running an already-attached release is a
+      # no-op — note this also skips re-uploading assets on such a re-run,
+      # which is intended (a fully-attached release needs no changes; to
+      # force a refresh, delete the release assets or the marker first). The
+      # leading `<!-- xrt:install-block -->` is the marker step 2 greps for.
       - name: Attach signed assets to release
+        if: steps.rel.outputs.append_notes == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
@@ -1021,6 +1055,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
+            <!-- xrt:install-block -->
             ## ${{ env.LAYER_NAME }} ${{ github.ref_name }}
 
             OpenXR API layer built from commit `${{ github.sha }}`.
