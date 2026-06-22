@@ -1000,26 +1000,18 @@ jobs:
           done
           ls -la ../release/
 
-      # release-please normally created this tag's GitHub Release (with the
-      # changelog as the body) before this build finishes. Two robustness
-      # guards before we attach assets:
+      # release-please owns this tag's GitHub Release and its body (the
+      # generated changelog) — see .github/workflows/release-please.yml. This
+      # job only ATTACHES the built + signed assets; it does NOT write the
+      # body. Per-release install instructions live in the README, not on the
+      # release page.
       #
-      #   1. Ensure the Release EXISTS. On a hand-pushed tag — or if
-      #      release-please raced behind this fast job — there'd be no
-      #      Release, and the softprops append below would CREATE one whose
-      #      body is ONLY the static install block: no changelog, no notes.
-      #      Create it here with GitHub's auto-generated notes instead, so a
-      #      Release is never shipped notes-less.
-      #   2. Decide whether to append the install block. The block carries an
-      #      HTML-comment marker; if a previous successful run already
-      #      appended it, skip — so re-running this job (Actions "Re-run
-      #      jobs") can't stack duplicate copies in the public release body.
-      #      A failed view/grep defaults to append_notes=true (fail-safe:
-      #      better a rare duplicate than a missing install block).
-      #
-      # gh needs the repo context without a checkout, hence GH_REPO.
-      - name: Ensure release exists and decide on install-note append
-        id: rel
+      # Guard: if no Release exists for the tag (a hand-pushed tag, or
+      # release-please racing behind this fast job), create it with GitHub's
+      # auto-generated notes so a Release is never shipped notes-less. In the
+      # normal release-please flow this is a no-op. gh needs the repo context
+      # without a checkout, hence GH_REPO.
+      - name: Ensure the GitHub Release exists
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1031,69 +1023,13 @@ jobs:
             echo "::warning::No Release for $TAG (hand-pushed tag, or release-please lagged) — creating with auto-generated notes."
             gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
           fi
-          if gh release view "$TAG" --json body -q .body | grep -qF '<!-- xrt:install-block -->'; then
-            echo "append_notes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "append_notes=true" >> "$GITHUB_OUTPUT"
-          fi
 
-      # Attach the built + signed assets and APPEND the static install
-      # instructions below release-please's changelog. `append_body: true`
-      # preserves that changelog (we drop `generate_release_notes` / `name:`
-      # so we don't fight release-please for those fields). Gated on the
-      # marker check above, so re-running an already-attached release is a
-      # no-op — note this also skips re-uploading assets on such a re-run,
-      # which is intended (a fully-attached release needs no changes; to
-      # force a refresh, delete the release assets or the marker first). The
-      # leading `<!-- xrt:install-block -->` is the marker step 2 greps for.
+      # Upload the built + signed assets. No body/append_body: release-please's
+      # changelog stays the entire release body. softprops overwrites
+      # same-named assets, so re-running this job is idempotent;
+      # fail_on_unmatched_files catches a packaging bug (an empty release/).
       - name: Attach signed assets to release
-        if: steps.rel.outputs.append_notes == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          append_body: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          body: |
-            <!-- xrt:install-block -->
-            ## ${{ env.LAYER_NAME }} ${{ github.ref_name }}
-
-            OpenXR API layer built from commit `${{ github.sha }}`.
-
-            ### Assets
-            | File | Description |
-            |------|-------------|
-            | `${{ env.LAYER_NAME }}-*-x64-Setup.exe` | **Installer (recommended)** — installs to Program Files, registers the layer, creates uninstaller in Add/Remove Programs |
-            | `${{ env.LAYER_NAME }}-Release-x64.zip` | ZIP for manual install (DLL + JSON + PowerShell scripts) |
-            | `${{ env.LAYER_NAME }}-Debug-x64.zip` | Debug build with full symbols, for troubleshooting |
-
-            ### Install (installer)
-            1. Download the `...-Setup.exe` above.
-            2. Run it — admin elevation is handled automatically.
-            3. The layer is installed to `C:\Program Files\XR-Telemetry\`
-               and registered with the OpenXR loader.
-
-            ### Install (manual / ZIP)
-            1. Download `...-Release-x64.zip` and unzip to a **permanent** location.
-            2. Open an **elevated** PowerShell and run:
-               ```powershell
-               powershell -ExecutionPolicy Bypass -File .\Install-Layer.ps1
-               ```
-
-            ### Uninstall
-            - **Installer**: Settings → Apps → ${{ env.LAYER_NAME }} → Uninstall
-            - **Manual**: run `Uninstall-Layer.ps1` from an elevated PowerShell
-
-            ### Disable without uninstalling
-            Set the environment variable `DISABLE_${{ env.LAYER_NAME }}=1` for the
-            target process.
-
-            > 🔒 Signed with a **Certum Open Source Code Signing Cloud** certificate
-            > (subject: *Open Source Developer Michael Ledour*). Verify locally with:
-            > ```powershell
-            > signtool verify /pa /v <file>.exe
-            > ```
-            > Windows SmartScreen may still warn ("Unknown publisher") on early
-            > downloads until the publisher reputation builds with volume.
-            > Anti-cheat systems may flag any OpenXR layer DLL — even a signed
-            > one — when loaded into a hooked game.
+          fail_on_unmatched_files: true
