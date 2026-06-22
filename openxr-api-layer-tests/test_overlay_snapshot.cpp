@@ -109,12 +109,21 @@ namespace {
         return s;
     }
 
-    // Rising-ramp histogram with two stutter spikes. A few empty slots
-    // at the LEADING (oldest) end only — they render as the 2-px "no-data"
-    // dash, so the golden still covers that placeholder path. The trailing
-    // (newest) slots are always filled: in a live session the most recent
-    // frames are never missing, so the bars run flush to the right edge
-    // (only the oldest end empties, during ring warm-up).
+    // Synthetic frametime ring shaped to read like a real session rather
+    // than a clean ramp. Three layers, all DETERMINISTIC (an integer hash,
+    // never rand() — the WARP golden is compared bit-for-bit, so the data
+    // must be identical run-to-run and independent of evaluation order):
+    //   * a slow load "swell" — two non-harmonic sine octaves at different
+    //     phases, so the envelope wanders UP and DOWN instead of climbing
+    //     monotonically;
+    //   * fast per-frame jitter — the grass-like ±0.5 ms frame-to-frame
+    //     noise every real frametime trace carries;
+    //   * sparse minor hitches — a few percent of frames take a small extra
+    //     bump, the organic micro-stutters between the two big scripted ones.
+    // Plus the two explicit stutter spikes (spike_a / spike_b) that anchor
+    // the orange/red tiers. A few empty slots at the LEADING (oldest) end
+    // render as the 2-px "no-data" dash (ring warm-up); the trailing
+    // (newest) slots are always filled, so the bars run flush to the right.
     void fillSyntheticRing(openxr_api_layer::detail::HistogramRing<
                               openxr_api_layer::detail::kOverlayHistoRingSize>& ring,
                             float base_ms, float amp_ms, float stutter_ms,
@@ -124,6 +133,17 @@ namespace {
         constexpr int kEmptyHead = 15;  // oldest slots: warm-up / dash test
         constexpr int kEmptyTail = 0;   // newest frames always present →
                                         // bars reach the right edge
+        constexpr float kPi = 3.14159265f;
+
+        // lowbias32 integer hash → [0,1). Deterministic and well-distributed;
+        // offsetting the input yields independent "random" streams per frame.
+        auto hash01 = [](uint32_t x) -> float {
+            x ^= x >> 16; x *= 0x7feb352dU;
+            x ^= x >> 15; x *= 0x846ca68bU;
+            x ^= x >> 16;
+            return static_cast<float>(x & 0x00FFFFFFu) / 16777216.0f;
+        };
+
         for (int i = 0; i < N; ++i) {
             int64_t ns = 0;
             if (i < kEmptyHead || i >= N - kEmptyTail) {
@@ -131,11 +151,22 @@ namespace {
             } else if (i == spike_a || i == spike_b) {
                 ns = static_cast<int64_t>(stutter_ms * 1.0e6f);
             } else {
+                const uint32_t idx = static_cast<uint32_t>(i);
                 const float t = static_cast<float>(i - kEmptyHead) /
                                  static_cast<float>(N - kEmptyHead - kEmptyTail);
-                const float wave = 0.5f *
-                    (1.0f + std::sin((t - 0.5f) * 3.14159265f));  // 0..1, monotonic
-                const float ms = base_ms + amp_ms * (wave - 0.5f) * 2.0f;
+                // Two non-harmonic octaves, phase-shifted → a wandering swell
+                // (range ≈ ±0.85), NOT a monotonic ramp.
+                const float swell =
+                    0.55f * std::sin((t * 2.3f + 0.20f) * 2.0f * kPi) +
+                    0.30f * std::sin((t * 5.7f + 0.85f) * 2.0f * kPi);
+                // Per-frame jitter in [-1,1).
+                const float jitter = hash01(idx + 101u) * 2.0f - 1.0f;
+                float ms = base_ms + amp_ms * swell + 0.45f * jitter;
+                // Sparse minor hitch on ~6 % of frames (distinct from the two
+                // big scripted spikes; magnitude kept below them).
+                if (hash01(idx + 50051u) > 0.94f) {
+                    ms += 0.8f + 1.7f * hash01(idx + 90007u);
+                }
                 ns = static_cast<int64_t>(std::max(0.0f, ms) * 1.0e6f);
             }
             ring.push(ns);

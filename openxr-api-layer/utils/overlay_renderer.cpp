@@ -327,17 +327,18 @@ namespace openxr_api_layer::detail {
         // aligned within it so the "ms" suffixes line up and the widest
         // label's leading digit sits at histoL, under the panel title.
         // 44 px holds "XX ms" at 13 px plus a gap before the first bar. The
-        // bars keep their fixed 4+1-px geometry, so the gutter costs the
-        // oldest ~9 of the 133 samples on the left via the strip's negative-
-        // slack clip (see drawPanel) — ≈1.4 s of history instead of 1.5 s.
+        // bars keep their fixed 5-px / no-gap geometry, so the gutter costs
+        // the oldest ~9 of the 133 samples on the left via the strip's
+        // negative-slack clip (see drawPanel) — ≈1.4 s of history instead of
+        // 1.5 s.
         constexpr float kAxisGutter      = 44.0f;
-        // 133 bars at the fixed 4-px-bar / 1-px-gap layout span
-        // 133×4 + 132×1 = 664 px. Since the ms-axis gutter narrows the plot
-        // to 664 − kAxisGutter = 630 px, the run no longer fits flush: the
-        // negative-slack path in drawPanel keeps the NEWEST bars against the
-        // right edge and the scissor clips the oldest ~7 (every bar still
-        // pixel-aligned at its 5-px step). Window covered ≈ 1.4 s @ 90 Hz /
-        // 0.9 s @ 144 Hz — still short enough to react within ~a second.
+        // 133 bars at the fixed 5-px-bar / no-gap layout span 133×5 = 665 px.
+        // Since the ms-axis gutter narrows the plot below that, the run no
+        // longer fits flush: the negative-slack path in drawPanel keeps the
+        // NEWEST bars against the right edge and the scissor clips the oldest
+        // few (every bar still pixel-aligned at its 5-px step). Window
+        // covered ≈ 1.4 s @ 90 Hz / 0.9 s @ 144 Hz — still short enough to
+        // react within ~a second.
         constexpr std::size_t kRingSize  = openxr_api_layer::detail::kOverlayHistoRingSize;
         static_assert(kRingSize == 133,
                        "kOverlayHistoRingSize must match the in-engine ring size; "
@@ -2181,17 +2182,20 @@ namespace openxr_api_layer::detail {
                 if (fullW <= 0.0f || stripH <= 0.0f) return;
 
                 const std::size_t n = ring.size();
-                // Fixed integer bar geometry: 4-px bars + 1-px gaps
-                // (step 5). Integer width AND integer positions make every
-                // bar pixel-identical — no sub-pixel width/gap variation,
-                // no AA needed. kRingSize bars span n*5 - 1 px; the histo
-                // region is wider, so the run is centred and the slack
-                // splits into equal left/right margins. (The strip width
-                // can be adapted later if the bars should sit flush to the
-                // panel edges.)
-                constexpr float kBarPx  = 4.0f;
-                constexpr float kStepPx = 5.0f;   // 4-px bar + 1-px gap
-                const float usedW = static_cast<float>(n) * kStepPx - 1.0f;
+                // Fixed integer bar geometry: 5-px bars at a 5-px step, so
+                // adjacent bars touch (no inter-bar gap). Integer width AND
+                // integer positions make every bar pixel-identical — no
+                // sub-pixel width variation, no AA needed. kRingSize bars
+                // span n*5 px; the histo region is wider, so the run is
+                // centred and the slack splits into equal left/right
+                // margins. (The strip width can be adapted later if the bars
+                // should sit flush to the panel edges.)
+                constexpr float kBarPx  = 5.0f;
+                constexpr float kStepPx = 5.0f;   // bar fills the step — no gap
+                // (n−1) full steps + one final bar; reduces to n·step when the
+                // bar fills the step (gap 0), i.e. the current geometry.
+                const float usedW =
+                    static_cast<float>(n) * kStepPx - (kStepPx - kBarPx);
                 const float slack = fullW - usedW;
                 // Positive slack → centre the run (equal L/R margins).
                 // Negative slack (strip narrower than the run, e.g. if a
@@ -2232,8 +2236,9 @@ namespace openxr_api_layer::detail {
                     }
                 }
 
-                // --- refill quads. UNDER bars: [0]=bg, [1..4]=grid. OVER bars:
-                //     [5]=axis, [6]=budget, [7]=0-ms baseline (see kSlot*) ---
+                // --- refill quads. ALL composite UNDER the bars: [0]=bg,
+                //     [1..4]=grid, [5]=budget, [6]=0-ms baseline, [7]=axis
+                //     (see kSlot*) ---
                 bool quadOk = false;
                 {
                     D3D11_MAPPED_SUBRESOURCE map{};
@@ -2263,7 +2268,7 @@ namespace openxr_api_layer::detail {
                         UINT slot = kSlotGridFirst;
                         if (axis.valid) {
                             for (int i = 0;
-                                 i < axis.tickCount && slot < kSlotAxis; ++i) {
+                                 i < axis.tickCount && slot < kSlotGridEnd; ++i) {
                                 if (axis.ticks[i].atBottomEdge) continue;
                                 const float y = histoT + stripH *
                                     (1.0f - axis.ticks[i].heightFrac);
@@ -2273,24 +2278,28 @@ namespace openxr_api_layer::detail {
                                               kGridDashPeriod, kGridDashOn);
                             }
                         }
-                        for (; slot < kSlotAxis; ++slot) {
+                        for (; slot < kSlotGridEnd; ++slot) {
                             q[slot] =
                                 makeQuad(plotL, histoT, 0.0f, 0.0f, kGridLine);
                         }
                         // Vertical ms-axis down the left edge (x = plotL),
                         // dashed to match the horizontal grid. The PS auto-
                         // orients the dash along the long axis, so this runs
-                        // along Y. Drawn OVER the bars (pass 2, with the budget +
-                        // baseline): the negative-slack run puts bar[0] flush
-                        // against plotL, so an under-bars axis would be occluded
-                        // with no inter-bar gap to show through (unlike the
-                        // horizontal gridlines). Over the bars the L-frame's
-                        // vertical arm reads at full weight, like the baseline.
+                        // along Y. Drawn UNDER the bars, like the rest of the
+                        // chrome: the negative-slack run puts bar[0] flush
+                        // against plotL, so the leftmost bar occludes the axis up
+                        // to its own height — the axis shows above that bar (and
+                        // wherever the left column is empty), and the bars read
+                        // in front of it, matching the budget + baseline.
                         q[kSlotAxis] = makeQuad(plotL, histoT, kChromeLineW,
                                                  stripH, kGridLine,
                                                  kGridDashPeriod, kGridDashOn);
                         const float by =
                             histoT + stripH * budgetLineFraction();
+                        // Budget reference line — drawn UNDER the bars (like all
+                        // the chrome now) so a bar that exceeds the budget draws
+                        // IN FRONT of the line instead of the line cutting across
+                        // the bar top.
                         // Same kChromeLineW as the panel borders / separators /
                         // grid: LOGICAL px → constant angular thickness across
                         // supersample factors, while a higher factor gives more
@@ -2300,10 +2309,13 @@ namespace openxr_api_layer::detail {
                         q[kSlotBudget] = makeQuad(plotL, by, fullW, kChromeLineW,
                                                    kBudgetLine);
                         // 0-ms baseline: dashed line flush with the strip bottom,
-                        // same weight/tone/dash as the grid + axis so it closes
-                        // the L with the vertical axis. Drawn OVER the bars too
-                        // (every bar starts at the baseline, so an under-bars
-                        // line would be hidden). Bottom-aligned (top at histoB −
+                        // same weight/tone/dash as the grid so it matches the
+                        // vertical axis. Drawn UNDER the bars (with the budget +
+                        // axis): every bar starts at the baseline, so wherever a bar (or
+                        // an empty-slot dash) sits the line is occluded — by
+                        // request the bars read in front of it, same as the
+                        // budget; it stays visible only in any truly empty column.
+                        // Bottom-aligned (top at histoB −
                         // kChromeLineW) to sit inside the strip scissor.
                         q[kSlotBaseline] = makeQuad(plotL, histoB - kChromeLineW,
                                                      fullW, kChromeLineW,
@@ -2331,7 +2343,7 @@ namespace openxr_api_layer::detail {
                     // cbuffer describes the actual plot rect.
                     bc.histoTL[0] = plotL;  bc.histoTL[1] = histoT;
                     bc.histoBR[0] = histoR; bc.histoBR[1] = histoB;
-                    bc.barWidth = kBarPx;   // fixed 4-px integer width
+                    bc.barWidth = kBarPx;   // fixed 5-px width — fills the step
                     bc.dashHeight = kDashPlaceholderH;  // tier-3 "no data" dash
                     bc.supersample = m_ss;  // logical→physical for the PS edge AA
                     copyColor(bc.gradTop,    isGpu ? kGpuGradTop : kCpuGradTop);
@@ -2374,15 +2386,14 @@ namespace openxr_api_layer::detail {
                 m_ctx->IASetPrimitiveTopology(
                     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-                // Three draw passes per panel. Layering relies on D3D11's
-                // documented in-order primitive submission: bg + 4 grid lines
-                // (alpha-over) → opaque bars → left axis + budget line + 0-ms
-                // baseline (alpha-over). Without that guarantee the alpha-
-                // blended grid and the over-bar lines could land on the wrong
-                // side of the bars.
+                // Two draw passes per panel. Layering relies on D3D11's
+                // documented in-order primitive submission: ALL the chrome —
+                // bg + 4 grid lines + budget + 0-ms baseline + left axis
+                // (alpha-over) → opaque bars on top. Without that guarantee the
+                // alpha-blended chrome could land on the wrong side of the bars.
                 //
-                // Both quad passes are skipped if the quad buffer didn't map
-                // this frame (quadOk == false) — never draw over its stale /
+                // The quad pass is skipped if the quad buffer didn't map this
+                // frame (quadOk == false) — never draw over its stale /
                 // uninitialized instance data. Mirrors the chrome-shape /
                 // glyph-atlas flushes, which suppress on a failed Map rather
                 // than compositing garbage. The bar pass is already gated by
@@ -2391,26 +2402,20 @@ namespace openxr_api_layer::detail {
                 // removed), so dropping the panel for that frame is the right
                 // trade.
                 //
-                // quad pass 1 — the UNDER-bars slots [0, kSlotAxis): bg (0) +
-                // interior grid lines [1..4]. Count tracks kSlotAxis.
+                // quad pass — ALL chrome composites UNDER the bars: bg (0) +
+                // interior grid lines [1..4] + budget (5) + 0-ms baseline (6) +
+                // left axis (7). Drawn before the bars so the bars are the top
+                // layer everywhere; count = kQuadSlots.
                 if (quadOk) {
                     bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, kSlotAxis, 0, 0);
+                    m_ctx->DrawInstanced(4, kQuadSlots, 0, 0);
                 }
 
-                // bar pass — samples on top of bg/grid (instances 0..barCount).
+                // bar pass — samples on top of ALL the chrome (instances
+                // 0..barCount).
                 if (barCount > 0) {
                     bindBarPipeline(m_barCB[cbIdx].GetAddressOf());
                     m_ctx->DrawInstanced(4, barCount, 0, 0);
-                }
-
-                // quad pass 2 — the OVER-bars slots [kSlotAxis, kQuadSlots):
-                // left axis + budget line + 0-ms baseline. Count + offset
-                // derived from the slot layout so they can't drift.
-                if (quadOk) {
-                    bindQuadPipeline();
-                    m_ctx->DrawInstanced(4, kQuadSlots - kSlotAxis, 0,
-                                          kSlotAxis);
                 }
             }
 
@@ -2450,22 +2455,26 @@ namespace openxr_api_layer::detail {
             // QuadInstance's size assert lives with the shared definition
             // in chrome_shape_renderer.h (overlay_quad_layout).
 
-            // Quad slot layout for the histogram region. q[0] = bg, then the
-            // interior gridlines; [kSlotGridFirst, kSlotAxis) composite UNDER
-            // the bars, [kSlotAxis, kQuadSlots) (axis, budget, 0-ms baseline)
-            // OVER them. The draw ranges in drawPanel derive their counts from
-            // these constants, so adding a slot can't silently desync the pass
-            // boundary (no hardcoded 6 / 2 / offset-6 literals).
+            // Quad slot layout for the histogram region — ALL of it composites
+            // UNDER the bars now (the bars are the top layer). q[0] = bg, then
+            // the interior gridlines [kSlotGridFirst, kSlotGridEnd), the budget
+            // line, the 0-ms baseline, and the left vertical axis. A bar
+            // OCCLUDES any chrome it overlaps, so the bars read in FRONT of every
+            // line. drawPanel draws all kQuadSlots quads in one pass before the
+            // bars; the count derives from kQuadSlots so adding a slot can't
+            // silently desync it. kSlotGridEnd (one past the grid run) stays
+            // separate from the budget slot that immediately follows it.
             static constexpr UINT kSlotGridFirst = 1;  // interior gridlines [1..4]
-            static constexpr UINT kSlotAxis      = 5;  // first OVER-bars slot
-            static constexpr UINT kSlotBudget    = 6;
-            static constexpr UINT kSlotBaseline  = 7;
+            static constexpr UINT kSlotGridEnd   = 5;  // one past the last grid slot
+            static constexpr UINT kSlotBudget    = 5;  // budget line
+            static constexpr UINT kSlotBaseline  = 6;  // 0-ms baseline
+            static constexpr UINT kSlotAxis      = 7;  // left vertical ms-axis
             static constexpr UINT kQuadSlots     = 8;  // total
-            // The [kSlotGridFirst, kSlotAxis) gridline slots must cover every
+            // The [kSlotGridFirst, kSlotGridEnd) gridline slots must cover every
             // non-zero tick (kMaxMsAxisTicks counts the 0 tick, drawn as the
             // baseline rather than an interior line). Catches a kMaxMsAxisTicks
             // bump that would otherwise overflow the grid slots at runtime.
-            static_assert(kSlotAxis - kSlotGridFirst >=
+            static_assert(kSlotGridEnd - kSlotGridFirst >=
                               static_cast<UINT>(kMaxMsAxisTicks - 1),
                           "too few interior-gridline slots for kMaxMsAxisTicks");
 
