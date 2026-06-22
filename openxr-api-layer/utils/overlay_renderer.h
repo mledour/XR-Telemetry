@@ -171,10 +171,13 @@ namespace openxr_api_layer::detail {
     // code can declare matching rings without hard-coding the value
     // (and the cpp's static_assert below guards against drift).
     //
-    // 133 = the bar count that fills the GPU histogram strip exactly
-    // with the fixed 4-px-bar / 1-px-gap layout: 133×4 + 132×1 = 664 px
-    // (the strip's inner width). Picking it leaves zero margin and keeps
-    // every bar pixel-aligned. ~133 samples ≈ 1.5 s @ 90 Hz.
+    // 133 = the histogram ring size. Originally chosen so the strip filled
+    // exactly with 4-px bars + 1-px gaps (133×4 + 132×1 = 664 px). The bars
+    // are now 5-px wide at a 5-px step with no gap (see overlay_renderer.cpp),
+    // so 133 bars span 133×5 = 665 px and the .cpp centres or left-clips the
+    // run within the strip's actual width rather than filling it exactly. The
+    // count is retained for the time window it captures: ~133 samples ≈
+    // 1.5 s @ 90 Hz.
     constexpr std::size_t kOverlayHistoRingSize = 133;
 
     // -------- GPU-path snapshot entry point (Task 18) ---------------------

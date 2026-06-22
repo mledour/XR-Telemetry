@@ -64,7 +64,7 @@ float4 PSMain(VSOutput i) : SV_TARGET
     // a bar chart and removes that artifact; the shared baseline at the
     // strip floor stays crisp for the same reason.
     //
-    // CONTRACT: bar geometry stays integer-aligned (4-px width, integer
+    // CONTRACT: bar geometry stays integer-aligned (5-px width, integer
     // xLeft — see HistogramBarRenderer::drawPanel). With that, covX
     // collapses to 1 everywhere and the sides ALSO render crisp — the
     // bars look pixel-perfect uniform. If a future layout reintroduces

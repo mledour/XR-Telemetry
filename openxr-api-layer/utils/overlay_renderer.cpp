@@ -2464,12 +2464,17 @@ namespace openxr_api_layer::detail {
             // bars; the count derives from kQuadSlots so adding a slot can't
             // silently desync it. kSlotGridEnd (one past the grid run) stays
             // separate from the budget slot that immediately follows it.
-            static constexpr UINT kSlotGridFirst = 1;  // interior gridlines [1..4]
+            static constexpr UINT kSlotGridFirst = 1;  // interior gridlines [kSlotGridFirst, kSlotGridEnd)
             static constexpr UINT kSlotGridEnd   = 5;  // one past the last grid slot
-            static constexpr UINT kSlotBudget    = 5;  // budget line
-            static constexpr UINT kSlotBaseline  = 6;  // 0-ms baseline
-            static constexpr UINT kSlotAxis      = 7;  // left vertical ms-axis
-            static constexpr UINT kQuadSlots     = 8;  // total
+            // Trailing single-quad slots derive sequentially from kSlotGridEnd
+            // so they can never silently collide with the grid run: bump
+            // kSlotGridEnd (e.g. to add an interior gridline) and budget /
+            // baseline / axis / total all shift up in lockstep instead of one
+            // quietly overwriting a grid slot. Values are unchanged (5/6/7/8).
+            static constexpr UINT kSlotBudget    = kSlotGridEnd;       // budget line
+            static constexpr UINT kSlotBaseline  = kSlotBudget + 1;    // 0-ms baseline
+            static constexpr UINT kSlotAxis      = kSlotBaseline + 1;  // left vertical ms-axis
+            static constexpr UINT kQuadSlots     = kSlotAxis + 1;      // total
             // The [kSlotGridFirst, kSlotGridEnd) gridline slots must cover every
             // non-zero tick (kMaxMsAxisTicks counts the 0 tick, drawn as the
             // baseline rather than an interior line). Catches a kMaxMsAxisTicks
