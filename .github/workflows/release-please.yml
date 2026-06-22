@@ -19,8 +19,8 @@ name: release-please
 # loops. If we used GITHUB_TOKEN here, build-and-release.yml would never
 # fire on the new tag and every Release would ship with an empty asset
 # list. The secret must be a PAT (or GitHub App token) with, on this repo,
-# Contents: read/write + Pull requests: read/write. Setup steps are in the
-# README ("Releases" section).
+# Contents: read/write + Pull requests: read/write. Setup steps are in
+# docs/DEVELOPMENT.md -> "Releases" -> "Required secret: RELEASE_PLEASE_TOKEN".
 on:
   push:
     branches: [main]

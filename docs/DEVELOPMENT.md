@@ -460,8 +460,8 @@ You never push a release tag by hand.
    whose type isn't recognised (chore, docs, ci, …) don't appear in
    the changelog and don't move the version.
 2. release-please keeps an open **"chore: release X.Y.Z" PR** that
-   bumps [`version.txt`](../version.txt) and regenerates
-   [`CHANGELOG.md`](../CHANGELOG.md) from those commits. It rewrites
+   bumps [`version.txt`](../version.txt) and regenerates `CHANGELOG.md`
+   (created by the first release PR) from those commits. It rewrites
    itself on every push to `main` — leave it alone until you're ready
    to ship.
 3. **Merging that PR is the release action.** release-please then

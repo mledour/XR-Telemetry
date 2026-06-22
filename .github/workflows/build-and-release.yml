@@ -992,9 +992,12 @@ jobs:
       # `generate_release_notes` and `name:` so we don't fight release-please
       # for ownership of those fields.
       #
-      # Caveat: append_body re-appends on a manual re-run of this job, which
-      # duplicates the install block. Re-running a finished tag build is
-      # rare; trim the release body by hand if that ever happens.
+      # Caveat: append_body is NOT idempotent — it re-appends the install
+      # block every time this job's attach step runs again for the same tag
+      # (e.g. the Actions "Re-run jobs" button on an already-green release).
+      # A failed signing/build re-run never reaches this step, so that common
+      # path is safe; if a duplicate does land, trim it from the release body
+      # by hand.
       - name: Attach signed assets to release
         uses: softprops/action-gh-release@v2
         with:
