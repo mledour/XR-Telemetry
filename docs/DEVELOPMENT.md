@@ -447,11 +447,32 @@ Suite against the layer on your target runtime — see
 
 ## Releases
 
-The GitHub Actions workflow
-([`build-and-release.yml`](../.github/workflows/build-and-release.yml))
-builds `Release` and `Debug` x64 on every push to `main` (as a sanity
-check), every PR, and every `v*.*.*` tag. On a tag push it
-additionally creates a GitHub Release and attaches:
+Releases are automated with
+[release-please](https://github.com/googleapis/release-please)
+([`release-please.yml`](../.github/workflows/release-please.yml)),
+driven by [Conventional Commits](https://www.conventionalcommits.org/).
+You never push a release tag by hand.
+
+**The flow:**
+
+1. Land Conventional-Commit commits on `main` — `feat:` → minor bump,
+   `fix:` → patch, `feat!:` / `BREAKING CHANGE:` → major. Commits
+   whose type isn't recognised (chore, docs, ci, …) don't appear in
+   the changelog and don't move the version.
+2. release-please keeps an open **"chore: release X.Y.Z" PR** that
+   bumps [`version.txt`](../version.txt) and regenerates `CHANGELOG.md`
+   (created by the first release PR) from those commits. It rewrites
+   itself on every push to `main` — leave it alone until you're ready
+   to ship.
+3. **Merging that PR is the release action.** release-please then
+   creates the `vX.Y.Z` tag and a GitHub Release whose body is the
+   generated changelog.
+4. That tag triggers
+   [`build-and-release.yml`](../.github/workflows/build-and-release.yml),
+   which builds + signs `Release`/`Debug` x64 and **attaches** the
+   assets to the Release release-please just created — appending the
+   install instructions below the changelog rather than overwriting
+   it:
 
 - `XR_APILAYER_MLEDOUR_xr_telemetry-<version>-x64-Setup.exe` —
   Inno Setup installer (recommended for end users)
@@ -460,18 +481,43 @@ additionally creates a GitHub Release and attaches:
 - `XR_APILAYER_MLEDOUR_xr_telemetry-Debug-x64.zip` — debug build
   with full symbols, for troubleshooting
 
-To publish a new release:
+`build-and-release.yml` still also builds `Release`/`Debug` on every
+push to `main` and every PR as a verification gate (unsigned, no
+Release) — that part is unchanged.
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The tag is derived into the DLL's `VERSIONINFO` resource at build
+The version is derived into the DLL's `VERSIONINFO` resource at build
 time via
-[`scripts/Generate-VersionRc.ps1`](../scripts/Generate-VersionRc.ps1),
-and into the installer's filename and `AppVersion` via the
-`/DMyAppVersion` flag passed to ISCC.
+[`scripts/Generate-VersionRc.ps1`](../scripts/Generate-VersionRc.ps1)
+(from the `v*.*.*` tag, falling back to `git describe`), and into the
+installer's filename and `AppVersion` via the `/DMyAppVersion` flag
+passed to ISCC.
+
+> **Bootstrapping:**
+> [`.release-please-manifest.json`](../.release-please-manifest.json)
+> is seeded at `1.0.0` to match the existing `v1.0.0` tag, so the
+> first release PR bumps from there using the commits landed since.
+
+### Required secret: `RELEASE_PLEASE_TOKEN`
+
+release-please must tag using a token **other than** the built-in
+`GITHUB_TOKEN`. GitHub deliberately does not let events created with
+`GITHUB_TOKEN` trigger further workflows (an anti-recursion measure),
+so a tag pushed with it would never start `build-and-release.yml` and
+the Release would ship with **no assets**. Provide a token as the
+`RELEASE_PLEASE_TOKEN` repository secret (Settings → Secrets and
+variables → Actions → New repository secret):
+
+| Option | What to grant |
+|--------|---------------|
+| **Fine-grained PAT** (recommended) | This repo only; repository permissions **Contents: Read and write** + **Pull requests: Read and write** |
+| **Classic PAT** | `repo` scope |
+| **GitHub App token** | `contents: write` + `pull_requests: write` — no expiry, more setup |
+
+Because release-please authenticates with this PAT, the "Allow GitHub
+Actions to create and approve pull requests" repo/org toggle is **not**
+required (that setting only gates the default `GITHUB_TOKEN`). If the
+secret is missing or under-scoped, the release-please job fails fast
+with a 403 — it never silently produces an asset-less Release.
 
 ## Code signing
 
@@ -628,6 +674,12 @@ for Release-tag builds to produce signed binaries. They are **never**
 echoed by `Sign-Artifact.ps1` and `Get-CertumTotp.ps1`, and the
 PowerShell scripts pass them as process arguments rather than through
 `cmd /c` so they don't leak into the shell-history transcript.
+
+> These three are **signing** secrets and are all optional (each
+> signing step skips cleanly when its secret is unset, yielding
+> unsigned artifacts). Release **automation** needs a separate secret,
+> [`RELEASE_PLEASE_TOKEN`](#required-secret-release_please_token),
+> documented under [Releases](#releases) above.
 
 Certum SimplySign uses 2FA where the **TOTP is the second factor** —
 there is no separate static password to set, so we don't need a

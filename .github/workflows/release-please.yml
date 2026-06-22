@@ -1,0 +1,52 @@
+name: release-please
+
+# Conventional-Commits release automation.
+#
+# On every push to main, release-please opens (and keeps updating) a single
+# "release PR" that bumps the version in version.txt and regenerates
+# CHANGELOG.md from the feat:/fix: commits landed since the last release.
+# Merging that PR is the release trigger: release-please creates the
+# vX.Y.Z git tag and a GitHub Release whose body is the generated changelog.
+#
+# That tag is what starts build-and-release.yml (build + Certum signing +
+# asset upload). Its `release` job then attaches the signed DLL/installer to
+# the very Release this action created — see the "Attach signed assets to
+# release" step over there.
+#
+# WHY THE CUSTOM TOKEN (secrets.RELEASE_PLEASE_TOKEN):
+# A tag/Release created with the built-in GITHUB_TOKEN does NOT trigger
+# other workflows — GitHub suppresses those events to prevent infinite
+# loops. If we used GITHUB_TOKEN here, build-and-release.yml would never
+# fire on the new tag and every Release would ship with an empty asset
+# list. The secret must be a PAT (or GitHub App token) with, on this repo,
+# Contents: read/write + Pull requests: read/write. Setup steps are in
+# docs/DEVELOPMENT.md -> "Releases" -> "Required secret: RELEASE_PLEASE_TOKEN".
+on:
+  push:
+    branches: [main]
+
+# Governs the built-in GITHUB_TOKEN. release-please itself authenticates
+# with the PAT passed as `token:` below, but the action still touches the
+# default token for some calls, so keep these scopes granted.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+# Serialise release-please runs so two quick pushes to main don't race on
+# updating the same release PR. Don't cancel an in-flight run — letting it
+# finish keeps the release PR consistent.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain release PR / cut release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

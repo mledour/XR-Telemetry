@@ -943,11 +943,15 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Release: only runs on a v*.*.* tag push. Pulls both matrix artifacts
-  # down from the `build` job and attaches them to a GitHub Release.
+  # Release: only runs on a v*.*.* tag push. That tag is created by
+  # release-please (see .github/workflows/release-please.yml) when its
+  # release PR is merged — release-please also creates the GitHub Release
+  # with the generated changelog as the body. This job pulls both matrix
+  # artifacts down from the `build` job and ATTACHES them to that existing
+  # Release (it does not create one — see the attach step below).
   # ---------------------------------------------------------------------------
   release:
-    name: Create GitHub Release
+    name: Attach assets to release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
@@ -978,14 +982,29 @@ jobs:
           done
           ls -la ../release/
 
-      - name: Create Release
+      # release-please (.github/workflows/release-please.yml) already created
+      # this tag's GitHub Release with the auto-generated changelog as the
+      # body. This step does NOT create a release — softprops finds the
+      # existing one (matched by the tag) and (a) uploads the built + signed
+      # assets and (b) APPENDS the static install instructions below the
+      # changelog. `append_body: true` is what preserves release-please's
+      # changelog instead of overwriting it; we deliberately drop
+      # `generate_release_notes` and `name:` so we don't fight release-please
+      # for ownership of those fields.
+      #
+      # Caveat: append_body is NOT idempotent — it re-appends the install
+      # block every time this job's attach step runs again for the same tag
+      # (e.g. the Actions "Re-run jobs" button on an already-green release).
+      # A failed signing/build re-run never reaches this step, so that common
+      # path is safe; if a duplicate does land, trim it from the release body
+      # by hand.
+      - name: Attach signed assets to release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          generate_release_notes: true
+          append_body: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          name: ${{ github.ref_name }}
           body: |
             ## ${{ env.LAYER_NAME }} ${{ github.ref_name }}
 
