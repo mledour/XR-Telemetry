@@ -75,10 +75,25 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build: Debug + Release in parallel via matrix. Always runs.
+  # Build: Debug + Release in parallel via matrix. Runs on every feature PR,
+  # every push to main, and every v*.*.* tag — EXCEPT release-please's own
+  # release PR (see the `if:` below).
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.configuration }} x64
+    # Skip this verification build on release-please's release PR
+    # (head branch `release-please--branches--main`). That PR only bumps
+    # version.txt + CHANGELOG.md — no code — so a full Windows build +
+    # snapshot test would merely duplicate the push-to-main build that
+    # already ran on the same tree when the previous commit landed. Without
+    # this skip, EVERY push to main costs two build runs: the push build
+    # plus a re-build of the release PR that release-please force-updates on
+    # each main push. The real, signed release build still runs later, on
+    # the v*.*.* tag this PR creates when merged. `github.head_ref` is empty
+    # for push and tag events, so startsWith() is false there and they build
+    # as before — only pull_request events from a release-please-* branch
+    # are skipped.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
