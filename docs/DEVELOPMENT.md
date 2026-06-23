@@ -99,10 +99,12 @@ build `Release|x64`. The pre-build event chain:
    version into `openxr-api-layer.rc` and `version.h` from their
    `.in` templates.
 
-A post-build event runs `scripts\sed.exe` to substitute
-`$(SolutionName)` into the loader's JSON manifest, so renaming the
-`.sln` automatically renames the manifest too — useful if you ever
-need to rename the layer.
+A post-build event copies the loader's JSON manifest next to the built
+DLL in the output directory. (Earlier revisions kept a templated
+manifest with an `XR_APILAYER_name` placeholder and substituted
+`$(SolutionName)` into it at build time via a bundled GNU `sed.exe`;
+the layer name is now fixed, so the manifest carries it directly and
+the build needs no `sed` — and no GPL tooling — anymore.)
 
 The test binary (`openxr-api-layer-tests.exe`) builds alongside the
 DLL and runs your `test_*.cpp` files via doctest. A non-zero exit
@@ -437,6 +439,35 @@ The provider name is inherited from mbucchia's template, so WPA
 labels traces as `OpenXRTemplate` rather than `XrTelemetry`. Edit
 [`framework/log.cpp`](../openxr-api-layer/framework/log.cpp) (provider
 name + GUID) if you want to rebrand.
+
+## Self-profiling (`self_profile`)
+
+`self_profile` is a developer-only setting for quantifying **this layer's
+own** per-frame CPU/GPU overhead — answering "how much does inserting
+XR-Telemetry cost the host app?". It is **off by default**, opt-in via the
+top-level boolean in the settings JSON:
+
+```json
+{ "self_profile": true }
+```
+
+When on, the bundled [`xrprof`](../external/xrprof) inline profiler brackets
+the layer's own per-frame work and writes a separate CSV,
+`xrprof-<layer>-<pid>.csv`, under
+`%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_xr_telemetry\`. This is distinct from the
+app-facing telemetry CSV and the in-headset overlay — it measures the
+*instrument*, not the *app*. It is deliberately absent from the end-user
+README: it's a diagnostic for development and for regression-checking the
+layer's footprint, not a user-facing feature.
+
+Note: the xrprof harness attaches during session creation regardless of the
+flag (a writer thread plus a few GPU timestamp queries per session);
+`self_profile` gates the CSV *output*, not the attach. So it isn't entirely
+free when off — negligible for normal use, but worth knowing when you're
+measuring the layer's idle cost.
+
+xrprof lives at [`external/xrprof`](../external/xrprof) (a submodule by the
+same author) and is compiled directly into the layer DLL.
 
 ## Conformance testing
 

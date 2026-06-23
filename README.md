@@ -338,3 +338,7 @@ ships under his MIT terms alongside ours.
 The bundled font (`Rajdhani-SemiBold.ttf`) is licensed under the SIL Open
 Font License v1.1 — see
 [`openxr-api-layer/fonts/OFL.txt`](./openxr-api-layer/fonts/OFL.txt).
+
+Full third-party attributions (OpenXR SDK, MixedReality SDK, RapidJSON,
+doctest, fmt, WIL, xrprof, and the bundled font) are listed in
+[THIRD_PARTY.md](./THIRD_PARTY.md).

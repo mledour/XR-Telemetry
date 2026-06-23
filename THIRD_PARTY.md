@@ -228,6 +228,16 @@ Microsoft OpenXR Mixed Reality SDK
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
 
+RapidJSON (bundled inside the Microsoft OpenXR Mixed Reality SDK submodule, at external/OpenXR-MixedReality/shared/ext/rapidjson/ — the settings parser is built on it)
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    Copyright (c) 2015 THL A29 Limited, a Tencent company, and Milo Yip
+
+    MIT License — https://github.com/Tencent/rapidjson/blob/master/license.txt
+
+    (RapidJSON additionally bundles a small amount of third-party code under
+    the BSD and JSON licences; see its license.txt for the full breakdown.)
+
 OpenXR-Layer-Template framework (openxr-api-layer/framework/, the dispatch generator, module.def, entry point, logging helpers)
 -----------------------------------------------------------------------------------------------------------------------------
 
@@ -276,3 +286,13 @@ Microsoft.Windows.ImplementationLibrary / WIL (header-only, pulled via NuGet at 
     Copyright (c) Microsoft Corporation
 
     MIT License — https://github.com/microsoft/wil/blob/master/LICENSE
+
+xrprof (external/xrprof/ submodule — compiled into the layer DLL)
+-----------------------------------------------------------------
+
+    Copyright (c) 2026 Michael Ledour
+
+    First-party companion library by the same author: the inline self-profiler
+    behind the `self_profile` developer setting (see docs/DEVELOPMENT.md).
+    Source: https://github.com/mledour/xrprof — distributed under this
+    project's MIT terms (see LICENSE).
