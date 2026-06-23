@@ -144,7 +144,7 @@
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
-      <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
+      <Command>copy /Y $(ProjectDir)\$(SolutionName).json $(OutDir)
 copy $(SolutionDir)\scripts\Install-Layer.ps1 $(OutDir)
 copy $(SolutionDir)\scripts\Uninstall-Layer.ps1 $(OutDir)
 </Command>
@@ -198,7 +198,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
-      <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
+      <Command>copy /Y $(ProjectDir)\$(SolutionName)-32.json $(OutDir)
 copy $(SolutionDir)\scripts\Install-Layer32.ps1 $(OutDir)
 copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
 </Command>
@@ -256,7 +256,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
-      <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName).json &gt; $(OutDir)\$(SolutionName).json
+      <Command>copy /Y $(ProjectDir)\$(SolutionName).json $(OutDir)
 copy $(SolutionDir)\scripts\Install-Layer.ps1 $(OutDir)
 copy $(SolutionDir)\scripts\Uninstall-Layer.ps1 $(OutDir)
 </Command>
@@ -314,7 +314,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
       <DelayLoadDLLs>d3d11.dll;d3dcompiler_47.dll;dxgi.dll;d2d1.dll;dwrite.dll</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
-      <Command>$(SolutionDir)\scripts\sed.exe "s/XR_APILAYER_name/$(SolutionName)/g" $(ProjectDir)\$(SolutionName)-32.json &gt; $(OutDir)\$(SolutionName)-32.json
+      <Command>copy /Y $(ProjectDir)\$(SolutionName)-32.json $(OutDir)
 copy $(SolutionDir)\scripts\Install-Layer32.ps1 $(OutDir)
 copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
 </Command>

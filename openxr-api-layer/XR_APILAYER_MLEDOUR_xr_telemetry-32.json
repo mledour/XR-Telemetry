@@ -1,14 +1,14 @@
 {
   "file_format_version" : "1.0.0",
   "api_layer": {
-    "name": "XR_APILAYER_name",
-    "library_path": ".\\XR_APILAYER_name-32.dll",
+    "name": "XR_APILAYER_MLEDOUR_xr_telemetry",
+    "library_path": ".\\XR_APILAYER_MLEDOUR_xr_telemetry-32.dll",
     "api_version": "1.0",
     "implementation_version": "2",
-    "description": "Captures per-frame timing telemetry (CPU headroom, compositor wait block) to a per-session CSV in %LOCALAPPDATA%.",
+    "description": "In-headset performance overlay (FPS, frametimes, GPU/CPU load) and optional per-frame CSV telemetry log, written to %LOCALAPPDATA%.",
     "functions": {
       "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
     },
-    "disable_environment": "DISABLE_XR_APILAYER_name"
+    "disable_environment": "DISABLE_XR_APILAYER_MLEDOUR_xr_telemetry"
   }
 }
