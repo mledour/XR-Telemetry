@@ -19,10 +19,10 @@ body:
       label: Layer version
       description: |
         Shown in the filename of the installer or ZIP you downloaded
-        (e.g. `XR_APILAYER_MLEDOUR_xr_telemetry-0.0.6-x64-Setup.exe`), or
+        (e.g. `XR_APILAYER_MLEDOUR_xr_telemetry-1.1.0-x64-Setup.exe`), or
         in Windows Explorer → right-click the DLL → Properties → Details
         → Product version.
-      placeholder: "0.0.6"
+      placeholder: "1.1.0"
     validations:
       required: true
 
