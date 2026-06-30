@@ -373,15 +373,31 @@ namespace openxr_api_layer::detail {
         // remains.
         constexpr float kHeaderSepInsetY      =  8.0f;
 
-        // Target DXGI format for the swapchain image — also the format
-        // the D2D RenderTarget paints into.
+        // Preferred swapchain format for the overlay image. BGRA8_UNORM is
+        // the historical first choice (the original D2D path painted BGRA),
+        // but the GPU shader path writes a logical float4(r,g,b,a) and lets
+        // the output-merger swizzle to the RTV's memory layout, so an RGBA8
+        // target renders identical colours. We therefore accept a small
+        // prioritised list and create the RTV in the chosen format.
         constexpr int64_t kFormatBGRA = static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
 
-        // Pick a swapchain format the runtime advertises that we can paint
-        // into. Returns kFormatBGRA on success, 0 on failure (caller logs
-        // and degrades). We don't try to fall back to RGBA8 — D2D's BGRA
-        // pipeline is the simple path, and modern runtimes (Pimax, SteamVR,
-        // WMR, Oculus, Varjo) all advertise BGRA8.
+        // Acceptable swapchain formats, most-preferred first. UNORM variants
+        // come before their sRGB siblings: an sRGB RTV makes the GPU re-encode
+        // our already-sRGB UI colours on write (slightly washed out), so we
+        // only take sRGB when the runtime advertises nothing linear. SteamVR
+        // (seen via OpenComposite) advertises RGBA/sRGB but not BGRA8_UNORM,
+        // which is exactly the case the BGRA-only gate used to reject.
+        constexpr int64_t kAcceptedFormats[] = {
+            kFormatBGRA,
+            static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
+            static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+            static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        };
+
+        // Pick the highest-priority format from kAcceptedFormats that the
+        // runtime advertises. Returns that format on success, 0 on failure
+        // (caller logs and degrades). On failure we dump the advertised list
+        // so a future unsupported-runtime report is one log line, not a guess.
         int64_t pickSwapchainFormat(OpenXrApi* api, XrSession session) {
             uint32_t count = 0;
             if (XR_FAILED(api->xrEnumerateSwapchainFormats(session, 0, &count, nullptr)) ||
@@ -393,9 +409,23 @@ namespace openxr_api_layer::detail {
                     session, count, &count, formats.data()))) {
                 return 0;
             }
-            for (const int64_t f : formats) {
-                if (f == kFormatBGRA) return kFormatBGRA;
+            for (const int64_t want : kAcceptedFormats) {
+                for (const int64_t f : formats) {
+                    if (f == want) return want;
+                }
             }
+            // Nothing usable — log what the runtime actually offered so the
+            // gate can be widened from a real list rather than a guess.
+            std::string advertised;
+            for (const int64_t f : formats) {
+                if (!advertised.empty()) advertised += ", ";
+                advertised += std::to_string(f);
+            }
+            Log(fmt::format(
+                "xr_telemetry: overlay — runtime advertised {} swapchain "
+                "format(s): [{}]; none are an accepted BGRA8/RGBA8 (UNORM or "
+                "sRGB) target\n",
+                count, advertised));
             return 0;
         }
 
@@ -3006,8 +3036,8 @@ namespace openxr_api_layer::detail {
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);
                 if (format == 0) {
-                    Log("xr_telemetry: overlay disabled — runtime doesn't advertise "
-                        "DXGI_FORMAT_B8G8R8A8_UNORM among supported swapchain formats\n");
+                    Log("xr_telemetry: overlay disabled — runtime advertises no "
+                        "accepted BGRA8/RGBA8 swapchain format (see list above)\n");
                     return false;
                 }
 
@@ -3137,12 +3167,14 @@ namespace openxr_api_layer::detail {
                 // One RTV per swapchain image — we paint chrome + text +
                 // bars DIRECTLY into the acquired image each frame (no
                 // intermediate texture, no CopyResource). The runtime's
-                // images are BGRA8 (typeless on Pimax), so we give the
-                // RTV an explicit BGRA8_UNORM desc to get a typed view.
+                // images can come back typeless (e.g. Pimax), so we give the
+                // RTV an explicit typed desc in the format we chose above —
+                // BGRA8 or, when that's all the runtime offers, RGBA8/sRGB.
+                const DXGI_FORMAT rtvFormat = static_cast<DXGI_FORMAT>(format);
                 m_imageRtvs.resize(m_images.size());
                 for (size_t i = 0; i < m_images.size(); ++i) {
                     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    rtvDesc.Format = rtvFormat;
                     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
                     rtvDesc.Texture2D.MipSlice = 0;
                     if (FAILED(m_device->CreateRenderTargetView(
@@ -3173,9 +3205,10 @@ namespace openxr_api_layer::detail {
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
-                    "images, direct-to-swapchain BGRA8 RT, "
+                    "images, direct-to-swapchain RT format={}, "
                     "feature_level={:#x})\n",
-                    imgCount, static_cast<unsigned int>(appLevel)));
+                    imgCount, static_cast<int>(rtvFormat),
+                    static_cast<unsigned int>(appLevel)));
                 return true;
             }
 
@@ -3486,8 +3519,8 @@ namespace openxr_api_layer::detail {
                 }
                 const int64_t format = pickSwapchainFormat(m_api, m_session);
                 if (format == 0) {
-                    Log("xr_telemetry: overlay disabled — runtime doesn't advertise "
-                        "BGRA8 for the D3D12 swapchain\n");
+                    Log("xr_telemetry: overlay disabled — runtime advertises no "
+                        "accepted BGRA8/RGBA8 swapchain format for the D3D12 path\n");
                     return false;
                 }
 
@@ -3568,9 +3601,10 @@ namespace openxr_api_layer::detail {
                 // into the acquired image each frame (no shim, no per-frame
                 // CopyResource). The wrapped resources were created with
                 // BIND_RENDER_TARGET above, so they're valid RTV targets.
-                // Use an EXPLICIT BGRA8_UNORM view so a typeless wrapped
-                // resource (some runtimes) still resolves to the format the
-                // shaders write — mirrors the D3D11 path's explicit desc.
+                // Use an EXPLICIT typed view in the format we chose above so a
+                // typeless wrapped resource (some runtimes) still resolves to
+                // the format the shaders write — mirrors the D3D11 path.
+                const DXGI_FORMAT rtvFormat = static_cast<DXGI_FORMAT>(format);
                 m_imageRtvs.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     ComPtr<ID3D11Texture2D> tex2d;
@@ -3581,7 +3615,7 @@ namespace openxr_api_layer::detail {
                         return false;
                     }
                     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.Format        = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    rtvDesc.Format        = rtvFormat;
                     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
                     rtvDesc.Texture2D.MipSlice = 0;
                     if (FAILED(m_d3d11Device->CreateRenderTargetView(
@@ -3611,8 +3645,8 @@ namespace openxr_api_layer::detail {
 
                 Log("xr_telemetry: overlay D3D12 renderer ready ("
                     + std::to_string(imgCount) +
-                    " swapchain images, D3D11On12 bridge, direct-to-image "
-                    "BGRA8 RT)\n");
+                    " swapchain images, D3D11On12 bridge, direct-to-image RT "
+                    "format=" + std::to_string(static_cast<int>(rtvFormat)) + ")\n");
                 return true;
             }
 
