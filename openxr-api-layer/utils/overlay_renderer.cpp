@@ -2877,7 +2877,8 @@ namespace openxr_api_layer::detail {
                                           CoreRenderer&            core,
                                           HistogramBarRenderer&    bars,
                                           glyph_atlas::Renderer&   gpuText,
-                                          chrome_shapes::Renderer& gpuShapes) {
+                                          chrome_shapes::Renderer& gpuShapes,
+                                          bool                     srgbComposite) {
             if (!bars.init(dev, ctx, kEffectiveSupersample)) {
                 Log("xr_telemetry: overlay disabled — bars init failed\n");
                 return false;
@@ -2889,11 +2890,14 @@ namespace openxr_api_layer::detail {
             }
             // dst = LOGICAL design space (cbuffer texSize); render = PHYSICAL
             // swapchain-image extent (viewport). They differ only when
-            // supersampled — the renderer maps between them.
+            // supersampled — the renderer maps between them. srgbComposite
+            // flips the text coverage-gamma direction for sRGB-decoding
+            // runtimes (SteamVR); only the glyph PS consumes it.
             if (!gpuText.init(dev, ctx, static_cast<UINT>(kTexW),
                                static_cast<UINT>(kTexH), core.atlas(),
                                static_cast<UINT>(kTexWPhys),
-                               static_cast<UINT>(kTexHPhys))) {
+                               static_cast<UINT>(kTexHPhys),
+                               srgbComposite)) {
                 Log("xr_telemetry: overlay disabled — glyph renderer init "
                     "failed\n");
                 return false;
@@ -3260,7 +3264,8 @@ namespace openxr_api_layer::detail {
                 // with the D3D12 backend so the two bring-ups can't drift.
                 if (!initOverlayRenderers(m_device.Get(), m_context.Get(),
                                            m_core, m_bars, m_glyphRenderer,
-                                           m_chromeShapeRenderer))
+                                           m_chromeShapeRenderer,
+                                           isSrgbSwapchainFormat(format)))
                     return false;
 
                 // Fill the immutable XrCompositionLayerQuad fields
@@ -3702,7 +3707,8 @@ namespace openxr_api_layer::detail {
                 if (!initOverlayRenderers(m_d3d11Device.Get(),
                                            m_d3d11Context.Get(),
                                            m_core, m_bars, m_glyphRenderer,
-                                           m_chromeShapeRenderer))
+                                           m_chromeShapeRenderer,
+                                           isSrgbSwapchainFormat(format)))
                     return false;
 
                 // One-time fill of the immutable quad-layer fields.

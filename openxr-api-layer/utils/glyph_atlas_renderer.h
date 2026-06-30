@@ -113,13 +113,20 @@ namespace openxr_api_layer::utils::glyph_atlas {
         //
         // Returns false on any pipeline-creation failure. Caller logs +
         // degrades to bypass — never crashes the host.
+        // `srgbComposite` tells the PS which way to apply its coverage gamma
+        // correction: false (default) = the runtime composites the quad in
+        // linear space (UNORM swapchain — Pimax/WMR/Oculus); true = the runtime
+        // sRGB-decodes the quad (sRGB swapchain — SteamVR), which inverts the
+        // correction. See overlay_text_ps.hlsl's DIRECTION CAVEAT. Defaulting
+        // to false keeps the snapshot/golden (supersample==1) path byte-stable.
         bool init(Microsoft::WRL::ComPtr<ID3D11Device>          device,
                   Microsoft::WRL::ComPtr<ID3D11DeviceContext>   ctx,
                   UINT                                          dstWidth,
                   UINT                                          dstHeight,
                   const BuildResult&                            atlas,
                   UINT                                          renderWidth  = 0,
-                  UINT                                          renderHeight = 0);
+                  UINT                                          renderHeight = 0,
+                  bool                                          srgbComposite = false);
 
         bool isReady() const noexcept { return m_ready; }
 
@@ -197,12 +204,15 @@ namespace openxr_api_layer::utils::glyph_atlas {
         };
 
         // Cbuffer mirror — two 16-byte registers. reg0 = texSize + atlasSize
-        // (2× float2); reg1 = supersample + pad. Must match overlay_text.hlsli.
+        // (2× float2); reg1 = supersample + srgbComposite + pad. Must match
+        // overlay_text.hlsli.
         struct TextConstants {
             float texSize[2];     // dest tex (kTexW, kTexH)
             float atlasSize[2];   // atlas (atlasWidth, atlasHeight)
             float supersample;    // = m_ss; PS gates its corrections on > 1
-            float pad[3];
+            float srgbComposite;  // 1.0 = runtime sRGB-decodes the quad; flips
+                                  // the PS coverage-gamma direction
+            float pad[2];
         };
         static_assert(sizeof(TextConstants) == 32,
                       "TextConstants must mirror overlay_text.hlsli's cbuffer "
@@ -240,6 +250,10 @@ namespace openxr_api_layer::utils::glyph_atlas {
         UINT                                            m_renderW = 0;
         UINT                                            m_renderH = 0;
         float                                           m_ss      = 1.0f;
+        // True when the runtime sRGB-decodes the overlay quad at composite
+        // (sRGB swapchain); baked into the cbuffer to flip the PS coverage
+        // gamma. Default false = linear composite (the golden path).
+        bool                                            m_srgbComposite = false;
 
         Microsoft::WRL::ComPtr<ID3D11VertexShader>     m_vs;
         Microsoft::WRL::ComPtr<ID3D11PixelShader>      m_ps;

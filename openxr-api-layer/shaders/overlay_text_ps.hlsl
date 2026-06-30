@@ -49,11 +49,13 @@
 // was tuned for; it is the single tuning knob:
 //   * lower toward 1.0  → lighter stems (1.0 == the old no-correction path)
 //   * raise             → heavier stems
-// DIRECTION CAVEAT: this assumes the runtime composites the quad in linear
-// space (true for the _UNORM swapchain on the tested runtimes). If a runtime
-// instead treats it as sRGB, the correction inverts — use pow(c, TEXT_GAMMA).
-// Worth one on-headset A/B pass to confirm weight + direction; it is purely
-// cosmetic and trivially reverted via this constant.
+// DIRECTION CAVEAT: the correction direction depends on whether the runtime
+// composites the quad in linear space (UNORM swapchain — Pimax/WMR/Oculus) or
+// sRGB-decodes it (sRGB swapchain — SteamVR). The renderer passes which case
+// applies via the `srgbComposite` cbuffer flag: linear → pow(c, 1/TEXT_GAMMA)
+// (lifts stems); sRGB → pow(c, TEXT_GAMMA) (the inverse). Both are still worth
+// one on-headset A/B pass to confirm weight + direction; purely cosmetic and
+// trivially tuned via TEXT_GAMMA (or by forcing the branch).
 // =============================================================================
 
 #include "overlay_text.hlsli"
@@ -98,11 +100,16 @@ float4 PSMain(TextVSOutput i) : SV_TARGET
         // Edge contrast first: steepen the coverage ramp about 0.5 so glyph
         // edges survive the compositor's bilinear resample crisper.
         coverage = saturate((coverage - 0.5f) * EDGE_SHARPEN + 0.5f);
-        // Then gamma-correct the coverage for the linear-space alpha-over
-        // blend. Guard pow(0): pow(0, x) is spec-undefined in SM4.0 (a driver
+        // Then gamma-correct the coverage. The exponent direction depends on
+        // how the runtime composites the quad (see DIRECTION CAVEAT): linear
+        // (UNORM swapchain) lifts with 1/TEXT_GAMMA; sRGB (sRGB swapchain, the
+        // runtime sRGB-decodes the quad) needs the inverse, TEXT_GAMMA.
+        // Guard pow(0): pow(0, x) is spec-undefined in SM4.0 (a driver
         // returning NaN would poison the blend) and 0 coverage must stay fully
         // transparent, so branch it rather than lifting it with an epsilon.
-        coverage = (coverage > 0.0f) ? pow(coverage, 1.0f / TEXT_GAMMA)
+        float gammaExp = (srgbComposite > 0.5f) ? TEXT_GAMMA
+                                                : (1.0f / TEXT_GAMMA);
+        coverage = (coverage > 0.0f) ? pow(coverage, gammaExp)
                                      : 0.0f;
     }
 
