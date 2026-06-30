@@ -429,6 +429,26 @@ namespace openxr_api_layer::detail {
             return 0;
         }
 
+        // Format for the RTV we paint through. It must NOT re-encode our
+        // already-sRGB UI colours: when the runtime only offers an sRGB
+        // swapchain (SteamVR advertises the _SRGB variants and returns a
+        // TYPELESS resource), an sRGB RTV would apply linear->sRGB on write,
+        // leaving the composited overlay washed out / light grey. Map an sRGB
+        // pick to its UNORM sibling so the shader output is stored verbatim
+        // and the runtime does the correct sRGB decode when compositing. A
+        // UNORM view over the TYPELESS resource is valid. UNORM picks (Pimax,
+        // WMR, Oculus, Varjo) pass straight through unchanged.
+        DXGI_FORMAT rtvFormatForSwapchain(int64_t swapchainFormat) {
+            switch (swapchainFormat) {
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                return DXGI_FORMAT_B8G8R8A8_UNORM;
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                return DXGI_FORMAT_R8G8B8A8_UNORM;
+            default:
+                return static_cast<DXGI_FORMAT>(swapchainFormat);
+            }
+        }
+
         // -------- GPU text formats ----------------------------------------
         //
         // One GpuTextFormat per IDWriteTextFormat the D2D path uses
@@ -3167,10 +3187,11 @@ namespace openxr_api_layer::detail {
                 // One RTV per swapchain image — we paint chrome + text +
                 // bars DIRECTLY into the acquired image each frame (no
                 // intermediate texture, no CopyResource). The runtime's
-                // images can come back typeless (e.g. Pimax), so we give the
-                // RTV an explicit typed desc in the format we chose above —
-                // BGRA8 or, when that's all the runtime offers, RGBA8/sRGB.
-                const DXGI_FORMAT rtvFormat = static_cast<DXGI_FORMAT>(format);
+                // images can come back typeless (e.g. Pimax/SteamVR), so we
+                // give the RTV an explicit typed desc. rtvFormatForSwapchain
+                // maps an sRGB swapchain to its UNORM sibling so we don't
+                // double-encode the colours (see helper for the why).
+                const DXGI_FORMAT rtvFormat = rtvFormatForSwapchain(format);
                 m_imageRtvs.resize(m_images.size());
                 for (size_t i = 0; i < m_images.size(); ++i) {
                     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
@@ -3601,10 +3622,10 @@ namespace openxr_api_layer::detail {
                 // into the acquired image each frame (no shim, no per-frame
                 // CopyResource). The wrapped resources were created with
                 // BIND_RENDER_TARGET above, so they're valid RTV targets.
-                // Use an EXPLICIT typed view in the format we chose above so a
-                // typeless wrapped resource (some runtimes) still resolves to
-                // the format the shaders write — mirrors the D3D11 path.
-                const DXGI_FORMAT rtvFormat = static_cast<DXGI_FORMAT>(format);
+                // Use an EXPLICIT typed view; rtvFormatForSwapchain maps an
+                // sRGB swapchain to its UNORM sibling so a typeless wrapped
+                // resource resolves to a non-re-encoding view — mirrors D3D11.
+                const DXGI_FORMAT rtvFormat = rtvFormatForSwapchain(format);
                 m_imageRtvs.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     ComPtr<ID3D11Texture2D> tex2d;
