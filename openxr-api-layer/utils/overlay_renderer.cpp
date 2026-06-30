@@ -373,28 +373,58 @@ namespace openxr_api_layer::detail {
         // remains.
         constexpr float kHeaderSepInsetY      =  8.0f;
 
-        // Preferred swapchain format for the overlay image. BGRA8_UNORM is
-        // the historical first choice (the original D2D path painted BGRA),
-        // but the GPU shader path writes a logical float4(r,g,b,a) and lets
-        // the output-merger swizzle to the RTV's memory layout, so an RGBA8
-        // target renders identical colours. We therefore accept a small
-        // prioritised list and create the RTV in the chosen format.
-        constexpr int64_t kFormatBGRA = static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-
-        // Acceptable swapchain formats, most-preferred first. UNORM variants
-        // come before their sRGB siblings: an sRGB RTV makes the GPU re-encode
-        // our already-sRGB UI colours on write (slightly washed out), so we
-        // only take sRGB when the runtime advertises nothing linear. SteamVR
-        // (seen via OpenComposite) advertises RGBA/sRGB but not BGRA8_UNORM,
-        // which is exactly the case the BGRA-only gate used to reject.
-        constexpr int64_t kAcceptedFormats[] = {
-            kFormatBGRA,
-            static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-            static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
-            static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        // Single source of truth for the overlay's swapchain/RTV formats.
+        // Each row pairs an accepted swapchain format with the RTV format we
+        // paint through. The GPU shader path writes a logical float4(r,g,b,a)
+        // and the output-merger swizzles to the RTV's memory layout, so BGRA8
+        // and RGBA8 render identical colours.
+        //
+        // The RTV must NOT re-encode our already-sRGB UI colours: when the
+        // runtime only offers an sRGB swapchain (SteamVR advertises the _SRGB
+        // variants and returns a TYPELESS resource), an sRGB RTV would apply
+        // linear->sRGB on write, leaving the overlay washed out / light grey.
+        // So each sRGB row maps to its UNORM sibling for the RTV — the shader
+        // output is stored verbatim and the runtime does the correct sRGB
+        // decode when compositing. A UNORM view over the TYPELESS resource is
+        // valid; UNORM picks (Pimax, WMR, Oculus, Varjo) map to themselves and
+        // keep their exact original path.
+        //
+        // Rows are in priority order (most-preferred first): linear UNORM
+        // ahead of sRGB so we only take an sRGB swapchain when the runtime
+        // advertises nothing linear. Keeping the accept list and the RTV map
+        // in ONE table means adding a format is one row — they cannot drift.
+        struct OverlayFormat {
+            int64_t     swapchain;  // an xrEnumerateSwapchainFormats value
+            DXGI_FORMAT rtv;        // RTV format we paint through (never sRGB)
+        };
+        constexpr OverlayFormat kOverlayFormats[] = {
+            { static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM),      DXGI_FORMAT_B8G8R8A8_UNORM },
+            { static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM),      DXGI_FORMAT_R8G8B8A8_UNORM },
+            { static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), DXGI_FORMAT_B8G8R8A8_UNORM },
+            { static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), DXGI_FORMAT_R8G8B8A8_UNORM },
         };
 
-        // Pick the highest-priority format from kAcceptedFormats that the
+        // True when the picked swapchain is an sRGB format — i.e. the runtime
+        // will sRGB-decode the quad at composite. Drives the RTV-fallback and
+        // the diagnostic logs; the text shader's gamma direction also depends
+        // on it (see overlay_text_ps.hlsl's DIRECTION CAVEAT).
+        bool isSrgbSwapchainFormat(int64_t f) {
+            return f == static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ||
+                   f == static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        }
+
+        // RTV format for a picked swapchain format. Looks the pick up in
+        // kOverlayFormats so the sRGB->UNORM mapping has one definition; an
+        // unlisted format (shouldn't happen — pick only returns listed ones)
+        // falls back to the format itself.
+        DXGI_FORMAT rtvFormatForSwapchain(int64_t swapchainFormat) {
+            for (const OverlayFormat& e : kOverlayFormats) {
+                if (e.swapchain == swapchainFormat) return e.rtv;
+            }
+            return static_cast<DXGI_FORMAT>(swapchainFormat);
+        }
+
+        // Pick the highest-priority format from kOverlayFormats that the
         // runtime advertises. Returns that format on success, 0 on failure
         // (caller logs and degrades). On failure we dump the advertised list
         // so a future unsupported-runtime report is one log line, not a guess.
@@ -409,9 +439,12 @@ namespace openxr_api_layer::detail {
                     session, count, &count, formats.data()))) {
                 return 0;
             }
-            for (const int64_t want : kAcceptedFormats) {
+            // The second call writes `count` entries; trust it over the vector's
+            // initial size so the diagnostic below never lists stale trailing 0s.
+            formats.resize(count);
+            for (const OverlayFormat& want : kOverlayFormats) {
                 for (const int64_t f : formats) {
-                    if (f == want) return want;
+                    if (f == want.swapchain) return want.swapchain;
                 }
             }
             // Nothing usable — log what the runtime actually offered so the
@@ -425,28 +458,41 @@ namespace openxr_api_layer::detail {
                 "xr_telemetry: overlay — runtime advertised {} swapchain "
                 "format(s): [{}]; none are an accepted BGRA8/RGBA8 (UNORM or "
                 "sRGB) target\n",
-                count, advertised));
+                formats.size(), advertised));
             return 0;
         }
 
-        // Format for the RTV we paint through. It must NOT re-encode our
-        // already-sRGB UI colours: when the runtime only offers an sRGB
-        // swapchain (SteamVR advertises the _SRGB variants and returns a
-        // TYPELESS resource), an sRGB RTV would apply linear->sRGB on write,
-        // leaving the composited overlay washed out / light grey. Map an sRGB
-        // pick to its UNORM sibling so the shader output is stored verbatim
-        // and the runtime does the correct sRGB decode when compositing. A
-        // UNORM view over the TYPELESS resource is valid. UNORM picks (Pimax,
-        // WMR, Oculus, Varjo) pass straight through unchanged.
-        DXGI_FORMAT rtvFormatForSwapchain(int64_t swapchainFormat) {
-            switch (swapchainFormat) {
-            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-                return DXGI_FORMAT_B8G8R8A8_UNORM;
-            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-                return DXGI_FORMAT_R8G8B8A8_UNORM;
-            default:
-                return static_cast<DXGI_FORMAT>(swapchainFormat);
+        // Create the per-image RTV, with a fallback for runtimes that hand
+        // back a fully-TYPED sRGB resource instead of TYPELESS. Normally the
+        // UNORM `primary` view is what we want (no colour re-encode). But a
+        // UNORM view is only legal over a TYPELESS or UNORM resource; a runtime
+        // that allocates a typed _SRGB backing would reject it with
+        // E_INVALIDARG. In that case retry with the sRGB `fallback` so the
+        // overlay still shows (colours may look washed out — logged once) and
+        // degrade only if even that fails. Shared by the D3D11 and D3D11On12
+        // paths so the two can't drift.
+        bool createOverlayImageRtv(ID3D11Device* device, ID3D11Texture2D* tex,
+                                   DXGI_FORMAT primary, DXGI_FORMAT fallback,
+                                   ID3D11RenderTargetView** out) {
+            D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+            rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            rtvDesc.Texture2D.MipSlice = 0;
+            rtvDesc.Format = primary;
+            if (SUCCEEDED(device->CreateRenderTargetView(tex, &rtvDesc, out)))
+                return true;
+            if (fallback != primary) {
+                rtvDesc.Format = fallback;
+                if (SUCCEEDED(device->CreateRenderTargetView(tex, &rtvDesc, out))) {
+                    Log(fmt::format(
+                        "xr_telemetry: overlay — UNORM RTV (format={}) rejected; "
+                        "fell back to sRGB RTV (format={}). Resource is typed "
+                        "sRGB, not typeless — overlay colours may look washed "
+                        "out on this runtime\n",
+                        static_cast<int>(primary), static_cast<int>(fallback)));
+                    return true;
+                }
             }
+            return false;
         }
 
         // -------- GPU text formats ----------------------------------------
@@ -3094,10 +3140,12 @@ namespace openxr_api_layer::detail {
                 }
 
                 // Stash the OpenXR swapchain images; the per-image RTVs
-                // are created below (Pimax hands back BGRA8_TYPELESS, so
-                // each RTV needs an explicit BGRA8_UNORM view desc). The
-                // diagnostic log on image 0 stays around for future
-                // format / bindFlags regressions.
+                // are created below with an explicit typed view desc (the
+                // resource comes back typeless — BGRA8_TYPELESS on Pimax,
+                // sRGB-typeless on SteamVR — so the view format is chosen by
+                // rtvFormatForSwapchain, not the resource). The diagnostic log
+                // on image 0 stays around for future format / bindFlags
+                // regressions.
                 m_images.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     m_images[i] = raw[i].texture;
@@ -3190,17 +3238,15 @@ namespace openxr_api_layer::detail {
                 // images can come back typeless (e.g. Pimax/SteamVR), so we
                 // give the RTV an explicit typed desc. rtvFormatForSwapchain
                 // maps an sRGB swapchain to its UNORM sibling so we don't
-                // double-encode the colours (see helper for the why).
+                // double-encode the colours; createOverlayImageRtv retries
+                // with the sRGB view if the resource is typed-sRGB not typeless.
                 const DXGI_FORMAT rtvFormat = rtvFormatForSwapchain(format);
+                const DXGI_FORMAT rtvFallback = static_cast<DXGI_FORMAT>(format);
                 m_imageRtvs.resize(m_images.size());
                 for (size_t i = 0; i < m_images.size(); ++i) {
-                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.Format = rtvFormat;
-                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    rtvDesc.Texture2D.MipSlice = 0;
-                    if (FAILED(m_device->CreateRenderTargetView(
-                            m_images[i].Get(), &rtvDesc,
-                            m_imageRtvs[i].GetAddressOf()))) {
+                    if (!createOverlayImageRtv(m_device.Get(), m_images[i].Get(),
+                                               rtvFormat, rtvFallback,
+                                               m_imageRtvs[i].GetAddressOf())) {
                         Log(fmt::format(
                             "xr_telemetry: overlay disabled — "
                             "CreateRenderTargetView (swapchain image[{}]) "
@@ -3226,9 +3272,11 @@ namespace openxr_api_layer::detail {
 
                 Log(fmt::format(
                     "xr_telemetry: overlay D3D11 renderer ready ({} swapchain "
-                    "images, direct-to-swapchain RT format={}, "
+                    "images, swapchain format={}{}, RT format={}, "
                     "feature_level={:#x})\n",
-                    imgCount, static_cast<int>(rtvFormat),
+                    imgCount, format,
+                    isSrgbSwapchainFormat(format) ? " (sRGB)" : "",
+                    static_cast<int>(rtvFormat),
                     static_cast<unsigned int>(appLevel)));
                 return true;
             }
@@ -3275,8 +3323,9 @@ namespace openxr_api_layer::detail {
             ComPtr<ID3DDeviceContextState> m_overlayState;
             ComPtr<ID3DDeviceContextState> m_savedState;
             XrSwapchain                 m_swapchain = XR_NULL_HANDLE;
-            // OpenXR swapchain images (BGRA8_TYPELESS on Pimax) + one
-            // typed BGRA8_UNORM RTV each. We paint directly into the
+            // OpenXR swapchain images (typeless on the tested runtimes) +
+            // one typed RTV each, in the UNORM format rtvFormatForSwapchain
+            // picks (BGRA8 or RGBA8; never sRGB). We paint directly into the
             // acquired image's RTV every frame — no intermediate, no
             // CopyResource. State isolation (SwapDeviceContextState)
             // keeps our pipeline changes from leaking into the app.
@@ -3624,8 +3673,10 @@ namespace openxr_api_layer::detail {
                 // BIND_RENDER_TARGET above, so they're valid RTV targets.
                 // Use an EXPLICIT typed view; rtvFormatForSwapchain maps an
                 // sRGB swapchain to its UNORM sibling so a typeless wrapped
-                // resource resolves to a non-re-encoding view — mirrors D3D11.
+                // resource resolves to a non-re-encoding view — mirrors D3D11,
+                // including the typed-sRGB fallback in createOverlayImageRtv.
                 const DXGI_FORMAT rtvFormat = rtvFormatForSwapchain(format);
+                const DXGI_FORMAT rtvFallback = static_cast<DXGI_FORMAT>(format);
                 m_imageRtvs.resize(imgCount);
                 for (uint32_t i = 0; i < imgCount; ++i) {
                     ComPtr<ID3D11Texture2D> tex2d;
@@ -3635,13 +3686,9 @@ namespace openxr_api_layer::detail {
                             "image " + std::to_string(i) + "\n");
                         return false;
                     }
-                    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-                    rtvDesc.Format        = rtvFormat;
-                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    rtvDesc.Texture2D.MipSlice = 0;
-                    if (FAILED(m_d3d11Device->CreateRenderTargetView(
-                            tex2d.Get(), &rtvDesc,
-                            m_imageRtvs[i].GetAddressOf()))) {
+                    if (!createOverlayImageRtv(m_d3d11Device.Get(), tex2d.Get(),
+                                               rtvFormat, rtvFallback,
+                                               m_imageRtvs[i].GetAddressOf())) {
                         Log("xr_telemetry: overlay disabled — D3D12 path "
                             "CreateRenderTargetView (wrapped image "
                             + std::to_string(i) + ") failed\n");
@@ -3666,8 +3713,11 @@ namespace openxr_api_layer::detail {
 
                 Log("xr_telemetry: overlay D3D12 renderer ready ("
                     + std::to_string(imgCount) +
-                    " swapchain images, D3D11On12 bridge, direct-to-image RT "
-                    "format=" + std::to_string(static_cast<int>(rtvFormat)) + ")\n");
+                    " swapchain images, D3D11On12 bridge, swapchain format="
+                    + std::to_string(format)
+                    + (isSrgbSwapchainFormat(format) ? " (sRGB)" : "")
+                    + ", direct-to-image RT format="
+                    + std::to_string(static_cast<int>(rtvFormat)) + ")\n");
                 return true;
             }
 
