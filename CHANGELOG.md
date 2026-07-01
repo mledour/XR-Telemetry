@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/mledour/XR-Telemetry/compare/v1.1.0...v1.1.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* **overlay:** render the HUD on SteamVR/OpenXR (sRGB swapchains) ([#77](https://github.com/mledour/XR-Telemetry/issues/77)) ([061cbfd](https://github.com/mledour/XR-Telemetry/commit/061cbfd3b5c4995ff2106a65b77e6aa605f7923b))
+
 ## [1.1.0](https://github.com/mledour/XR-Telemetry/compare/v1.0.0...v1.1.0) (2026-06-22)
 
 
