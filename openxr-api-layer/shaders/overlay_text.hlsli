@@ -49,8 +49,13 @@ cbuffer TextConstants : register(b0)
     // Overlay supersample factor (= renderer m_ss). The VS ignores it; the PS
     // gates its edge-contrast + gamma corrections on supersample > 1 so the
     // 1x (snapshot/golden) path stays byte-identical to the legacy shader.
-    float  supersample; // reg1.x
-    float3 _pad;        // reg1.yzw
+    float  supersample;   // reg1.x
+    // 1.0 when the runtime sRGB-decodes the overlay quad at composite (sRGB
+    // swapchain, e.g. SteamVR); 0.0 when it composites linearly (UNORM
+    // swapchain). Flips the PS coverage-gamma direction — see the DIRECTION
+    // CAVEAT in overlay_text_ps.hlsl.
+    float  srgbComposite; // reg1.y
+    float2 _pad;          // reg1.zw
 };
 
 Texture2D<float> atlasTexture : register(t0);   // R8_UNORM glyph atlas

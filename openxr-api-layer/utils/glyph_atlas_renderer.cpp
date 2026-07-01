@@ -52,7 +52,8 @@ namespace openxr_api_layer::utils::glyph_atlas {
                         UINT                        dstHeight,
                         const BuildResult&          atlas,
                         UINT                        renderWidth,
-                        UINT                        renderHeight) {
+                        UINT                        renderHeight,
+                        bool                        srgbComposite) {
         if (!device || !ctx || dstWidth == 0 || dstHeight == 0) return false;
         if (atlas.atlasWidth == 0 || atlas.atlasHeight == 0) return false;
         if (atlas.bitmap.empty()) return false;
@@ -67,6 +68,7 @@ namespace openxr_api_layer::utils::glyph_atlas {
         m_renderW = renderWidth  ? renderWidth  : dstWidth;
         m_renderH = renderHeight ? renderHeight : dstHeight;
         m_ss      = static_cast<float>(m_renderW) / static_cast<float>(m_dstW);
+        m_srgbComposite = srgbComposite;
         // Snapshot the atlas dimensions before createBuffers — it bakes
         // them (with texSize) into an IMMUTABLE constant buffer, so they
         // must be set first.
@@ -234,7 +236,8 @@ namespace openxr_api_layer::utils::glyph_atlas {
             { static_cast<float>(m_dstW),   static_cast<float>(m_dstH) },
             { static_cast<float>(m_atlasW), static_cast<float>(m_atlasH) },
             m_ss,
-            { 0.0f, 0.0f, 0.0f }
+            m_srgbComposite ? 1.0f : 0.0f,
+            { 0.0f, 0.0f }
         };
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth      = sizeof(TextConstants);
