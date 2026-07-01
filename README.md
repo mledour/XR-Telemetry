@@ -12,6 +12,27 @@ across SteamVR / WMR / Oculus / Pimax / Varjo without per-runtime
 patches. It never modifies the frame content the game submits; it only
 observes timings and (optionally) composites its own quad on top.
 
+## Compatibility
+
+The layer is runtime-agnostic — it sits below the game on the OpenXR call
+path, so any conformant OpenXR runtime should work. The overlay additionally
+needs a D3D11 or D3D12 session and a BGRA8/RGBA8 swapchain format (UNORM or
+sRGB); the logging feature has no such requirement.
+
+Verified on real hardware:
+
+| Application | Bridge | OpenXR runtime | Overlay | Logging |
+| --- | --- | --- | :---: | :---: |
+| OpenVR game | OpenComposite | Pimax OpenXR | ✅ | ✅ |
+| OpenXR game | — (native)    | Pimax OpenXR | ✅ | ✅ |
+| OpenVR game | OpenComposite | SteamVR/OpenXR | ✅ | ✅ |
+
+*Bridge* is the OpenVR→OpenXR translation layer that lets a legacy OpenVR
+title run on an OpenXR runtime; native OpenXR games need none. Tested with
+Pimax OpenXR 0.1.0 and SteamVR/OpenXR 2.16.7. Other runtimes
+(WMR / Oculus / Varjo) are expected to work but haven't been verified yet —
+reports welcome.
+
 ## Install
 
 Download the latest `Setup.exe` from
